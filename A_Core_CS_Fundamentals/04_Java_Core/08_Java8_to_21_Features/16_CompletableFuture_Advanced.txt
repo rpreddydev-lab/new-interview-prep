@@ -1,0 +1,245 @@
+COMPLETABLEFUTURE ADVANCED PATTERNS
+=====================================
+
+OVERVIEW
+---------
+  CompletableFuture<T> (Java 8) enables composable asynchronous programming.
+  Java 9 added important enhancements (timeout, delayed execution).
+  This file covers advanced patterns beyond the basics.
+
+  (See 07_Multithreading_and_Concurrency/08_Future_CompletableFuture.txt for fundamentals)
+
+TIMEOUTS (JAVA 9 — JEP 266)
+------------------------------
+  Before Java 9, there was no way to timeout a CompletableFuture automatically;
+  you had to schedule a separate task.
+
+  Java 9 added two methods on CompletableFuture:
+
+  // orTimeout(duration, unit) — complete exceptionally with TimeoutException:
+  CompletableFuture<String> cf = fetchDataAsync()
+      .orTimeout(3, TimeUnit.SECONDS);
+  // If fetchDataAsync doesn't complete within 3 seconds, cf fails with TimeoutException
+
+  // completeOnTimeout(value, duration, unit) — complete with fallback value:
+  CompletableFuture<String> cf2 = fetchDataAsync()
+      .completeOnTimeout("default", 3, TimeUnit.SECONDS);
+  // If it times out, completes with "default" instead of an exception
+
+  // Practical pattern — timeout with fallback:
+  CompletableFuture<User> user = fetchUser(id)
+      .completeOnTimeout(User.unknown(), 2, TimeUnit.SECONDS)
+      .exceptionally(ex -> User.error(ex.getMessage()));
+
+DELAYED EXECUTOR (JAVA 9)
+--------------------------
+  CompletableFuture.delayedExecutor(delay, unit) creates an Executor that delays
+  task submission by the specified amount:
+
+  // Run a task after a 2-second delay:
+  Executor delayed = CompletableFuture.delayedExecutor(2, TimeUnit.SECONDS);
+  CompletableFuture.supplyAsync(() -> doWork(), delayed);
+
+  // Schedule a retry with delay:
+  CompletableFuture<String> withRetry = primaryTask
+      .exceptionallyComposeAsync(
+          ex -> retryTask(),
+          CompletableFuture.delayedExecutor(1, TimeUnit.SECONDS)
+      );
+
+EXCEPTIONALLY COMPOSE (JAVA 12)
+---------------------------------
+  exceptionallyCompose(fn) — like thenCompose but for the error path:
+  // If this CF fails, call fn which returns a new CF (async fallback):
+
+  CompletableFuture<Data> withFallback = fetchPrimary()
+      .exceptionallyCompose(ex -> fetchFallback());  // returns CompletableFuture<Data>
+
+  // Async variant:
+  CompletableFuture<Data> async = fetchPrimary()
+      .exceptionallyComposeAsync(ex -> fetchFallback(), executor);
+
+ERROR HANDLING CHAIN
+---------------------
+  // Three error handling methods:
+  //   exceptionally(fn)      — fn runs on exception, returns T, chain continues
+  //   handle(BiFunction)     — ALWAYS runs (like finally), returns new value
+  //   whenComplete(BiConsumer) — ALWAYS runs for side effect, propagates same value/exception
+
+  CompletableFuture<String> cf = fetchData()
+      .thenApply(data -> transform(data))          // normal path
+      .exceptionally(ex -> {                        // catch and recover
+          log.error("Failed", ex);
+          return "fallback";
+      })
+      .thenApply(String::toUpperCase)              // continues with "fallback" or real value
+      .handle((result, ex) -> {                    // always runs
+          if (ex != null) return "error: " + ex.getMessage();
+          return result;
+      })
+      .whenComplete((result, ex) -> {              // side effect, doesn't change value
+          audit.log("Completed: " + result);
+      });
+
+  // Key differences:
+  // exceptionally: only on exception, returns T (same type)
+  // handle:        always, returns any type (can change type), replaces exception
+  // whenComplete:  always, void (side effect only), does NOT suppress exceptions
+
+COMBINING MULTIPLE FUTURES
+----------------------------
+  // allOf — wait for all, then extract results:
+  CompletableFuture<User>    userFuture    = fetchUser(userId);
+  CompletableFuture<Orders>  ordersFuture  = fetchOrders(userId);
+  CompletableFuture<Profile> profileFuture = fetchProfile(userId);
+
+  CompletableFuture<Void> all = CompletableFuture.allOf(userFuture, ordersFuture, profileFuture);
+
+  CompletableFuture<Dashboard> dashboard = all.thenApply(__ ->
+      new Dashboard(
+          userFuture.join(),     // join() is safe here — all futures already completed
+          ordersFuture.join(),
+          profileFuture.join()
+      )
+  );
+
+  // Helper method to extract all results from allOf:
+  public static <T> CompletableFuture<List<T>> allOfList(List<CompletableFuture<T>> futures) {
+      CompletableFuture<Void> all = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+      return all.thenApply(__ ->
+          futures.stream().map(CompletableFuture::join).collect(Collectors.toList())
+      );
+  }
+
+  // anyOf — first to complete wins (returns CompletableFuture<Object>):
+  CompletableFuture<Object> fastest = CompletableFuture.anyOf(server1, server2, server3);
+  // Cast the result to the expected type — all futures should return the same type
+  CompletableFuture<String> firstServer = CompletableFuture.anyOf(s1, s2, s3)
+      .thenApply(r -> (String) r);
+
+PARALLEL EXECUTION PATTERN
+----------------------------
+  // Execute multiple independent tasks in parallel, collect all results:
+  List<String> urls = List.of("url1", "url2", "url3", "url4");
+  List<CompletableFuture<String>> futures = urls.stream()
+      .map(url -> CompletableFuture.supplyAsync(() -> fetch(url), executor))
+      .collect(Collectors.toList());
+
+  List<String> results = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+      .thenApply(__ -> futures.stream().map(CompletableFuture::join).collect(Collectors.toList()))
+      .join();
+
+RETRY PATTERN
+--------------
+  static <T> CompletableFuture<T> retry(Supplier<CompletableFuture<T>> taskFactory,
+                                         int maxRetries,
+                                         Executor executor) {
+      CompletableFuture<T> result = taskFactory.get();
+      for (int i = 0; i < maxRetries; i++) {
+          final int attempt = i;
+          result = result.exceptionallyComposeAsync(
+              ex -> {
+                  System.out.println("Retry " + (attempt + 1));
+                  return taskFactory.get();
+              },
+              CompletableFuture.delayedExecutor(500L * (1 << attempt), TimeUnit.MILLISECONDS)
+          );
+      }
+      return result;
+  }
+
+  // Usage:
+  CompletableFuture<Data> robust = retry(() -> fetchFromApi(), 3, Executors.newFixedThreadPool(4));
+
+COMPLETABLEFUTURE WITH VIRTUAL THREADS (JAVA 21)
+--------------------------------------------------
+  Traditional CF uses ForkJoinPool.commonPool() by default (CPU-bound, limited parallelism).
+  For I/O-heavy tasks, use a virtual thread executor:
+
+  Executor vtExecutor = Executors.newVirtualThreadPerTaskExecutor();
+
+  CompletableFuture<String> cf = CompletableFuture.supplyAsync(() -> {
+      // I/O-heavy operation — runs on virtual thread
+      return httpClient.send(request, BodyHandlers.ofString()).body();
+  }, vtExecutor);
+
+  // allOf with virtual threads — each fetch on its own virtual thread:
+  List<CompletableFuture<String>> fetches = urls.stream()
+      .map(url -> CompletableFuture.supplyAsync(() -> fetch(url), vtExecutor))
+      .collect(Collectors.toList());
+
+GET() VS JOIN()
+----------------
+  | Aspect          | get()                          | join()                       |
+  |-----------------|-------------------------------|------------------------------|
+  | Exception       | Checked — ExecutionException  | Unchecked — CompletionException|
+  | Interrupt       | throws InterruptedException   | No InterruptedException      |
+  | Use in lambdas  | Requires try-catch            | Can use directly             |
+  | Blocking        | Yes                           | Yes                          |
+  | Timeout         | get(timeout, unit)            | No built-in timeout variant  |
+
+COMPLETABLEFUTURE METHODS QUICK REFERENCE
+------------------------------------------
+  Creation:
+    supplyAsync(Supplier)              — async, produces T
+    runAsync(Runnable)                 — async, produces Void
+    completedFuture(T)                 — already-completed CF
+    failedFuture(Throwable) [J9]       — already-failed CF
+
+  Chaining (next step after success):
+    thenApply(Function)                — synchronous transform
+    thenApplyAsync(Function)           — async transform
+    thenCompose(Function→CF)           — flat map (avoid nesting)
+    thenAccept(Consumer)               — consume, return Void CF
+    thenRun(Runnable)                  — run, no data access
+
+  Combining:
+    thenCombine(other, BiFunction)     — both complete → combine
+    thenAcceptBoth(other, BiConsumer)  — both complete → consume
+    runAfterBoth(other, Runnable)      — both complete → run
+    applyToEither(other, Function)     — first complete → transform
+    acceptEither(other, Consumer)      — first complete → consume
+    allOf(CFs...)                      — wait for all
+    anyOf(CFs...)                      — wait for first
+
+  Error handling:
+    exceptionally(Function)            — catch and recover with T
+    handle(BiFunction)                 — always, can change type
+    whenComplete(BiConsumer)           — always, side effect only
+    exceptionallyCompose(fn) [J12]     — catch and recover with CF<T>
+
+  Timeout (Java 9):
+    orTimeout(time, unit)              — fail with TimeoutException
+    completeOnTimeout(value, time, unit) — fallback value on timeout
+
+COMMON INTERVIEW QUESTIONS
+---------------------------
+Q: What is the difference between thenApply, thenCompose, and thenCombine?
+A: thenApply(Function<T,R>) synchronously transforms the result T to R within the same
+   completion stage — used for simple mapping. thenCompose(Function<T,CompletableFuture<R>>)
+   is flatMap for CFs — the function returns a new CF, avoiding nesting (CF<CF<T>>);
+   use it to chain async operations that themselves return CFs. thenCombine(CF<U>, BiFunction<T,U,R>)
+   waits for BOTH this CF and another independent CF to complete, then combines their
+   results — for parallel independent tasks.
+
+Q: How do you handle timeouts in CompletableFuture?
+A: Java 9 added orTimeout(duration, unit), which completes the CF exceptionally with
+   TimeoutException if it doesn't complete within the specified time. There's also
+   completeOnTimeout(value, duration, unit), which completes with a fallback value instead
+   of an exception. Before Java 9, you had to schedule a ScheduledExecutorService task
+   to call completeExceptionally on the CF after the timeout.
+
+Q: What is the difference between exceptionally, handle, and whenComplete?
+A: exceptionally runs only on failure and returns a recovery value of type T (same type
+   as the CF). handle always runs regardless of success or failure, receives both result
+   and exception (either may be null), and returns a new value (can change the type).
+   whenComplete always runs for side effects (logging, cleanup) but cannot change the
+   result or exception — whatever was the result/exception continues to propagate.
+
+Q: What is the risk of using CompletableFuture.allOf and how do you extract results?
+A: allOf(CF...) returns CompletableFuture<Void> — it doesn't hold the results directly.
+   You must call join() on each original CF after allOf completes. Since allOf guarantees
+   all futures are done when the returned CF completes, join() inside a thenApply callback
+   won't block. The safe pattern is: allOf(...).thenApply(__ -> futures.stream().map(CF::join)
+   .collect(toList())). The risk is if any future fails — allOf itself fails, and you must
+   handle exceptions on individual futures before calling allOf if you need partial results.
