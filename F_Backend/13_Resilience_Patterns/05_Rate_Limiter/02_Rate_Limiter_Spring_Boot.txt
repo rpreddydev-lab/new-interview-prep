@@ -1,0 +1,193 @@
+RATE LIMITER PATTERN — RESILIENCE4J + SPRING BOOT
+==================================================
+
+Overview
+--------
+Rate Limiter controls how many calls can be made to a service in a given time period.
+
+Use cases:
+  - Protect downstream services from being overwhelmed (client-side rate limiting)
+  - Respect third-party API quotas (e.g., payment gateway: 100 req/sec)
+  - Prevent a single tenant from monopolizing shared resources
+
+Resilience4j Rate Limiter: token-bucket-like algorithm.
+  - N permissions (tokens) refreshed every period
+  - If no token available, call waits up to timeout-duration, then throws RateLimiterFullException
+
+---
+
+Dependency
+----------
+  <dependency>
+    <groupId>io.github.resilience4j</groupId>
+    <artifactId>resilience4j-spring-boot3</artifactId>
+  </dependency>
+
+---
+
+Configuration (application.yml)
+---------------------------------
+  resilience4j:
+    ratelimiter:
+      instances:
+        paymentGateway:
+          limit-for-period: 10             # 10 calls per refresh period
+          limit-refresh-period: 1s         # reset every 1 second
+          timeout-duration: 250ms          # wait up to 250ms for a permission
+          allow-health-indicator-to-fail: true
+          subscribe-for-events: true
+
+  Effective rate: 10 calls/second to paymentGateway.
+  Exceeding: waits 250ms → RateLimiterRequestNotPermitted exception.
+
+---
+
+@RateLimiter Annotation
+------------------------
+  @Service
+  public class PaymentService {
+
+      @RateLimiter(name = "paymentGateway", fallbackMethod = "paymentRateFallback")
+      public PaymentResult processPayment(PaymentRequest request) {
+          return stripeClient.charge(request);
+      }
+
+      private PaymentResult paymentRateFallback(PaymentRequest request,
+                                                RequestNotPermitted ex) {
+          log.warn("Rate limit exceeded for payment gateway — queuing request");
+          // Options: queue in Redis/Kafka for later, return 429, use degraded service
+          eventPublisher.publishEvent(new PaymentQueuedEvent(request));
+          return PaymentResult.queued("Request queued due to rate limit");
+      }
+  }
+
+---
+
+Programmatic Usage
+------------------
+  @Autowired
+  RateLimiterRegistry rateLimiterRegistry;
+
+  RateLimiter limiter = rateLimiterRegistry.rateLimiter("paymentGateway");
+
+  // Decorate a call
+  Supplier<PaymentResult> decorated =
+      RateLimiter.decorateSupplier(limiter, () -> stripeClient.charge(request));
+
+  // Execute
+  Try<PaymentResult> result = Try.ofSupplier(decorated)
+      .recover(RequestNotPermitted.class, ex -> PaymentResult.queued("Rate limited"));
+
+  // Check metrics
+  RateLimiter.Metrics metrics = limiter.getMetrics();
+  int available = metrics.getAvailablePermissions();    // tokens left
+  int waiting   = metrics.getNumberOfWaitingThreads(); // threads waiting for token
+
+  // Event listener
+  limiter.getEventPublisher()
+      .onSuccess(e -> log.debug("Rate limiter permitted call"))
+      .onFailure(e -> log.warn("Rate limiter rejected call — limit exceeded"));
+
+  // Dynamically change limits at runtime
+  limiter.changeLimitForPeriod(20);        // double the limit
+  limiter.changeTimeoutDuration(Duration.ofMillis(500));
+
+---
+
+Rate Limiter vs Bulkhead
+------------------------
+  Rate Limiter: "Max N calls per second" — time-windowed
+  Bulkhead:     "Max N concurrent calls" — concurrency-based
+
+  Rate Limiter rejects based on throughput rate.
+  Bulkhead rejects based on concurrent load.
+
+  Used together:
+    Rate Limiter: max 100 req/sec to payment gateway
+    Bulkhead:     max 10 concurrent payment calls at any time
+
+---
+
+Handling 429 Too Many Requests from External APIs
+--------------------------------------------------
+When calling an external API that returns 429:
+
+  @RateLimiter(name = "externalApi")
+  @Retry(name = "externalApi")  // retry after wait on 429
+  public ApiResponse callExternalApi(ApiRequest request) {
+      ResponseEntity<ApiResponse> response = restTemplate.postForEntity(url, request, ApiResponse.class);
+      if (response.getStatusCode() == HttpStatus.TOO_MANY_REQUESTS) {
+          String retryAfter = response.getHeaders().getFirst("Retry-After");
+          throw new RateLimitException("External API rate limited. Retry after: " + retryAfter);
+      }
+      return response.getBody();
+  }
+
+Configure retry to recognize RateLimitException:
+  resilience4j:
+    retry:
+      instances:
+        externalApi:
+          retry-exceptions:
+            - com.example.exceptions.RateLimitException
+
+---
+
+Multi-tenant Rate Limiting
+---------------------------
+For per-tenant or per-user limits, create rate limiters dynamically:
+
+  @Service
+  public class TenantAwarePaymentService {
+
+      private final RateLimiterRegistry registry;
+
+      public PaymentResult processPayment(String tenantId, PaymentRequest request) {
+          RateLimiter tenantLimiter = registry.rateLimiter(
+              "tenant-" + tenantId,
+              RateLimiterConfig.custom()
+                  .limitForPeriod(getTenantLimit(tenantId))
+                  .limitRefreshPeriod(Duration.ofSeconds(1))
+                  .timeoutDuration(Duration.ofMillis(100))
+                  .build()
+          );
+
+          return RateLimiter.decorateSupplier(tenantLimiter,
+              () -> stripeClient.charge(request)).get();
+      }
+  }
+
+Warning: Dynamic rate limiters accumulate in registry — evict stale ones:
+  registry.remove("tenant-" + oldTenantId);
+
+---
+
+Metrics (Micrometer)
+--------------------
+  resilience4j_ratelimiter_available_permissions   — tokens available
+  resilience4j_ratelimiter_waiting_threads         — threads waiting
+
+Grafana alert: alert when available_permissions == 0 for 30s (sustained saturation)
+
+---
+
+Testing Rate Limiter
+--------------------
+  @Test
+  void shouldThrottleCallsExceedingRateLimit() {
+      RateLimiter limiter = RateLimiter.of("test",
+          RateLimiterConfig.custom()
+              .limitForPeriod(5)
+              .limitRefreshPeriod(Duration.ofSeconds(10))
+              .timeoutDuration(Duration.ZERO) // fail immediately if no token
+              .build());
+
+      // 5 calls succeed
+      IntStream.range(0, 5).forEach(i ->
+          RateLimiter.decorateRunnable(limiter, () -> {}).run());
+
+      // 6th call fails
+      assertThatThrownBy(() ->
+          RateLimiter.decorateRunnable(limiter, () -> {}).run())
+          .isInstanceOf(RequestNotPermitted.class);
+  }

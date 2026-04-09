@@ -1,0 +1,183 @@
+BULKHEAD PATTERN — RESILIENCE4J + SPRING BOOT
+==============================================
+
+Overview
+--------
+Bulkhead isolates resources to prevent one slow/failing dependency from
+exhausting all threads/connections and bringing down the entire service.
+
+Named after ship bulkheads — watertight compartments that prevent one breach
+from sinking the whole ship.
+
+Two implementations in Resilience4j:
+  SemaphoreBulkhead  — limits concurrent calls via semaphore permits
+  ThreadPoolBulkhead — executes calls in a dedicated, isolated thread pool
+
+---
+
+Dependency
+----------
+  <dependency>
+    <groupId>io.github.resilience4j</groupId>
+    <artifactId>resilience4j-spring-boot3</artifactId>
+  </dependency>
+
+---
+
+SemaphoreBulkhead Configuration
+---------------------------------
+Limits concurrent calls to a service. When full, new calls fail immediately.
+
+  resilience4j:
+    bulkhead:
+      instances:
+        paymentService:
+          max-concurrent-calls: 10         # max simultaneous calls
+          max-wait-duration: 100ms         # how long to wait for a permit (0 = fail fast)
+
+  Behavior:
+    - 10 concurrent calls to paymentService allowed
+    - 11th call waits up to 100ms for a permit
+    - After 100ms: throws BulkheadFullException → trigger fallback
+
+---
+
+ThreadPoolBulkhead Configuration
+----------------------------------
+Executes calls in a separate thread pool — better isolation than semaphore.
+Calls are async (returns CompletionStage).
+
+  resilience4j:
+    thread-pool-bulkhead:
+      instances:
+        paymentService:
+          max-thread-pool-size: 10        # max threads in pool
+          core-thread-pool-size: 5        # minimum threads always alive
+          queue-capacity: 20              # task queue when all threads busy
+          keep-alive-duration: 20ms       # idle thread timeout
+
+  Behavior:
+    - Up to 10 threads execute paymentService calls
+    - Up to 20 more queued when all threads busy
+    - If queue full: throws BulkheadFullException
+
+---
+
+@Bulkhead Annotation — Semaphore (sync)
+-----------------------------------------
+  @Service
+  public class OrderService {
+
+      @Bulkhead(name = "paymentService",
+                type = Bulkhead.Type.SEMAPHORE,
+                fallbackMethod = "paymentFallback")
+      public PaymentResult processPayment(Order order) {
+          return paymentClient.pay(order.getAmount());
+      }
+
+      private PaymentResult paymentFallback(Order order, BulkheadFullException ex) {
+          log.warn("Bulkhead full — payment service at capacity");
+          return PaymentResult.queued(); // or throw a 429 Too Many Requests
+      }
+  }
+
+@Bulkhead Annotation — ThreadPool (async)
+------------------------------------------
+  @Bulkhead(name = "paymentService",
+            type = Bulkhead.Type.THREADPOOL)
+  public CompletableFuture<PaymentResult> processPaymentAsync(Order order) {
+      return CompletableFuture.supplyAsync(() -> paymentClient.pay(order.getAmount()));
+  }
+
+  // Caller:
+  CompletableFuture<PaymentResult> future = orderService.processPaymentAsync(order);
+  future.exceptionally(ex -> PaymentResult.failed(ex.getMessage()));
+
+---
+
+Programmatic Usage
+------------------
+  Bulkhead bulkhead = bulkheadRegistry.bulkhead("paymentService");
+
+  // Available permits
+  int available = bulkhead.getMetrics().getAvailableConcurrentCalls();
+
+  // Event listener
+  bulkhead.getEventPublisher()
+      .onCallPermitted(e -> log.debug("Call permitted, available: {}",
+          bulkhead.getMetrics().getAvailableConcurrentCalls()))
+      .onCallRejected(e -> log.warn("Call rejected — bulkhead full"))
+      .onCallFinished(e -> log.debug("Call finished"));
+
+  // Decorate a supplier
+  Supplier<PaymentResult> decorated =
+      Bulkhead.decorateSupplier(bulkhead, () -> paymentClient.pay(amount));
+
+  Try<PaymentResult> result = Try.ofSupplier(decorated)
+      .recover(BulkheadFullException.class, ex -> PaymentResult.queued());
+
+---
+
+Metrics (Auto-registered with Micrometer)
+-----------------------------------------
+  resilience4j_bulkhead_available_concurrent_calls   — remaining permits
+  resilience4j_bulkhead_max_allowed_concurrent_calls — configured max
+
+Grafana alert: alert when available_concurrent_calls < 2 for 1m (near saturation)
+
+---
+
+Semaphore vs ThreadPool Bulkhead
+---------------------------------
+  | Aspect            | SemaphoreBulkhead         | ThreadPoolBulkhead         |
+  |-------------------|---------------------------|----------------------------|
+  | Execution         | Same thread (sync)         | Dedicated thread pool      |
+  | Async support     | No                         | Yes (CompletionStage)      |
+  | Resource isolation| Permit-based               | Thread-pool based          |
+  | CPU overhead      | Very low                   | Thread context switching   |
+  | Timeout support   | No (use TimeLimiter)        | Built-in queue timeout     |
+  | Spring MVC        | Best fit                   | Works but overkill         |
+  | WebFlux           | Works (non-blocking)        | Use semaphore with WebFlux |
+
+---
+
+Combining Bulkhead with Circuit Breaker
+-----------------------------------------
+Common pattern: Bulkhead limits concurrency, CB trips on failures.
+
+  @Bulkhead(name = "paymentService", fallbackMethod = "paymentFallback")
+  @CircuitBreaker(name = "paymentService", fallbackMethod = "paymentFallback")
+  public PaymentResult processPayment(Order order) {
+      return paymentClient.pay(order.getAmount());
+  }
+
+Order of execution: CircuitBreaker (outer) → Bulkhead (inner) → actual call.
+If CB is OPEN, Bulkhead never runs (saves permits for other callers).
+
+---
+
+Testing Bulkhead
+----------------
+  @Test
+  void shouldRejectCallWhenBulkheadFull() throws InterruptedException {
+      Bulkhead bulkhead = bulkheadRegistry.bulkhead("paymentService");
+
+      // Fill the bulkhead
+      CountDownLatch latch = new CountDownLatch(1);
+      IntStream.range(0, 10).forEach(i ->
+          CompletableFuture.runAsync(() -> {
+              Bulkhead.decorateRunnable(bulkhead, () -> {
+                  try { latch.await(); } catch (InterruptedException ignored) {}
+              }).run();
+          })
+      );
+
+      // Next call should be rejected
+      Callable<PaymentResult> call =
+          Bulkhead.decorateCallable(bulkhead, () -> paymentClient.pay(amount));
+
+      assertThatThrownBy(call::call)
+          .isInstanceOf(BulkheadFullException.class);
+
+      latch.countDown(); // release
+  }

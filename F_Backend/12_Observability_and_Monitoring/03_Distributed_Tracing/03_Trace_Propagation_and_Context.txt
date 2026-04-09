@@ -1,0 +1,161 @@
+TRACE PROPAGATION AND CONTEXT
+===============================
+
+Overview
+--------
+Distributed tracing only works when trace context is forwarded between services.
+Without propagation, each service creates isolated, disconnected traces.
+
+Spring Boot 3 + Micrometer Tracing handles propagation automatically for:
+  - HTTP (RestTemplate, WebClient, Feign, Spring MVC)
+  - Messaging (Kafka, RabbitMQ — with observationEnabled=true)
+  - Scheduled tasks (new root span per execution)
+
+---
+
+Propagation Formats
+--------------------
+
+W3C TraceContext (recommended — modern standard):
+  Header: traceparent
+  Format: {version}-{traceId}-{parentSpanId}-{flags}
+  Example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+
+  Header: tracestate (optional vendor-specific data)
+  Example: vendor1=opaqueValue1
+
+B3 (Zipkin / Brave format):
+  Single header:  b3: {traceId}-{spanId}-{sampled}
+  Multi-header:   X-B3-TraceId, X-B3-SpanId, X-B3-ParentSpanId, X-B3-Sampled
+
+  Example:
+    X-B3-TraceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    X-B3-SpanId: 00f067aa0ba902b7
+    X-B3-Sampled: 1
+
+Configure propagation format:
+  management:
+    tracing:
+      propagation:
+        type: W3C   # or B3, B3_MULTI
+
+---
+
+HTTP Propagation (Auto)
+------------------------
+Spring auto-propagates for:
+
+  RestTemplate (add interceptor bean for auto-propagation):
+    @Bean
+    RestTemplate restTemplate(RestTemplateBuilder builder) {
+        return builder.build();
+        // Spring Boot auto-configures ObservationRestTemplateCustomizer
+    }
+
+  WebClient (auto):
+    @Bean
+    WebClient webClient(WebClient.Builder builder) {
+        return builder.build();
+        // ObservationWebClientCustomizer applied automatically
+    }
+
+  Feign (auto with micrometer-tracing on classpath)
+
+Incoming requests:
+  Spring MVC / WebFlux filters extract the traceparent header and
+  resume (or start) a trace for the inbound request.
+
+---
+
+Messaging Propagation
+-----------------------
+
+Kafka (Spring Kafka):
+  @Bean
+  KafkaTemplate<String, Object> kafkaTemplate(...) {
+      template.setObservationEnabled(true); // inject trace headers into Kafka record
+  }
+
+  @KafkaListener(topics = "orders", observationEnabled = "true")
+  public void handle(Order order) { ... }
+  // Extracts trace headers, continues the span
+
+RabbitMQ (Spring AMQP):
+  @Bean
+  RabbitTemplate rabbitTemplate(ConnectionFactory cf) {
+      template.setObservationEnabled(true); // inject trace into AMQP message headers
+  }
+
+  @RabbitListener(queues = "orders.queue", observationEnabled = "true")
+  public void handle(Order order) { ... }
+
+---
+
+Manual Context Propagation
+----------------------------
+When automatic propagation doesn't cover your case:
+
+Inject into outgoing request:
+  @Autowired
+  Propagator propagator;
+
+  @Autowired
+  Tracer tracer;
+
+  Map<String, String> carrier = new HashMap<>();
+  propagator.inject(tracer.currentSpan().context(), carrier, Map::put);
+  // Add carrier headers to your outgoing HTTP call
+
+Extract from incoming:
+  Propagator.Getter<Map<String, String>> getter = Map::get;
+  TraceContext.Extractor<Map<String, String>> extractor =
+      propagator.extractor(getter);
+
+  TraceContextOrSamplingFlags traceContextOrFlags =
+      extractor.extract(incomingHeaders);
+
+  Span span = tracer.nextSpan(traceContextOrFlags).name("my-span").start();
+
+---
+
+MDC Integration (Logs with Trace IDs)
+----------------------------------------
+Spring Boot 3 auto-puts traceId and spanId into MDC (Mapped Diagnostic Context).
+
+application.yml:
+  logging:
+    pattern:
+      level: "%5p [${spring.application.name},%X{traceId:-},%X{spanId:-}]"
+
+Log output:
+  INFO  [orders-service,4bf92f3577b34da6a3,00f067aa0ba902b7] Processing order 123
+
+This ties logs to traces — paste traceId into Zipkin/Jaeger/Tempo to see the trace.
+
+---
+
+Baggage (Cross-Cutting Context)
+---------------------------------
+Baggage propagates custom key-value pairs alongside the trace.
+Useful for: tenant ID, user ID, correlation ID, feature flag.
+
+  # Enable baggage fields
+  management:
+    tracing:
+      baggage:
+        remote-fields: tenant-id, user-id
+        correlation:
+          fields: tenant-id  # also inject into MDC
+
+Access baggage:
+  @Autowired
+  Tracer tracer;
+
+  String tenantId = tracer.currentSpan()
+      .context()
+      .baggageItem("tenant-id");
+
+Set baggage:
+  tracer.currentSpanCustomizer().tag("tenant-id", "acme");
+
+Note: Baggage adds overhead — limit to essential cross-cutting concerns.

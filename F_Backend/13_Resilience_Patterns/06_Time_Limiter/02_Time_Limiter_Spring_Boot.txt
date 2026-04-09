@@ -1,0 +1,188 @@
+TIME LIMITER PATTERN — RESILIENCE4J + SPRING BOOT
+==================================================
+
+Overview
+--------
+Time Limiter enforces a maximum duration for a call.
+If the call exceeds the configured duration, it is cancelled and a
+TimeoutException is thrown (which can trigger a fallback or retry).
+
+Use cases:
+  - Prevent slow external services from holding threads indefinitely
+  - Enforce SLAs on downstream calls
+  - Used with async calls (CompletableFuture / reactive)
+
+Important: TimeLimiter in Resilience4j works with async (non-blocking) calls.
+For sync calls, combine with a timeout in RestTemplate/WebClient or use @Timeout.
+
+---
+
+Dependency
+----------
+  <dependency>
+    <groupId>io.github.resilience4j</groupId>
+    <artifactId>resilience4j-spring-boot3</artifactId>
+  </dependency>
+
+---
+
+Configuration (application.yml)
+---------------------------------
+  resilience4j:
+    timelimiter:
+      instances:
+        paymentService:
+          timeout-duration: 2s             # max 2 seconds per call
+          cancel-running-future: true      # cancel CompletableFuture on timeout
+
+---
+
+@TimeLimiter Annotation (Requires Async)
+-----------------------------------------
+  @Service
+  public class PaymentService {
+
+      @TimeLimiter(name = "paymentService", fallbackMethod = "paymentTimeout")
+      @CircuitBreaker(name = "paymentService")
+      public CompletableFuture<PaymentResult> processPaymentAsync(PaymentRequest request) {
+          return CompletableFuture.supplyAsync(() -> paymentClient.pay(request));
+      }
+
+      private CompletableFuture<PaymentResult> paymentTimeout(PaymentRequest request,
+                                                              TimeoutException ex) {
+          log.warn("Payment timed out — returning queued status");
+          return CompletableFuture.completedFuture(PaymentResult.queued());
+      }
+  }
+
+  // Caller:
+  CompletableFuture<PaymentResult> future =
+      paymentService.processPaymentAsync(request);
+
+  // Async with timeout handling
+  PaymentResult result = future
+      .exceptionally(ex -> PaymentResult.failed("timeout"))
+      .get();
+
+---
+
+Programmatic Usage
+------------------
+  @Autowired
+  TimeLimiterRegistry timeLimiterRegistry;
+
+  TimeLimiter limiter = timeLimiterRegistry.timeLimiter("paymentService");
+
+  // Wrap a CompletableFuture supplier
+  Callable<PaymentResult> callable = TimeLimiter.decorateFutureSupplier(
+      limiter,
+      () -> CompletableFuture.supplyAsync(() -> paymentClient.pay(request))
+  );
+
+  Try<PaymentResult> result = Try.of(callable::call)
+      .recover(TimeoutException.class, ex -> PaymentResult.queued());
+
+  // Event listener
+  limiter.getEventPublisher()
+      .onSuccess(e -> log.debug("Call completed within timeout"))
+      .onTimeout(e -> log.warn("Call timed out: {}", e.getTimeLimiterName()))
+      .onError(e -> log.error("Call failed: {}", e.getThrowable().getMessage()));
+
+---
+
+TimeLimiter with WebFlux (Reactive)
+--------------------------------------
+  @TimeLimiter(name = "paymentService")
+  public Mono<PaymentResult> processPayment(PaymentRequest request) {
+      return webClient.post()
+          .uri("/payment")
+          .bodyValue(request)
+          .retrieve()
+          .bodyToMono(PaymentResult.class)
+          .timeout(Duration.ofSeconds(2)); // Reactor's own timeout (use either or both)
+  }
+
+  // Reactor's .timeout() is idiomatic for WebFlux
+  // Resilience4j @TimeLimiter also works with Mono/Flux
+
+---
+
+TimeLimiter vs Other Timeout Approaches
+-----------------------------------------
+  | Approach                    | Works With       | Note                           |
+  |-----------------------------|------------------|--------------------------------|
+  | @TimeLimiter (Resilience4j) | Async (CF/Mono)  | Integrates with R4j ecosystem  |
+  | RestTemplate readTimeout    | Sync HTTP        | Timeout at HTTP connection     |
+  | WebClient.timeout()         | Reactive         | Reactor native                 |
+  | @Async + future.get(timeout)| Async            | Manual, less elegant           |
+  | Thread.interrupt()          | Any              | Not reliable                   |
+
+RestTemplate timeout config (sync, no @TimeLimiter needed):
+  @Bean
+  RestTemplate restTemplate(RestTemplateBuilder builder) {
+      return builder
+          .connectTimeout(Duration.ofMillis(500))
+          .readTimeout(Duration.ofSeconds(2))
+          .build();
+  }
+
+WebClient timeout (reactive):
+  webClient.get()
+      .uri("/resource")
+      .retrieve()
+      .bodyToMono(Response.class)
+      .timeout(Duration.ofSeconds(2),
+               Mono.error(new ServiceTimeoutException("Timed out")));
+
+---
+
+Combining TimeLimiter with Circuit Breaker and Retry
+-----------------------------------------------------
+Recommended decoration order (outermost first):
+  CircuitBreaker → TimeLimiter → Retry → actual call
+
+  @Retry(name = "paymentService")
+  @TimeLimiter(name = "paymentService")
+  @CircuitBreaker(name = "paymentService", fallbackMethod = "fallback")
+  public CompletableFuture<PaymentResult> processPayment(PaymentRequest request) {
+      return CompletableFuture.supplyAsync(() -> paymentClient.pay(request));
+  }
+
+  How it works:
+    - CircuitBreaker checks state first — if OPEN, immediately triggers fallback
+    - TimeLimiter cancels if response takes > 2s
+    - TimeoutException from TimeLimiter triggers Retry (if configured)
+    - After max retries, CircuitBreaker records the failure
+    - After enough failures, CB transitions to OPEN
+
+---
+
+Metrics (Micrometer)
+--------------------
+  resilience4j_timelimiter_calls_total{kind="successful"} — on-time completions
+  resilience4j_timelimiter_calls_total{kind="timeout"}    — timed out calls
+  resilience4j_timelimiter_calls_total{kind="failed"}     — other failures
+
+Grafana alert: alert when timeout rate > 5% for 2 minutes
+
+---
+
+Testing TimeLimiter
+-------------------
+  @Test
+  void shouldTimeoutSlowService() {
+      TimeLimiter limiter = TimeLimiter.of("test",
+          TimeLimiterConfig.custom()
+              .timeoutDuration(Duration.ofMillis(100))
+              .cancelRunningFuture(true)
+              .build());
+
+      Callable<String> call = TimeLimiter.decorateFutureSupplier(limiter, () ->
+          CompletableFuture.supplyAsync(() -> {
+              Thread.sleep(1000); // simulate slow call
+              return "result";
+          })
+      );
+
+      assertThatThrownBy(call::call).isInstanceOf(TimeoutException.class);
+  }

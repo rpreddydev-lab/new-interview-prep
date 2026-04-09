@@ -1,0 +1,173 @@
+LOG AGGREGATION PATTERNS
+==========================
+
+Overview
+--------
+In microservices, logs are spread across dozens of pods/containers.
+Log aggregation collects, centralizes, and indexes logs for search and alerting.
+
+Main stacks:
+  ELK    — Elasticsearch + Logstash + Kibana  (self-hosted, feature-rich)
+  EFK    — Elasticsearch + Fluentd + Kibana   (Kubernetes-native, lighter than Logstash)
+  PLG    — Promtail + Loki + Grafana          (low-cost, label-indexed, GitOps-friendly)
+  Splunk — Enterprise, expensive, very powerful
+  Datadog / New Relic — SaaS, all-in-one
+
+---
+
+ELK Stack (Self-Hosted)
+------------------------
+Elasticsearch: Distributed full-text search and analytics engine.
+Logstash:      Log collection, transformation pipeline.
+Kibana:        Visualization and search UI.
+
+Flow:
+  App (JSON logs) → Logstash → Elasticsearch → Kibana
+
+Logstash pipeline (logstash.conf):
+  input {
+    beats {
+      port => 5044
+    }
+  }
+
+  filter {
+    json {
+      source => "message"
+    }
+    date {
+      match => ["@timestamp", "ISO8601"]
+    }
+    mutate {
+      remove_field => ["agent", "ecs", "host", "input"]
+    }
+  }
+
+  output {
+    elasticsearch {
+      hosts => ["http://elasticsearch:9200"]
+      index => "app-logs-%{+YYYY.MM.dd}"
+    }
+  }
+
+Filebeat (lightweight log shipper to replace Logstash as shipper):
+  filebeat.inputs:
+    - type: container
+      paths:
+        - '/var/lib/docker/containers/*/*.log'
+  output.logstash:
+    hosts: ["logstash:5044"]
+
+Kibana queries (KQL):
+  level: "ERROR" and app: "orders-service"
+  traceId: "4bf92f3577b34da6a3ce929d0e0e4736"
+  message: "OutOfMemory*" and env: "prod"
+
+---
+
+Loki + Grafana (Lightweight Alternative)
+------------------------------------------
+Loki does NOT index log content — only indexes labels (service, env, level).
+Logs are stored compressed in object storage (S3, GCS, filesystem).
+Much cheaper than Elasticsearch at scale.
+
+Flow:
+  App → Promtail (or OTLP) → Loki → Grafana
+
+LogQL query examples:
+  {app="orders-service", level="ERROR"}
+  {app="orders-service"} |= "OrderNotFoundException"
+  {app="orders-service"} | json | orderId="ORD-001"
+  rate({app="orders-service", level="ERROR"}[5m])  # error rate
+
+Spring Boot → Loki via Loki4j Appender:
+  <dependency>
+    <groupId>com.github.loki4j</groupId>
+    <artifactId>loki-logback-appender</artifactId>
+  </dependency>
+
+  logback-spring.xml:
+  <appender name="LOKI" class="com.github.loki4j.logback.Loki4jAppender">
+    <http>
+      <url>http://loki:3100/loki/api/v1/push</url>
+    </http>
+    <format>
+      <label>
+        <pattern>app=${spring.application.name},env=${spring.profiles.active},level=%level</pattern>
+      </label>
+      <message class="com.github.loki4j.logback.JsonLayout"/>
+    </format>
+  </appender>
+
+Grafana Correlation (Logs ↔ Traces):
+  In Grafana datasource config for Loki, set derivedFields:
+    - name: TraceID
+      matcherRegex: "traceId=(\w+)"
+      url: "$${__value.raw}"   # links to Tempo trace
+  → Click a log line → jump directly to related trace in Tempo
+
+---
+
+Kubernetes Log Collection
+--------------------------
+
+DaemonSet approach (Fluentd / Promtail):
+  - Run a log collector as a DaemonSet (one per node)
+  - Reads /var/log/containers/*.log
+  - Adds Kubernetes metadata (namespace, pod, container) as labels
+  - Ships to Elasticsearch or Loki
+
+  Promtail config snippet:
+    scrape_configs:
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: app
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+
+Sidecar approach:
+  - Log collector runs as sidecar in same pod
+  - Reads shared volume with app logs
+  - More isolation, more resource cost
+
+OTLP Logs (emerging standard):
+  Spring Boot 3.4+ supports exporting logs via OpenTelemetry Protocol (OTLP).
+  Sends logs directly to OpenTelemetry Collector → Loki / Elasticsearch.
+
+  management:
+    otlp:
+      logging:
+        endpoint: http://otel-collector:4318/v1/logs
+
+---
+
+Retention and Cost Management
+-------------------------------
+  - Hot tier (recent 7 days): fast SSD storage
+  - Warm tier (7–30 days): slower storage
+  - Cold tier (30–90 days): compressed, cheap object storage
+  - Delete or archive beyond 90 days
+
+Index Lifecycle Management (Elasticsearch ILM):
+  Automatically moves indices through hot → warm → cold → delete phases.
+
+Loki retention:
+  table_manager:
+    retention_deletes_enabled: true
+    retention_period: 744h  # 31 days
+
+---
+
+Best Practices
+--------------
+  1. Always output JSON in non-local environments
+  2. Include traceId, spanId, service name in every log line
+  3. Log at the boundary (controller, kafka listener) — not inside domain logic
+  4. Never log sensitive data (passwords, tokens, PII)
+  5. Use warn/error sparingly — don't cry wolf
+  6. Set up alerts on error rate increase (not just error presence)
+  7. Correlate logs with traces (traceId) and metrics (time window)
+  8. Use sampling for high-volume debug logs

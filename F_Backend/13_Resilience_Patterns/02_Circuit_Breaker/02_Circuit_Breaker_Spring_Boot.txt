@@ -1,0 +1,176 @@
+CIRCUIT BREAKER — RESILIENCE4J + SPRING BOOT
+=============================================
+
+Overview
+--------
+Circuit Breaker prevents cascading failures by stopping calls to a failing service.
+States:
+  CLOSED   — requests flow normally, failures counted
+  OPEN     — requests blocked immediately (fail-fast), fallback executed
+  HALF_OPEN — limited test requests allowed; if they succeed → CLOSED, else → OPEN
+
+---
+
+Dependency (Spring Boot 3)
+--------------------------
+  <dependency>
+    <groupId>io.github.resilience4j</groupId>
+    <artifactId>resilience4j-spring-boot3</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-aop</artifactId>
+  </dependency>
+
+---
+
+Configuration (application.yml)
+---------------------------------
+  resilience4j:
+    circuitbreaker:
+      instances:
+        paymentService:
+          sliding-window-type: COUNT_BASED        # or TIME_BASED
+          sliding-window-size: 10                 # last 10 calls
+          minimum-number-of-calls: 5              # don't open before 5 calls
+          failure-rate-threshold: 50              # open if ≥50% fail
+          slow-call-rate-threshold: 80            # also trip on slow calls
+          slow-call-duration-threshold: 2s        # "slow" = >2s
+          wait-duration-in-open-state: 30s        # stay OPEN 30s before HALF_OPEN
+          permitted-number-of-calls-in-half-open-state: 3
+          automatic-transition-from-open-to-half-open-enabled: true
+          record-exceptions:
+            - java.io.IOException
+            - java.util.concurrent.TimeoutException
+            - org.springframework.web.client.HttpServerErrorException
+          ignore-exceptions:
+            - com.example.exceptions.BusinessException  # don't count as failure
+
+---
+
+@CircuitBreaker Annotation
+---------------------------
+  @Service
+  public class OrderService {
+
+      @CircuitBreaker(name = "paymentService", fallbackMethod = "paymentFallback")
+      public PaymentResult processPayment(Order order) {
+          return paymentClient.pay(order.getAmount());
+      }
+
+      // Fallback signature must match + add Throwable parameter
+      private PaymentResult paymentFallback(Order order, CallNotPermittedException ex) {
+          log.warn("Circuit OPEN — using fallback for order {}", order.getId());
+          return PaymentResult.pending(); // queue for later processing
+      }
+
+      private PaymentResult paymentFallback(Order order, IOException ex) {
+          log.error("IO error — fallback", ex);
+          return PaymentResult.failed("Service unavailable");
+      }
+  }
+
+Note: Spring picks the most specific fallback method by exception type.
+
+---
+
+Programmatic Usage
+------------------
+  @Autowired
+  CircuitBreakerRegistry circuitBreakerRegistry;
+
+  CircuitBreaker cb = circuitBreakerRegistry.circuitBreaker("paymentService");
+
+  // Decorate a supplier
+  Supplier<PaymentResult> decorated = CircuitBreaker.decorateSupplier(
+      cb, () -> paymentClient.pay(amount));
+
+  // Execute with fallback
+  Try<PaymentResult> result = Try.ofSupplier(decorated)
+      .recover(CallNotPermittedException.class, ex -> PaymentResult.pending());
+
+  // Check state
+  CircuitBreaker.State state = cb.getState(); // CLOSED, OPEN, HALF_OPEN
+
+  // Event listener
+  cb.getEventPublisher()
+      .onStateTransition(event ->
+          log.info("CB {} transitioned: {} → {}",
+              event.getCircuitBreakerName(),
+              event.getStateTransition().getFromState(),
+              event.getStateTransition().getToState()));
+
+---
+
+Metrics (Micrometer Auto-Integration)
+---------------------------------------
+Resilience4j auto-registers metrics when Micrometer is on classpath:
+
+  resilience4j_circuitbreaker_state                  — current state (0=closed,1=open,2=half_open)
+  resilience4j_circuitbreaker_calls_total            — total calls by kind (successful/failed/slow)
+  resilience4j_circuitbreaker_failure_rate           — current failure rate %
+  resilience4j_circuitbreaker_not_permitted_calls    — calls blocked by OPEN state
+
+Grafana alert: alert when failure_rate > 40% for 2m
+
+---
+
+Sliding Window Types
+--------------------
+COUNT_BASED (default):
+  Evaluates last N calls regardless of time.
+  Best for: consistent traffic.
+
+TIME_BASED:
+  Evaluates calls in last N seconds.
+  sliding-window-size: 10   (means last 10 seconds)
+  Best for: variable traffic, burst patterns.
+
+---
+
+Circuit Breaker vs Retry Interaction
+--------------------------------------
+ALWAYS put Retry inside CircuitBreaker (CB wraps Retry):
+  Each retry attempt is seen as a separate call by the CB.
+  If CB is OPEN, Retry never executes (saves unnecessary retries).
+
+With @CircuitBreaker + @Retry on same method:
+  @Retry(name = "paymentService")           // inner — retries first
+  @CircuitBreaker(name = "paymentService")  // outer — trips after retry exhaustion
+  public PaymentResult processPayment(Order order) { ... }
+
+---
+
+Testing Circuit Breaker
+-----------------------
+  @SpringBootTest
+  class CircuitBreakerTest {
+
+      @Autowired
+      CircuitBreakerRegistry registry;
+
+      @Autowired
+      OrderService orderService;
+
+      @MockBean
+      PaymentClient paymentClient;
+
+      @Test
+      void shouldOpenCircuitAfterFailures() {
+          when(paymentClient.pay(any())).thenThrow(IOException.class);
+
+          // Exhaust the minimum calls to open circuit
+          IntStream.range(0, 10).forEach(i -> {
+              try { orderService.processPayment(order); }
+              catch (Exception ignored) {}
+          });
+
+          CircuitBreaker cb = registry.circuitBreaker("paymentService");
+          assertThat(cb.getState()).isEqualTo(CircuitBreaker.State.OPEN);
+      }
+  }
+
+Force state for testing:
+  circuitBreaker.transitionToOpenState();
+  circuitBreaker.transitionToClosedState();
+  circuitBreaker.transitionToHalfOpenState();

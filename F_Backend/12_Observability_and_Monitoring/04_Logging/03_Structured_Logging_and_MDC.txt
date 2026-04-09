@@ -1,0 +1,178 @@
+STRUCTURED LOGGING AND MDC
+===========================
+
+Overview
+--------
+Structured logging outputs logs as machine-parseable key-value pairs (typically JSON)
+instead of free-form text strings.
+
+Why structured:
+  - Log aggregators (ELK, Loki, Splunk) can filter/search on individual fields
+  - No need for fragile regex parsing
+  - Consistent schema across all services
+  - Easy to add context (tenant, user, order ID) without changing log format
+
+---
+
+Logback JSON Output (Logstash Encoder)
+----------------------------------------
+Dependency:
+  <dependency>
+    <groupId>net.logstash.logback</groupId>
+    <artifactId>logstash-logback-encoder</artifactId>
+    <version>7.4</version>
+  </dependency>
+
+logback-spring.xml:
+  <configuration>
+    <springProfile name="!local">
+      <appender name="JSON_CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+          <includeMdcKeyName>traceId</includeMdcKeyName>
+          <includeMdcKeyName>spanId</includeMdcKeyName>
+          <includeMdcKeyName>tenantId</includeMdcKeyName>
+          <customFields>{"app":"orders-service","env":"prod"}</customFields>
+        </encoder>
+      </appender>
+      <root level="INFO"><appender-ref ref="JSON_CONSOLE"/></root>
+    </springProfile>
+
+    <springProfile name="local">
+      <!-- Human-readable in local dev -->
+      <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+          <pattern>%d{HH:mm:ss} %-5level [%X{traceId}] %logger{36} - %msg%n</pattern>
+        </encoder>
+      </appender>
+      <root level="DEBUG"><appender-ref ref="CONSOLE"/></root>
+    </springProfile>
+  </configuration>
+
+Sample JSON output:
+  {
+    "@timestamp": "2026-04-09T10:15:30.123Z",
+    "level": "INFO",
+    "logger_name": "com.example.OrderService",
+    "message": "Order processed",
+    "app": "orders-service",
+    "env": "prod",
+    "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "spanId": "00f067aa0ba902b7",
+    "tenantId": "acme",
+    "orderId": "ORD-001"
+  }
+
+---
+
+MDC (Mapped Diagnostic Context)
+---------------------------------
+MDC is a thread-local map injected into every log statement on that thread.
+Spring Boot 3 auto-populates traceId and spanId.
+
+Add custom fields to MDC:
+  import org.slf4j.MDC;
+
+  // In a filter, interceptor, or listener
+  MDC.put("tenantId", request.getHeader("X-Tenant-ID"));
+  MDC.put("userId", SecurityContextHolder.getContext()
+      .getAuthentication().getName());
+
+  try {
+      filterChain.doFilter(request, response);
+  } finally {
+      MDC.remove("tenantId");  // always clean up
+      MDC.remove("userId");
+  }
+
+MDC in Spring MVC Filter:
+  @Component
+  @Order(Ordered.HIGHEST_PRECEDENCE)
+  public class TenantMdcFilter extends OncePerRequestFilter {
+
+      @Override
+      protected void doFilterInternal(HttpServletRequest request,
+                                      HttpServletResponse response,
+                                      FilterChain filterChain)
+              throws ServletException, IOException {
+          String tenantId = request.getHeader("X-Tenant-ID");
+          if (tenantId != null) MDC.put("tenantId", tenantId);
+          try {
+              filterChain.doFilter(request, response);
+          } finally {
+              MDC.clear();
+          }
+      }
+  }
+
+MDC in Kafka listener (must set manually — new thread):
+  @KafkaListener(topics = "orders")
+  public void handle(ConsumerRecord<String, Order> record) {
+      MDC.put("kafkaOffset", String.valueOf(record.offset()));
+      MDC.put("kafkaPartition", String.valueOf(record.partition()));
+      try {
+          process(record.value());
+      } finally {
+          MDC.clear();
+      }
+  }
+
+Warning: MDC is thread-local — breaks with virtual threads or reactive code.
+  For virtual threads (Java 21+): MDC works but use ScopedValue as future alternative.
+  For WebFlux: use reactor.util.context.Context instead of MDC.
+
+---
+
+Structured Arguments (Individual Fields without Concatenation)
+---------------------------------------------------------------
+Avoid string concatenation in log messages — use structured arguments:
+
+With Logback/SLF4J + StructuredArguments (logstash-logback-encoder):
+  import static net.logstash.logback.argument.StructuredArguments.*;
+
+  log.info("Order processed {}",
+      kv("orderId", order.getId()),
+      kv("amount", order.getAmount()),
+      kv("tenantId", tenantId));
+
+  // Output JSON:
+  // {"message":"Order processed", "orderId":"123", "amount":99.99, "tenantId":"acme"}
+
+Using keyValue vs value:
+  kv("orderId", "123")     → "orderId": "123"  (field + value in JSON)
+  value("123")             → just the value in the message text
+
+---
+
+Log Levels Best Practices
+--------------------------
+  ERROR — system cannot continue, requires immediate action
+  WARN  — unexpected but recoverable (retried, degraded mode)
+  INFO  — business-significant events (order created, user login)
+  DEBUG — detailed diagnostic (request params, intermediate values) — OFF in prod
+  TRACE — very fine-grained — OFF in prod always
+
+Per-package level config:
+  logging:
+    level:
+      root: INFO
+      com.example.orders: DEBUG
+      org.springframework.web: WARN
+      org.hibernate.SQL: DEBUG  # logs all SQL
+      org.hibernate.type.descriptor.sql: TRACE  # logs SQL bind params
+
+---
+
+Log Sampling (High-Volume Services)
+-------------------------------------
+Too many DEBUG/INFO logs in high-throughput services → performance hit.
+
+Logback Turbo Filter (rate limit):
+  <turboFilter class="ch.qos.logback.classic.turbo.DuplicateMessageFilter">
+    <cacheSize>500</cacheSize>
+    <allowedRepetitions>5</allowedRepetitions>
+  </turboFilter>
+
+Application-level sampling:
+  if (log.isDebugEnabled() && ThreadLocalRandom.current().nextDouble() < 0.01) {
+      log.debug("Sampled debug: {}", expensiveToString());
+  }

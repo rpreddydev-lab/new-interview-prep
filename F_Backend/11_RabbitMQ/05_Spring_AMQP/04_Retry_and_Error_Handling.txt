@@ -1,0 +1,158 @@
+RABBITMQ SPRING AMQP — RETRY AND ERROR HANDLING
+=================================================
+
+Overview
+--------
+RabbitMQ itself does not retry — retry is implemented in:
+  1. Application layer (Spring Retry — in-memory, fast retries)
+  2. Broker layer (DLQ + TTL — delayed re-queueing, survives restarts)
+
+Typically both are used together: Spring Retry for transient failures, DLQ for exhausted retries.
+
+---
+
+Spring Retry (In-Memory)
+-------------------------
+Retry happens inside the listener before a NACK is sent to the broker.
+Message is NOT re-queued between attempts — it stays in memory.
+
+Dependencies:
+  <dependency>
+    <groupId>org.springframework.retry</groupId>
+    <artifactId>spring-retry</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework</groupId>
+    <artifactId>spring-aspects</artifactId>
+  </dependency>
+
+Configure via container factory:
+  @Bean
+  SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
+          ConnectionFactory cf, Jackson2JsonMessageConverter conv) {
+      var factory = new SimpleRabbitListenerContainerFactory();
+      factory.setConnectionFactory(cf);
+      factory.setMessageConverter(conv);
+
+      // Stateless retry (no transaction awareness)
+      RetryTemplate retryTemplate = new RetryTemplateBuilder()
+          .maxAttempts(3)
+          .exponentialBackoff(1000, 2.0, 10_000) // 1s → 2s → 4s (max 10s)
+          .retryOn(TransientDataAccessException.class) // only retry specific exceptions
+          .build();
+
+      factory.setAdviceChain(RetryInterceptorBuilder.stateless()
+          .retryTemplate(retryTemplate)
+          .recoverer(new RejectAndDontRequeueRecoverer()) // final failure → DLQ
+          .build());
+
+      return factory;
+  }
+
+MessageRecoverer options:
+  RejectAndDontRequeueRecoverer  — NACK with requeue=false (→ DLQ if configured)
+  RepublishMessageRecoverer      — republish to a specific exchange/routing key
+  ImmediateRequeueMessageRecoverer — requeue immediately (careful: infinite loop risk)
+
+RepublishMessageRecoverer (recommended for detailed DLQ routing):
+  @Bean
+  MessageRecoverer republishRecoverer(RabbitTemplate rabbitTemplate) {
+      return new RepublishMessageRecoverer(rabbitTemplate, "dlx.exchange", "orders.dead");
+  }
+  // Adds headers: x-exception-message, x-original-exchange, x-original-routing-key
+
+---
+
+DLQ-Based Retry (Broker-Level)
+-------------------------------
+Survives application restarts. Uses TTL + DLX to delay re-queuing.
+
+Single retry queue approach:
+  orders.queue (DLX → dlx.exchange) → orders.dlq (TTL=30s, DLX → orders.exchange)
+
+  @Bean
+  Queue ordersQueue() {
+      return QueueBuilder.durable("orders.queue")
+          .deadLetterExchange("dlx.exchange")
+          .deadLetterRoutingKey("orders.dead")
+          .build();
+  }
+
+  @Bean
+  Queue ordersDlq() {
+      return QueueBuilder.durable("orders.dlq")
+          .ttl(30_000)                    // wait 30s before re-queueing
+          .deadLetterExchange("")          // default exchange
+          .deadLetterRoutingKey("orders.queue") // back to original
+          .build();
+  }
+
+Tracking retry count (prevent infinite loops):
+  @RabbitListener(queues = "orders.queue", ackMode = "MANUAL")
+  public void handle(Order order, Message message, Channel channel,
+                     @Header(AmqpHeaders.DELIVERY_TAG) long tag) throws IOException {
+      int retryCount = Optional.ofNullable(
+          (Integer) message.getMessageProperties().getHeaders().get("x-retry-count"))
+          .orElse(0);
+
+      try {
+          orderService.process(order);
+          channel.basicAck(tag, false);
+      } catch (Exception e) {
+          if (retryCount >= 3) {
+              // Send to parking lot / final dead letter
+              channel.basicNack(tag, false, false);
+          } else {
+              message.getMessageProperties().setHeader("x-retry-count", retryCount + 1);
+              rabbitTemplate.send("dlx.exchange", "orders.dead", message);
+              channel.basicAck(tag, false); // ack original, manually sent to DLQ
+          }
+      }
+  }
+
+---
+
+Poison Message Handling
+-----------------------
+A message that always fails must not loop forever.
+
+Strategies:
+  1. Track x-death header (set by broker) — count deaths
+     List<Map<String, Object>> deaths = (List) headers.get("x-death");
+     long deathCount = (Long) deaths.get(0).get("count");
+
+  2. Use custom header x-retry-count (application-managed, see above)
+
+  3. Final parking lot queue — unroutable after max retries, stored for manual review
+
+x-death header structure:
+  [{
+    "count": 3,
+    "reason": "expired",  // or "rejected", "maxlen"
+    "queue": "orders.queue",
+    "exchange": "orders.exchange",
+    "routing-keys": ["order.created"],
+    "time": <timestamp>
+  }]
+
+---
+
+Global Error Handler
+--------------------
+Fallback for uncaught errors outside retry chain:
+
+  @Bean
+  SimpleRabbitListenerContainerFactory containerFactory(...) {
+      factory.setErrorHandler(new ConditionalRejectingErrorHandler(
+          new MyFatalExceptionStrategy()
+      ));
+  }
+
+  class MyFatalExceptionStrategy extends ConditionalRejectingErrorHandler.DefaultExceptionStrategy {
+      @Override
+      public boolean isFatal(Throwable t) {
+          // Parsing errors are fatal — don't retry
+          return t instanceof ListenerExecutionFailedException &&
+                 t.getCause() instanceof MessageConversionException;
+      }
+  }

@@ -1,0 +1,169 @@
+RABBITMQ MONITORING AND OBSERVABILITY
+======================================
+
+Overview
+--------
+Monitoring RabbitMQ covers:
+  1. Broker health — nodes, disk, memory, file descriptors
+  2. Queue metrics — depth, message rates, consumer count, DLQ size
+  3. Connection/channel metrics — open connections, unacked messages
+  4. Application metrics — publish rate, consume rate, processing latency
+
+---
+
+Management Plugin (HTTP API + UI)
+----------------------------------
+Built-in plugin, always enable in production:
+  rabbitmq-plugins enable rabbitmq_management
+
+Web UI:    http://localhost:15672
+REST API:  http://localhost:15672/api
+
+Key API endpoints:
+  GET /api/overview          — cluster-level summary
+  GET /api/queues            — all queues with depth, rates, consumers
+  GET /api/queues/%2f/orders.queue — specific queue
+  GET /api/nodes             — node health, memory, disk, fd usage
+  GET /api/connections       — open connections
+  GET /api/exchanges         — exchanges and bindings
+  GET /api/healthchecks/node — simple health check endpoint
+
+Health Check:
+  curl -u guest:guest http://localhost:15672/api/healthchecks/node
+  # Returns {"status":"ok"} or details on failure
+
+---
+
+Key Metrics to Monitor
+-----------------------
+Queue Depth (messages_ready):
+  - Alert threshold: > X messages ready for > Y minutes
+  - Indicates consumers can't keep up
+
+Unacked Messages (messages_unacknowledged):
+  - Indicates slow or hung consumers
+  - High unacked + low ready = consumer processing bottleneck
+
+Consumer Count:
+  - If = 0 and messages_ready > 0 → consumers are down (critical alert)
+
+Publish Rate vs Consume Rate:
+  - If publish_rate > deliver_rate → queue growing (backpressure building)
+
+Memory and Disk Alarms:
+  - memory_alarm = true → broker blocks producers
+  - disk_alarm = true → broker blocks producers
+  - Monitor: mem_used / mem_limit, disk_free / disk_limit
+
+File Descriptors:
+  - fd_used / fd_total → if near limit, connections will fail
+  - Increase: ulimit -n or systemd LimitNOFILE
+
+Node Health:
+  - running = true for all nodes
+  - partitions = [] (empty = no network partitions)
+
+---
+
+Prometheus and Grafana
+-----------------------
+Enable Prometheus scraping:
+  rabbitmq-plugins enable rabbitmq_prometheus
+
+Metrics endpoint: http://localhost:15692/metrics
+
+Prometheus config:
+  scrape_configs:
+    - job_name: 'rabbitmq'
+      static_configs:
+        - targets: ['rabbitmq-host:15692']
+
+Key Prometheus metrics:
+  rabbitmq_queue_messages_ready                 — queue depth
+  rabbitmq_queue_messages_unacked               — unacked messages
+  rabbitmq_queue_consumers                      — consumer count
+  rabbitmq_channel_messages_published_total     — publish rate
+  rabbitmq_channel_messages_delivered_ack_total — consume rate
+  rabbitmq_process_resident_memory_bytes        — memory usage
+  rabbitmq_disk_space_available_bytes           — disk space
+
+Grafana Dashboard:
+  Official dashboard ID: 10991 (RabbitMQ Overview — import from grafana.com)
+
+---
+
+Spring Boot Actuator Metrics for RabbitMQ
+------------------------------------------
+When using Spring AMQP, Spring Boot auto-registers metrics:
+
+  spring.rabbitmq.listener.simple.concurrency=3
+  management.metrics.enable.rabbitmq=true
+
+Metrics exposed:
+  rabbitmq.acknowledged          — messages acked by listeners
+  rabbitmq.published             — messages sent via RabbitTemplate
+  rabbitmq.rejected              — messages nacked/rejected
+  rabbitmq.failed_to_publish     — publish failures
+
+Micrometer integration:
+  @Bean
+  RabbitTemplate rabbitTemplate(...) {
+      template.setObservationEnabled(true); // Spring Boot 3+: tracing on publish
+  }
+
+---
+
+Alerting Rules (Prometheus AlertManager)
+-----------------------------------------
+  groups:
+    - name: rabbitmq
+      rules:
+        - alert: QueueDepthCritical
+          expr: rabbitmq_queue_messages_ready > 10000
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Queue {{ $labels.queue }} depth is {{ $value }}"
+
+        - alert: NoConsumers
+          expr: rabbitmq_queue_consumers == 0 and rabbitmq_queue_messages_ready > 0
+          for: 1m
+          labels:
+            severity: critical
+
+        - alert: MemoryAlarm
+          expr: rabbitmq_alarms_memory_used_watermark > 0
+          for: 0m
+          labels:
+            severity: critical
+
+        - alert: DiskAlarm
+          expr: rabbitmq_alarms_free_disk_space_watermark > 0
+          for: 0m
+          labels:
+            severity: critical
+
+---
+
+Distributed Tracing
+-------------------
+Spring Boot 3 + Micrometer Tracing propagates trace context through AMQP headers.
+
+  # application.yml
+  management:
+    tracing:
+      sampling:
+        probability: 1.0
+
+  @Bean
+  RabbitTemplate rabbitTemplate(ConnectionFactory cf) {
+      RabbitTemplate template = new RabbitTemplate(cf);
+      template.setObservationEnabled(true);
+      return template;
+  }
+
+  @RabbitListener(queues = "orders.queue", observationEnabled = true)
+  public void handleOrder(Order order) { ... }
+
+Trace ID is injected as AMQP message header and propagated to the listener's span.

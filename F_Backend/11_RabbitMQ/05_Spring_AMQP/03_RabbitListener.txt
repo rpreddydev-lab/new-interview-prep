@@ -1,0 +1,166 @@
+RABBITMQ SPRING AMQP — @RABBITLISTENER
+========================================
+
+Overview
+--------
+@RabbitListener marks methods (or classes) as handlers for RabbitMQ messages.
+Backed by SimpleMessageListenerContainer or DirectMessageListenerContainer.
+
+Enable listener infrastructure:
+  @EnableRabbit  // on @Configuration class (auto-added by Spring Boot)
+
+Basic Usage:
+  @Component
+  public class OrderListener {
+
+      @RabbitListener(queues = "orders.queue")
+      public void handleOrder(Order order) {
+          // Spring auto-deserializes via configured MessageConverter
+          orderService.process(order);
+      }
+  }
+
+---
+
+Listener Variants
+-----------------
+
+Receive raw Message:
+  @RabbitListener(queues = "orders.queue")
+  public void handle(Message message) {
+      byte[] body = message.getBody();
+      MessageProperties props = message.getMessageProperties();
+  }
+
+Receive with Channel (manual ack):
+  @RabbitListener(queues = "orders.queue",
+                  ackMode = "MANUAL")
+  public void handle(Order order, Channel channel,
+                     @Header(AmqpHeaders.DELIVERY_TAG) long tag) throws IOException {
+      try {
+          orderService.process(order);
+          channel.basicAck(tag, false);
+      } catch (Exception e) {
+          channel.basicNack(tag, false, false); // false = don't requeue → goes to DLQ
+      }
+  }
+
+Access Headers:
+  @RabbitListener(queues = "orders.queue")
+  public void handle(Order order,
+                     @Header("tenant") String tenant,
+                     @Headers Map<String, Object> allHeaders) {
+      // ...
+  }
+
+Reply (Request-Reply / RPC):
+  @RabbitListener(queues = "order.status.request")
+  @SendTo("order.status.reply")
+  public OrderStatus handleStatusRequest(String orderId) {
+      return orderService.getStatus(orderId);
+  }
+  // Or use empty @SendTo("") to reply to replyTo header automatically
+
+---
+
+Queue Declaration in @RabbitListener
+--------------------------------------
+Declare queues, exchanges, bindings inline (no separate @Bean needed):
+
+  @RabbitListener(bindings = @QueueBinding(
+      value = @Queue(value = "orders.queue", durable = "true",
+                     arguments = {
+                         @Argument(name = "x-dead-letter-exchange", value = "dlx.exchange"),
+                         @Argument(name = "x-message-ttl", value = "60000", type = "java.lang.Long")
+                     }),
+      exchange = @Exchange(value = "orders.exchange", type = ExchangeTypes.TOPIC),
+      key = "order.#"
+  ))
+  public void handleOrder(Order order) { ... }
+
+---
+
+Acknowledgement Modes
+----------------------
+  AUTO   — ack on successful return, nack on exception (default)
+  MANUAL — app calls channel.basicAck / basicNack explicitly
+  NONE   — no ack sent (auto-ack at broker level — risk of data loss)
+
+Configuration:
+  spring:
+    rabbitmq:
+      listener:
+        simple:
+          acknowledge-mode: auto
+
+---
+
+Concurrency and Prefetch
+-------------------------
+  spring:
+    rabbitmq:
+      listener:
+        simple:
+          concurrency: 3         # min consumer threads
+          max-concurrency: 10    # max consumer threads
+          prefetch: 10           # messages fetched per consumer before ack
+
+Per-listener override:
+  @RabbitListener(queues = "orders.queue", concurrency = "3-10")
+
+---
+
+Container Types
+---------------
+SimpleMessageListenerContainer (default):
+  - Uses thread pool
+  - Good for most use cases
+
+DirectMessageListenerContainer:
+  - One thread per consumer (amqp protocol channel)
+  - Better for low-latency, precise control
+
+  @Bean
+  SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
+          ConnectionFactory cf, Jackson2JsonMessageConverter conv) {
+      SimpleRabbitListenerContainerFactory factory = new SimpleRabbitListenerContainerFactory();
+      factory.setConnectionFactory(cf);
+      factory.setMessageConverter(conv);
+      factory.setConcurrentConsumers(3);
+      factory.setMaxConcurrentConsumers(10);
+      factory.setPrefetchCount(10);
+      factory.setAcknowledgeMode(AcknowledgeMode.AUTO);
+      return factory;
+  }
+
+---
+
+Error Handling and Retry
+-------------------------
+
+Auto retry with Spring Retry (in-memory, before nack):
+  @Bean
+  SimpleRabbitListenerContainerFactory containerFactory(...) {
+      factory.setAdviceChain(RetryInterceptorBuilder.stateless()
+          .maxAttempts(3)
+          .backOffOptions(1000, 2.0, 10000) // 1s, 2x, max 10s
+          .recoverer(new RejectAndDontRequeueRecoverer()) // nack after all retries
+          .build());
+  }
+
+Custom error handler:
+  factory.setErrorHandler(t -> log.error("Listener error", t));
+
+@RabbitHandler on class-level (multi-method dispatch by type):
+  @RabbitListener(queues = "events.queue")
+  public class EventListener {
+
+      @RabbitHandler
+      public void handleOrder(OrderEvent event) { ... }
+
+      @RabbitHandler
+      public void handlePayment(PaymentEvent event) { ... }
+
+      @RabbitHandler(isDefault = true)
+      public void handleUnknown(Object message) { ... }
+  }

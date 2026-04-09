@@ -1,0 +1,199 @@
+RETRY PATTERN — RESILIENCE4J + SPRING BOOT
+===========================================
+
+Overview
+--------
+Retry automatically re-attempts a failed operation, with configurable:
+  - Max attempts
+  - Wait duration between attempts
+  - Backoff strategy (fixed, exponential, random jitter)
+  - Which exceptions to retry vs ignore
+
+---
+
+Dependency
+----------
+  <dependency>
+    <groupId>io.github.resilience4j</groupId>
+    <artifactId>resilience4j-spring-boot3</artifactId>
+  </dependency>
+
+---
+
+Configuration (application.yml)
+---------------------------------
+  resilience4j:
+    retry:
+      instances:
+        paymentService:
+          max-attempts: 3
+          wait-duration: 1s
+          enable-exponential-backoff: true
+          exponential-backoff-multiplier: 2       # 1s → 2s → 4s
+          exponential-max-wait-duration: 10s      # cap at 10s
+          randomized-wait-factor: 0.2             # ±20% jitter (prevents thundering herd)
+          retry-exceptions:
+            - java.io.IOException
+            - java.util.concurrent.TimeoutException
+            - feign.RetryableException
+          ignore-exceptions:
+            - com.example.exceptions.BusinessValidationException
+
+---
+
+@Retry Annotation
+-----------------
+  @Service
+  public class PaymentService {
+
+      @Retry(name = "paymentService", fallbackMethod = "paymentFallback")
+      public PaymentResult processPayment(PaymentRequest request) {
+          return paymentClient.pay(request);
+      }
+
+      // Called after all retries exhausted
+      private PaymentResult paymentFallback(PaymentRequest request, IOException ex) {
+          log.error("All retries exhausted for payment", ex);
+          return PaymentResult.failed("Payment service unavailable");
+      }
+
+      private PaymentResult paymentFallback(PaymentRequest request, Exception ex) {
+          // Generic fallback for other exceptions
+          return PaymentResult.failed("Unexpected error");
+      }
+  }
+
+---
+
+Programmatic Usage
+------------------
+  @Autowired
+  RetryRegistry retryRegistry;
+
+  Retry retry = retryRegistry.retry("paymentService");
+
+  // Decorate a supplier
+  Supplier<PaymentResult> decorated =
+      Retry.decorateSupplier(retry, () -> paymentClient.pay(request));
+
+  PaymentResult result = Try.ofSupplier(decorated)
+      .getOrElse(PaymentResult.failed("unavailable"));
+
+  // Event listeners
+  retry.getEventPublisher()
+      .onRetry(event ->
+          log.warn("Retry attempt {} for {}: {}",
+              event.getNumberOfRetryAttempts(),
+              event.getName(),
+              event.getLastThrowable().getMessage()))
+      .onError(event ->
+          log.error("All retries failed for {}", event.getName()))
+      .onSuccess(event ->
+          log.info("Succeeded after {} retries", event.getNumberOfRetryAttempts()));
+
+---
+
+Backoff Strategies
+------------------
+Fixed:
+  wait-duration: 2s  # always wait 2s between retries
+
+Exponential (most common for external services):
+  enable-exponential-backoff: true
+  wait-duration: 1s
+  exponential-backoff-multiplier: 2
+  # Retries: attempt 1 (fail), wait 1s → attempt 2 (fail), wait 2s → attempt 3
+
+Exponential with Jitter (recommended to prevent thundering herd):
+  randomized-wait-factor: 0.3  # adds ±30% random variance to wait
+  # 1s ± 0.3s, 2s ± 0.6s, 4s ± 1.2s
+
+---
+
+Retry vs Circuit Breaker
+------------------------
+  Retry:          Handles transient failures (temporary network blip, timeout)
+  Circuit Breaker: Handles sustained failures (service is down for minutes)
+
+Combined (Retry inside Circuit Breaker):
+  @Retry(name = "paymentService")
+  @CircuitBreaker(name = "paymentService", fallbackMethod = "fallback")
+  public PaymentResult processPayment(PaymentRequest request) { ... }
+
+  Order matters: Retry executes first (inner), CB wraps the retry-inclusive call (outer).
+  CB sees the final outcome of all retry attempts as one call.
+
+---
+
+Retry with @Transactional (Important Caveat)
+----------------------------------------------
+  @Transactional + @Retry on same method = BAD
+
+  Problem: Transaction is committed after method returns.
+  If retry happens, it re-uses the same (failed) transaction context.
+
+  Solution: Put @Retry on a non-transactional wrapper, @Transactional on inner method:
+
+  // Outer — has @Retry
+  @Retry(name = "dbOp")
+  public void createOrderWithRetry(Order order) {
+      orderRepository.createOrder(order);  // this is @Transactional
+  }
+
+  // Inner — has @Transactional
+  @Transactional
+  public void createOrder(Order order) { ... }
+
+---
+
+Idempotency with Retry
+-----------------------
+Retried operations MUST be idempotent — calling them multiple times = same result.
+
+Strategies:
+  1. Idempotency key: include unique request ID in header/body
+     POST /api/payments  +  X-Idempotency-Key: uuid
+
+  2. Check before write:
+     if (!orderRepository.existsById(order.getId())) {
+         orderRepository.save(order);
+     }
+
+  3. Upsert: use database ON CONFLICT DO NOTHING / INSERT OR IGNORE
+
+---
+
+Testing Retry
+--------------
+  @SpringBootTest
+  class RetryTest {
+
+      @MockBean
+      PaymentClient paymentClient;
+
+      @Autowired
+      PaymentService paymentService;
+
+      @Test
+      void shouldRetryThreeTimes() {
+          when(paymentClient.pay(any()))
+              .thenThrow(IOException.class)   // attempt 1
+              .thenThrow(IOException.class)   // attempt 2
+              .thenReturn(PaymentResult.ok()); // attempt 3 — success
+
+          PaymentResult result = paymentService.processPayment(request);
+
+          assertThat(result.isSuccess()).isTrue();
+          verify(paymentClient, times(3)).pay(any());
+      }
+
+      @Test
+      void shouldUseFallbackAfterAllRetriesExhausted() {
+          when(paymentClient.pay(any())).thenThrow(IOException.class);
+
+          PaymentResult result = paymentService.processPayment(request);
+
+          assertThat(result.getStatus()).isEqualTo("FAILED");
+          verify(paymentClient, times(3)).pay(any()); // 3 = max-attempts
+      }
+  }

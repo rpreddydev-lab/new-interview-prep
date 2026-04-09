@@ -1,0 +1,201 @@
+MICROMETER METRICS — CUSTOM METRICS AND BEST PRACTICES
+========================================================
+
+Overview
+--------
+Micrometer is a vendor-neutral metrics facade for JVM applications.
+Spring Boot auto-configures Micrometer and exposes metrics via Actuator.
+
+Metric types:
+  Counter    — monotonically increasing count (requests processed, errors)
+  Gauge      — point-in-time snapshot (queue size, active connections)
+  Timer      — measures duration + throughput (request latency)
+  DistributionSummary — like Timer but for non-time values (request size, order amount)
+  LongTaskTimer       — long-running task duration (while task is still running)
+
+---
+
+MeterRegistry
+--------------
+Central registry — inject it anywhere:
+
+  @Component
+  public class OrderService {
+
+      private final Counter ordersCreated;
+      private final Counter ordersFailed;
+      private final Timer orderProcessingTime;
+      private final MeterRegistry registry;
+
+      public OrderService(MeterRegistry registry) {
+          this.registry = registry;
+          this.ordersCreated = Counter.builder("orders.created")
+              .description("Total orders successfully created")
+              .tag("region", "us-east-1")
+              .register(registry);
+
+          this.ordersFailed = registry.counter("orders.failed", "region", "us-east-1");
+
+          this.orderProcessingTime = Timer.builder("orders.processing.time")
+              .description("Time to process an order")
+              .publishPercentiles(0.5, 0.95, 0.99)
+              .publishPercentileHistogram()
+              .register(registry);
+      }
+
+      public void createOrder(Order order) {
+          orderProcessingTime.record(() -> {
+              try {
+                  doCreate(order);
+                  ordersCreated.increment();
+              } catch (Exception e) {
+                  ordersFailed.increment();
+                  throw e;
+              }
+          });
+      }
+  }
+
+---
+
+Tags (Dimensions)
+-----------------
+Tags are key-value pairs that allow filtering/grouping in dashboards.
+
+  Counter.builder("http.requests")
+      .tag("method", "POST")
+      .tag("endpoint", "/api/orders")
+      .tag("status", "200")
+      .register(registry);
+
+Tag cardinality warning:
+  NEVER use high-cardinality values as tags:
+    Bad:  .tag("userId", userId)   // millions of unique users = millions of time series
+    Bad:  .tag("orderId", orderId)
+    Good: .tag("region", "us-east-1")
+    Good: .tag("status", "success")
+
+---
+
+Gauge
+-----
+For values that go up and down:
+
+  // Gauge a collection size
+  Gauge.builder("orders.queue.size", orderQueue, Queue::size)
+      .description("Current orders in queue")
+      .register(registry);
+
+  // Gauge a simple value
+  AtomicInteger activeConnections = new AtomicInteger(0);
+  Gauge.builder("db.connections.active", activeConnections, AtomicInteger::get)
+      .register(registry);
+
+  // Functional gauge
+  registry.gauge("cache.size", cache, Cache::estimatedSize);
+
+---
+
+Timer
+-----
+  // Record a specific duration
+  timer.record(Duration.ofMillis(42));
+
+  // Time a block of code
+  timer.record(() -> expensiveOperation());
+
+  // Return result while timing
+  String result = timer.record(() -> fetchData());
+
+  // Wrap a Supplier
+  Supplier<Order> timedSupplier = timer.wrap(() -> orderService.find(id));
+
+  // Time a runnable
+  Timer.Sample sample = Timer.start(registry);
+  try {
+      doWork();
+  } finally {
+      sample.stop(timer);
+  }
+
+Percentile publishing (for Prometheus):
+  Timer.builder("my.timer")
+      .publishPercentiles(0.5, 0.95, 0.99)        // pre-computed in app
+      .publishPercentileHistogram()                 // Prometheus histogram (calculate server-side)
+      .serviceLevelObjectives(Duration.ofMillis(100), Duration.ofMillis(500))
+      .register(registry);
+
+---
+
+@Timed Annotation
+------------------
+  @Service
+  public class OrderService {
+
+      @Timed(value = "orders.create", percentiles = {0.5, 0.95, 0.99})
+      public Order createOrder(CreateOrderRequest request) {
+          // automatically timed
+      }
+  }
+
+Requires: @EnableAspectJAutoProxy and micrometer-core on classpath.
+
+---
+
+MeterBinder — Reusable Metric Definitions
+------------------------------------------
+  public class DatabasePoolMetrics implements MeterBinder {
+
+      private final DataSource dataSource;
+
+      @Override
+      public void bindTo(MeterRegistry registry) {
+          Gauge.builder("db.pool.active", dataSource,
+                  ds -> getActiveConnections(ds))
+              .register(registry);
+      }
+  }
+
+  @Bean
+  MeterBinder databasePoolMetrics(DataSource dataSource) {
+      return new DatabasePoolMetrics(dataSource);
+  }
+
+---
+
+Prometheus Endpoint
+-------------------
+  management:
+    endpoints:
+      web:
+        exposure:
+          include: prometheus, health, info, metrics
+    metrics:
+      export:
+        prometheus:
+          enabled: true
+
+Endpoint: GET /actuator/prometheus
+
+Prometheus scrape config:
+  scrape_configs:
+    - job_name: 'orders-service'
+      metrics_path: /actuator/prometheus
+      static_configs:
+        - targets: ['orders-service:8080']
+
+---
+
+Grafana Dashboard Queries (PromQL)
+------------------------------------
+  # Request rate
+  rate(orders_created_total[5m])
+
+  # Error rate
+  rate(orders_failed_total[5m]) / rate(orders_created_total[5m])
+
+  # P99 latency
+  histogram_quantile(0.99, rate(orders_processing_time_seconds_bucket[5m]))
+
+  # JVM heap usage
+  jvm_memory_used_bytes{area="heap"} / jvm_memory_max_bytes{area="heap"}

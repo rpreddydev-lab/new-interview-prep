@@ -1,0 +1,189 @@
+RESILIENCE PATTERNS — COMBINING AND BEST PRACTICES
+====================================================
+
+Overview
+--------
+Individual resilience patterns (CB, Retry, Bulkhead, RateLimiter, TimeLimiter)
+are most powerful when combined correctly.
+
+Resilience4j decoration order (annotations applied innermost first):
+  Outermost → innermost: CB → RateLimiter → TimeLimiter → Bulkhead → Retry → Function
+
+When using annotations on same method, apply in this order (inner = first annotation):
+  @Retry          ← innermost (retries the actual call)
+  @TimeLimiter    ← wraps retry
+  @Bulkhead       ← wraps timelimiter
+  @RateLimiter    ← wraps bulkhead
+  @CircuitBreaker ← outermost (sees final result of all retries)
+
+  @CircuitBreaker(name = "svc", fallbackMethod = "fallback")
+  @RateLimiter(name = "svc")
+  @Bulkhead(name = "svc")
+  @TimeLimiter(name = "svc")
+  @Retry(name = "svc")
+  public CompletableFuture<Result> callService(Request req) { ... }
+
+---
+
+Pattern Responsibilities Summary
+----------------------------------
+  Pattern        | What It Does                          | Triggers On
+  ---------------|---------------------------------------|-------------------------
+  Circuit Breaker| Stop calls to failing service         | High failure rate
+  Retry          | Re-attempt transient failures         | IOException, timeout
+  Bulkhead       | Limit concurrent calls                | Too many simultaneous calls
+  Rate Limiter   | Limit throughput (calls/second)       | Quota exceeded
+  Time Limiter   | Enforce max call duration             | Slow responses
+
+---
+
+Fallback Strategy Design
+------------------------
+Fallbacks should degrade gracefully, not just return null.
+
+Options:
+  1. Return stale cache:
+     return cacheService.getLastKnownValue(request.getId());
+
+  2. Return safe default:
+     return ProductAvailability.UNKNOWN; // UI shows "Check store"
+
+  3. Queue for async processing:
+     eventBus.publish(new DeferredOrderEvent(order));
+     return OrderResult.queued("Processing deferred");
+
+  4. Return partial response:
+     return new OrderSummary(order.getId(), "Some data unavailable");
+
+  5. Throw 503 / 429 to caller (let client retry):
+     throw new ServiceUnavailableException("Payment service unavailable");
+
+Never:
+  - Return null (causes NullPointerException upstream)
+  - Silently swallow failures without logging
+  - Return incorrect data (e.g., payment success when it failed)
+
+---
+
+Single Shared Configuration vs Per-Instance
+---------------------------------------------
+  Use per-instance config for different SLAs per dependency:
+
+  resilience4j:
+    circuitbreaker:
+      configs:
+        default:                           # base config (shared)
+          sliding-window-size: 10
+          failure-rate-threshold: 50
+          wait-duration-in-open-state: 30s
+      instances:
+        paymentService:
+          base-config: default
+          failure-rate-threshold: 30       # stricter — payment is critical
+          wait-duration-in-open-state: 60s # longer penalty
+        inventoryService:
+          base-config: default
+          # inherits all defaults — less critical
+
+---
+
+Health Indicators
+-----------------
+Resilience4j exposes health for all circuit breakers via Actuator:
+
+  management:
+    health:
+      circuitbreakers:
+        enabled: true
+    endpoint:
+      health:
+        show-details: always
+
+  GET /actuator/health
+  {
+    "components": {
+      "circuitBreakers": {
+        "details": {
+          "paymentService": {
+            "status": "UP",
+            "details": {
+              "state": "CLOSED",
+              "failureRate": "10%",
+              "slowCallRate": "0%",
+              "bufferedCalls": 10,
+              "failedCalls": 1
+            }
+          }
+        }
+      }
+    }
+  }
+
+  Circuit OPEN → health status = DOWN → readiness probe fails → pod removed from LB.
+
+---
+
+Observability — All Patterns Emit Metrics
+------------------------------------------
+  resilience4j_circuitbreaker_*
+  resilience4j_retry_*
+  resilience4j_bulkhead_*
+  resilience4j_ratelimiter_*
+  resilience4j_timelimiter_*
+
+Single Grafana dashboard (import ID: 15564 — Resilience4j Dashboard).
+
+---
+
+Common Anti-Patterns
+--------------------
+
+1. Retry without idempotency:
+   Retrying a non-idempotent operation can cause duplicate charges/orders.
+   Fix: Idempotency key or check-before-write.
+
+2. Overly aggressive retries:
+   Too many retries under load = thundering herd, makes outages worse.
+   Fix: Exponential backoff with jitter + circuit breaker.
+
+3. Circuit Breaker with no fallback:
+   OPEN state throws exception — propagates to user as 500.
+   Fix: Always define a meaningful fallback.
+
+4. Bulkhead too small:
+   Rejects legitimate traffic under normal load.
+   Fix: Load test to set correct concurrency limits.
+
+5. TimeLimiter without cancel-running-future=true:
+   Thread/task continues running even after timeout (resource leak).
+   Fix: Always set cancel-running-future: true.
+
+6. All patterns with same name:
+   All share the same config instance — not isolated per downstream service.
+   Fix: Use unique names per dependency.
+
+---
+
+Resilience4j + Spring Cloud Gateway
+--------------------------------------
+Apply resilience patterns at the gateway level for all downstream services:
+
+  spring:
+    cloud:
+      gateway:
+        routes:
+          - id: payment-route
+            uri: lb://payment-service
+            filters:
+              - name: CircuitBreaker
+                args:
+                  name: paymentService
+                  fallbackUri: forward:/fallback/payment
+              - name: RequestRateLimiter
+                args:
+                  redis-rate-limiter.replenishRate: 100
+                  redis-rate-limiter.burstCapacity: 200
+              - name: Retry
+                args:
+                  retries: 2
+                  statuses: SERVICE_UNAVAILABLE

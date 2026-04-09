@@ -1,0 +1,195 @@
+RABBITMQ SPRING AMQP — TESTING
+================================
+
+Overview
+--------
+Three levels of testing RabbitMQ in Spring Boot:
+  1. Unit tests — mock RabbitTemplate / listeners
+  2. Integration tests with Testcontainers — real broker
+  3. Embedded broker tests — less common, use QPID or Testcontainers
+
+---
+
+Unit Testing Listeners
+-----------------------
+No broker needed — directly invoke the listener method.
+
+  @ExtendWith(MockitoExtension.class)
+  class OrderListenerTest {
+
+      @InjectMocks
+      OrderListener orderListener;
+
+      @Mock
+      OrderService orderService;
+
+      @Test
+      void shouldProcessOrder() {
+          Order order = new Order("123", "PENDING");
+          orderListener.handleOrder(order);
+          verify(orderService).process(order);
+      }
+  }
+
+Unit Testing with Message object:
+  @Test
+  void shouldHandleMessage() {
+      Order order = new Order("123", "PENDING");
+      Message message = MessageBuilder
+          .withBody(objectMapper.writeValueAsBytes(order))
+          .setContentType("application/json")
+          .build();
+
+      orderListener.handle(message);
+      verify(orderService).process(any(Order.class));
+  }
+
+---
+
+Mocking RabbitTemplate
+-----------------------
+  @ExtendWith(MockitoExtension.class)
+  class OrderServiceTest {
+
+      @Mock
+      RabbitTemplate rabbitTemplate;
+
+      @InjectMocks
+      OrderService orderService;
+
+      @Test
+      void shouldPublishEvent() {
+          orderService.createOrder(new Order("123"));
+
+          verify(rabbitTemplate).convertAndSend(
+              eq("orders.exchange"),
+              eq("order.created"),
+              any(Order.class)
+          );
+      }
+
+      @Test
+      void shouldCapturePublishedMessage() {
+          ArgumentCaptor<Order> captor = ArgumentCaptor.forClass(Order.class);
+          orderService.createOrder(new Order("123"));
+
+          verify(rabbitTemplate).convertAndSend(any(), any(), captor.capture());
+          assertThat(captor.getValue().getStatus()).isEqualTo("CREATED");
+      }
+  }
+
+---
+
+Integration Testing with Testcontainers
+-----------------------------------------
+Full integration test with a real RabbitMQ broker.
+
+Dependency:
+  <dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>rabbitmq</artifactId>
+    <scope>test</scope>
+  </dependency>
+
+  @SpringBootTest
+  @Testcontainers
+  class OrderIntegrationTest {
+
+      @Container
+      static RabbitMQContainer rabbitMQ = new RabbitMQContainer("rabbitmq:3.13-management");
+
+      @DynamicPropertySource
+      static void rabbitProperties(DynamicPropertyRegistry registry) {
+          registry.add("spring.rabbitmq.host", rabbitMQ::getHost);
+          registry.add("spring.rabbitmq.port", rabbitMQ::getAmqpPort);
+          registry.add("spring.rabbitmq.username", rabbitMQ::getAdminUsername);
+          registry.add("spring.rabbitmq.password", rabbitMQ::getAdminPassword);
+      }
+
+      @Autowired
+      RabbitTemplate rabbitTemplate;
+
+      @Autowired
+      OrderRepository orderRepository;
+
+      @Test
+      void shouldProcessOrderEndToEnd() throws InterruptedException {
+          Order order = new Order("TEST-001", "PENDING");
+          rabbitTemplate.convertAndSend("orders.exchange", "order.created", order);
+
+          // Wait for async processing
+          await().atMost(5, SECONDS).untilAsserted(() ->
+              assertThat(orderRepository.findById("TEST-001")).isPresent()
+          );
+      }
+  }
+
+---
+
+Testing with Awaitility
+------------------------
+For async listener testing — don't use Thread.sleep()
+
+Dependency:
+  <dependency>
+    <groupId>org.awaitility</groupId>
+    <artifactId>awaitility</artifactId>
+    <scope>test</scope>
+  </dependency>
+
+  import static org.awaitility.Awaitility.*;
+  import static java.util.concurrent.TimeUnit.*;
+
+  await()
+      .atMost(10, SECONDS)
+      .pollInterval(500, MILLISECONDS)
+      .untilAsserted(() -> {
+          verify(orderService, times(1)).process(any(Order.class));
+      });
+
+---
+
+Testing DLQ Behavior
+--------------------
+Verify that failed messages end up in DLQ:
+
+  @Test
+  void shouldRouteToDeadLetterQueueOnFailure() throws InterruptedException {
+      // Send a malformed message that will fail deserialization
+      rabbitTemplate.convertAndSend("orders.exchange", "order.created", "INVALID");
+
+      await().atMost(10, SECONDS).untilAsserted(() -> {
+          Message dlqMessage = rabbitTemplate.receive("orders.dlq", 2000);
+          assertThat(dlqMessage).isNotNull();
+      });
+  }
+
+---
+
+Verifying Published Messages in Integration Tests
+--------------------------------------------------
+  @Autowired
+  RabbitTemplate rabbitTemplate;
+
+  @Test
+  void shouldPublishOrderCreatedEvent() throws Exception {
+      orderService.createOrder(new CreateOrderRequest("P001", 2));
+
+      Message msg = rabbitTemplate.receive("orders.queue", 5000);
+      assertThat(msg).isNotNull();
+
+      Order published = objectMapper.readValue(msg.getBody(), Order.class);
+      assertThat(published.getProductId()).isEqualTo("P001");
+  }
+
+---
+
+@SpringBootTest Slice for Messaging
+-------------------------------------
+No built-in slice like @DataJpaTest, but you can use:
+
+  @SpringBootTest(classes = {RabbitConfig.class, OrderListener.class, OrderService.class})
+  @ImportAutoConfiguration(RabbitAutoConfiguration.class)
+  class ListenerSliceTest {
+      // lightweight context with only messaging beans
+  }

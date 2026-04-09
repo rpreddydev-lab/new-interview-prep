@@ -1,0 +1,165 @@
+RABBITMQ SPRING AMQP — RABBITTEMPLATE
+======================================
+
+Overview
+--------
+RabbitTemplate is the central class in Spring AMQP for sending and receiving messages.
+It wraps the raw RabbitMQ Java client with Spring idioms (converters, retry, exception translation).
+
+Auto-configured by Spring Boot when spring-boot-starter-amqp is on classpath.
+
+Basic Configuration:
+  spring:
+    rabbitmq:
+      host: localhost
+      port: 5672
+      username: guest
+      password: guest
+      virtual-host: /
+
+Custom RabbitTemplate Bean:
+  @Bean
+  RabbitTemplate rabbitTemplate(ConnectionFactory connectionFactory) {
+      RabbitTemplate template = new RabbitTemplate(connectionFactory);
+      template.setMessageConverter(jackson2JsonMessageConverter());
+      template.setConfirmCallback((correlationData, ack, cause) -> {
+          if (!ack) log.error("Message NACK'd: {}", cause);
+      });
+      template.setReturnsCallback(returned -> {
+          log.warn("Message returned: {}", returned.getMessage());
+      });
+      return template;
+  }
+
+  @Bean
+  Jackson2JsonMessageConverter jackson2JsonMessageConverter() {
+      return new Jackson2JsonMessageConverter();
+  }
+
+---
+
+Sending Messages
+----------------
+
+convertAndSend — most common, handles serialization:
+  // To default exchange (direct to queue by name)
+  rabbitTemplate.convertAndSend("orders.queue", orderObject);
+
+  // To named exchange with routing key
+  rabbitTemplate.convertAndSend("orders.exchange", "order.created", orderObject);
+
+  // With MessagePostProcessor (add headers, priority, TTL, etc.)
+  rabbitTemplate.convertAndSend("orders.exchange", "order.created", orderObject, message -> {
+      message.getMessageProperties().setHeader("tenant", "acme");
+      message.getMessageProperties().setDeliveryMode(MessageDeliveryMode.PERSISTENT);
+      return message;
+  });
+
+send — low-level, requires explicit Message object:
+  Message message = MessageBuilder
+      .withBody(json.getBytes())
+      .setContentType(MessageProperties.CONTENT_TYPE_JSON)
+      .setMessageId(UUID.randomUUID().toString())
+      .build();
+  rabbitTemplate.send("orders.exchange", "order.created", message);
+
+---
+
+Publisher Confirms and Returns
+-------------------------------
+Publisher Confirms: broker acknowledges receipt of message.
+Returns: broker sends message back if it can't be routed.
+
+Enable in config:
+  spring:
+    rabbitmq:
+      publisher-confirm-type: correlated  # or 'simple'
+      publisher-returns: true
+      template:
+        mandatory: true  # required for returns
+
+CorrelationData for tracking:
+  CorrelationData correlationData = new CorrelationData(UUID.randomUUID().toString());
+  rabbitTemplate.convertAndSend("orders.exchange", "order.created", order, correlationData);
+
+Callback:
+  template.setConfirmCallback((correlationData, ack, cause) -> {
+      if (ack) {
+          log.info("Confirmed: {}", correlationData.getId());
+      } else {
+          log.error("NACK: {} - Reason: {}", correlationData.getId(), cause);
+          // trigger retry or alerting
+      }
+  });
+
+---
+
+Request-Reply (RPC Pattern)
+----------------------------
+Synchronous RPC over RabbitMQ using reply queues.
+
+  // Blocking call — waits for reply
+  OrderStatus status = (OrderStatus) rabbitTemplate.convertSendAndReceive(
+      "orders.exchange", "order.status.request", orderId);
+
+  // With timeout
+  rabbitTemplate.setReplyTimeout(5000);
+
+Server side processes and replies:
+  @RabbitListener(queues = "order.status.request")
+  @SendTo("") // reply to the replyTo header
+  public OrderStatus handleStatusRequest(String orderId) {
+      return orderService.getStatus(orderId);
+  }
+
+---
+
+Receive (Polling)
+-----------------
+Not recommended for production — use @RabbitListener instead.
+  Message msg = rabbitTemplate.receive("orders.queue", 2000); // 2s timeout
+  Order order = (Order) rabbitTemplate.receiveAndConvert("orders.queue");
+
+---
+
+Message Converter
+-----------------
+Default: SimpleMessageConverter (Java serialization — avoid in production)
+Recommended: Jackson2JsonMessageConverter
+
+  @Bean
+  Jackson2JsonMessageConverter converter() {
+      Jackson2JsonMessageConverter converter = new Jackson2JsonMessageConverter();
+      // Enable type information for polymorphism
+      converter.setClassMapper(new DefaultJackson2JavaTypeMapper());
+      return converter;
+  }
+
+  @Bean
+  RabbitTemplate rabbitTemplate(ConnectionFactory cf, Jackson2JsonMessageConverter conv) {
+      RabbitTemplate template = new RabbitTemplate(cf);
+      template.setMessageConverter(conv);
+      return template;
+  }
+
+---
+
+RabbitAdmin — Declare Infrastructure
+--------------------------------------
+RabbitAdmin auto-declares exchanges, queues, bindings from Spring beans on startup.
+
+  @Bean
+  RabbitAdmin rabbitAdmin(ConnectionFactory connectionFactory) {
+      return new RabbitAdmin(connectionFactory);
+  }
+
+  @Bean
+  Queue ordersQueue() { return new Queue("orders.queue", true); }
+
+  @Bean
+  TopicExchange ordersExchange() { return new TopicExchange("orders.exchange"); }
+
+  @Bean
+  Binding binding(Queue ordersQueue, TopicExchange ordersExchange) {
+      return BindingBuilder.bind(ordersQueue).to(ordersExchange).with("order.#");
+  }
