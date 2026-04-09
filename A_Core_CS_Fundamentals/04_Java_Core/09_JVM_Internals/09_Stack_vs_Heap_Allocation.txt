@@ -1,0 +1,155 @@
+STACK VS HEAP ALLOCATION
+==========================
+
+CORE DISTINCTION
+-----------------
+  Stack: per-thread, stores method call frames (local variables, primitive values, object references)
+  Heap:  shared, stores all object instances and arrays (GC-managed)
+
+  Rule of thumb:
+  - Primitives declared as local variables → stack
+  - Object created with new → heap
+  - Reference to an object → stored wherever the reference variable lives (stack for locals, heap for fields)
+
+  int x = 5;           // x (int primitive) → stack (local variable slot)
+  String s = "Hello";  // s (reference) → stack; String object → heap
+  int[] arr = new int[10]; // arr (reference) → stack; the array → heap
+
+STACK ALLOCATION IN DETAIL
+----------------------------
+  Each thread gets a private JVM stack.
+  Each method invocation pushes a stack frame:
+  +----------------------------+
+  |  Stack Frame               |
+  |  Local variables array     |  (params + declared locals)
+  |  Operand stack             |  (intermediate computation)
+  |  Return address            |
+  |  Reference to constant pool|
+  +----------------------------+
+
+  When the method returns, the frame is popped — all local primitive values are reclaimed
+  immediately (no GC needed). Stack memory is LIFO, very fast.
+
+  Stack size: fixed or bounded per thread (-Xss flag).
+  Default: 512 KB – 1 MB depending on OS and JVM.
+  Deep recursion without a base case → StackOverflowError.
+
+HEAP ALLOCATION IN DETAIL
+--------------------------
+  All objects created with new go to the heap.
+  Initially allocated in Eden (Young Generation).
+  Long-lived objects promoted to Old Generation.
+  Memory reclaimed by Garbage Collector (non-deterministic timing).
+
+  Heap allocation:
+  - "Bump-pointer" allocation in Eden: fast (just increment a pointer)
+  - Thread-Local Allocation Buffers (TLAB): each thread has a private slice of Eden
+    — eliminates synchronization during allocation for most cases
+  - Large objects (Humongous): bypass Young Gen → straight to Old Gen in G1
+
+TLAB (THREAD-LOCAL ALLOCATION BUFFER)
+---------------------------------------
+  Each thread is assigned a small private region of Eden (TLAB).
+  Allocations in TLAB are bump-pointer — no synchronization needed.
+  When TLAB is full, thread requests a new TLAB from the main Eden space.
+  This makes new Object() essentially free in the common case.
+
+  Tuning:
+  -XX:+UseTLAB                — enable TLAB (default: on)
+  -XX:TLABSize=N              — initial TLAB size
+
+ESCAPE ANALYSIS AND STACK ALLOCATION
+--------------------------------------
+  The JIT compiler performs escape analysis to determine if an object "escapes" the
+  method that created it:
+
+  - Does NOT escape: object never returned, never assigned to a field, never passed to
+    a method that stores it elsewhere → JIT may allocate it on the STACK (no GC needed!)
+
+  - Escapes: object returned, stored in a field, passed to another thread → heap allocation
+
+  // Stack allocation candidate (non-escaping):
+  void compute() {
+      Point p = new Point(3, 4);  // p doesn't escape compute()
+      return p.x + p.y;           // result returned, not p
+  }
+  // JIT may eliminate the heap allocation for p entirely (scalar replacement)
+
+  Scalar Replacement:
+  If an object would be stack-allocated and its fields are only used as primitives,
+  the JIT can replace the object with its individual fields in registers/stack.
+  new Point(x, y) → just use x and y as scalar variables — no object at all!
+
+  Lock Elision:
+  If an object doesn't escape its thread, synchronized(obj) is unnecessary.
+  JIT eliminates the lock operations entirely.
+
+  // Automatically elided by JIT:
+  void foo() {
+      StringBuffer sb = new StringBuffer();  // doesn't escape
+      sb.append("a");    // synchronized — but JIT elides the lock!
+      sb.append("b");
+      return sb.toString();
+  }
+
+PERFORMANCE IMPLICATIONS
+-------------------------
+  Stack allocation:
+  - Allocation: ~O(1) — just increment stack pointer
+  - Deallocation: ~O(1) — just decrement (method return)
+  - No GC involvement
+  - Fast but limited size; deep call stacks or large locals → StackOverflowError
+
+  Heap allocation (without escape analysis):
+  - TLAB fast path: ~similar to stack (bump pointer)
+  - TLAB refill / large objects: slower (requires synchronization with Eden)
+  - GC needed for reclamation — adds latency and CPU overhead
+  - Supports virtually unlimited objects (until OOM)
+
+  Impact: creating many short-lived objects (especially in loops) puts pressure on GC.
+  Modern JIT + escape analysis reduces heap allocation for non-escaping objects.
+  Prefer primitives over boxed types (Integer vs int) for tight loops.
+
+MEMORY LAYOUT COMPARISON
+--------------------------
+  | Aspect           | Stack                        | Heap                          |
+  |------------------|------------------------------|-------------------------------|
+  | Scope            | Per-thread (private)         | Shared across all threads     |
+  | Stores           | Primitives, references, frames | Objects, arrays             |
+  | Allocation speed | Instant (bump pointer)       | Fast via TLAB, slower for GC  |
+  | Deallocation     | Automatic (method return)    | GC (non-deterministic)        |
+  | Thread safety    | No sync needed               | Needs synchronization for shared objects|
+  | Size             | Limited (~1 MB default)      | Large (-Xmx limits it)        |
+  | Overflow error   | StackOverflowError           | OutOfMemoryError              |
+  | GC involvement   | None                         | Yes                           |
+
+COMMON INTERVIEW QUESTIONS
+---------------------------
+Q: Where are primitives stored in Java — stack or heap?
+A: It depends on context. A primitive local variable (int x in a method) is stored in the
+   JVM stack frame's local variable array — on the stack. A primitive instance field (int x
+   in a class) is stored as part of the object, which is on the heap. A primitive in an
+   array (int[] arr) has the array object on the heap, and the elements are stored inline
+   in the array object on the heap.
+
+Q: Can objects be allocated on the stack in Java?
+A: Yes, via JIT escape analysis. If the JIT determines that an object doesn't escape the
+   method (never returned, stored in a field, or passed off-thread), it may perform stack
+   allocation or scalar replacement — replacing the object with its scalar fields in
+   registers/stack slots. This eliminates heap allocation and GC overhead. It's transparent
+   to the developer; the JVM decides automatically.
+
+Q: What is a TLAB and why does it matter?
+A: A Thread-Local Allocation Buffer (TLAB) is a private slice of Eden assigned to each
+   thread. Allocations within a TLAB are simple bump-pointer operations — no synchronization
+   needed, making new Object() essentially free in the common case. When a TLAB is exhausted,
+   the thread requests a new one from Eden (requires brief synchronization). TLABs dramatically
+   reduce contention for object allocation in multi-threaded applications.
+
+Q: When would you get a StackOverflowError vs an OutOfMemoryError?
+A: StackOverflowError occurs when a thread's call stack exceeds its size limit — typically
+   from deep or infinite recursion. Each method call pushes a frame; when the stack is full,
+   the next call fails. OutOfMemoryError: Java heap space occurs when the heap is exhausted
+   — no more room for new objects after GC. OutOfMemoryError: unable to create new native
+   thread occurs when the OS can't create more threads — the JVM needs both heap for the
+   Thread object and native memory for the stack.

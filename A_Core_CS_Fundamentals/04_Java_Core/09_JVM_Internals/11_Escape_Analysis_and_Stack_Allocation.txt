@@ -1,0 +1,221 @@
+ESCAPE ANALYSIS AND STACK ALLOCATION
+======================================
+
+WHAT IS ESCAPE ANALYSIS?
+-------------------------
+  Escape analysis is a compile-time (JIT) optimization technique where the JVM analyzes
+  whether an object's lifetime and reference scope are confined to a specific method or
+  thread. If an object doesn't "escape" its creating method or thread, the JVM can apply
+  powerful optimizations:
+  1. Stack Allocation  — allocate the object on the JVM stack instead of the heap
+  2. Scalar Replacement — decompose the object into individual scalar fields (no object at all)
+  3. Lock Elision      — eliminate synchronized blocks on non-escaping objects
+
+  Enabled by default in HotSpot (Java 6+):
+  -XX:+DoEscapeAnalysis   (default: on in Java 6+)
+  -XX:+EliminateAllocations   (enables scalar replacement; default: on)
+
+  Performed by: C2 (server) JIT compiler. Requires the method to be hot enough to be
+  compiled at tier 4. Escape analysis is an interprocedural analysis — the JIT can inline
+  callee methods and then determine escape status of objects across method boundaries.
+
+THE THREE ESCAPE STATES
+------------------------
+  1. NO ESCAPE (NoEscape):
+     The object is not returned from the method, not stored in a heap field, not passed to
+     another thread, and not passed to a native method. Its lifetime is fully bounded by
+     the method's activation.
+     → JIT may perform stack allocation or scalar replacement.
+
+  2. ARGUMENT ESCAPE (ArgEscape):
+     The object is passed as an argument to a method or returned from one, but does not
+     otherwise escape to the heap (the callee method doesn't store it in a field or hand
+     it off to another thread).
+     → Partial optimization possible: lock elision still applies. Stack allocation
+       generally NOT applied because the reference may be observed by the callee.
+
+  3. GLOBAL ESCAPE (GlobalEscape):
+     The object is stored in a static field, a heap field, or passed to a new thread.
+     Its lifetime may extend beyond the method or thread boundary.
+     → No allocation optimizations. Standard heap allocation.
+
+  Code examples illustrating escape states:
+
+  // Case 1: NoEscape — prime candidate for scalar replacement
+  int computeDistance(int x1, int y1, int x2, int y2) {
+      Point p1 = new Point(x1, y1);  // NoEscape
+      Point p2 = new Point(x2, y2);  // NoEscape
+      return p1.distanceTo(p2);       // p1, p2 never leave this method
+      // JIT: replaces Point objects with scalar int fields — NO heap allocation!
+  }
+
+  // Case 2: GlobalEscape — no optimization
+  static Point cachedPoint;
+  void storePoint(int x, int y) {
+      cachedPoint = new Point(x, y);  // GlobalEscape: stored in static field → heap allocation
+  }
+
+  // Case 3: ArgEscape — lock elision possible
+  String buildString() {
+      StringBuilder sb = new StringBuilder();  // ArgEscape (passed to append)
+      sb.append("hello");
+      sb.append("world");
+      return sb.toString();
+  }
+  // StringBuffer variant: internal synchronized blocks are elided by JIT
+  // because sb doesn't escape to another thread
+
+STACK ALLOCATION
+-----------------
+  When escape analysis confirms NoEscape, the JIT can allocate the object's data on the
+  JVM stack frame of the creating method. When the method returns, the frame is popped —
+  no GC involvement at all.
+
+  Benefits:
+  - Zero GC pressure from that allocation
+  - Better cache locality (stack is contiguous per thread)
+  - Faster allocation (no TLAB needed, no synchronization)
+
+  Limitation:
+  - Object must NOT be returned, stored in a field, or passed to another thread
+  - Stack size is limited; large objects might cause StackOverflowError if stack-allocated
+  - JVM may not stack-allocate if inlining budget is exceeded or method is too complex
+
+  Note: In Java, you cannot force stack allocation. The JVM decides. Virtual threads
+  (Java 21) don't change this; escape analysis is orthogonal to thread model.
+
+SCALAR REPLACEMENT
+------------------
+  More aggressive than simple stack allocation: the JVM eliminates the object entirely
+  and replaces its fields with individual scalar variables in registers or stack slots.
+
+  Example:
+  class Point { int x; int y; }
+
+  void printSum() {
+      Point p = new Point();
+      p.x = 10;
+      p.y = 20;
+      System.out.println(p.x + p.y);
+  }
+  // After scalar replacement in JIT bytecode (conceptually):
+  // int p_x = 10;
+  // int p_y = 20;
+  // System.out.println(p_x + p_y);
+  // The Point object never exists in memory!
+
+  This eliminates:
+  - Object header overhead (16 bytes)
+  - TLAB bump-pointer allocation
+  - Field access indirection
+  - GC tracking
+
+  -XX:+EliminateAllocations — controls scalar replacement (default: on)
+
+LOCK ELISION
+------------
+  If escape analysis determines that an object is thread-local (no other thread can access
+  it), synchronized blocks on that object are unnecessary and are removed by the JIT.
+
+  Classic example: using StringBuffer (which is thread-safe) in a single-threaded context:
+
+  String concat(int n) {
+      StringBuffer sb = new StringBuffer();  // local to this method
+      for (int i = 0; i < n; i++) {
+          sb.append(i);          // each append is synchronized — but JIT elides the lock!
+      }
+      return sb.toString();
+  }
+  // JIT recognizes sb doesn't escape → eliminates all monitor enter/exit instructions
+  // Result: same performance as StringBuilder (which has no synchronization)
+
+  This is why StringBuffer and StringBuilder perform similarly in single-threaded benchmarks
+  — lock elision makes StringBuffer's locks disappear.
+
+  -XX:+EliminateLocks — controls lock elision (default: on, requires DoEscapeAnalysis)
+
+HOW TO VERIFY ESCAPE ANALYSIS IS WORKING
+-----------------------------------------
+  Print JIT compilation details:
+  -XX:+PrintEscapeAnalysis           — print escape analysis results (verbose)
+  -XX:+PrintEliminateAllocations     — print scalar replacement decisions
+  -XX:+PrintEliminateLocks           — print lock elision decisions
+  -XX:+UnlockDiagnosticVMOptions     — required to enable above diagnostic flags
+
+  Example JVM flags for analysis:
+  java -XX:+UnlockDiagnosticVMOptions -XX:+PrintEscapeAnalysis \
+       -XX:+PrintEliminateAllocations -server MyApp
+
+  Benchmark approach:
+  Use JMH (Java Microbenchmark Harness) to compare allocation rates.
+  Use -prof gc in JMH to count GC allocations per operation.
+  If allocation rate is 0 for an operation, escape analysis eliminated the allocation.
+
+LIMITATIONS AND CASES WHERE ESCAPE ANALYSIS FAILS
+---------------------------------------------------
+  1. Reflection: Objects accessed via reflection always escape (JIT can't prove safety).
+  2. JNI: Objects passed to native methods via JNI always escape (native code is opaque).
+  3. Method too large: JIT has inlining and analysis budgets. If a method is too big, or
+     the call chain is too deep, JIT may not inline callees, and escape analysis becomes
+     conservative (assumes escape).
+  4. Polymorphism: If an interface method has multiple implementations, JIT may not inline
+     the callee, limiting escape analysis scope. Monomorphic call sites are JIT-friendly.
+  5. Object arrays: Storing objects in arrays typically causes escape.
+  6. Interpreter / Tier 1–3: Escape analysis only at C2 (tier 4) compilation. Methods
+     that never get hot enough won't benefit.
+
+  -XX:MaxInlineSize=N    — controls inlining limit (default: 35 bytes of bytecode)
+  -XX:InlineSmallCode=N  — inline small code threshold
+
+ESCAPE ANALYSIS VS VIRTUAL THREADS (Java 21)
+---------------------------------------------
+  Virtual threads (Project Loom) don't change escape analysis semantics.
+  An object created and used entirely within a virtual thread's task still undergoes
+  escape analysis normally. If it doesn't escape the task (analogous to a method
+  in this context), JIT may still optimize it. The thread model (carrier vs virtual)
+  is transparent to the JIT's escape analysis.
+
+PERFORMANCE IMPACT EXAMPLE
+---------------------------
+  // Benchmark: summing 1,000,000 points
+  int sumPoints(int n) {
+      int sum = 0;
+      for (int i = 0; i < n; i++) {
+          Point p = new Point(i, i * 2);  // NoEscape — scalar replaced!
+          sum += p.x + p.y;
+      }
+      return sum;
+  }
+  // Without escape analysis: 1,000,000 Point objects on heap → GC pressure
+  // With escape analysis:    zero heap allocations → dramatically lower GC, higher throughput
+
+COMMON INTERVIEW QUESTIONS
+---------------------------
+Q: What is escape analysis in the JVM?
+A: Escape analysis is a JIT optimization that determines whether an object's references
+   are confined to a method (NoEscape), passed to callees (ArgEscape), or stored in shared
+   state (GlobalEscape). For NoEscape objects, the JIT can eliminate heap allocation via
+   stack allocation or scalar replacement, and elide locks via lock elision. It reduces
+   GC pressure and improves throughput for allocation-heavy code.
+
+Q: What is scalar replacement, and how does it relate to escape analysis?
+A: Scalar replacement is a JIT optimization enabled by escape analysis. When an object is
+   determined to be NoEscape, the JIT replaces the entire object with its individual scalar
+   fields (ints, longs, references). The object never exists as a heap allocation — its
+   fields are stored in registers or stack slots. This eliminates the object header, the
+   allocation cost, and all GC involvement for that object.
+
+Q: Can a developer force stack allocation in Java?
+A: No. Unlike C/C++ where you can declare objects on the stack explicitly, Java abstracts
+   this. The JVM (specifically the C2 JIT) decides whether to apply escape analysis and
+   stack/scalar allocation. Developers can encourage it by writing short methods (easier
+   to inline), avoiding storing objects in fields unnecessarily, and using local variables
+   for short-lived computations. You can verify it's happening using JMH with GC profiling
+   or with diagnostic JVM flags like -XX:+PrintEliminateAllocations.
+
+Q: What is lock elision and when does the JVM apply it?
+A: Lock elision is a JIT optimization where the JVM removes synchronized blocks on objects
+   that escape analysis has proven cannot be accessed by another thread. The classic example
+   is using StringBuffer (synchronized) in a single-threaded context — all its internal
+   synchronized methods are elided, giving it the same performance as StringBuilder.
+   It's enabled with -XX:+EliminateLocks (default: on) and requires escape analysis.

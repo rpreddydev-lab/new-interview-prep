@@ -1,0 +1,218 @@
+STRING INTERNING AND STRING POOL INTERNALS
+===========================================
+
+THE STRING POOL (INTERNING POOL)
+----------------------------------
+  Java's String pool is a special area in the JVM heap where String literals are stored
+  and shared. When the JVM encounters a String literal, it checks the pool first; if an
+  equal String already exists, it returns the existing reference. This is string interning.
+
+  Java 7+: String pool is in the HEAP (under the Young/Old generation area).
+  Java 6 and earlier: String pool was in PermGen — caused infamous PermGen OOM errors.
+  Moving to heap means: interned strings are subject to normal GC and don't cause OOM
+  from PermGen overflow.
+
+  Implementation: the pool is backed by a native hash table in HotSpot.
+  Default size: ~60,013 buckets (prime number). Tunable with -XX:StringTableSize=N.
+
+HOW STRING LITERALS WORK
+--------------------------
+  At compile time, string literals are stored in the .class file's constant pool.
+  At class loading/linking (resolution phase), the JVM calls String.intern() on each
+  string literal → looks up the String pool → returns the canonical interned reference.
+
+  "hello"                 → interned automatically at class loading
+  new String("hello")     → creates a NEW heap object, NOT the interned reference
+  new String("hello").intern()  → manually intern; returns the pool reference
+
+  // == compares references:
+  String a = "hello";
+  String b = "hello";
+  System.out.println(a == b);           // true  — both point to pool entry
+  System.out.println(a.equals(b));      // true
+
+  String c = new String("hello");
+  System.out.println(a == c);           // false — c is a new heap object
+  System.out.println(a == c.intern());  // true  — c.intern() returns pool reference
+  System.out.println(a.equals(c));      // true  — .equals() compares content
+
+  KEY RULE: Always use .equals() for String content comparison. Use == ONLY when
+  specifically dealing with interned/literal strings and intentionally comparing identity.
+
+COMPILE-TIME CONSTANT FOLDING AND CONCATENATION
+-------------------------------------------------
+  The compiler folds constant String expressions at compile time. The folded result is
+  a single literal that gets interned:
+
+  String s1 = "foo" + "bar";       // folded at compile time → "foobar" literal → interned
+  String s2 = "foobar";
+  System.out.println(s1 == s2);    // true — same pool entry
+
+  final String x = "foo";
+  final String y = "bar";
+  String s3 = x + y;              // also folded at compile time (final + literal) → interned
+  System.out.println(s2 == s3);   // true
+
+  String a = "foo";                // not final
+  String b = "bar";                // not final
+  String s4 = a + b;              // runtime concatenation → new heap String → NOT interned
+  System.out.println(s2 == s4);   // false
+
+STRING.INTERN() METHOD
+-----------------------
+  String.intern() is a native method that looks up the string in the pool:
+  - If an equal string already exists in the pool → return that canonical reference
+  - If not → add this string to the pool → return it
+
+  Use case: when you have many Strings with repeated values (e.g., from parsing CSV),
+  interning deduplicates them → significant memory savings.
+
+  String pooled = someRuntimeString.intern();  // returns canonical pool reference
+
+  Interning trade-offs:
+  Pros: memory saving for highly repeated strings; allows == comparison for interned strings
+  Cons: pool lookup has overhead (native hash table lookup); over-interning bloats the pool;
+  interned strings in the pool may live longer (until GC can collect them from the heap)
+
+  -XX:StringTableSize=N   — resize pool hash table (increase for heavy interning)
+  jcmd <pid> VM.stringtable — dump string table statistics (HotSpot)
+
+STRING DEDUPLICATION (G1 GC)
+------------------------------
+  G1 GC includes a String Deduplication feature (JEP 192, Java 8u20+).
+  It does NOT use interning. Instead:
+  - G1 identifies String objects with equal char[]/byte[] backing arrays
+  - Multiple String objects that are equal share a single backing array
+  - String headers still exist separately; only the data array is deduplicated
+  - Happens in background GC threads — transparent, no application code changes
+
+  Enable: -XX:+UseStringDeduplication (requires -XX:+UseG1GC, default: off)
+  Monitor: -XX:+PrintStringDeduplicationStatistics
+
+  | Mechanism              | How it works                    | Applies to                    |
+  |------------------------|---------------------------------|-------------------------------|
+  | String.intern()        | Returns shared String object    | Any String, explicit call     |
+  | String Deduplication   | Shares backing char[]/byte[]    | G1 GC, automatic, background  |
+
+COMPACT STRINGS (JAVA 9 — JEP 254)
+-------------------------------------
+  Before Java 9: All strings used char[] (UTF-16, 2 bytes per character).
+  Java 9+: Compact Strings change the internal storage:
+
+  - If all characters fit in Latin-1 (ISO-8859-1, codes 0–255): store as byte[] (1 byte/char)
+  - If any character requires more than 8 bits: store as byte[] with UTF-16 encoding (2 bytes/char)
+  - A coder field (0 = LATIN1, 1 = UTF16) indicates the encoding
+
+  class String {
+      private final byte[] value;   // Java 9+: was char[] in Java 8 and earlier
+      private final byte coder;     // 0 = LATIN1, 1 = UTF16
+  }
+
+  Benefits:
+  - 50% memory reduction for ASCII/Latin-1 dominated applications (common for English text)
+  - Reduced GC pressure from smaller String objects
+  - Better cache utilization
+
+  You don't need to do anything. It's automatic. All String operations correctly handle both
+  encodings transparently.
+
+  Disable if needed (rare): -XX:-CompactStrings
+
+STRING CONCATENATION PERFORMANCE
+----------------------------------
+  Pre-Java 9: String concatenation with + was compiled to:
+  new StringBuilder(str1).append(str2).append(str3).toString()
+  This creates an intermediate StringBuilder + a final String object each time.
+
+  Java 9+: invokedynamic-based concatenation (JEP 280 "Indify String Concatenation")
+  The JVM now uses StringConcatFactory (invokedynamic) which can:
+  - Directly write bytes into a result byte[] (avoiding StringBuilder intermediate!)
+  - Potentially more optimizable by the JIT
+
+  For loops: always use StringBuilder explicitly — the compiler can't optimize away
+  the StringBuilder creation inside a loop.
+
+  // BAD: creates a new StringBuilder + String in every iteration
+  String result = "";
+  for (String s : list) {
+      result += s;   // O(n²) — n string copies total
+  }
+
+  // GOOD: single StringBuilder for the whole loop
+  StringBuilder sb = new StringBuilder();
+  for (String s : list) {
+      sb.append(s);
+  }
+  String result = sb.toString();  // O(n) — one copy at the end
+
+  String.join() and String.format() / String.formatted() create their own internal mechanism
+  and are generally fine for readability when performance isn't critical.
+
+IMPORTANT STRING METHODS
+--------------------------
+  String.valueOf(x)     — converts any type to String (null-safe: returns "null" for null)
+  x.toString()          — calls toString() on object (throws NullPointerException if x is null!)
+  "" + x                — concatenation (null-safe: null → "null"; also NullPointerException-free)
+
+  Prefer String.valueOf() when x might be null.
+
+  String.format() vs formatted() (Java 15+):
+  String s = "Hello %s".formatted(name);   // instance method, more readable
+
+  intern() vs String.valueOf():
+  String.valueOf(42)     — creates a heap String (NOT from pool unless small int cache applies)
+  Integer.toString(42)   — also creates a heap String
+  "42"                   — from pool
+
+STRING POOL SIZE TUNING
+------------------------
+  Default pool size: 60,013 buckets (HotSpot, Java 8+)
+  JVM flag: -XX:StringTableSize=<prime number>
+  Increase if: application interns very many strings and pool collisions are high.
+
+  Check stats: jcmd <pid> VM.stringtable
+  Example output:
+  StringTable statistics:
+  Number of buckets       :    131072 = 1048576 bytes,
+  Number of entries       :     20000 =   ...
+  Average bucket size     :         0
+  Longest bucket chain    :         5
+
+  Too few buckets → long chains → O(n) lookup → slow interning.
+  Rule: StringTableSize should be a prime number ≥ 2x the number of unique interned strings.
+
+COMMON INTERVIEW QUESTIONS
+---------------------------
+Q: What is the String pool in Java and where is it located?
+A: The String pool (also called the intern pool or string constant pool) is a cache of
+   String objects maintained by the JVM. String literals and the results of String.intern()
+   are stored here. In Java 7+, the pool is part of the main heap (it was in PermGen in
+   Java 6 and earlier). Because it's in the heap, interned strings are subject to normal
+   garbage collection. The pool is backed by a native hash table in HotSpot.
+
+Q: Why does == return true for String literals but false for new String()?
+A: String literals are automatically interned — the JVM stores one canonical instance per
+   unique string value in the pool and returns that instance for every literal with the
+   same content. So "hello" == "hello" → true because both refer to the same pool entry.
+   new String("hello") bypasses the pool and creates a fresh heap object; its reference
+   is different from the pool entry, so == returns false. .equals() always compares content,
+   not identity, and returns true for any two strings with the same characters.
+
+Q: What is the difference between String interning and G1's String deduplication?
+A: Both reduce memory for repeated strings, but they work differently:
+   String interning (String.intern()) deduplicates the String OBJECT itself — multiple
+   variables point to the same String instance in the pool. You need to call intern()
+   explicitly (or use literals). G1's String deduplication (-XX:+UseStringDeduplication)
+   deduplicates the backing byte[] array — separate String objects may still exist, but
+   they share the same character data. Deduplication runs in background GC threads,
+   requires no code changes, and works on any String that survived at least one GC.
+   Interning is eager and explicit; deduplication is lazy and automatic.
+
+Q: What are Compact Strings in Java 9, and why do they matter?
+A: JEP 254 changed String's internal representation from char[] (always 2 bytes/char) to
+   byte[] with a coder field. For strings containing only Latin-1 characters (codes 0–255),
+   the backing byte[] stores 1 byte per character — halving memory usage for typical
+   ASCII-heavy applications. For strings with non-Latin-1 characters (e.g., Chinese,
+   emoji), UTF-16 encoding is used (2 bytes/char). All String operations handle both
+   encodings transparently. Compact Strings reduce heap usage and GC pressure
+   significantly for applications with many short ASCII strings.
