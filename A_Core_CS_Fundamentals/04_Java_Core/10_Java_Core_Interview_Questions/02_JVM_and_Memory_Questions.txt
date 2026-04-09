@@ -1,0 +1,186 @@
+JVM AND MEMORY QUESTIONS
+=========================
+
+Q1: Describe the JVM memory areas. What is stored where?
+---------------------------------------------------------
+A:
+  Heap:
+  - Shared across all threads
+  - Stores all object instances and arrays
+  - Divided into: Young Generation (Eden + Survivor S0/S1) and Old Generation
+  - Managed by GC
+
+  JVM Stack (per-thread):
+  - Each thread has its own private stack
+  - Stores method frames (local variables, operand stack, return address)
+  - Primitives declared as local variables live here as values
+  - Object references (not the objects) live here
+
+  Metaspace (replaces PermGen since Java 8):
+  - Class metadata: class structures, method bytecode, constant pools, field info
+  - Off-heap (native memory) — grows dynamically; bounded by -XX:MaxMetaspaceSize
+  - Not subject to Old Gen GC; has its own GC (class unloading)
+
+  Code Cache:
+  - Stores JIT-compiled native code
+  - Off-heap; bounded by -XX:ReservedCodeCacheSize
+
+  Native Stack (per-thread):
+  - Used by native (JNI) method calls
+
+  PC Register (per-thread):
+  - Instruction pointer — current instruction being executed
+
+Q2: What is the difference between Young Generation and Old Generation?
+-----------------------------------------------------------------------
+A:
+  Young Generation:
+  - Where new objects are allocated (in Eden)
+  - Minor GC collects it (fast, frequent — typically < 100ms with G1)
+  - Survivors copied between S0/S1 survivor spaces
+  - After N survivals (default: 15), object promoted to Old Gen
+  - Most objects die young (generational hypothesis)
+
+  Old Generation (Tenured):
+  - Stores long-lived objects that survived multiple Minor GCs
+  - Major/Full GC collects it (slower, less frequent)
+  - G1 performs concurrent marking to avoid long STW pauses
+  - Old Gen full → OOM if GC can't reclaim enough
+
+  Tuning:
+  -Xmn — set Young Gen size
+  -XX:NewRatio=N — ratio of Old:Young (default: 2, meaning 2/3 old, 1/3 young)
+  -XX:MaxTenuringThreshold=N — number of GC cycles before promotion
+
+Q3: What is a Stop-The-World (STW) pause, and how do modern GCs minimize it?
+-----------------------------------------------------------------------------
+A:
+  STW pause: a phase where all application threads are halted so the GC can safely operate.
+  Required for phases that need a consistent snapshot of heap state (e.g., initial mark,
+  remark in CMS; evacuating regions in G1).
+
+  During STW: application is completely unresponsive — latency spikes.
+
+  Modern GC strategies to minimize STW:
+  - Concurrent marking (G1, ZGC, Shenandoah): trace live objects concurrently while
+    application runs; only a short STW for initial mark and remark
+  - Region-based collection (G1): collect only a subset of regions per cycle — pause
+    duration is proportional to the amount collected, not total heap size
+  - ZGC and Shenandoah: nearly all work done concurrently; pauses < 10ms even for TB-scale heaps
+  - Generational GC: most objects die young → collect only Young Gen (fast STW) frequently;
+    avoid Full GC (long STW) by keeping Old Gen pressure low
+
+Q4: What is a memory leak in Java, and how do you detect one?
+-------------------------------------------------------------
+A:
+  A Java memory leak occurs when objects that are no longer needed are still referenced
+  by GC roots (directly or transitively), preventing GC from reclaiming them.
+
+  Common causes:
+  - Static collections that grow unboundedly (static Map with items never removed)
+  - Listeners/callbacks not deregistered (Observer pattern leak)
+  - ThreadLocal variables not cleaned up (ThreadLocal.remove() not called)
+  - Inner class instances holding a reference to the outer class
+  - Caches without eviction policy (no WeakHashMap, no Caffeine TTL)
+  - Classloader leaks in hot-deploy scenarios (web containers)
+
+  Detection:
+  1. jstat -gcutil <pid> — Old Gen keeps growing even after Full GC → leak
+  2. jcmd GC.heap_dump /tmp/heap.hprof — take heap dump
+  3. Analyze in JMC or VisualVM: histogram (which class has most instances?)
+     dominator tree (what is keeping them alive?)
+  4. JFR allocation profiling: find where objects are being created
+  5. Heap dump comparison: two dumps at intervals — what's new/growing?
+
+Q5: What is Metaspace, and what replaced PermGen?
+-------------------------------------------------
+A:
+  In Java 7 and earlier, class metadata (class structures, method bytecode) was stored in
+  PermGen (Permanent Generation) — a fixed-size region of the JVM heap.
+  PermGen was notorious for "java.lang.OutOfMemoryError: PermGen space" errors in
+  applications that loaded many classes (frameworks, hot-deploy, code generation).
+
+  Java 8 replaced PermGen with Metaspace:
+  - Metaspace is OFF-heap (native memory) — not part of the Java heap
+  - Grows dynamically as more classes are loaded
+  - Bounded by -XX:MaxMetaspaceSize (default: unlimited — bounded by native memory)
+  - When a ClassLoader is GC'd, its associated Metaspace is reclaimed
+  - Eliminates PermGen OOM for class metadata (OOM still possible if MaxMetaspaceSize set)
+
+  Default: set -XX:MaxMetaspaceSize to prevent uncontrolled native memory growth in
+  production (e.g., -XX:MaxMetaspaceSize=256m).
+
+Q6: What are the different types of Java references (Strong, Soft, Weak, Phantom)?
+-----------------------------------------------------------------------------------
+A:
+  Strong Reference: default. Object is never GC'd as long as a strong reference exists.
+    Object obj = new Object();   // strong reference
+
+  Soft Reference (java.lang.ref.SoftReference):
+    GC reclaims ONLY when the JVM is under memory pressure (before OOM).
+    Use case: memory-sensitive caches (image cache, lookup cache).
+
+  Weak Reference (java.lang.ref.WeakReference):
+    GC reclaims as soon as no strong/soft references exist (even if memory is available).
+    Use case: WeakHashMap (keys GC'd when no other strong references); canonical mappings.
+
+  Phantom Reference (java.lang.ref.PhantomReference):
+    get() always returns null. Object placed in ReferenceQueue AFTER it's finalized.
+    Use case: resource cleanup without finalize() — know when an object is collected.
+
+  Reference Queues: SoftReference/WeakReference/PhantomReference can be associated with
+  a ReferenceQueue. When the referent is collected, the Reference object is enqueued.
+  This allows post-mortem cleanup (e.g., releasing native resources).
+
+Q7: What is the Java Memory Model (JMM) and why does it matter?
+---------------------------------------------------------------
+A:
+  The JMM defines how threads interact through memory, specifically:
+  - When writes by one thread become visible to another thread
+  - What ordering guarantees the JVM provides (compiler/CPU reordering)
+
+  Without JMM rules, the JVM and CPU can freely reorder instructions for performance.
+  A "data race" (two threads accessing shared data without synchronization) leads to
+  undefined / unpredictable behavior.
+
+  Key JMM concepts:
+  - happens-before: if action A happens-before action B, then A's effects are visible to B.
+  - Main happens-before rules:
+    * Thread start: thread.start() hb → all actions in the new thread
+    * Monitor unlock hb → subsequent lock of the same monitor
+    * volatile write hb → subsequent volatile read of the same variable
+    * Thread join: all actions in a thread hb → thread.join() returning
+    * Final field freeze: constructor completion hb → any subsequent read of a final field
+
+  Practical implications:
+  - Use synchronized, volatile, or java.util.concurrent classes to establish happens-before
+  - Without it, a variable written by one thread may never be seen by another (cached in CPU register)
+
+Q8: What causes OutOfMemoryError in Java, and how do you diagnose it?
+---------------------------------------------------------------------
+A:
+  Java heap space: heap is exhausted — no room for new objects after GC.
+    Cause: genuine growth (too many live objects), memory leak, undersized heap.
+    Diagnosis: heap dump → JMC/VisualVM histogram → find which class dominates.
+
+  GC overhead limit exceeded: GC is running >98% of the time and reclaiming <2% of heap.
+    Cause: heap chronically undersized or catastrophic memory leak.
+    Fix: increase -Xmx; fix leak.
+
+  Metaspace: class metadata exhausted the Metaspace.
+    Cause: -XX:MaxMetaspaceSize too small; classloader leak (hot-deploy/OSGi).
+    Diagnosis: jcmd VM.classes; monitor Metaspace with -Xlog:class+unload.
+
+  unable to create new native thread: OS can't create more threads.
+    Cause: too many threads alive (thread-per-request model at scale); insufficient OS limits.
+    Diagnosis: jstack; check /proc/sys/kernel/threads-max (Linux).
+
+  Direct buffer memory: off-heap (ByteBuffer.allocateDirect) exhausted.
+    Cause: NIO direct buffers not released; too much off-heap allocation.
+    Tuning: -XX:MaxDirectMemorySize=N
+
+  Common diagnostic steps:
+  1. Check -Xmx setting — is heap too small for the workload?
+  2. jstat -gcutil — is Old Gen growing unboundedly?
+  3. Take heap dump on OOM: -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/
+  4. Analyze heap dump: class histogram, dominator tree, reference chains.
