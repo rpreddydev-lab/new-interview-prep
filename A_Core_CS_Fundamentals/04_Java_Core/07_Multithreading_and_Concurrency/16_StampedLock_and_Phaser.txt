@@ -1,0 +1,170 @@
+STAMPEDLOCK AND PHASER
+========================
+
+StampedLock
+------------
+  Introduced in Java 8 as a more performant alternative to ReadWriteLock
+  for read-heavy workloads. Key improvements:
+  - Optimistic reads — try reading WITHOUT acquiring a lock, then validate
+  - If validation fails, fall back to a pessimistic read lock
+  - Write lock acquisition returns a stamp (version token) used to unlock
+
+  StampedLock does NOT support reentrancy (unlike ReentrantReadWriteLock).
+  StampedLock does NOT support Condition objects.
+
+THE THREE LOCKING MODES
+------------------------
+  1. WRITE LOCK — exclusive, blocks all readers and writers
+     long stamp = lock.writeLock();
+     try { /* modify state */ }
+     finally { lock.unlockWrite(stamp); }
+
+  2. READ LOCK (pessimistic) — shared among multiple readers, blocks writers
+     long stamp = lock.readLock();
+     try { /* read state */ }
+     finally { lock.unlockRead(stamp); }
+
+  3. OPTIMISTIC READ — no lock acquired! Just read a stamp and validate afterward
+     long stamp = lock.tryOptimisticRead();
+     double x = this.x, y = this.y;  // snapshot (may be stale!)
+     if (!lock.validate(stamp)) {    // validate: was a write lock acquired since?
+         stamp = lock.readLock();    // fall back to full read lock
+         try { x = this.x; y = this.y; }
+         finally { lock.unlockRead(stamp); }
+     }
+     // use x, y
+
+  Optimistic reads are extremely fast (no lock acquisition) but require re-reading
+  if a writer intervened. Perfect for frequently-read, rarely-written data.
+
+FULL STAMPEDLOCK EXAMPLE
+--------------------------
+  public class Point {
+      private volatile double x, y;
+      private final StampedLock lock = new StampedLock();
+
+      public void move(double dx, double dy) {
+          long stamp = lock.writeLock();
+          try { x += dx; y += dy; }
+          finally { lock.unlockWrite(stamp); }
+      }
+
+      public double distanceFromOrigin() {
+          long stamp = lock.tryOptimisticRead();     // optimistic: no lock
+          double curX = x, curY = y;                // snapshot
+          if (!lock.validate(stamp)) {              // check if writer intervened
+              stamp = lock.readLock();              // fall back to pessimistic read
+              try { curX = x; curY = y; }
+              finally { lock.unlockRead(stamp); }
+          }
+          return Math.sqrt(curX * curX + curY * curY);
+      }
+
+      // Lock conversion: upgrade read → write (atomic if no intervening writer)
+      public void conditionalIncrement(double threshold) {
+          long stamp = lock.readLock();
+          try {
+              while (x < threshold) {
+                  long writeStamp = lock.tryConvertToWriteLock(stamp);
+                  if (writeStamp != 0L) {  // conversion succeeded
+                      stamp = writeStamp;
+                      x++;
+                      break;
+                  } else {
+                      lock.unlockRead(stamp);
+                      stamp = lock.writeLock();  // full write lock
+                  }
+              }
+          } finally { lock.unlock(stamp); }
+      }
+  }
+
+STAMPEDLOCK vs ReadWriteLock
+-----------------------------
+  Aspect                 | ReentrantReadWriteLock    | StampedLock
+  -----------------------|---------------------------|------------------------------
+  Optimistic reads       | ❌ No                     | ✅ Yes (very fast)
+  Reentrancy             | ✅ Yes                    | ❌ No
+  Condition objects      | ✅ Yes                    | ❌ No
+  Lock conversion        | ❌ No                     | ✅ Yes (read→write)
+  Throughput (reads)     | Good                     | Excellent
+  Correctness complexity | Lower                    | Higher (must validate!)
+
+Phaser
+-------
+  Phaser is a flexible reusable synchronization barrier (like CyclicBarrier but more powerful):
+  - Variable number of parties (register/deregister dynamically)
+  - Supports multiple phases (phases auto-advance)
+  - Can be hierarchical (tree of Phasers for scalability)
+  - Can be terminated
+
+  Key methods:
+    register()           — add one more party to the current phase
+    bulkRegister(int)    — add N parties
+    arriveAndAwaitAdvance() — signal arrival, wait for all parties, advance to next phase
+    arriveAndDeregister()   — signal arrival, remove self from future phases
+    arrive()             — signal arrival without waiting (async)
+    awaitAdvance(int phase) — wait until phaser advances past given phase
+    getPhase()           — current phase number
+    getRegisteredParties() — how many parties registered
+    onAdvance(int phase, int registeredParties) — override for custom phase transition logic
+
+PHASER EXAMPLE — MULTI-PHASE COMPUTATION
+------------------------------------------
+  int PARTIES = 4;
+  Phaser phaser = new Phaser(PARTIES);  // register 4 parties upfront
+
+  for (int i = 0; i < PARTIES; i++) {
+      final int id = i;
+      new Thread(() -> {
+          for (int phase = 0; phase < 3; phase++) {
+              System.out.printf("Thread %d: phase %d starting%n", id, phase);
+              doWork(phase, id);
+              phaser.arriveAndAwaitAdvance();  // wait for all, then advance
+              System.out.printf("Thread %d: phase %d done%n", id, phase);
+          }
+          phaser.arriveAndDeregister();  // deregister when all phases complete
+      }).start();
+  }
+
+TERMINATING A PHASER
+---------------------
+  Override onAdvance() to control termination:
+
+  Phaser phaser = new Phaser(PARTIES) {
+      @Override
+      protected boolean onAdvance(int phase, int registeredParties) {
+          return phase >= 2 || registeredParties == 0;  // terminate after phase 2
+      }
+  };
+
+  phaser.isTerminated()  // check if terminated
+
+PHASER vs CyclicBarrier vs CountDownLatch
+------------------------------------------
+  Feature                    | CountDownLatch | CyclicBarrier | Phaser
+  ---------------------------|----------------|---------------|--------------------
+  Reusable                   | ❌ One-shot    | ✅ Auto-reset | ✅ Multi-phase
+  Dynamic parties            | ❌ Fixed       | ❌ Fixed      | ✅ register/deregister
+  Phases                     | 1              | 1             | Multiple (unlimited)
+  Termination control        | N/A            | N/A           | ✅ onAdvance()
+  Hierarchical               | ❌             | ❌            | ✅
+  Barrier action             | ❌             | ✅ Runnable   | ✅ onAdvance() override
+  Complexity                 | Low            | Medium        | Higher
+
+COMMON INTERVIEW QUESTIONS
+---------------------------
+Q: What is the advantage of StampedLock's optimistic read over ReadWriteLock?
+A: Optimistic reads in StampedLock acquire NO lock — they just read a stamp and then
+   validate whether a write lock was acquired in between. If no write occurred, the read
+   is completed with zero lock overhead. This makes read-heavy workloads significantly
+   faster than ReadWriteLock, where even read locks require CAS operations. The trade-off
+   is complexity: you must always validate and re-read if validation fails.
+
+Q: When would you choose Phaser over CyclicBarrier?
+A: Phaser is more flexible: it supports dynamic registration/deregistration of parties
+   (threads can join or leave mid-computation), multiple named phases (the phase counter
+   auto-increments), termination conditions via onAdvance(), and hierarchical structures
+   for large-scale coordination. Use CyclicBarrier when the number of parties is fixed
+   and you only need one barrier point per cycle. Use Phaser for complex multi-phase
+   workflows where threads may join or leave, or for multi-phase algorithms.

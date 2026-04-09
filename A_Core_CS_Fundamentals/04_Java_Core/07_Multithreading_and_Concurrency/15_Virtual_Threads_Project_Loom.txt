@@ -1,0 +1,153 @@
+VIRTUAL THREADS (PROJECT LOOM)
+================================
+
+BACKGROUND: THE PROBLEM WITH PLATFORM THREADS
+-----------------------------------------------
+  Traditional Java threads (platform threads) map 1:1 to OS threads.
+  OS threads are expensive:
+  - ~1MB default stack per thread
+  - Kernel thread creation/destruction overhead
+  - Context switches managed by the OS scheduler
+  - Practical limit: ~thousands of threads per JVM
+
+  Thread-per-request model breaks under high I/O concurrency:
+  - Thread blocks on DB query, HTTP call, file read
+  - Blocked thread consumes memory, does no useful work
+  - Solution (pre-Loom): async callbacks or reactive programming
+  → Async code: hard to write, read, debug, and reason about
+
+VIRTUAL THREADS (Java 21 — GA)
+--------------------------------
+  Virtual threads are LIGHTWEIGHT threads managed by the JVM (not the OS).
+  - Backed by a small number of OS carrier threads (ForkJoinPool-based)
+  - When a virtual thread blocks (I/O, sleep, lock), it is UNMOUNTED from the carrier
+  - Carrier thread is freed to run another virtual thread
+  - When the blocking operation completes, the virtual thread is remounted on any carrier
+  - Stack stored on heap (grows/shrinks dynamically) — starts at ~few KB vs ~1MB
+
+  Result: you CAN have MILLIONS of virtual threads in a single JVM.
+  Blocking is cheap — the OS thread is never actually blocked.
+
+CREATING VIRTUAL THREADS
+--------------------------
+  // Method 1: Thread.ofVirtual()
+  Thread vt = Thread.ofVirtual()
+      .name("vt-worker")
+      .start(() -> doWork());
+
+  // Method 2: Thread.startVirtualThread()
+  Thread vt = Thread.startVirtualThread(() -> doWork());
+
+  // Method 3: ExecutorService with virtual threads (recommended for server code)
+  try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+      for (int i = 0; i < 1_000_000; i++) {
+          executor.submit(() -> handleRequest());  // 1M virtual threads — fine!
+      }
+  }  // auto-shutdown (Executors.newVirtualThreadPerTaskExecutor is AutoCloseable)
+
+VIRTUAL vs PLATFORM THREADS
+-----------------------------
+  Aspect                  | Platform Thread           | Virtual Thread
+  ------------------------|---------------------------|------------------------------
+  Mapped to               | OS kernel thread (1:1)    | JVM carrier thread (M:N)
+  Stack size              | ~512KB - 1MB (fixed)      | ~few KB (grows on heap)
+  Max per JVM             | ~thousands                | Millions
+  Blocking I/O cost       | Blocks OS thread          | Unmounts carrier; zero wasted OS thread
+  Creation cost           | High                      | Very low (~same as allocating an object)
+  Scheduling              | OS scheduler              | JVM scheduler (ForkJoinPool)
+  Thread locals           | Works as usual            | Works (but may cause memory issues at scale)
+  Synchronization         | Full support              | Avoid synchronized (pinning issue — see below)
+
+UNMOUNTING AND PINNING
+------------------------
+  When a virtual thread calls a blocking operation (network I/O, Thread.sleep(), etc.),
+  the JVM unmounts it from the carrier thread. The carrier is free to run other VTs.
+
+  PINNING: A virtual thread is "pinned" to its carrier (cannot unmount) when:
+  1. Inside a synchronized block or method
+  2. Running a native method or foreign function
+
+  Pinning defeats the purpose — the carrier OS thread IS blocked.
+  Fix: replace synchronized with ReentrantLock in code called frequently from virtual threads.
+
+  // ❌ Pinning — carrier thread blocked during the lock body:
+  synchronized (lock) {
+      Thread.sleep(1000); // virtual thread pinned — carrier blocked!
+  }
+
+  // ✅ No pinning with ReentrantLock:
+  lock.lock();
+  try {
+      Thread.sleep(1000); // virtual thread unmounts — carrier free!
+  } finally { lock.unlock(); }
+
+THREAD-PER-REQUEST WITH VIRTUAL THREADS
+-----------------------------------------
+  The golden use case: server applications serving many concurrent requests.
+  Each request gets its own virtual thread — simple, sequential code, no async/callbacks.
+
+  // HTTP server — simple thread-per-request model scales to millions of connections:
+  try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+      server.setExecutor(executor);
+      server.start();
+  }
+
+  // vs reactive/async alternative (hard to read, hard to debug):
+  webClient.get()
+      .uri("/api/data")
+      .retrieve()
+      .bodyToMono(Data.class)
+      .flatMap(data -> processAsync(data))
+      .subscribe(result -> handleResult(result));
+
+WHAT VIRTUAL THREADS ARE NOT
+------------------------------
+  ❌ NOT for CPU-bound tasks — N virtual threads on N carriers doesn't add parallelism
+     for compute; use ForkJoinPool or parallel streams for that
+  ❌ NOT magic for all blocking — pinned blocking still blocks a carrier
+  ❌ NOT a replacement for asynchronous I/O for maximum throughput at OS level
+  ✅ Perfect for: blocking I/O intensive workloads, high-concurrency request handling,
+     migration of thread-per-request servers without rewriting to async
+
+STRUCTURED CONCURRENCY (Java 21 Preview / Java 23+)
+------------------------------------------------------
+  Virtual threads pair with Structured Concurrency (see file 19) to manage
+  fan-out of virtual threads with clear scope, cancellation, and error propagation.
+
+  try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+      Subtask<User>    userTask  = scope.fork(() -> fetchUser(id));
+      Subtask<Account> acctTask  = scope.fork(() -> fetchAccount(id));
+      scope.join();           // wait for all
+      scope.throwIfFailed();  // propagate any failure
+      return new Response(userTask.get(), acctTask.get());
+  }
+
+COMMON INTERVIEW QUESTIONS
+---------------------------
+Q: What are virtual threads and why were they introduced?
+A: Virtual threads are lightweight JVM-managed threads introduced in Java 21 (GA).
+   Unlike platform threads (1:1 OS thread mapping), virtual threads are multiplexed
+   onto a small pool of OS carrier threads. When a virtual thread blocks on I/O or
+   sleep, it is unmounted and the carrier thread is freed to run another virtual thread.
+   This enables millions of concurrent threads per JVM, making the simple thread-per-request
+   model scalable without reactive/async programming complexity.
+
+Q: What is "pinning" in the context of virtual threads?
+A: Pinning occurs when a virtual thread cannot be unmounted from its carrier OS thread.
+   This happens when the virtual thread is inside a synchronized block/method or a native
+   method while blocking. A pinned virtual thread keeps the carrier OS thread blocked —
+   defeating virtual threads' key benefit. The fix: replace synchronized with ReentrantLock
+   in hotspot blocking code, since ReentrantLock does not cause pinning.
+
+Q: Are virtual threads better for CPU-bound or I/O-bound tasks?
+A: I/O-bound tasks — overwhelmingly. Virtual threads shine when threads spend most time
+   waiting (network calls, database queries, file I/O). For CPU-bound work, more threads
+   don't help because you're limited by the number of cores. Use ForkJoinPool or parallel
+   streams for CPU-intensive parallel computation; use virtual threads for I/O concurrency.
+
+Q: Can you use virtual threads with existing Java code?
+A: Yes — virtual threads are transparent to existing APIs. Any code that works with platform
+   threads (synchronized, Thread.sleep(), locks, BlockingQueue) works with virtual threads.
+   The main changes needed: replace synchronized with ReentrantLock in hot blocking paths
+   (to avoid pinning), and migrate to Executors.newVirtualThreadPerTaskExecutor() instead
+   of fixed thread pools for I/O-bound workloads.

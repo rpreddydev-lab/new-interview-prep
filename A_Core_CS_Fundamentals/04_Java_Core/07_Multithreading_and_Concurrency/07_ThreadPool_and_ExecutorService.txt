@@ -1,0 +1,168 @@
+THREAD POOL AND EXECUTORSERVICE
+=================================
+
+WHY THREAD POOLS?
+------------------
+  Creating a new Thread per task is expensive:
+  - OS thread allocation: ~1MB stack by default + OS bookkeeping
+  - Thread creation/destruction overhead per task
+  - Uncontrolled growth: thousands of tasks → thousands of threads → OOM / thrashing
+
+  A thread pool pre-creates N worker threads that pick tasks from a queue.
+  - Bounded resource usage
+  - Reuse of threads (no creation/destruction overhead per task)
+  - Backpressure via queue limits
+  - Managed lifecycle (shutdown, awaitTermination)
+
+EXECUTORSERVICE INTERFACE
+--------------------------
+  java.util.concurrent.ExecutorService is the main interface for thread pools.
+
+  Key methods:
+    submit(Runnable)         → Future<?> (for tracking completion)
+    submit(Callable<T>)      → Future<T> (for result retrieval)
+    execute(Runnable)        → void (fire-and-forget, no Future)
+    shutdown()               → initiate graceful shutdown (no new tasks accepted)
+    shutdownNow()            → interrupt all running tasks, return un-started tasks
+    awaitTermination(long, TimeUnit) → wait for shutdown to complete
+    isShutdown()             → true after shutdown() called
+    isTerminated()           → true after all tasks finished post-shutdown
+    invokeAll(Collection<Callable<T>>) → block until all tasks complete, return List<Future<T>>
+    invokeAny(Collection<Callable<T>>) → block until ONE task completes, return its result
+
+FACTORY METHODS: Executors.*
+------------------------------
+  Executors.newFixedThreadPool(int n):
+    - Exactly n threads, constant pool size
+    - Unbounded LinkedBlockingQueue — can cause OOM if tasks pile up endlessly
+    - Best for CPU-bound tasks where n = Runtime.getRuntime().availableProcessors()
+
+  Executors.newCachedThreadPool():
+    - Grows unboundedly as needed, idle threads expire after 60s
+    - Good for many short-lived I/O-bound tasks
+    - Dangerous if tasks arrive faster than they complete — may create thousands of threads
+
+  Executors.newSingleThreadExecutor():
+    - Single worker thread — tasks execute sequentially in submission order
+    - Useful for serializing access to a shared resource
+
+  Executors.newScheduledThreadPool(int n):
+    - Supports delayed and periodic task execution
+    - Returns ScheduledExecutorService
+
+  Executors.newWorkStealingPool():
+    - Uses ForkJoinPool.commonPool() internals with work-stealing
+    - Parallelism = number of available processors
+    - Java 8+
+
+PREFERRED: ThreadPoolExecutor (EXPLICIT CONFIGURATION)
+-------------------------------------------------------
+  The Executors factories hide important config. For production, use ThreadPoolExecutor:
+
+  ThreadPoolExecutor executor = new ThreadPoolExecutor(
+      4,                             // corePoolSize   — min threads always alive
+      8,                             // maximumPoolSize — max threads when queue full
+      60L, TimeUnit.SECONDS,         // keepAliveTime  — idle time before extra threads die
+      new ArrayBlockingQueue<>(100), // workQueue      — bounded, causes backpressure
+      new ThreadFactory() {          // custom thread factory
+          private final AtomicInteger count = new AtomicInteger(0);
+          public Thread newThread(Runnable r) {
+              return new Thread(r, "worker-" + count.incrementAndGet());
+          }
+      },
+      new ThreadPoolExecutor.CallerRunsPolicy() // rejection policy
+  );
+
+  TASK FLOW:
+  1. If running threads < corePoolSize → create new thread for task
+  2. If at corePoolSize → put task in queue
+  3. If queue full AND running < maximumPoolSize → create new thread
+  4. If at maximumPoolSize AND queue full → apply rejection policy
+
+REJECTION POLICIES
+-------------------
+  RejectedExecutionHandler — what happens when pool is at max AND queue is full:
+
+  AbortPolicy (default)    — throws RejectedExecutionException
+  CallerRunsPolicy         — calling thread runs the task itself (natural throttling)
+  DiscardPolicy            — silently discards the task (dangerous — data loss)
+  DiscardOldestPolicy      — discards the oldest queued task, retries submission
+
+SCHEDULED TASKS
+----------------
+  ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+
+  // Run once after 5 seconds:
+  scheduler.schedule(() -> sendReport(), 5, TimeUnit.SECONDS);
+
+  // Run every 10 seconds (fixed rate — from start of last run):
+  scheduler.scheduleAtFixedRate(() -> healthCheck(), 0, 10, TimeUnit.SECONDS);
+
+  // Run 10 seconds after each completion (fixed delay):
+  scheduler.scheduleWithFixedDelay(() -> cleanup(), 0, 10, TimeUnit.SECONDS);
+
+PROPER SHUTDOWN PATTERN
+------------------------
+  executor.shutdown();                        // no new tasks
+  try {
+      if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
+          executor.shutdownNow();             // force cancel running tasks
+          if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
+              System.err.println("Pool did not terminate!");
+          }
+      }
+  } catch (InterruptedException e) {
+      executor.shutdownNow();
+      Thread.currentThread().interrupt();
+  }
+
+SUBMITTING MULTIPLE TASKS
+--------------------------
+  List<Callable<Integer>> tasks = List.of(
+      () -> compute(1),
+      () -> compute(2),
+      () -> compute(3)
+  );
+
+  // Wait for all, get results:
+  List<Future<Integer>> futures = executor.invokeAll(tasks);
+  for (Future<Integer> f : futures) {
+      System.out.println(f.get());  // blocks per future if not yet done
+  }
+
+  // Get result of FIRST successful task:
+  Integer first = executor.invokeAny(tasks);  // cancels the rest
+
+THREAD POOL SIZING HEURISTICS
+-------------------------------
+  CPU-bound tasks:  n = Runtime.getRuntime().availableProcessors()  (or +1)
+  I/O-bound tasks:  n = processors * (1 + wait_time / compute_time)
+                    If tasks spend 90% waiting: n = processors * 10
+
+COMMON INTERVIEW QUESTIONS
+---------------------------
+Q: Why use a thread pool instead of creating new threads per task?
+A: Thread creation is expensive (OS thread allocation, stack memory). Unbounded thread
+   creation can exhaust memory or overwhelm the OS. A thread pool reuses a fixed set
+   of threads, provides bounded resource usage, controlled backpressure via queue limits,
+   and a managed lifecycle (shutdown/awaitTermination). ExecutorService also provides
+   Future-based result handling and exception propagation.
+
+Q: What is the difference between shutdown() and shutdownNow()?
+A: shutdown() initiates an orderly shutdown — no new tasks are accepted, but tasks
+   already submitted (queued or running) are allowed to complete. shutdownNow() tries
+   to stop all actively executing tasks by interrupting them, and returns the list
+   of tasks that were queued but never started. Neither method waits for tasks to
+   complete — use awaitTermination() afterward.
+
+Q: What is CallerRunsPolicy and why is it useful?
+A: When the thread pool queue is full and the pool is at maximum size, CallerRunsPolicy
+   makes the thread that SUBMITTED the task run it directly. This creates natural
+   backpressure: the producer is slowed down (busy executing) while the pool catches up.
+   It prevents task loss (unlike DiscardPolicy) and avoids exceptions (unlike AbortPolicy).
+
+Q: What are the risks of Executors.newCachedThreadPool()?
+A: newCachedThreadPool() creates threads without bound — if tasks arrive faster than they
+   complete, it can spawn thousands of threads, exhausting memory and OS thread limits.
+   Use it only for short-lived, well-bounded I/O tasks. For production, prefer an explicit
+   ThreadPoolExecutor with a bounded queue and a suitable rejection policy.

@@ -1,0 +1,150 @@
+STRUCTURED CONCURRENCY (JAVA 21+)
+===================================
+
+THE PROBLEM WITH UNSTRUCTURED CONCURRENCY
+-------------------------------------------
+  In traditional concurrent code, spawned threads are unrelated to the parent thread's
+  lifetime. If one sub-task fails:
+  - The parent thread might not know immediately
+  - Other sibling sub-tasks continue wasting resources
+  - Cancellation must be implemented manually
+  - Exceptions from worker threads may be silently lost
+  - Thread leaks are possible if tasks are not joined
+
+  // Classic broken fan-out pattern:
+  Future<User>    userFuture = executor.submit(() -> fetchUser(id));
+  Future<Account> acctFuture = executor.submit(() -> fetchAccount(id));
+
+  User user;
+  Account acct;
+  try {
+      user = userFuture.get();   // blocks — what if fetchAccount fails here?
+      acct = acctFuture.get();   // fetchUser's thread still running wasted work
+  } catch (ExecutionException e) {
+      // fetchUser's thread NOT cancelled — resource leak!
+  }
+
+STRUCTURED CONCURRENCY
+------------------------
+  Structured Concurrency (java.util.concurrent.StructuredTaskScope) ensures that:
+  1. The SCOPE OWNER (parent task) waits for ALL sub-tasks to complete
+  2. If any sub-task fails, the scope can CANCEL all others
+  3. No task outlives its scope — no thread leaks
+  4. Clear parent-child relationship mirrors structured code flow (like try-finally)
+
+  Status: Preview in Java 21, finalized in Java 23+ (as of 2026).
+
+STRUCTUREDTASKSCOPE
+---------------------
+  // ShutdownOnFailure: cancels all sub-tasks if ANY fails
+  try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+
+      Subtask<User>    userTask  = scope.fork(() -> fetchUser(id));
+      Subtask<Account> acctTask  = scope.fork(() -> fetchAccount(id));
+      Subtask<Orders>  orderTask = scope.fork(() -> fetchOrders(id));
+
+      scope.join();           // wait for all (or until one fails / deadline reached)
+      scope.throwIfFailed();  // rethrow the first failure as-is
+
+      // All succeeded — safe to get results
+      return new Dashboard(userTask.get(), acctTask.get(), orderTask.get());
+
+  }  // scope closes: any still-running tasks are cancelled
+
+  // ShutdownOnSuccess: returns when ANY sub-task succeeds (races for first result)
+  try (var scope = new StructuredTaskScope.ShutdownOnSuccess<String>()) {
+
+      scope.fork(() -> fetchFromPrimaryDB(query));
+      scope.fork(() -> fetchFromCache(query));    // race — return fastest
+
+      scope.join();
+      return scope.result();  // result of whichever finished first
+
+  }
+
+STRUCTUREDTASKSCOPE METHODS
+-----------------------------
+  fork(Callable<T>)        — start a new virtual thread for the task, return Subtask<T>
+  join()                   — wait for all forked tasks (or scope policy to trigger)
+  joinUntil(Instant)       — wait with deadline; throws TimeoutException
+  throwIfFailed()          — ShutdownOnFailure only: throw the first failure if any
+  result()                 — ShutdownOnSuccess only: return the winning result
+  shutdown()               — cancel all running tasks
+  Subtask.get()            — retrieve result after join; throws if task failed
+
+SCOPED VALUES WITH STRUCTURED CONCURRENCY
+-------------------------------------------
+  ScopedValue propagates context (like ThreadLocal but immutable and scope-bound)
+  from parent to all forked sub-tasks automatically:
+
+  static final ScopedValue<String> REQUEST_ID = ScopedValue.newInstance();
+
+  ScopedValue.where(REQUEST_ID, "req-abc").run(() -> {
+      try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+          scope.fork(() -> {
+              // REQUEST_ID.get() == "req-abc" inside this sub-task
+              auditLog(REQUEST_ID.get(), "fetchUser started");
+              return fetchUser(id);
+          });
+          scope.join().throwIfFailed();
+      }
+  });
+
+STRUCTURED vs UNSTRUCTURED CONCURRENCY
+-----------------------------------------
+  Aspect                  | Unstructured (Future)            | Structured (TaskScope)
+  ------------------------|----------------------------------|---------------------------
+  Thread lifetime         | May outlive parent               | Bounded to scope
+  Error propagation       | Manual Future.get() + catch      | scope.throwIfFailed()
+  Cancellation            | Manual (cancel each Future)      | Automatic on scope close
+  Thread leaks            | Possible (easy to forget join)   | Impossible (enforced by try-with-res)
+  Code structure          | Flat / callback-based            | Matches logical call tree
+  Observability           | Hard to correlate threads        | Parent-child tree visible in dumps
+  Scoped values           | ❌ ThreadLocal (unsafe)           | ✅ ScopedValue propagation
+
+CUSTOM TASKSCOPE POLICY
+------------------------
+  Extend StructuredTaskScope to implement custom completion policies:
+
+  class FirstNSuccessScope<T> extends StructuredTaskScope<T> {
+      private final List<T> results = new CopyOnWriteArrayList<>();
+      private final int needed;
+
+      public FirstNSuccessScope(int needed) { this.needed = needed; }
+
+      @Override
+      protected void handleComplete(Subtask<? extends T> task) {
+          if (task.state() == Subtask.State.SUCCESS) {
+              results.add(task.get());
+              if (results.size() >= needed) shutdown();  // got enough — cancel the rest
+          }
+      }
+
+      public List<T> results() { return List.copyOf(results); }
+  }
+
+COMMON INTERVIEW QUESTIONS
+---------------------------
+Q: What is structured concurrency and why was it introduced?
+A: Structured concurrency (StructuredTaskScope, Java 21+) ensures that a group of
+   concurrent tasks is treated as a unit — the scope owner waits for all forked tasks,
+   and the lifetime of sub-tasks is bounded to the scope. It solves problems with
+   traditional Future-based concurrency: thread leaks (tasks outliving the parent),
+   silent error loss, and manual cancellation complexity. The result is code whose
+   concurrent structure mirrors the code's logical structure (like structured programming
+   vs GOTO).
+
+Q: What is the difference between ShutdownOnFailure and ShutdownOnSuccess?
+A: ShutdownOnFailure cancels all remaining sub-tasks when ANY sub-task fails, then
+   throwIfFailed() rethrows the exception. Use it when ALL results are required (all-or-nothing).
+   ShutdownOnSuccess cancels remaining sub-tasks when ANY sub-task succeeds first, and
+   result() returns that winning result. Use it when you want the fastest result from
+   multiple equivalent sources (e.g., racing a cache fetch against a DB query).
+
+Q: How do ScopedValues work with structured concurrency?
+A: ScopedValue is a JVM 21+ companion to structured concurrency. Unlike ThreadLocal,
+   ScopedValue is immutable within a scope and automatically propagates to all virtual
+   threads forked within the scope. Child tasks read the same scoped value as the parent
+   without any risk of accidental mutation. When the scope exits, the value is automatically
+   removed — no remove() needed. This replaces ThreadLocal for per-request context in
+   structured concurrency code.

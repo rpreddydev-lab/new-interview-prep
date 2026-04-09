@@ -1,0 +1,167 @@
+FORK/JOIN FRAMEWORK
+=====================
+
+PURPOSE
+--------
+  The Fork/Join framework (java.util.concurrent.ForkJoinPool) is designed for
+  parallelizing RECURSIVE DIVIDE-AND-CONQUER algorithms on multi-core hardware.
+
+  Core idea:
+  1. FORK — split a large task into smaller subtasks, submit them to the pool
+  2. JOIN — wait for subtasks to complete, combine their results
+
+  Key innovation: WORK STEALING
+  Each worker thread has its own deque of tasks. When a thread's queue is empty,
+  it "steals" a task from the tail of another thread's deque.
+  This keeps all CPU cores busy even when work is unevenly distributed.
+
+ForkJoinPool
+-------------
+  ForkJoinPool pool = new ForkJoinPool();                    // default parallelism = processors
+  ForkJoinPool pool = new ForkJoinPool(4);                   // explicit parallelism
+  ForkJoinPool.commonPool()                                  // shared JVM-wide pool (Java 8+)
+
+  Parallel streams and CompletableFuture use ForkJoinPool.commonPool() by default.
+
+RecursiveTask<T> — returns a value
+------------------------------------
+  Extend RecursiveTask<T> and implement compute():
+
+  public class SumTask extends RecursiveTask<Long> {
+      private static final int THRESHOLD = 1000;  // below this: compute directly
+      private final long[] array;
+      private final int start, end;
+
+      public SumTask(long[] array, int start, int end) {
+          this.array = array;
+          this.start = start;
+          this.end = end;
+      }
+
+      @Override
+      protected Long compute() {
+          int length = end - start;
+          if (length <= THRESHOLD) {
+              // Base case: compute directly (sequential)
+              long sum = 0;
+              for (int i = start; i < end; i++) sum += array[i];
+              return sum;
+          }
+
+          // Recursive case: split in half
+          int mid = start + length / 2;
+          SumTask left  = new SumTask(array, start, mid);
+          SumTask right = new SumTask(array, mid, end);
+
+          left.fork();                  // submit left to pool (async)
+          long rightResult = right.compute();  // compute right in current thread
+          long leftResult  = left.join();      // wait for left to finish
+
+          return leftResult + rightResult;
+      }
+  }
+
+  // Usage:
+  long[] data = new long[10_000_000];
+  Arrays.fill(data, 1L);
+
+  ForkJoinPool pool = ForkJoinPool.commonPool();
+  long sum = pool.invoke(new SumTask(data, 0, data.length));
+  System.out.println("Sum = " + sum); // 10_000_000
+
+RecursiveAction — no return value
+------------------------------------
+  Extend RecursiveAction for tasks that don't return a value (sorting, fill, etc.):
+
+  public class ParallelSort extends RecursiveAction {
+      private final int[] array;
+      private final int start, end;
+      private static final int THRESHOLD = 500;
+
+      public ParallelSort(int[] array, int start, int end) {
+          this.array = array; this.start = start; this.end = end;
+      }
+
+      @Override
+      protected void compute() {
+          if (end - start <= THRESHOLD) {
+              Arrays.sort(array, start, end);  // base case
+              return;
+          }
+          int mid = (start + end) / 2;
+          ParallelSort leftTask  = new ParallelSort(array, start, mid);
+          ParallelSort rightTask = new ParallelSort(array, mid, end);
+          invokeAll(leftTask, rightTask);      // fork both, join both
+          merge(array, start, mid, end);       // merge sorted halves
+      }
+  }
+
+FORK/JOIN BEST PRACTICES
+--------------------------
+  ✅ Set THRESHOLD appropriately — too small → too many tiny tasks (overhead dominates)
+                                 → too large → poor parallelism (few tasks per core)
+  ✅ Compute one subtask in the current thread (right.compute()), fork the other (left.fork())
+     — avoids unnecessary thread overhead for one of the two halves
+  ✅ Use invokeAll() when forking multiple equal subtasks — cleaner than manual fork+join
+  ✅ Avoid blocking operations inside ForkJoin tasks (I/O, sleep, synchronized) — 
+     ForkJoin threads are precious; blocking wastes pool capacity
+  ❌ Don't use ForkJoin for I/O-bound tasks — use standard ExecutorService instead
+  ❌ Don't call join() before fork() on the same task — it will execute synchronously
+
+invokeAll() SHORTHAND
+-----------------------
+  invokeAll(leftTask, rightTask);
+  // Equivalent to: leftTask.fork(); rightTask.fork(); rightTask.join(); leftTask.join();
+  // Both are forked and the current thread joins both before returning.
+
+PARALLEL STREAMS AND FORK/JOIN
+--------------------------------
+  Java 8 Parallel Streams use ForkJoinPool.commonPool() under the hood.
+  This is convenient but shares the pool with all other parallel-stream/CF work.
+
+  // Simple parallel computation via streams (no ForkJoin boilerplate):
+  long sum = LongStream.rangeClosed(1, 10_000_000L)
+                       .parallel()
+                       .sum();
+
+  // Run on a custom pool (avoid polluting commonPool):
+  ForkJoinPool customPool = new ForkJoinPool(4);
+  long result = customPool.submit(() ->
+      LongStream.rangeClosed(1, 1_000_000L).parallel().sum()
+  ).join();
+
+WORK STEALING EXPLAINED
+------------------------
+  Each ForkJoinPool worker has a private double-ended deque (deque).
+  Workers push new forked tasks to the HEAD of their own deque.
+  Workers pop tasks to execute from the HEAD of their own deque (LIFO — better cache locality).
+  When idle, workers steal tasks from the TAIL of ANOTHER worker's deque (FIFO steal).
+  Stealing from the tail grabs the largest, oldest tasks — reducing steal frequency.
+  This self-balancing mechanism keeps all cores busy with minimal synchronization.
+
+COMMON INTERVIEW QUESTIONS
+---------------------------
+Q: What is the Fork/Join framework and what problem does it solve?
+A: Fork/Join provides efficient parallel execution of divide-and-conquer recursive
+   algorithms on multi-core CPUs. A large task is repeatedly split (forked) into smaller
+   subtasks until a threshold is reached; results are combined (joined) on the way back
+   up. The work-stealing scheduler keeps all threads busy even when split work is uneven,
+   maximizing CPU utilization for CPU-bound parallel tasks.
+
+Q: What is work stealing?
+A: Each ForkJoin worker thread maintains its own task deque. When a worker finishes
+   its tasks, it "steals" work from another thread's deque (from the tail, while the
+   owner works from the head). This prevents idle cores while others are overloaded,
+   providing automatic load balancing with minimal synchronization overhead.
+
+Q: What is the difference between RecursiveTask and RecursiveAction?
+A: RecursiveTask<T> is for tasks that produce a result (compute() returns T).
+   RecursiveAction is for tasks with no return value (compute() returns void) — like
+   sorting an array in place or filling data. Both extend ForkJoinTask<T>.
+
+Q: Should you use ForkJoinPool for I/O-bound tasks?
+A: No. ForkJoinPool threads should never block (I/O, sleep, waiting on locks) because
+   the pool's parallelism is fixed and blocking threads cannot be stolen from. Use a
+   standard ExecutorService (with many threads) for I/O-bound work where blocking is
+   normal. ForkJoinPool.ManagedBlocker can help in rare cases where blocking inside
+   ForkJoin is unavoidable, as it signals the pool to add a compensation thread.
