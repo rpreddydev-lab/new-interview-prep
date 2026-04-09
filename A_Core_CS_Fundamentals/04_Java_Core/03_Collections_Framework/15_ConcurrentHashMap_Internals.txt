@@ -1,0 +1,194 @@
+CONCURRENTHASHMAP INTERNALS
+=============================
+
+WHY CONCURRENTHASHMAP?
+-----------------------
+  HashMap is not thread-safe — concurrent modifications cause:
+    - Data corruption (lost updates)
+    - Infinite loops (Java 7 resize bug — circular linked list)
+    - Incorrect values returned
+
+  Hashtable / Collections.synchronizedMap(): fully synchronized — one lock for ALL operations.
+  → Terrible performance under concurrent load (all threads block on one lock)
+
+  ConcurrentHashMap: designed for high-concurrency — fine-grained locking + lock-free reads.
+  Java 7 vs Java 8 are architecturally quite different — both covered below.
+
+JAVA 7 ARCHITECTURE: SEGMENTS
+-------------------------------
+  Key idea: divide the hash table into N SEGMENTS (default 16).
+  Each segment is an independent, separately-locked HashTable.
+  A put/get on key K only locks segment[K.hash & (N-1)].
+  Up to 16 threads can write SIMULTANEOUSLY (one per segment).
+
+  // Simplified structure:
+  Segment<K,V>[] segments;   // 16 segments by default
+  // Each Segment extends ReentrantLock and contains its own HashEntry[] table
+
+  // Write: locks only the relevant segment
+  // Read:  volatile reads — usually lock-free
+
+  Concurrency level: default 16 (max simultaneous writers).
+  Limitation: wasted memory for the 16 ReentrantLock objects, even for small maps.
+
+JAVA 8 ARCHITECTURE: PER-BUCKET LOCKING + CAS
+------------------------------------------------
+  Key idea: remove segments entirely. Use a flat Node[] array (like HashMap).
+  Synchronization is per-bucket (per array index) — much finer granularity.
+
+  TWO MECHANISMS:
+  1. CAS (Compare-And-Swap): for the first insert into an empty bucket
+     - No lock needed — just one atomic CAS instruction
+     - If CAS fails (another thread beat us), fall back to synchronized
+
+  2. synchronized(bucket[i]): for insert into a non-empty bucket
+     - Only locks the HEAD node of the bucket
+     - Other buckets are completely independent
+
+  // Simplified put logic:
+  if (bucket[index] == null) {
+      // CAS: insert without lock
+      if (casTabAt(tab, index, null, newNode)) break; // success
+      // else: retry (another thread modified it)
+  } else {
+      synchronized (bucket[index]) {
+          // Lock only this bucket's head node
+          // Find or append to linked list / tree
+      }
+  }
+
+INTERNAL DATA STRUCTURES
+-------------------------
+  // Regular node
+  static class Node<K,V> implements Map.Entry<K,V> {
+      final int hash;
+      final K key;
+      volatile V val;    // volatile — visible across threads without lock
+      volatile Node<K,V> next;
+  }
+
+  // Treeified node (same as HashMap TreeNode)
+  static final class TreeBin<K,V> extends Node<K,V> {
+      TreeNode<K,V> root;
+      volatile TreeNode<K,V> first;
+      volatile Thread waiter;
+      volatile int lockState; // own read/write locking for tree operations
+  }
+
+  // Forward node — placed during resize to redirect threads
+  static final class ForwardingNode<K,V> extends Node<K,V> {
+      final Node<K,V>[] nextTable; // reference to new table during resize
+  }
+
+READS (GET) — LOCK-FREE
+------------------------
+  get() is COMPLETELY lock-free in Java 8 ConcurrentHashMap:
+  1. Volatile read of the table array
+  2. Volatile read of bucket[index]
+  3. Walk the chain using volatile next pointers
+  No locks, no CAS — just volatile reads.
+  This makes reads extremely fast — almost as fast as HashMap.
+
+SIZE COUNTING — LONGADDER PATTERN
+-----------------------------------
+  Incrementing size with a single AtomicLong would cause contention.
+  ConcurrentHashMap uses a striped counter (similar to LongAdder):
+    - CounterCell[] array — one cell per thread (approximately)
+    - Each thread increments its own cell
+    - size() / mappingCount() sums all cells
+  This eliminates the CAS contention bottleneck for size tracking.
+
+RESIZE — COOPERATIVE (JAVA 8)
+-------------------------------
+  When table needs to grow:
+  1. One thread creates the new table (2× larger) and sets nextTable
+  2. Transfers buckets from old table to new table
+  3. AS OTHER THREADS ENCOUNTER a ForwardingNode during put/get, they HELP with the transfer
+  4. Cooperative transfer — multiple threads can transfer different buckets simultaneously
+  5. Transferred buckets have their old slot replaced with ForwardingNode(nextTable)
+
+  This prevents any single thread from holding a global lock during resize.
+
+NULL KEYS/VALUES: NOT ALLOWED
+-------------------------------
+  Neither null keys nor null values are allowed in ConcurrentHashMap.
+  Reason: In concurrent context, get(key) == null is ambiguous:
+    → could mean "key not present" OR "value was null"
+  Atomic operations like putIfAbsent depend on this unambiguity.
+  NullPointerException thrown on null key or value.
+
+KEY ATOMIC OPERATIONS
+-----------------------
+  putIfAbsent(K key, V value)            // insert only if key absent — atomic
+  replace(K key, V oldVal, V newVal)     // conditional replace — atomic (compare-and-swap semantics)
+  remove(K key, V value)                 // conditional remove — atomic
+
+  compute(K key, BiFunction remapping)   // atomic compute — reads current + applies function
+  computeIfAbsent(K key, Function fn)    // compute only if key absent
+  computeIfPresent(K key, BiFunction fn) // compute only if key present
+  merge(K key, V value, BiFunction fn)   // merge value using function — atomic
+
+  Example — thread-safe counter:
+    ConcurrentHashMap<String, Integer> counter = new ConcurrentHashMap<>();
+    // ❌ WRONG — not atomic:
+    counter.put(word, counter.getOrDefault(word, 0) + 1);  // race condition between get and put
+
+    // ✅ CORRECT — atomic:
+    counter.merge(word, 1, Integer::sum);
+    // or:
+    counter.compute(word, (k, v) -> v == null ? 1 : v + 1);
+
+COMPARISON: JAVA 7 vs JAVA 8 CONCURRENTHASHMAP
+------------------------------------------------
+  Feature                    | Java 7 (Segments)        | Java 8 (Per-Bucket)
+  ---------------------------|--------------------------|------------------------
+  Locking granularity        | Per segment (16 locks)   | Per bucket (head node)
+  Read locking               | No lock (volatile read)  | No lock (volatile read)
+  Write locking              | Segment lock (ReentrantLock)| synchronized(bucket)
+  Empty bucket insert        | Segment lock             | CAS (lock-free)
+  Max parallel writers       | 16 (concurrency level)   | Theoretically n (n=buckets)
+  Resize                     | Per-segment              | Cooperative (multi-thread)
+  Memory                     | 16 ReentrantLock objects | Lighter (no Segment)
+  Treeification              | No                       | Yes (Java 8 – bucket→tree at 8)
+
+FULL COMPARISON: HashMap vs Hashtable vs ConcurrentHashMap
+------------------------------------------------------------
+  Feature              | HashMap         | Hashtable       | ConcurrentHashMap
+  ---------------------|-----------------|-----------------|-------------------
+  Thread-safe          | ❌ No           | ✅ Yes          | ✅ Yes
+  Locking granularity  | None            | Whole map       | Per bucket
+  Null key             | ✅ One null     | ❌ No           | ❌ No
+  Null value           | ✅ Multiple     | ❌ No           | ❌ No
+  Read performance     | Fastest         | Slowest         | Near HashMap
+  Write performance    | Fastest         | Slowest         | Very good
+  Atomic operations    | ❌ No           | ❌ No           | ✅ Yes
+  Iterator type        | Fail-fast       | Fail-fast       | Weakly consistent
+  Use case             | Single-thread   | Legacy (avoid)  | Concurrent multi-thread
+
+COMMON INTERVIEW QUESTIONS
+---------------------------
+Q: How does ConcurrentHashMap achieve thread safety without locking the entire map?
+A: Java 8: uses CAS for inserting into empty buckets (no lock at all), and synchronized
+   on only the HEAD node of the bucket for non-empty buckets. Reads use volatile fields —
+   completely lock-free. Different buckets are independent — multiple threads can write
+   to different buckets simultaneously. Only conflict when two threads target the SAME bucket.
+
+Q: What happens during ConcurrentHashMap resize — does it block all threads?
+A: No. Java 8 uses cooperative resize: the thread that triggers resize starts transferring buckets.
+   Other threads that encounter a ForwardingNode (marker for a transferred bucket) JOIN the
+   transfer and help move other buckets. Reads are redirected via ForwardingNode to the new table.
+   The map remains accessible throughout the resize.
+
+Q: Is ConcurrentHashMap.size() accurate?
+A: Not necessarily for a snapshot. size() uses an approximate counter (striped cells).
+   Between the time each cell is read and summed, other threads may modify the map.
+   For most purposes, the approximate count is fine. Use mappingCount() for large maps
+   (returns long). For exact synchronized size: avoid using ConcurrentHashMap for that use case.
+
+Q: Can I use ConcurrentHashMap in place of HashMap in all cases?
+A: Yes functionally. Key differences to consider:
+   - No null keys/values (NPE if used)
+   - Slightly higher overhead than HashMap (but negligible)
+   - Compound operations must use atomic methods (merge/compute) not get+put
+   For single-threaded code, HashMap is faster and simpler. Use ConcurrentHashMap only when
+   multiple threads will access/modify the map concurrently.
