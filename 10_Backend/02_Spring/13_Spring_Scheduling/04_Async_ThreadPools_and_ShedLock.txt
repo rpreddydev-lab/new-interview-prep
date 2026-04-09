@@ -1,0 +1,278 @@
+# @Async, Distributed Scheduling, and Thread Pool Pitfalls — Complete Guide
+
+## @Async — Spring Asynchronous Execution
+
+`@Async` runs a method in a separate thread from Spring's task executor pool.
+
+### Basic Setup
+
+```java
+// 1. Enable async support
+@Configuration
+@EnableAsync
+public class AsyncConfig {
+
+    // REQUIRED: Define a custom executor
+    // Without this, Spring uses SimpleAsyncTaskExecutor — creates a new thread per task (no pooling!)
+    @Bean(name = "taskExecutor")
+    public Executor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(5);         // always-alive threads
+        executor.setMaxPoolSize(20);         // max threads under load
+        executor.setQueueCapacity(100);      // task queue before rejecting
+        executor.setThreadNamePrefix("async-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.initialize();
+        return executor;
+    }
+}
+
+// 2. Mark method as async
+@Service
+public class EmailService {
+
+    @Async("taskExecutor")  // explicitly name the executor bean
+    public void sendWelcomeEmail(String email) {
+        // runs in async-N thread, not the caller's thread
+        emailClient.send(email, "Welcome!");
+    }
+
+    @Async("taskExecutor")
+    public CompletableFuture<String> fetchExternalData(String id) {
+        String result = externalApi.fetch(id);
+        return CompletableFuture.completedFuture(result);
+    }
+}
+```
+
+---
+
+## Critical @Async Pitfalls
+
+### ❌ Pitfall 1: @Async on Private Methods
+```java
+// BROKEN: @Async requires Spring AOP proxy — private methods bypass the proxy
+@Async
+private void sendEmail() { ... }  // @Async is silently ignored!
+
+// FIX: Must be public
+@Async
+public void sendEmail() { ... }
+```
+
+### ❌ Pitfall 2: Self-Invocation (calling @Async within the same class)
+```java
+@Service
+public class OrderService {
+
+    public void processOrder(Order order) {
+        sendConfirmation(order);  // BROKEN: direct call bypasses Spring proxy
+                                  // @Async is silently ignored!
+    }
+
+    @Async
+    public void sendConfirmation(Order order) { ... }
+}
+
+// FIX OPTION 1: Inject self (Spring provides the proxy)
+@Service
+public class OrderService {
+    @Autowired
+    private OrderService self;  // Spring injects the proxy, not 'this'
+
+    public void processOrder(Order order) {
+        self.sendConfirmation(order);  // goes through proxy → @Async works
+    }
+}
+
+// FIX OPTION 2: Extract to a separate bean
+@Service
+public class OrderNotificationService {
+    @Async
+    public void sendConfirmation(Order order) { ... }
+}
+```
+
+### ❌ Pitfall 3: @Async + @Transactional on the same method
+```java
+// PROBLEMATIC: @Async runs in a NEW thread → no transaction context from caller
+// @Transactional on the async method creates its own NEW transaction
+// This means: caller's transaction and async method's transaction are INDEPENDENT
+// Changes in caller's transaction are NOT visible to the async method until committed
+
+@Service
+public class OrderService {
+
+    @Transactional
+    public void placeOrder(Order order) {
+        orderRepository.save(order);          // saved but NOT committed yet
+        emailService.sendConfirmation(order); // async task starts NOW
+        // The async thread tries to read order from DB → may not find it yet!
+    }
+}
+
+@Service
+public class EmailService {
+    @Async
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void sendConfirmation(Order order) {
+        // order.getId() exists in the Order object in memory
+        // but DB query for Order by id may MISS it (caller hasn't committed yet)
+        Order o = orderRepo.findById(order.getId()).orElseThrow();  // may throw!
+    }
+}
+
+// FIX: Pass only the ID/data needed, not the entity. Or use application events.
+// Publish ApplicationEvent at end of @Transactional method:
+// Spring ApplicationEventPublisher fires AFTER transaction commits if listener is @Async
+@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+@Async
+public void onOrderPlaced(OrderPlacedEvent event) {
+    // Guaranteed to run AFTER the transaction commits → order is visible in DB
+    emailService.sendConfirmation(event.getOrderId());
+}
+```
+
+### ❌ Pitfall 4: No Thread Pool → Thread Exhaustion
+```java
+// BAD: SimpleAsyncTaskExecutor (default when no executor bean)
+// Creates a NEW thread for EVERY @Async call — no pooling, no limits
+// Under load: thousands of threads, OOM, OS thread limit exceeded
+
+// ALWAYS define a ThreadPoolTaskExecutor and set explicit bounds
+```
+
+### ❌ Pitfall 5: SecurityContext Not Propagated
+```java
+// @Async methods run in a different thread
+// SecurityContextHolder uses ThreadLocal by default → NOT inherited by async threads
+
+// FIX: Use DelegatingSecurityContextAsyncTaskExecutor
+@Bean
+public Executor securityAwareExecutor() {
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(5);
+    executor.initialize();
+    // Wrap with security context delegation
+    return new DelegatingSecurityContextAsyncTaskExecutor(executor);
+}
+```
+
+---
+
+## Thread Pool Sizing Formula
+
+```
+For I/O-bound tasks (HTTP calls, DB queries, file I/O):
+  threadCount = availableCores × (1 + waitTime / cpuTime)
+  Example: 4 cores, 90% wait time → 4 × (1 + 90/10) = 40 threads
+
+For CPU-bound tasks (computation, in-memory processing):
+  threadCount = availableCores + 1  (to handle page faults)
+  Example: 4 cores → 5 threads
+
+Queue capacity:
+  Low queue (10-50): tasks fail fast under overload → caller knows quickly
+  High queue (1000+): tasks queue up, memory grows, latency spikes silently
+  → prefer lower queue + CallerRunsPolicy for backpressure
+```
+
+---
+
+## Distributed Scheduling with ShedLock
+
+Problem: `@Scheduled` runs in EVERY instance of a service when deployed in multiple pods. The task runs N times simultaneously.
+
+```java
+// Without ShedLock — all 3 pods run the job simultaneously:
+@Scheduled(cron = "0 0 * * * *")  // every hour
+public void generateDailyReport() {
+    // RUNS 3 TIMES simultaneously across 3 pods!
+}
+```
+
+**ShedLock** ensures only one instance runs a scheduled task at a time using a distributed lock backed by your database.
+
+### Setup
+
+```xml
+<!-- pom.xml -->
+<dependency>
+    <groupId>net.javacrumbs.shedlock</groupId>
+    <artifactId>shedlock-spring</artifactId>
+    <version>5.10.0</version>
+</dependency>
+<dependency>
+    <groupId>net.javacrumbs.shedlock</groupId>
+    <artifactId>shedlock-provider-jdbc-template</artifactId>
+    <version>5.10.0</version>
+</dependency>
+```
+
+```sql
+-- Required table (for JDBC provider)
+CREATE TABLE shedlock (
+    name       VARCHAR(64)  NOT NULL,
+    lock_until TIMESTAMP    NOT NULL,
+    locked_at  TIMESTAMP    NOT NULL,
+    locked_by  VARCHAR(255) NOT NULL,
+    PRIMARY KEY (name)
+);
+```
+
+```java
+@Configuration
+@EnableScheduling
+@EnableSchedulerLock(defaultLockAtMostFor = "PT10M")  // default max lock duration = 10 min
+public class SchedulingConfig {
+
+    @Bean
+    public LockProvider lockProvider(DataSource dataSource) {
+        return new JdbcTemplateLockProvider(
+            JdbcTemplateLockProvider.Configuration.builder()
+                .withJdbcTemplate(new JdbcTemplate(dataSource))
+                .usingDbTime()  // use DB server time (avoids clock skew between pods)
+                .build()
+        );
+    }
+}
+
+@Component
+public class ReportScheduler {
+
+    @Scheduled(cron = "0 0 * * * *")
+    @SchedulerLock(
+        name = "generateDailyReport",           // lock name — must be unique per job
+        lockAtLeastFor = "PT5M",                // hold lock for at least 5 min (prevent rapid re-run)
+        lockAtMostFor = "PT30M"                 // force-release after 30 min (stuck job protection)
+    )
+    public void generateDailyReport() {
+        // Only ONE instance across all pods runs this at a time
+    }
+}
+```
+
+### ShedLock Guarantees
+- `lockAtLeastFor`: even if job finishes in 1s, lock held for minimum duration (prevents second pod running immediately after)
+- `lockAtMostFor`: if the pod that holds the lock crashes, lock is force-released after this duration (prevents indefinite blocking)
+- Use **DB server time** (`usingDbTime()`) to avoid pod clock skew issues
+
+---
+
+## Interview Q&A
+
+**Q: What is the difference between @Async and creating a new Thread manually?**
+A: `@Async` delegates execution to a configured `TaskExecutor` (thread pool), providing pooling, lifecycle management, and Spring integration. A manually created `Thread` is unmanaged — it doesn't participate in Spring's lifecycle, doesn't inherit Spring security context (unless you configure it), and has no pooling (creating many threads is expensive). `@Async` also supports returning `CompletableFuture` for composable async pipelines. Manual threads should be a last resort; prefer `@Async` with a properly configured `ThreadPoolTaskExecutor`.
+
+**Q: Why can't you call an @Async method from the same class?**
+A: Spring implements `@Async` using AOP proxies. When you call a method on a Spring bean, you are calling it through the proxy, which intercepts the call and dispatches it to the thread pool. When a method calls another method on `this`, it bypasses the proxy entirely — it's a direct Java method call. Spring never gets a chance to intercept and apply the `@Async` behavior. The fix is to inject a reference to the proxy (inject self or split into a separate bean) so that all calls go through the proxy.
+
+**Q: How do you prevent a scheduled task from running on every pod in a cluster?**
+A: Use a distributed lock library like ShedLock (database-backed) or use a single-pod scheduling approach (designate one pod as the scheduler via environment variable + conditional annotation). ShedLock is the standard approach: it creates a lock record in the database before running the task and releases it after. If the pod crashes while holding the lock, `lockAtMostFor` ensures the lock is automatically released after a configured timeout, allowing another pod to pick up the next scheduled execution.
+
+**Q: What is @TransactionalEventListener and when would you use it over @Async?**
+A: `@TransactionalEventListener` is for reacting to domain events that are published within a `@Transactional` method, but you want the listener to run only after the transaction commits (not during). This solves the "read your own write" problem in async processing — the async listener is guaranteed to see committed data. A common pattern: the `@Transactional` service method publishes an `ApplicationEvent`; the listener annotated with `@TransactionalEventListener(phase = AFTER_COMMIT)` and `@Async` runs after commit in a thread pool thread, reading the now-committed data safely.
+
+---
+
+*Last Updated: 2026 | Spring Scheduling — @Async, Thread Pools, ShedLock*

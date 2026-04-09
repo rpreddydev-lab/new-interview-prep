@@ -1,0 +1,259 @@
+# CompletableFuture + @Async in Spring — Complete Guide
+
+## CompletableFuture Recap (Java)
+
+`CompletableFuture` is Java's non-blocking, composable async API. It represents a computation that may complete in the future.
+
+```java
+// Basic chaining
+CompletableFuture.supplyAsync(() -> fetchUser(userId))          // runs async
+    .thenApply(user -> enrichWithProfile(user))                 // transforms result
+    .thenCompose(user -> fetchOrdersAsync(user.getId()))        // chains another future
+    .thenAccept(orders -> log.info("Orders: {}", orders))       // consumes result
+    .exceptionally(ex -> { log.error("Failed", ex); return null; }); // error handling
+
+// Combining two futures
+CompletableFuture<User> userFuture = fetchUserAsync(userId);
+CompletableFuture<Account> accountFuture = fetchAccountAsync(userId);
+
+CompletableFuture.allOf(userFuture, accountFuture)
+    .thenRun(() -> {
+        User user = userFuture.join();      // safe to call join() after allOf completes
+        Account account = accountFuture.join();
+        buildResponse(user, account);
+    });
+```
+
+---
+
+## @Async Returning CompletableFuture
+
+```java
+@Service
+public class ProductService {
+
+    @Async("taskExecutor")
+    public CompletableFuture<Product> fetchProduct(String productId) {
+        Product product = productRepository.findById(productId)
+            .orElseThrow(() -> new ProductNotFoundException(productId));
+        return CompletableFuture.completedFuture(product);
+    }
+
+    @Async("taskExecutor")
+    public CompletableFuture<Price> fetchPrice(String productId) {
+        Price price = pricingService.getPrice(productId);
+        return CompletableFuture.completedFuture(price);
+    }
+}
+
+@Service
+public class ProductAggregatorService {
+
+    private final ProductService productService;
+
+    // Run two @Async calls in PARALLEL then combine results
+    public ProductDetails getProductDetails(String productId) {
+        CompletableFuture<Product> productFuture = productService.fetchProduct(productId);
+        CompletableFuture<Price> priceFuture = productService.fetchPrice(productId);
+
+        // Wait for both to complete
+        CompletableFuture.allOf(productFuture, priceFuture).join();
+
+        return new ProductDetails(productFuture.join(), priceFuture.join());
+    }
+}
+```
+
+---
+
+## Spring-Specific CompletableFuture Patterns
+
+### Pattern 1: Parallel Service Calls in Controller
+
+```java
+@RestController
+public class DashboardController {
+
+    @GetMapping("/dashboard/{userId}")
+    public DashboardResponse getDashboard(@PathVariable String userId)
+            throws ExecutionException, InterruptedException {
+
+        // Fire all async calls simultaneously
+        CompletableFuture<User> userFuture = userService.getUser(userId);
+        CompletableFuture<List<Order>> ordersFuture = orderService.getRecentOrders(userId);
+        CompletableFuture<List<Notification>> notifsFuture = notifService.getUnread(userId);
+
+        // Wait for all
+        CompletableFuture.allOf(userFuture, ordersFuture, notifsFuture).get();
+
+        return DashboardResponse.builder()
+            .user(userFuture.get())
+            .recentOrders(ordersFuture.get())
+            .notifications(notifsFuture.get())
+            .build();
+    }
+}
+```
+
+### Pattern 2: Timeout on Async Calls
+
+```java
+@Async("taskExecutor")
+public CompletableFuture<String> fetchWithTimeout(String id) {
+    return CompletableFuture.supplyAsync(() -> externalApi.fetch(id))
+        .orTimeout(2, TimeUnit.SECONDS)           // Java 9+ — completes exceptionally on timeout
+        .exceptionally(ex -> {
+            if (ex instanceof TimeoutException) {
+                log.warn("Timeout fetching {}", id);
+                return "default-value";            // fallback
+            }
+            throw new CompletionException(ex);
+        });
+}
+```
+
+### Pattern 3: Async Event Processing Pipeline
+
+```java
+@Service
+public class OrderPipeline {
+
+    @Async("taskExecutor")
+    public CompletableFuture<Void> processOrder(Order order) {
+        return CompletableFuture
+            .supplyAsync(() -> validateOrder(order))
+            .thenApply(validated -> applyDiscounts(validated))
+            .thenCompose(discounted -> reserveInventoryAsync(discounted))   // async step
+            .thenCompose(reserved  -> chargePaymentAsync(reserved))         // async step
+            .thenAccept(charged    -> publishOrderPlacedEvent(charged))
+            .exceptionally(ex -> {
+                compensate(order, ex);   // saga compensation
+                return null;
+            });
+    }
+}
+```
+
+---
+
+## Common Mistakes with CompletableFuture in Spring
+
+### ❌ Mistake 1: Blocking the caller thread with .get() in @Async context
+```java
+@Async
+public CompletableFuture<String> badMethod() {
+    // Don't call .get() inside an @Async method — you're blocking a pool thread
+    String result = anotherFuture.get();  // blocks a thread that should be async
+    return CompletableFuture.completedFuture(result);
+}
+
+// FIX: Use .thenCompose() / .thenApply() for chaining instead of blocking
+@Async
+public CompletableFuture<String> goodMethod() {
+    return anotherFuture.thenApply(result -> process(result));
+}
+```
+
+### ❌ Mistake 2: Not handling exceptions
+```java
+// Without exceptionally/handle, exceptions are silently swallowed in non-returned futures
+CompletableFuture.runAsync(() -> riskyOperation());  // exception disappears into the void!
+
+// ALWAYS add exception handling
+CompletableFuture.runAsync(() -> riskyOperation())
+    .exceptionally(ex -> {
+        log.error("riskyOperation failed", ex);
+        return null;
+    });
+```
+
+### ❌ Mistake 3: Using ForkJoinPool.commonPool() (default for supplyAsync without executor)
+```java
+// BAD: Uses JVM-global ForkJoinPool.commonPool() — shared with ALL code in the JVM
+CompletableFuture.supplyAsync(() -> blockingDbCall());  // starves other tasks in the pool!
+
+// GOOD: Always provide a custom executor for Spring services
+CompletableFuture.supplyAsync(() -> blockingDbCall(), taskExecutor);
+```
+
+### ❌ Mistake 4: Transaction propagation across CompletableFuture stages
+```java
+// @Transactional context does NOT propagate into CompletableFuture.thenApply() stages
+// Each .thenApply() may run in a different thread with no transaction
+
+@Transactional
+public void process() {
+    CompletableFuture.supplyAsync(() -> repo.findById(id))  // NEW thread, NO transaction!
+        .thenApply(entity -> {
+            entity.setStatus(PROCESSED);  // detached entity — no persistence context
+            return repo.save(entity);     // might throw or silently fail
+        });
+}
+
+// FIX: Keep DB work inside @Transactional methods, use async only for I/O-bound non-transactional work
+```
+
+---
+
+## Executor Configuration Best Practices
+
+```java
+@Configuration
+@EnableAsync
+public class AsyncConfig implements AsyncConfigurer {
+
+    // Override default executor for all @Async methods without explicit name
+    @Override
+    public Executor getAsyncExecutor() {
+        return buildExecutor("default-async", 5, 20, 100);
+    }
+
+    // Override default async exception handler
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (ex, method, params) ->
+            log.error("Uncaught async exception in {}: {}", method.getName(), ex.getMessage(), ex);
+    }
+
+    @Bean("ioExecutor")
+    public Executor ioExecutor() {
+        return buildExecutor("io-async", 10, 50, 200);  // I/O-bound: more threads
+    }
+
+    @Bean("cpuExecutor")
+    public Executor cpuExecutor() {
+        int cores = Runtime.getRuntime().availableProcessors();
+        return buildExecutor("cpu-async", cores, cores + 1, 50);  // CPU-bound: fewer threads
+    }
+
+    private Executor buildExecutor(String prefix, int core, int max, int queueCapacity) {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(core);
+        executor.setMaxPoolSize(max);
+        executor.setQueueCapacity(queueCapacity);
+        executor.setThreadNamePrefix(prefix + "-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(60);
+        executor.initialize();
+        return executor;
+    }
+}
+```
+
+---
+
+## Interview Q&A
+
+**Q: What is the difference between CompletableFuture and Future in Java?**
+A: `Future` (Java 5) is a blocking API — the only way to get the result is `future.get()`, which blocks the caller. You cannot chain futures, combine multiple futures, or attach callbacks. `CompletableFuture` (Java 8) adds non-blocking composition: `.thenApply()`, `.thenCompose()`, `.allOf()`, `.anyOf()`, `.exceptionally()`. You can build pipelines of async operations without blocking any thread. `CompletableFuture` can also be manually completed (`complete(value)`, `completeExceptionally(ex)`), enabling integration with callback-based APIs.
+
+**Q: How would you make 3 independent API calls in parallel and combine the results?**
+A: Use `CompletableFuture.allOf()`. Fire all three calls as `@Async` methods returning `CompletableFuture`, then call `CompletableFuture.allOf(f1, f2, f3).join()` to wait for all three to complete. Extract results with `.join()` on each individual future (safe after `allOf` returns). Total time ≈ max of the 3 individual call times, vs. sequential time = sum of all 3. In a Spring context, make sure each `@Async` call uses a named `ThreadPoolTaskExecutor`, not the default `ForkJoinPool.commonPool()`.
+
+**Q: How do you handle errors in a CompletableFuture pipeline?**
+A: Two main methods: `.exceptionally(fn)` — if any stage throws, `fn` receives the exception and must return a fallback value of the same type; downstream stages continue with the fallback. `.handle(fn)` — receives both the result (may be null on error) and exception (may be null on success), allowing you to decide what to do with either case — more flexible than `exceptionally`. For unrecoverable errors, re-throw from within the handler: `throw new CompletionException(ex)`. If no error handler is attached, exceptions are silently captured in the `CompletableFuture` and only surface when `.get()` or `.join()` is called.
+
+---
+
+*Last Updated: 2026 | Spring — CompletableFuture and @Async Integration*

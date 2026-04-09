@@ -1,0 +1,191 @@
+# Outbox Pattern at System Design Level — Complete Guide
+
+## The Problem: Dual Write
+
+In a distributed system, a service often needs to atomically:
+1. Write to its own database (commit the business transaction)
+2. Publish an event to a message broker (Kafka, SQS, RabbitMQ)
+
+These are two separate systems. If the service writes to the DB but crashes before publishing the event, downstream services never receive it. If it publishes the event first but the DB write fails, the event is published for a state that was rolled back.
+
+```
+❌ Naive dual write — NOT safe:
+  BEGIN TRANSACTION
+    INSERT INTO orders ...        ← DB write
+  COMMIT
+  kafka.send("OrderPlaced", ...)  ← Kafka publish
+  ↑ If crash here, DB committed but Kafka never got the event
+
+❌ Publish-first also broken:
+  kafka.send("OrderPlaced", ...)  ← Kafka publish
+  BEGIN TRANSACTION
+    INSERT INTO orders ...        ← DB write fails
+  ROLLBACK
+  ↑ Kafka got an event for a transaction that never committed
+```
+
+---
+
+## The Solution: Transactional Outbox Pattern
+
+Write both the business data and the event **atomically** in the same database transaction. A separate **relay process** reads the outbox and publishes to the broker.
+
+```
+✅ Outbox Pattern:
+
+Application:
+  BEGIN TRANSACTION
+    INSERT INTO orders (...)       ← business data
+    INSERT INTO outbox (           ← event record
+      aggregate_type = 'Order',
+      aggregate_id   = 'ord-123',
+      event_type     = 'OrderPlaced',
+      payload        = '{"items":[...]}',
+      created_at     = NOW()
+    )
+  COMMIT                           ← atomic: both or neither
+
+Outbox Relay (separate process):
+  LOOP:
+    SELECT * FROM outbox WHERE published = false ORDER BY created_at LIMIT 100
+    FOR each record:
+      kafka.send(event_type, payload)   ← publish to broker
+      UPDATE outbox SET published = true WHERE id = record.id
+    SLEEP(100ms)
+```
+
+---
+
+## HLD: Order Service with Outbox
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                      Order Service                                │
+│                                                                   │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │                   PostgreSQL                              │    │
+│  │                                                           │    │
+│  │  ┌──────────────┐    ┌───────────────────────────────┐   │    │
+│  │  │ orders table │    │ outbox table                  │   │    │
+│  │  │              │    │ id | event_type | payload      │   │    │
+│  │  │ id=ord-123   │    │ 1  | OrderPlaced| {...}        │   │    │
+│  │  │ status=PLACED│    │ 2  | OrderShipped| {...}       │   │    │
+│  │  └──────────────┘    └───────────────────────────────┘   │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│                                   │                               │
+│                    ┌──────────────┘                               │
+│                    ↓                                              │
+│          ┌──────────────────────┐                                 │
+│          │  Outbox Relay /      │                                 │
+│          │  Message Relay       │                                 │
+│          │  (polls outbox,      │                                 │
+│          │   publishes to Kafka,│                                 │
+│          │   marks published)   │                                 │
+│          └──────────┬───────────┘                                 │
+└─────────────────────┼────────────────────────────────────────────┘
+                      │
+                      ↓
+            ┌───────────────────┐
+            │      Kafka         │
+            │  order-events      │
+            │  topic             │
+            └───────┬───────────┘
+                    │
+          ┌─────────┴─────────┐
+          ↓                   ↓
+   Inventory Service    Notification Service
+```
+
+---
+
+## Relay Implementation Approaches
+
+### 1. Polling Relay (simplest)
+- Service polls `outbox` table every 100–500ms
+- Publish events, mark as published
+- **Pro:** Simple, no infrastructure dependency beyond your DB
+- **Con:** Polling adds DB load; slight latency
+
+### 2. Change Data Capture (CDC) via Debezium
+- Debezium streams changes from the DB transaction log directly to Kafka
+- No polling — events are captured at the DB level
+- **Pro:** Zero-latency, no polling, outbox table is just a staging buffer
+- **Con:** Requires Debezium infrastructure, Kafka Connect
+
+```
+PostgreSQL WAL → Debezium Connector → Kafka topic
+                       ↑
+              (reads transaction log,
+               captures outbox inserts)
+```
+
+### 3. Application-Level CDC
+- Application uses a library like `transactional-outbox` (Spring integration)
+- Handles polling and publishing inside the service
+
+---
+
+## Guarantees and Tradeoffs
+
+| Property | Outbox Pattern |
+|---------|----------------|
+| Atomicity | ✅ DB transaction ensures both business data and event are written or neither |
+| At-least-once delivery | ✅ Relay retries on failure; consumers must be idempotent |
+| Exactly-once delivery | ❌ Not guaranteed — if relay crashes after publish but before marking published, event re-sent |
+| Ordering | ✅ Events ordered by `created_at` / sequence within the outbox table |
+| Latency | ⚠️ Slight delay (polling interval or CDC propagation) vs. direct publish |
+
+---
+
+## Consumers Must Be Idempotent
+
+Because the relay guarantees at-least-once delivery, every downstream consumer **must** handle duplicate events:
+
+```
+Inventory Service consuming OrderPlaced:
+  IF NOT EXISTS (SELECT 1 FROM processed_events WHERE event_id = ?)
+    reserve_stock(order.items)
+    INSERT INTO processed_events (event_id, processed_at) VALUES (?, NOW())
+```
+
+Or use database upserts, or design operations to be naturally idempotent.
+
+---
+
+## Outbox Table Schema
+
+```sql
+CREATE TABLE outbox (
+  id             UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+  aggregate_type VARCHAR(100) NOT NULL,   -- 'Order', 'Payment'
+  aggregate_id   VARCHAR(100) NOT NULL,   -- 'ord-123'
+  event_type     VARCHAR(200) NOT NULL,   -- 'OrderPlaced'
+  payload        JSONB        NOT NULL,
+  created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  published      BOOLEAN      NOT NULL DEFAULT FALSE,
+  published_at   TIMESTAMPTZ
+);
+
+CREATE INDEX idx_outbox_unpublished ON outbox (created_at)
+  WHERE published = FALSE;  -- partial index for relay efficiency
+```
+
+---
+
+## Interview Q&A
+
+**Q: What is the Outbox pattern and why is it needed?**
+A: The Outbox pattern solves the dual-write problem: a service must atomically update its database and publish an event to a message broker, but these are two different systems with no shared transaction. Without the Outbox, you risk publishing an event for a rolled-back transaction, or committing to DB but never publishing the event. The Outbox works by including the event record in the same database transaction as the business data — both commit or both roll back. A separate relay process then reads the outbox and publishes to the broker, guaranteeing at-least-once delivery.
+
+**Q: How is the Outbox pattern different from just publishing events in the service code?**
+A: Direct in-code publishing (calling Kafka after the DB commit) fails if the service crashes between commit and publish — the event is lost. The Outbox makes the event record durable in the database as part of the transaction. Even if the relay crashes, it will restart and re-publish from the outbox. The tradeoff is added operational complexity (relay process, deduplication on consumers) and slight latency.
+
+**Q: What happens if the relay publishes an event but crashes before marking it as published?**
+A: The relay will re-publish the same event when it restarts. This means consumers receive duplicate events. The Outbox guarantees at-least-once delivery, not exactly-once. Consumers must be idempotent — using deduplication tables, database upserts, or naturally idempotent operations.
+
+**Q: How would you implement this at scale?**
+A: At large scale, use Debezium (CDC) instead of polling. Debezium reads the PostgreSQL WAL (write-ahead log) and streams outbox inserts directly to Kafka with near-zero latency and no polling load on the DB. The outbox table becomes a staging artifact — CDC picks up the insert before the relay even polls. This is the production pattern at companies running millions of events per day.
+
+---
+
+*Last Updated: 2026 | System Design — Outbox Pattern*

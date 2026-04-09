@@ -1,0 +1,166 @@
+# Event Sourcing at System Design Level — Complete Guide
+
+## What Is Event Sourcing?
+
+Instead of storing the **current state** of an entity (e.g., `order.status = SHIPPED`), Event Sourcing stores the **sequence of events** that produced that state (e.g., `OrderPlaced`, `PaymentReceived`, `OrderShipped`). The current state is derived by replaying events.
+
+```
+Traditional (State-Based):
+  DB Row:  order_id=123, status=SHIPPED, total=99.99, updated_at=...
+           ↑ only current state, history is lost
+
+Event Sourcing:
+  Event Store:
+    1. OrderPlaced       { orderId: 123, items: [...], total: 99.99 }
+    2. PaymentReceived   { orderId: 123, paymentId: PAY-456 }
+    3. OrderShipped      { orderId: 123, trackingId: TRACK-789 }
+           ↑ full history preserved, current state derived by replay
+```
+
+---
+
+## When to Use Event Sourcing (System Design Decision)
+
+**Use Event Sourcing when:**
+- Audit trail is a hard requirement (financial, healthcare, compliance)
+- You need temporal queries ("what was the state of this order at 2pm yesterday?")
+- Business needs event-driven integration — other services react to domain events
+- Debugging production issues requires full history of what happened
+
+**Do NOT use Event Sourcing when:**
+- Simple CRUD domain — enormous complexity for no benefit
+- Team is not experienced with it — operational footprint is significant
+- Strong requirement for simple SQL reporting on current state
+
+---
+
+## HLD: Event-Sourced Order Service
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Order Service                             │
+│                                                                  │
+│   Command Handler                                                │
+│   PlaceOrder(cmd) → OrderAggregate.place() → [OrderPlaced]      │
+│   ShipOrder(cmd)  → OrderAggregate.ship()  → [OrderShipped]     │
+│                                │                                 │
+│                                ↓                                 │
+│                    ┌───────────────────────┐                     │
+│                    │     Event Store        │                     │
+│                    │ (Append-Only Log)      │                     │
+│                    │                        │                     │
+│                    │ stream: order-123      │                     │
+│                    │   v1: OrderPlaced      │                     │
+│                    │   v2: PaymentReceived  │                     │
+│                    │   v3: OrderShipped     │                     │
+│                    └───────────┬───────────┘                     │
+└────────────────────────────────┼────────────────────────────────┘
+                                 │ Publish events
+                                 ↓
+                    ┌────────────────────────┐
+                    │   Message Broker        │
+                    │   (Kafka / EventStoreDB)│
+                    └────────┬───────────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ↓              ↓              ↓
+         Inventory      Notification    Read Model
+         Service        Service         Projector
+         (reserve        (send email)   (builds read DB)
+          stock)
+```
+
+---
+
+## Key Concepts
+
+### Aggregate and Event Stream
+- Each aggregate (e.g., Order) has its own **event stream**
+- Loading an aggregate = replaying its event stream from position 0 (or last snapshot)
+- Saving = appending new events to the stream (with optimistic concurrency check on version)
+
+### Snapshots (Performance Optimization)
+- Replaying 10,000 events on every command is slow
+- Take a **snapshot** periodically (every 50 or 100 events)
+- Load = snapshot + events since snapshot
+- Snapshots are optional and don't affect correctness
+
+```
+Without snapshot:   Load 1,000 events → apply all → current state
+With snapshot:      Load snapshot at event 950 → apply 50 events → current state
+```
+
+### Optimistic Concurrency
+- When saving events, include the **expected version** of the stream
+- If another process has written events in the meantime, the version won't match → conflict detected
+- Retry with fresh state (re-load events, re-apply command)
+
+### Event Versioning (Schema Evolution)
+- Events are immutable once written — you cannot change past events
+- When event structure needs to change, use **upcasting**: transform old event format to new format at read time
+- Alternative: version events (`OrderPlacedV1`, `OrderPlacedV2`) and handle both in the aggregate
+
+---
+
+## Event Store Options
+
+| Technology | Notes |
+|-----------|-------|
+| **EventStoreDB** | Purpose-built event store, projections built-in, subscription feeds |
+| **Kafka** | Durable log, good for event streaming but not true event store (limited per-stream semantics) |
+| **PostgreSQL** (append-only table) | Simple, works well at moderate scale, good starting point |
+| **DynamoDB** (event table per aggregate) | Scalable, sort key = version, condition expression for optimistic concurrency |
+
+**PostgreSQL Append-Only Pattern:**
+```sql
+CREATE TABLE events (
+  aggregate_id   UUID        NOT NULL,
+  aggregate_type VARCHAR(100) NOT NULL,
+  version        INTEGER      NOT NULL,
+  event_type     VARCHAR(200) NOT NULL,
+  event_data     JSONB        NOT NULL,
+  occurred_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (aggregate_id, version)  -- version uniqueness enforces optimistic concurrency
+);
+```
+
+---
+
+## Rebuilding Read Models (Projections)
+
+```
+Event Store
+  [e1, e2, e3, e4, e5, e6, e7...]
+       ↓
+  Projection processor (stateful consumer)
+       ↓
+  Read Model DB (Postgres / Elasticsearch / Redis)
+       ↓
+  Query API
+
+If read model is corrupted or schema changes:
+  1. Drop the read model
+  2. Reset consumer offset to 0
+  3. Replay all events → rebuild read model
+  (This is the killer feature: read models are disposable)
+```
+
+---
+
+## Interview Q&A
+
+**Q: What is Event Sourcing and why would you use it?**
+A: Event Sourcing is a persistence pattern where the system of record is the sequence of domain events rather than the current state. You get: (1) full audit log for free — every change is recorded as an immutable event with timestamp; (2) temporal queries — you can reconstruct state at any point in time by replaying events up to that timestamp; (3) natural integration surface — other services subscribe to events without polling; (4) read model flexibility — you can build any read model by replaying events, so changing the query model doesn't require data migration. The cost is significant complexity: event versioning, snapshot management, eventual consistency, and larger operational footprint.
+
+**Q: How do you handle schema changes in Event Sourcing?**
+A: Events are immutable, so you cannot modify past events. Three strategies: (1) **Upcasting** — when reading an old event, transform it to the new format in memory before passing to the aggregate handler; the event store is unchanged. (2) **New event version** — add `OrderPlacedV2` alongside `OrderPlacedV1`; the aggregate handler handles both. (3) **Copy-and-transform migration** — write a migration that reads old events, transforms them, and writes new events to a new stream (rarely needed). Upcasting is the standard approach for most schema changes.
+
+**Q: What is the difference between Event Sourcing and Change Data Capture (CDC)?**
+A: Both produce streams of changes, but they are architecturally different. CDC (e.g., Debezium) captures database-level changes (row inserts/updates/deletes) from the transaction log of a traditional state-based database — it retrofits event streaming onto existing systems. Event Sourcing is a first-class design pattern where the application explicitly models and stores domain events as the primary system of record. CDC events are often low-level (column changes), while Event Sourcing events are rich domain events (OrderShipped with business meaning). CDC is a migration tool; Event Sourcing is an architecture decision.
+
+**Q: How do you handle the read model being out of sync?**
+A: The read model is eventually consistent by design. Strategies: (1) Accept the lag (typically milliseconds to seconds) — most UIs tolerate this. (2) Return the new state directly from the command API response so the client doesn't need to re-query immediately. (3) Version-check: the command returns the event version that reflects the change; the client polls the read API until that version appears. (4) For specific screens that must be consistent (e.g., just-placed order confirmation), query the event store directly rather than the read model.
+
+---
+
+*Last Updated: 2026 | System Design — Event Sourcing*

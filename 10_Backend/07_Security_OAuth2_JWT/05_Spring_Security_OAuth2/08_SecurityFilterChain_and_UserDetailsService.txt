@@ -1,0 +1,305 @@
+# Spring Security Filter Chain — Complete Guide
+
+## Architecture Overview
+
+Spring Security is implemented as a chain of Servlet filters. Every HTTP request passes through this chain before reaching the controller.
+
+```
+HTTP Request
+     │
+     ↓
+┌─────────────────────────────────────────────────────────────┐
+│               Spring Security Filter Chain                   │
+│                                                              │
+│  1. SecurityContextPersistenceFilter                         │
+│     (loads SecurityContext from session / HTTP header)        │
+│                    │                                         │
+│  2. UsernamePasswordAuthenticationFilter  (form login)       │
+│     OR                                                       │
+│     BearerTokenAuthenticationFilter       (JWT/OAuth2)       │
+│     OR                                                       │
+│     BasicAuthenticationFilter             (HTTP Basic)       │
+│                    │                                         │
+│  3. ExceptionTranslationFilter                               │
+│     (converts AuthenticationException → 401,                 │
+│      AccessDeniedException → 403)                            │
+│                    │                                         │
+│  4. FilterSecurityInterceptor / AuthorizationFilter          │
+│     (evaluates authorization rules)                          │
+└──────────────────────┬──────────────────────────────────────┘
+                       │ (if all filters pass)
+                       ↓
+                   Controller
+```
+
+---
+
+## SecurityFilterChain Configuration (Spring Security 6.x)
+
+Spring Security 6 moved from `WebSecurityConfigurerAdapter` (deprecated in 5.7) to bean-based configuration.
+
+```java
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity  // enables @PreAuthorize, @PostAuthorize
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            // Disable CSRF for stateless REST APIs (JWT-based)
+            .csrf(AbstractHttpConfigurer::disable)
+
+            // Session management — stateless for REST APIs
+            .sessionManagement(session ->
+                session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+
+            // Authorization rules
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/public/**").permitAll()
+                .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                .requestMatchers(HttpMethod.GET, "/api/products/**").hasAnyRole("USER", "ADMIN")
+                .anyRequest().authenticated()
+            )
+
+            // JWT filter — insert before UsernamePasswordAuthenticationFilter
+            .addFilterBefore(jwtAuthenticationFilter(), UsernamePasswordAuthenticationFilter.class)
+
+            // Exception handling
+            .exceptionHandling(ex -> ex
+                .authenticationEntryPoint(customAuthEntryPoint())  // 401 response
+                .accessDeniedHandler(customAccessDeniedHandler())  // 403 response
+            );
+
+        return http.build();
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+
+    @Bean
+    public AuthenticationManager authenticationManager(
+            AuthenticationConfiguration config) throws Exception {
+        return config.getAuthenticationManager();
+    }
+}
+```
+
+---
+
+## JWT Authentication Filter
+
+```java
+@Component
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    private final JwtService jwtService;
+    private final UserDetailsService userDetailsService;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain filterChain)
+            throws ServletException, IOException {
+
+        String authHeader = request.getHeader("Authorization");
+
+        // If no Bearer token, skip JWT processing (other filters may handle it)
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+
+        String token = authHeader.substring(7);  // Remove "Bearer " prefix
+
+        try {
+            String username = jwtService.extractUsername(token);
+
+            // Only authenticate if not already authenticated
+            if (username != null &&
+                    SecurityContextHolder.getContext().getAuthentication() == null) {
+
+                UserDetails userDetails = userDetailsService.loadUserByUsername(username);
+
+                if (jwtService.isTokenValid(token, userDetails)) {
+                    UsernamePasswordAuthenticationToken authToken =
+                        new UsernamePasswordAuthenticationToken(
+                            userDetails,
+                            null,               // credentials — null for JWT (already verified)
+                            userDetails.getAuthorities()
+                        );
+
+                    authToken.setDetails(
+                        new WebAuthenticationDetailsSource().buildDetails(request));
+
+                    // Set authentication in SecurityContext for this request
+                    SecurityContextHolder.getContext().setAuthentication(authToken);
+                }
+            }
+        } catch (JwtException e) {
+            // Invalid token — clear context, let ExceptionTranslationFilter handle 401
+            SecurityContextHolder.clearContext();
+            response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Invalid token");
+            return;
+        }
+
+        filterChain.doFilter(request, response);
+    }
+}
+```
+
+---
+
+## Custom UserDetailsService
+
+```java
+@Service
+public class CustomUserDetailsService implements UserDetailsService {
+
+    private final UserRepository userRepository;
+
+    @Override
+    public UserDetails loadUserByUsername(String username) throws UsernameNotFoundException {
+        User user = userRepository.findByEmail(username)  // or findByUsername
+            .orElseThrow(() -> new UsernameNotFoundException(
+                "User not found: " + username));
+
+        return org.springframework.security.core.userdetails.User.builder()
+            .username(user.getEmail())
+            .password(user.getPasswordHash())   // BCrypt-hashed
+            .authorities(mapRolesToAuthorities(user.getRoles()))
+            .accountExpired(!user.isActive())
+            .credentialsExpired(user.isPasswordExpired())
+            .disabled(!user.isEnabled())
+            .build();
+    }
+
+    private Collection<GrantedAuthority> mapRolesToAuthorities(Set<Role> roles) {
+        return roles.stream()
+            .map(role -> new SimpleGrantedAuthority("ROLE_" + role.name()))
+            .collect(Collectors.toList());
+    }
+}
+```
+
+---
+
+## Form Login vs. JWT Filter Chain
+
+| Aspect | Form Login (session-based) | JWT (stateless) |
+|--------|---------------------------|-----------------|
+| Session | Server maintains session (HttpSession) | No server-side session |
+| State | Stateful | Stateless |
+| CSRF | Enabled (required) | Disabled (Bearer token is not CSRF-vulnerable) |
+| Filter used | `UsernamePasswordAuthenticationFilter` | Custom `OncePerRequestFilter` |
+| Token storage | Session cookie (HttpOnly) | Authorization: Bearer header |
+| Horizontal scaling | Requires sticky sessions or session store (Redis) | Works out of the box (stateless) |
+| Use case | Web apps, traditional MVC | REST APIs, microservices, mobile |
+
+**Form Login Config:**
+```java
+.formLogin(form -> form
+    .loginPage("/login")
+    .loginProcessingUrl("/authenticate")
+    .defaultSuccessUrl("/dashboard", true)
+    .failureUrl("/login?error")
+    .permitAll()
+)
+.logout(logout -> logout
+    .logoutUrl("/logout")
+    .invalidateHttpSession(true)
+    .deleteCookies("JSESSIONID")
+)
+.sessionManagement(session -> session
+    .sessionCreationPolicy(SessionCreationPolicy.IF_REQUIRED)
+    .maximumSessions(1)  // prevent concurrent sessions
+)
+.csrf(csrf -> csrf.csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse()))
+```
+
+---
+
+## Multiple SecurityFilterChain Beans (Different Rules per URL)
+
+```java
+@Bean
+@Order(1)  // Higher priority — checked first
+public SecurityFilterChain apiSecurityFilterChain(HttpSecurity http) throws Exception {
+    http
+        .securityMatcher("/api/**")  // only applies to /api/** paths
+        .csrf(AbstractHttpConfigurer::disable)
+        .sessionManagement(s -> s.sessionCreationPolicy(STATELESS))
+        .authorizeHttpRequests(auth -> auth
+            .requestMatchers("/api/public/**").permitAll()
+            .anyRequest().authenticated()
+        )
+        .addFilterBefore(jwtFilter(), UsernamePasswordAuthenticationFilter.class);
+    return http.build();
+}
+
+@Bean
+@Order(2)  // Lower priority — catches everything else
+public SecurityFilterChain webSecurityFilterChain(HttpSecurity http) throws Exception {
+    http
+        .securityMatcher("/**")
+        .authorizeHttpRequests(auth -> auth
+            .requestMatchers("/", "/login", "/css/**").permitAll()
+            .anyRequest().authenticated()
+        )
+        .formLogin(Customizer.withDefaults());
+    return http.build();
+}
+```
+
+---
+
+## SecurityContext and Thread Safety
+
+```java
+// The SecurityContext is stored in a ThreadLocal by default
+// It is CLEARED after each request by SecurityContextPersistenceFilter
+
+// Accessing current user anywhere in the call stack:
+Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+String username = auth.getName();
+Collection<? extends GrantedAuthority> authorities = auth.getAuthorities();
+
+// In @RestController via parameter injection:
+@GetMapping("/profile")
+public ResponseEntity<Profile> getProfile(
+        @AuthenticationPrincipal UserDetails userDetails) {
+    // userDetails is the object returned by UserDetailsService.loadUserByUsername()
+    return ResponseEntity.ok(profileService.getProfile(userDetails.getUsername()));
+}
+
+// WARNING: @Async methods run in a different thread → SecurityContext NOT inherited by default
+// Fix: configure SecurityContextHolder to use MODE_INHERITABLETHREADLOCAL
+// OR manually propagate the context:
+@Async
+public void asyncTask() {
+    // SecurityContextHolder.getContext() is EMPTY here by default!
+    // Use DelegatingSecurityContextRunnable or configure mode
+}
+```
+
+---
+
+## Interview Q&A
+
+**Q: How does Spring Security's filter chain work?**
+A: Spring Security registers a `DelegatingFilterProxy` in the Servlet container, which delegates to a Spring-managed `FilterChainProxy`. The `FilterChainProxy` contains one or more `SecurityFilterChain` beans. Each request is matched against the filter chains in `@Order` sequence; the first matching chain handles the request. Within a chain, filters execute in a fixed order: context loading → authentication → exception translation → authorization. The `SecurityContextHolder` (backed by a `ThreadLocal`) carries the `Authentication` object through the request processing.
+
+**Q: What is the difference between `@EnableWebSecurity` and `@EnableMethodSecurity`?**
+A: `@EnableWebSecurity` enables Spring Security's web security support and the filter chain infrastructure — it's the entry point for configuring URL-based security. `@EnableMethodSecurity` (formerly `@EnableGlobalMethodSecurity`) enables method-level security annotations: `@PreAuthorize`, `@PostAuthorize`, `@Secured`, and `@RolesAllowed`. You typically need both: `@EnableWebSecurity` for HTTP layer security, `@EnableMethodSecurity` for service layer security. `@PreAuthorize("hasRole('ADMIN')")` on a service method is enforced even if the caller bypasses the HTTP layer (e.g., internal calls).
+
+**Q: How does `OncePerRequestFilter` work and why use it for JWT?**
+A: `OncePerRequestFilter` guarantees that `doFilterInternal` is called exactly once per request, even in cases where the Servlet container dispatches the request multiple times (e.g., error dispatches, async dispatches). JWT filters extend `OncePerRequestFilter` to avoid processing the token multiple times in the same request. The alternative, implementing `Filter` directly, risks multiple invocations for the same request in certain Servlet configurations.
+
+**Q: What is the difference between 401 and 403 in Spring Security, and how are they configured?**
+A: `AuthenticationEntryPoint` handles 401 Unauthorized — the request arrived without credentials or with invalid credentials. Spring Security calls `authenticationEntryPoint.commence()` when `AuthenticationException` is thrown. `AccessDeniedHandler` handles 403 Forbidden — the user is authenticated but does not have the required authority. Spring Security calls `accessDeniedHandler.handle()` when `AccessDeniedException` is thrown. The `ExceptionTranslationFilter` in the chain decides which to invoke based on whether the `SecurityContext` has an authenticated user.
+
+---
+
+*Last Updated: 2026 | Spring Security — Filter Chain and UserDetailsService*
