@@ -1,0 +1,178 @@
+EXCEPTION CHAINING AND CAUSE
+===============================
+
+WHAT IS EXCEPTION CHAINING?
+------------------------------
+  Exception chaining (also called "exception wrapping") means catching one exception
+  and throwing a NEW exception that wraps it — preserving the original as the CAUSE.
+
+  This allows:
+  - Translation of low-level technical exceptions to domain-meaningful ones
+  - Preservation of the full root-cause stack trace for debugging
+  - Separation of abstraction layers (service layer should not leak JDBC details)
+
+  Without chaining (bad — root cause lost):
+    } catch (SQLException e) {
+        throw new ServiceException("Order save failed");  // ❌ original cause discarded
+    }
+
+  With chaining (correct — root cause preserved):
+    } catch (SQLException e) {
+        throw new ServiceException("Order save failed", e);  // ✅ cause preserved
+    }
+
+THE CAUSE MECHANISM
+---------------------
+  Throwable constructors that accept a cause:
+    Throwable(String message, Throwable cause)
+    Throwable(Throwable cause)
+
+  Key methods:
+    getCause()          — returns the wrapped (cause) Throwable
+    initCause(t)        — sets cause on exceptions that don't have a cause constructor
+                          (legacy API — prefer the cause constructor)
+    printStackTrace()   — prints the full chain: primary exception + "Caused by:" + cause chain
+    toString()          — only shows the primary exception, NOT the cause
+
+  Example — full chain:
+    try {
+        try {
+            int[] arr = new int[1];
+            arr[5] = 1;                             // ArrayIndexOutOfBoundsException
+        } catch (ArrayIndexOutOfBoundsException e) {
+            throw new IllegalStateException("Array access failed", e);  // wrap it
+        }
+    } catch (IllegalStateException e) {
+        throw new ServiceException("Processing failed", e);  // wrap again
+    }
+
+  Stack trace output:
+    ServiceException: Processing failed
+        at ...
+    Caused by: IllegalStateException: Array access failed
+        at ...
+    Caused by: ArrayIndexOutOfBoundsException: Index 5 out of bounds for length 1
+        at ...
+
+WALKING THE CAUSE CHAIN
+-------------------------
+  public static Throwable getRootCause(Throwable t) {
+      Throwable cause = t.getCause();
+      return (cause == null) ? t : getRootCause(cause);  // recursive
+  }
+
+  // Check if any cause in the chain is a specific type:
+  public static boolean hasCause(Throwable t, Class<? extends Throwable> type) {
+      while (t != null) {
+          if (type.isInstance(t)) return true;
+          t = t.getCause();
+      }
+      return false;
+  }
+
+EXCEPTION TRANSLATION PATTERN
+--------------------------------
+  A formal pattern where each layer of the architecture translates exceptions
+  from the layer below into its own exception vocabulary.
+
+  Architecture:
+    Database layer  → throws SQLException
+    Repository layer → catches SQLException, throws DataAccessException
+    Service layer   → catches DataAccessException, throws ServiceException
+    Controller layer → catches ServiceException, returns HTTP error response
+
+  Example:
+    // Repository layer — isolates JDBC details from service layer
+    public class UserRepository {
+        public User findById(long id) {
+            try {
+                // JDBC code
+                PreparedStatement ps = conn.prepareStatement("SELECT * FROM users WHERE id=?");
+                ps.setLong(1, id);
+                ResultSet rs = ps.executeQuery();
+                if (!rs.next()) throw new UserNotFoundException(id);
+                return mapUser(rs);
+            } catch (SQLException e) {
+                // Translate to a non-JDBC exception — service layer doesn't know/care about JDBC
+                throw new DataAccessException("Failed to find user " + id, e);
+            }
+        }
+    }
+
+    // Service layer — translates DataAccessException to a business exception
+    public class UserService {
+        public UserDTO getUser(long id) {
+            try {
+                return userMapper.toDTO(userRepository.findById(id));
+            } catch (UserNotFoundException e) {
+                throw e;  // re-throw domain exception as-is
+            } catch (DataAccessException e) {
+                throw new ServiceException("User retrieval unavailable", e);
+            }
+        }
+    }
+
+initCause() — LEGACY USAGE
+-----------------------------
+  Some old exception classes don't have a cause constructor.
+  initCause() can set the cause after construction:
+
+    IOException ioe = new IOException("IO failed");
+    ioe.initCause(originalException);  // sets cause
+    throw ioe;
+
+  initCause() can only be called ONCE. Calling it a second time throws
+  IllegalStateException. Prefer constructors with cause parameter when available.
+
+EXCEPTION CHAINING IN CONCURRENT CODE
+----------------------------------------
+  ExecutionException (thrown by Future.get()) wraps the actual exception from
+  the async computation:
+
+    Future<Result> future = executor.submit(this::riskyComputation);
+    try {
+        Result r = future.get();
+    } catch (ExecutionException e) {
+        Throwable actual = e.getCause();  // unwrap the real exception
+        if (actual instanceof UserNotFoundException) {
+            throw (UserNotFoundException) actual;
+        }
+        throw new ServiceException("Async computation failed", actual);
+    }
+
+COMPARISON TABLE: CAUSE HANDLING APPROACHES
+----------------------------------------------
+  Approach                  | Cause Preserved? | Best For
+  --------------------------|------------------|---------------------------------------
+  throw new Ex(msg, cause)  | ✅ Yes           | All new custom exception classes
+  throw new Ex(cause)       | ✅ Yes           | When message = cause.toString()
+  ex.initCause(cause)       | ✅ Yes           | Legacy exceptions without cause constructor
+  throw new Ex(msg)         | ❌ No            | Only if cause genuinely doesn't matter
+  catch; ignore             | ❌ No            | NEVER (swallowing exceptions)
+
+COMMON INTERVIEW QUESTIONS
+---------------------------
+Q: What is exception chaining? Why is it important?
+A: Exception chaining is the practice of catching an exception and rethrowing a NEW
+   exception that wraps it, using the cause constructor: throw new MyEx(message, originalException).
+   It is important because:
+   1. Each layer can use its own exception vocabulary (service layer hides JDBC)
+   2. The full root cause stack trace is preserved for debugging
+   3. Without chaining, the original exception is lost and diagnosing issues becomes very hard.
+
+Q: What is the difference between getCause() and getMessage()?
+A: getMessage() returns just the message string of THIS exception.
+   getCause() returns the WRAPPED Throwable — the exception that originally caused this one.
+   When you call printStackTrace(), Java automatically traverses the cause chain and prints
+   each level with "Caused by:" labels, giving a complete picture of what went wrong.
+
+Q: What is the initCause() method? When would you use it?
+A: initCause(Throwable cause) sets the cause on a Throwable. It's a legacy method for
+   older exceptions that lack a constructor accepting a cause parameter.
+   It can only be called ONCE per exception instance (subsequent calls throw IllegalStateException).
+   Modern code prefers using constructors: new MyException(message, cause).
+
+Q: What does ExecutionException.getCause() return?
+A: When a callable throws inside an executor, the executor wraps the exception in
+   ExecutionException. getCause() on the ExecutionException returns the ACTUAL exception
+   thrown by the computation. You must always unwrap it: catch (ExecutionException e) { Throwable real = e.getCause(); }.
