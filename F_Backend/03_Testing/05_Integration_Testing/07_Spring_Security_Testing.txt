@@ -1,0 +1,213 @@
+SPRING SECURITY TESTING
+========================
+
+=== DEPENDENCIES ===
+
+spring-boot-starter-test already includes spring-security-test.
+If adding manually:
+  <dependency>
+      <groupId>org.springframework.security</groupId>
+      <artifactId>spring-security-test</artifactId>
+      <scope>test</scope>
+  </dependency>
+
+=== @WITHMOCKUSER ===
+
+Simplest way to mock an authenticated user in Spring MVC tests.
+Sets up a SecurityContext with a UsernamePasswordAuthenticationToken.
+
+@SpringBootTest
+@AutoConfigureMockMvc
+class UserControllerTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @Test
+    @WithMockUser(username = "john", roles = {"USER"})
+    void shouldReturnUserProfile() throws Exception {
+        mockMvc.perform(get("/api/profile"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.username").value("john"));
+    }
+
+    @Test
+    @WithMockUser(roles = {"ADMIN"})
+    void shouldAllowAdminAccess() throws Exception {
+        mockMvc.perform(delete("/api/users/123"))
+            .andExpect(status().isOk());
+    }
+
+    @Test
+    void shouldReturn401WhenNotAuthenticated() throws Exception {
+        mockMvc.perform(get("/api/profile"))
+            .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @WithMockUser(roles = {"USER"})    // not ADMIN
+    void shouldReturn403WhenNotAuthorized() throws Exception {
+        mockMvc.perform(delete("/api/users/123"))
+            .andExpect(status().isForbidden());
+    }
+}
+
+=== @WITHUSERDETAILS ===
+
+When you need the actual UserDetails loaded from UserDetailsService.
+Useful when your code calls authentication.getPrincipal() and expects
+a specific UserDetails implementation (e.g., CustomUserDetails).
+
+@Test
+@WithUserDetails(value = "john@example.com",
+                 userDetailsServiceBeanName = "customUserDetailsService")
+void shouldLoadCustomUserDetails() throws Exception {
+    mockMvc.perform(get("/api/profile"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.userId").isNotEmpty());
+}
+
+Requires: "john@example.com" to exist in test data / embedded DB.
+
+=== CUSTOM SECURITY ANNOTATION ===
+
+Create @WithMockAdmin for repeated use:
+
+@Target({ElementType.METHOD, ElementType.TYPE})
+@Retention(RetentionPolicy.RUNTIME)
+@WithMockUser(username = "admin@example.com", roles = {"ADMIN"})
+public @interface WithMockAdmin { }
+
+// Usage:
+@Test
+@WithMockAdmin
+void adminCanDeleteUser() throws Exception { ... }
+
+=== CUSTOM WITHSECURITYCONTEXT ===
+
+For complex authentication objects (OAuth2, JWT, custom principal):
+
+public class WithCustomUserSecurityContextFactory
+    implements WithSecurityContextFactory<WithMockUser> {
+
+    @Override
+    public SecurityContext createSecurityContext(WithMockUser annotation) {
+        SecurityContext context = SecurityContextHolder.createEmptyContext();
+        UserDetails user = User.withUsername(annotation.username())
+            .password("password")
+            .roles(annotation.roles())
+            .build();
+        Authentication auth = new UsernamePasswordAuthenticationToken(
+            user, null, user.getAuthorities());
+        context.setAuthentication(auth);
+        return context;
+    }
+}
+
+=== TESTING JWT / OAUTH2 RESOURCE SERVER ===
+
+For services secured as OAuth2 Resource Server (JWT):
+
+@Test
+void shouldAccessProtectedEndpointWithJwt() throws Exception {
+    mockMvc.perform(get("/api/orders")
+            .with(jwt().jwt(jwt -> jwt
+                .subject("user-123")
+                .claim("roles", List.of("USER"))
+                .claim("email", "user@example.com"))))
+        .andExpect(status().isOk());
+}
+
+// With authorities
+mockMvc.perform(get("/api/admin")
+        .with(jwt().authorities(new SimpleGrantedAuthority("SCOPE_admin"))))
+    .andExpect(status().isOk());
+
+// With custom JWT builder
+mockMvc.perform(get("/api/profile")
+        .with(jwt().jwt(Jwt.withTokenValue("token")
+            .header("alg", "none")
+            .subject("user123")
+            .claim("email", "test@test.com")
+            .issuedAt(Instant.now())
+            .expiresAt(Instant.now().plus(1, ChronoUnit.HOURS))
+            .build())))
+    .andExpect(status().isOk());
+
+=== TESTING OAUTH2 LOGIN ===
+
+@Test
+void shouldHandleOAuth2LoginCallback() throws Exception {
+    mockMvc.perform(get("/api/dashboard")
+            .with(oauth2Login()
+                .attributes(attrs -> {
+                    attrs.put("sub", "user-123");
+                    attrs.put("email", "user@example.com");
+                    attrs.put("name", "Test User");
+                })))
+        .andExpect(status().isOk());
+}
+
+=== METHOD SECURITY TESTING ===
+
+@SpringBootTest  // no MockMvc needed — test service directly
+class OrderServiceSecurityTest {
+
+    @Autowired
+    private OrderService orderService;
+
+    @Test
+    @WithMockUser(roles = "USER")
+    void userCanViewOwnOrders() {
+        // @PreAuthorize checks pass in the Spring context
+        List<Order> orders = orderService.getMyOrders("user-123");
+        assertThat(orders).isNotNull();
+    }
+
+    @Test
+    @WithMockUser(roles = "USER")  // not ADMIN
+    void userCannotDeleteOrders() {
+        assertThatThrownBy(() -> orderService.deleteOrder(1L))
+            .isInstanceOf(AccessDeniedException.class);
+    }
+
+    @Test
+    @WithMockUser(roles = "ADMIN")
+    void adminCanDeleteOrders() {
+        assertThatCode(() -> orderService.deleteOrder(1L))
+            .doesNotThrowAnyException();
+    }
+}
+
+=== CSRF IN TESTS ===
+
+Default: MockMvc disables CSRF validation for tests.
+To test CSRF explicitly:
+
+// Without CSRF token (should fail for state-changing requests)
+mockMvc.perform(post("/api/orders")
+        .with(user("alice"))
+        .contentType(MediaType.APPLICATION_JSON)
+        .content(requestBody))
+    .andExpect(status().isForbidden()); // if CSRF enabled
+
+// With CSRF token
+mockMvc.perform(post("/api/orders")
+        .with(csrf())                    // inject CSRF token
+        .with(user("alice"))
+        .contentType(MediaType.APPLICATION_JSON)
+        .content(requestBody))
+    .andExpect(status().isCreated());
+
+=== SECURITYMOCKMVCREQUESTPOSTPROCESSORS QUICK REFERENCE ===
+
+.with(user("alice"))                        — basic user
+.with(user("alice").roles("ADMIN"))         — with roles
+.with(user(customUserDetails))              — with UserDetails
+.with(jwt())                               — JWT token (default)
+.with(jwt().jwt(jwtBuilder))               — custom JWT
+.with(oauth2Login())                       — OAuth2 login
+.with(oidcLogin())                         — OIDC login
+.with(csrf())                              — include CSRF token
+.with(anonymous())                         — anonymous user
+.with(httpBasic("alice", "password"))      — HTTP Basic auth

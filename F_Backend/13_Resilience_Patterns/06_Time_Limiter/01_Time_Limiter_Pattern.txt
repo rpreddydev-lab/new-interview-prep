@@ -1,0 +1,161 @@
+TIME LIMITER PATTERN
+=====================
+
+=== CONCEPT ===
+
+Time Limiter enforces a maximum execution time for asynchronous/reactive calls.
+If a call does not complete within the timeout, a TimeoutException is thrown.
+
+Time Limiter vs @Timeout:
+  @Timeout (plain): Uses Thread.interrupt() — limited, doesn't kill blocking I/O
+  Time Limiter: Works with CompletableFuture/Mono/Flux — cancels async computation
+
+Primary use cases:
+  - WebClient (reactive) calls with strict SLA requirements
+  - CompletableFuture-based async operations
+  - Preventing slow downstream from holding resources indefinitely
+  - Cascading failure prevention (slow is worse than failing fast)
+
+=== RESILIENCE4J TIME LIMITER CONFIGURATION ===
+
+application.yml:
+  resilience4j:
+    timelimiter:
+      instances:
+        user-service:
+          timeoutDuration: 2s            # max allowed time for the call
+          cancelRunningFuture: true      # cancel the future if timeout exceeded
+
+cancelRunningFuture: true → attempt to interrupt the future's execution
+cancelRunningFuture: false → let it continue, but throw timeout to caller
+  (Useful when the result might be needed for auditing/logging but caller moves on)
+
+=== USAGE WITH COMPLETABLEFUTURE ===
+
+@Service
+public class UserServiceClient {
+
+    @TimeLimiter(name = "user-service", fallbackMethod = "userFallback")
+    public CompletableFuture<User> getUserAsync(String userId) {
+        return CompletableFuture.supplyAsync(() -> {
+            // This call must complete within timeoutDuration
+            return httpClient.getUser(userId);
+        });
+    }
+
+    // Fallback MUST return same type wrapped in CompletableFuture
+    private CompletableFuture<User> userFallback(String userId, TimeoutException ex) {
+        log.error("Timeout calling user-service for user: {}", userId);
+        return CompletableFuture.completedFuture(User.anonymous());
+    }
+}
+
+IMPORTANT: @TimeLimiter REQUIRES the method to return CompletableFuture<T>
+           (or Mono<T>/Flux<T> for reactive) — not T directly.
+
+=== USAGE WITH WEBCLIENT (REACTIVE) ===
+
+@Service
+public class ProductService {
+
+    @TimeLimiter(name = "product-service")
+    public Mono<Product> getProduct(String id) {
+        return webClient.get()
+            .uri("/products/{id}", id)
+            .retrieve()
+            .bodyToMono(Product.class)
+            .timeout(Duration.ofSeconds(2))   // WebClient native timeout
+            // OR use @TimeLimiter annotation for consistency with other patterns
+            ;
+    }
+}
+
+Note: WebClient has its own .timeout() operator which is usually preferred
+for reactive code. @TimeLimiter adds consistency when combining with other
+Resilience4j annotations.
+
+=== TIME LIMITER + CIRCUIT BREAKER COMBINATION ===
+
+Common pattern — enforce timeout AND track failures for circuit breaking:
+
+application.yml:
+  resilience4j:
+    timelimiter:
+      instances:
+        payment-service:
+          timeoutDuration: 3s
+          cancelRunningFuture: true
+    circuitbreaker:
+      instances:
+        payment-service:
+          slidingWindowSize: 10
+          failureRateThreshold: 50
+          recordExceptions:
+            - java.util.concurrent.TimeoutException   # Count timeouts as failures!
+
+@CircuitBreaker(name = "payment-service", fallbackMethod = "fallback")
+@TimeLimiter(name = "payment-service")
+public CompletableFuture<PaymentResult> processPayment(PaymentRequest req) {
+    return CompletableFuture.supplyAsync(() -> paymentGateway.charge(req));
+}
+
+Order of execution (inner → outer): TimeLimiter → CircuitBreaker
+TimeLimiter throws TimeoutException → CircuitBreaker records it as failure.
+After 50% failures → Circuit opens → calls fail fast without even waiting.
+
+=== TIMEOUT HIERARCHY IN A SPRING APPLICATION ===
+
+Multiple timeout layers exist — should be aligned:
+
+Client timeout (e.g., Feign/RestTemplate/WebClient): 2s
+  ↓ inner
+@TimeLimiter timeout: 3s
+  ↓
+@Retry waitDuration × maxAttempts: 3 retries × 1s wait = 4s total max
+  ↓
+Application-level SLA: 5s total
+
+Rule: inner timeouts should be LESS than outer timeouts.
+If TimeLimiter is 3s and Retry has 3 attempts (each up to 3s) → total 9s.
+Combine carefully to meet your overall SLA.
+
+=== CONFIGURING HTTP CLIENT TIMEOUTS ===
+
+WebClient (preferred for reactive):
+  WebClient.builder()
+      .clientConnector(new ReactorClientHttpConnector(
+          HttpClient.create()
+              .responseTimeout(Duration.ofSeconds(2))        // total response timeout
+              .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 1000)  // connect timeout
+      ))
+      .build();
+
+RestTemplate (blocking):
+  SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+  factory.setConnectTimeout(1000);   // connect timeout ms
+  factory.setReadTimeout(2000);      // read timeout ms
+
+Feign Client:
+  feign:
+    client:
+      config:
+        default:
+          connectTimeout: 1000
+          readTimeout: 2000
+
+=== TIME LIMITER METRICS ===
+
+resilience4j.timelimiter.calls{name="payment-service", kind="successful"}
+resilience4j.timelimiter.calls{name="payment-service", kind="timeout"}
+resilience4j.timelimiter.calls{name="payment-service", kind="failed"}
+
+Alert: timeout calls increasing → downstream is getting slower (pre-cursor to outage).
+
+=== BEST PRACTICES ===
+
+1. Always set timeouts — never let a call block forever
+2. Align timeout values: HttpClient < TimeLimiter < Retry total < Overall SLA
+3. Use cancelRunningFuture=true to free up resources quickly
+4. Count TimeoutException as failures in CircuitBreaker
+5. Log timeout with context (which service, which endpoint, which user)
+6. Set different timeouts per service based on their SLAs

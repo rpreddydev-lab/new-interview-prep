@@ -1,0 +1,181 @@
+SPRING AMQP AND SPRING BOOT RABBITMQ INTEGRATION
+==================================================
+
+Spring AMQP provides:
+- AmqpTemplate / RabbitTemplate — for sending messages
+- @RabbitListener — for consuming messages
+- RabbitAdmin — for declaring exchanges, queues, bindings
+- MessageConverter — for serializing/deserializing messages
+
+=== DEPENDENCIES ===
+
+pom.xml:
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-amqp</artifactId>
+  </dependency>
+
+=== CONFIGURATION ===
+
+application.yml:
+  spring:
+    rabbitmq:
+      host: localhost
+      port: 5672
+      username: guest
+      password: guest
+      virtual-host: /
+      listener:
+        simple:
+          acknowledge-mode: manual     # or auto
+          prefetch: 1
+          concurrency: 2
+          max-concurrency: 10
+      template:
+        retry:
+          enabled: true
+          max-attempts: 3
+          initial-interval: 1000
+
+=== DECLARING INFRASTRUCTURE ===
+
+@Configuration
+public class RabbitConfig {
+
+    @Bean
+    public Queue orderQueue() {
+        return QueueBuilder.durable("order-queue")
+            .withArgument("x-dead-letter-exchange", "dlx")
+            .withArgument("x-message-ttl", 60000)
+            .build();
+    }
+
+    @Bean
+    public TopicExchange orderExchange() {
+        return new TopicExchange("order-exchange");
+    }
+
+    @Bean
+    public Binding orderBinding(Queue orderQueue, TopicExchange orderExchange) {
+        return BindingBuilder.bind(orderQueue)
+            .to(orderExchange)
+            .with("order.#");
+    }
+
+    @Bean
+    public MessageConverter jsonMessageConverter() {
+        return new Jackson2JsonMessageConverter();
+    }
+
+    @Bean
+    public RabbitTemplate rabbitTemplate(ConnectionFactory cf) {
+        RabbitTemplate template = new RabbitTemplate(cf);
+        template.setMessageConverter(jsonMessageConverter());
+        return template;
+    }
+}
+
+=== SENDING MESSAGES ===
+
+@Service
+public class OrderPublisher {
+
+    private final RabbitTemplate rabbitTemplate;
+
+    public void publishOrder(Order order) {
+        // Send to exchange with routing key
+        rabbitTemplate.convertAndSend("order-exchange", "order.created", order);
+    }
+
+    public void publishWithHeaders(Order order) {
+        rabbitTemplate.convertAndSend("order-exchange", "order.created", order,
+            message -> {
+                message.getMessageProperties().setHeader("region", "us");
+                message.getMessageProperties().setPriority(5);
+                return message;
+            });
+    }
+}
+
+=== CONSUMING MESSAGES ===
+
+@Component
+public class OrderConsumer {
+
+    // Simple listener — auto-ack
+    @RabbitListener(queues = "order-queue")
+    public void handleOrder(Order order) {
+        System.out.println("Processing: " + order);
+    }
+
+    // Manual ack listener
+    @RabbitListener(queues = "order-queue")
+    public void handleWithAck(Order order, Channel channel,
+                              @Header(AmqpHeaders.DELIVERY_TAG) long deliveryTag)
+                              throws IOException {
+        try {
+            process(order);
+            channel.basicAck(deliveryTag, false);
+        } catch (Exception e) {
+            // requeue=false → goes to DLX
+            channel.basicNack(deliveryTag, false, false);
+        }
+    }
+
+    // Annotation-based queue declaration (no @Bean required)
+    @RabbitListener(bindings = @QueueBinding(
+        value = @Queue(value = "events-queue", durable = "true"),
+        exchange = @Exchange(value = "events-exchange", type = ExchangeTypes.TOPIC),
+        key = "event.#"
+    ))
+    public void handleEvent(String eventJson) {
+        System.out.println("Event: " + eventJson);
+    }
+}
+
+=== ERROR HANDLING ===
+
+Default error handler: SimpleMessageListenerContainer uses AmqpRejectAndDontRequeueException
+to route message to DLX without requeue.
+
+Custom error handler:
+  @Bean
+  public RabbitListenerErrorHandler errorHandler() {
+      return (amqpMessage, message, exception) -> {
+          log.error("Failed to process message", exception);
+          throw new AmqpRejectAndDontRequeueException("Processing error", exception);
+      };
+  }
+
+  @RabbitListener(queues = "order-queue", errorHandler = "errorHandler")
+
+=== RABBIT ADMIN ===
+
+@Bean
+public RabbitAdmin rabbitAdmin(ConnectionFactory cf) {
+    return new RabbitAdmin(cf);
+}
+// RabbitAdmin auto-detects and declares all Queue/Exchange/Binding beans at startup
+
+=== TESTING WITH RABBITMQ ===
+
+Option 1: Testcontainers
+  @Container
+  static RabbitMQContainer rabbit = new RabbitMQContainer("rabbitmq:3.12-management");
+
+  @DynamicPropertySource
+  static void configureProperties(DynamicPropertyRegistry registry) {
+      registry.add("spring.rabbitmq.host", rabbit::getHost);
+      registry.add("spring.rabbitmq.port", rabbit::getAmqpPort);
+  }
+
+Option 2: Embedded RabbitMQ (less common — use Testcontainers instead)
+
+=== VIRTUAL HOSTS ===
+
+- vHost provides logical isolation within one RabbitMQ broker
+- Separate exchanges, queues, users, permissions per vHost
+- Default vHost: "/"
+- Use for: multi-tenant applications, environment separation (dev/qa)
+
+spring.rabbitmq.virtual-host: /production

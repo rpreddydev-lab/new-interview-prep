@@ -1,0 +1,142 @@
+BULKHEAD PATTERN
+================
+
+=== CONCEPT ===
+
+Named after ship compartments (bulkheads) that prevent flooding from spreading.
+Goal: Isolate failures in one part of the system from cascading to others.
+Limit the number of concurrent calls to a downstream service, preventing thread
+pool exhaustion and resource starvation.
+
+Problem without Bulkhead:
+  All service calls use the same shared thread pool.
+  SlowService starts taking 30s per call.
+  Threads pile up waiting for SlowService.
+  Entire application runs out of threads — even healthy services are affected.
+
+With Bulkhead:
+  Each downstream service has its own isolated resource pool.
+  SlowService only consumes its own allocated threads.
+  Other services continue to operate normally.
+
+=== TWO TYPES OF BULKHEAD IN RESILIENCE4J ===
+
+1. SEMAPHORE BULKHEAD (default)
+   - Limits max concurrent calls using a counting semaphore
+   - Runs in the CALLER's thread
+   - Lightweight — no extra threads needed
+   - Blocks caller if limit reached (until timeout)
+
+2. THREAD POOL BULKHEAD
+   - Executes calls in a SEPARATE dedicated thread pool
+   - Caller thread submits task and waits (or uses async)
+   - More isolation but higher overhead
+   - Required for reactive/async scenarios
+
+=== SEMAPHORE BULKHEAD CONFIGURATION ===
+
+application.yml:
+  resilience4j:
+    bulkhead:
+      instances:
+        inventory-service:
+          maxConcurrentCalls: 10     # max parallel calls allowed
+          maxWaitDuration: 100ms     # how long to wait if slots full
+                                     # 0 = fail immediately (fail fast)
+
+If maxConcurrentCalls=10 and 11th call comes in:
+  - It waits up to maxWaitDuration for a slot
+  - If no slot frees up → BulkheadFullException thrown
+  - Fallback method is triggered
+
+=== THREAD POOL BULKHEAD CONFIGURATION ===
+
+application.yml:
+  resilience4j:
+    thread-pool-bulkhead:
+      instances:
+        notification-service:
+          maxThreadPoolSize: 5        # max threads in pool
+          coreThreadPoolSize: 3       # base threads always alive
+          queueCapacity: 20           # queue for waiting tasks
+          keepAliveDuration: 30s      # idle thread TTL
+
+If pool is full AND queue is full → BulkheadFullException
+
+=== ANNOTATION USAGE ===
+
+Semaphore Bulkhead:
+  @Bulkhead(name = "inventory-service", fallbackMethod = "inventoryFallback")
+  public InventoryResponse getInventory(String productId) {
+      return inventoryClient.get(productId);
+  }
+
+  private InventoryResponse inventoryFallback(String productId,
+                                               BulkheadFullException ex) {
+      log.warn("Bulkhead full for inventory-service");
+      return InventoryResponse.cached(productId);
+  }
+
+Thread Pool Bulkhead:
+  @Bulkhead(
+      name = "notification-service",
+      type = Bulkhead.Type.THREADPOOL,
+      fallbackMethod = "notificationFallback"
+  )
+  public CompletableFuture<Void> sendNotification(Notification n) {
+      return CompletableFuture.runAsync(() -> notificationClient.send(n));
+  }
+
+  private CompletableFuture<Void> notificationFallback(Notification n,
+                                                        BulkheadFullException ex) {
+      log.warn("Notification bulkhead full, queuing for later");
+      return CompletableFuture.completedFuture(null);
+  }
+
+=== CHOOSING SEMAPHORE VS THREAD POOL ===
+
+Semaphore Bulkhead:
+  + Lightweight, no extra threads
+  + Simple to configure
+  - Caller thread is blocked (not freed for other work)
+  - Less isolation — shared thread pool still used
+  Best for: synchronous, blocking calls; low overhead scenarios
+
+Thread Pool Bulkhead:
+  + True isolation — dedicated thread pool per service
+  + Caller thread is freed (non-blocking)
+  - Higher resource usage (more threads)
+  - More complex to tune
+  Best for: async operations; high-throughput services; WebClient calls
+
+=== BULKHEAD + CIRCUIT BREAKER ===
+
+They work together:
+  Bulkhead: limits concurrent calls (prevents overload)
+  Circuit Breaker: stops calls when failure rate is high
+
+Order of decorators (outer → inner):
+  @Bulkhead → @CircuitBreaker → @Retry → actual call
+
+If CB is OPEN → Bulkhead never gets congested (calls rejected earlier)
+If downstream is slow → Bulkhead fills up → rejects excess → CB measures failure rate
+
+=== SIZING GUIDELINES ===
+
+For maxConcurrentCalls (semaphore):
+  Analyze average latency of downstream service.
+  If latency = 100ms and you handle 1000 RPS → need 100 concurrent slots.
+  Formula: concurrentCalls = TPS × avgLatency(seconds)
+  Add 20-30% buffer for spikes.
+
+For thread pool:
+  Start small (5-10 threads), profile under load.
+  Monitor queueCapacity fill rate — if queue is always full, increase pool size.
+
+=== BULKHEAD METRICS ===
+
+resilience4j.bulkhead.available.concurrent.calls{name="inventory-service"}
+resilience4j.bulkhead.max.allowed.concurrent.calls{name="inventory-service"}
+resilience4j.bulkhead.call.rejected.count{name="inventory-service"}
+
+Alert: rejected.count > 0 sustained → bulkhead is undersized or downstream too slow.

@@ -1,0 +1,180 @@
+REDIS BLOOM FILTER
+==================
+
+=== CONCEPT ===
+
+A Bloom Filter is a probabilistic data structure that answers one question:
+"Is this element POSSIBLY in the set, or DEFINITELY NOT?"
+
+Properties:
+  - FALSE POSITIVES possible: "Yes, possibly in set" (but actually not)
+  - FALSE NEGATIVES impossible: "No, definitely not in set" is always correct
+  - Space-efficient: represents millions of elements in kilobytes
+  - O(1) add and check operations (hash-based)
+
+Perfect when:
+  - "Definitely not in DB" answer is sufficient to skip expensive DB lookup
+  - Small false positive rate acceptable (tunable: 0.01%, 0.1%, 1%)
+
+Use cases:
+  - Cache: "Is this URL cached?" (skip DB if definitely not)
+  - Fraud detection: "Have we seen this transaction ID before?"
+  - Username availability: quick check before DB query
+  - Duplicate prevention: newsletter sent to this email before?
+  - Malicious URL filtering (Google Safe Browsing uses Bloom Filters)
+  - Database query optimization: skip shard if key definitely not there
+
+=== REDIS BLOOM (REDISBLOOM MODULE) ===
+
+RedisBloom is a Redis module providing Bloom Filter and other probabilistic structures.
+Available in:
+  - Redis Stack (community, includes RedisBloom)
+  - Redis Cloud
+  - Redis Enterprise
+
+Docker:
+  docker run -p 6379:6379 redis/redis-stack:latest
+
+=== BASIC COMMANDS ===
+
+BF.RESERVE — create bloom filter with custom settings:
+  BF.RESERVE myfilter 0.01 1000000
+  # error_rate: 0.01 (1% false positives)
+  # capacity: 1,000,000 expected items
+
+BF.ADD — add item:
+  BF.ADD myfilter "user:12345"
+  # Returns 1 if newly added, 0 if already existed
+
+BF.EXISTS — check membership:
+  BF.EXISTS myfilter "user:12345"
+  # Returns 1 (possibly exists) or 0 (definitely does not exist)
+
+BF.MADD — add multiple items:
+  BF.MADD myfilter "item1" "item2" "item3"
+
+BF.MEXISTS — check multiple items:
+  BF.MEXISTS myfilter "item1" "unknown"
+  # Returns [1, 0] or [1, 1] (if false positive)
+
+BF.INFO — get filter information:
+  BF.INFO myfilter
+  # Returns: capacity, size, filter count, insertions, deletions, expansion rate
+
+=== JAVA / SPRING USAGE (JEDIS) ===
+
+<dependency>
+    <groupId>redis.clients</groupId>
+    <artifactId>jedis</artifactId>
+</dependency>
+
+import redis.clients.jedis.UnifiedJedis;
+import redis.clients.jedis.bloom.BFInsertParams;
+
+@Service
+public class BloomFilterService {
+
+    private final UnifiedJedis jedis;
+    private static final String SEEN_EMAILS_FILTER = "newsletter:seen-emails";
+
+    public BloomFilterService(UnifiedJedis jedis) {
+        this.jedis = jedis;
+        // Create filter if not exists (1% false positive rate, 10M capacity)
+        jedis.bfReserve(SEEN_EMAILS_FILTER, 0.01, 10_000_000L);
+    }
+
+    public boolean hasEmailBeenSent(String email) {
+        return jedis.bfExists(SEEN_EMAILS_FILTER, email);
+    }
+
+    public void markEmailSent(String email) {
+        jedis.bfAdd(SEEN_EMAILS_FILTER, email);
+    }
+
+    // Usage: only send if definitely not seen before
+    public void sendNewsletterIfNotSent(String email) {
+        if (!hasEmailBeenSent(email)) {  // quick O(1) bloom filter check
+            // Small false positive rate: might skip a re-send for 1%
+            // But: definitely sends to everyone who never received it
+            newsletterService.send(email);
+            markEmailSent(email);
+        }
+    }
+}
+
+=== JAVA / SPRING USAGE (LETTUCE + SPRING DATA REDIS) ===
+
+For Lettuce-based RedisTemplate, use execute() with raw commands:
+
+@Service
+public class BloomFilterRedisService {
+
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    public boolean exists(String filterName, String value) {
+        return Boolean.TRUE.equals(
+            redisTemplate.execute(
+                (RedisCallback<Boolean>) connection ->
+                    (Boolean) connection.execute("BF.EXISTS",
+                        filterName.getBytes(),
+                        value.getBytes())
+            )
+        );
+    }
+
+    public void add(String filterName, String value) {
+        redisTemplate.execute(
+            (RedisCallback<Void>) connection -> {
+                connection.execute("BF.ADD",
+                    filterName.getBytes(),
+                    value.getBytes());
+                return null;
+            }
+        );
+    }
+}
+
+=== CACHE PENETRATION WITH BLOOM FILTER ===
+
+Problem without bloom filter (Cache Penetration):
+  1. Request for ID 99999 (doesn't exist in DB)
+  2. Check Redis cache → miss
+  3. Query DB → not found
+  4. Nothing cached (what to cache for "not found"?)
+  5. Attacker sends millions of requests for non-existent IDs → DB overload
+
+Solution with Bloom Filter:
+  1. At startup: load all valid IDs into bloom filter
+  2. Request for ID 99999 comes in
+  3. BF.EXISTS validIds "99999" → 0 (definitely not in DB)
+  4. Return 404 immediately — no DB query, no cache query
+  5. ID 12345 → BF.EXISTS → 1 (possibly exists) → check cache → check DB
+
+=== COUNTING BLOOM FILTER (CBF) ===
+
+Standard Bloom Filter: no deletion (adding a bit is irreversible)
+Counting Bloom Filter: allows deletion by using counters instead of bits
+
+Redis command: CF.* (Cuckoo Filter — alternative to CBF)
+  CF.RESERVE  // Cuckoo Filter (more space efficient, supports deletion)
+  CF.ADD
+  CF.EXISTS
+  CF.DEL      // DELETE supported (unlike standard BF)
+
+Use Cuckoo Filter when you need to remove items.
+
+=== TUNING ===
+
+false_positive_rate | Memory per item | Typical use
+--------------------|-----------------|------------------
+0.001 (0.1%)        | ~15 bits        | High precision (security, payments)
+0.01 (1%)           | ~10 bits        | Good for most use cases
+0.1 (10%)           | ~5 bits         | Low precision acceptable
+
+Formula for memory:
+  Memory ≈ -n × ln(p) / (ln(2))² bits
+  where n = capacity, p = false positive rate
+
+For 1M items at 1% false positive:
+  Memory ≈ 1,200,000 bytes ≈ 1.2 MB

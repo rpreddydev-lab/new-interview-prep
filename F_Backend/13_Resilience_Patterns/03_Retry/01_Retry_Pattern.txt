@@ -1,0 +1,125 @@
+RETRY PATTERN
+==============
+
+=== CONCEPT ===
+
+Retry automatically retries a failed operation, assuming the failure is transient
+(temporary network blip, momentary service unavailability).
+
+When to use Retry:
+- Transient failures (network timeouts, 503 Service Unavailable)
+- Idempotent operations (safe to call multiple times)
+- Expected intermittent failures from external systems
+
+When NOT to use Retry:
+- Non-transient failures (404 Not Found, 400 Bad Request, 401 Unauthorized)
+- Non-idempotent operations (creating orders, charging payments) — unless idempotency key is used
+- When the downstream service is overloaded — retrying makes it worse
+
+=== RETRY STRATEGIES ===
+
+1. FIXED DELAY
+   Retry after fixed interval: 1s, 1s, 1s, fail
+   Simple but can cause thundering herd if many clients retry simultaneously.
+
+2. EXPONENTIAL BACKOFF
+   Retry with increasing delay: 1s, 2s, 4s, 8s, fail
+   Gives downstream service more time to recover with each attempt.
+
+3. EXPONENTIAL BACKOFF + JITTER (RECOMMENDED)
+   Add randomness to backoff: 1s + rand, 2s + rand, 4s + rand
+   Prevents thundering herd — retries from multiple clients are spread out.
+
+=== RESILIENCE4J RETRY CONFIGURATION ===
+
+application.yml:
+  resilience4j:
+    retry:
+      instances:
+        payment-service:
+          maxAttempts: 3                    # total attempts (including first)
+          waitDuration: 1s                  # base wait between retries
+          enableExponentialBackoff: true
+          exponentialBackoffMultiplier: 2   # 1s, 2s, 4s
+          enableRandomizedWait: true
+          randomizedWaitFactor: 0.5         # ±50% jitter
+          retryExceptions:
+            - java.io.IOException
+            - java.util.concurrent.TimeoutException
+            - feign.RetryableException
+          ignoreExceptions:
+            - com.myapp.BusinessException   # don't retry business errors
+            - com.myapp.ValidationException
+
+=== ANNOTATION USAGE ===
+
+@Service
+public class PaymentClient {
+
+    @Retry(name = "payment-service", fallbackMethod = "paymentFallback")
+    public PaymentResponse process(PaymentRequest request) {
+        return externalApi.charge(request);
+    }
+
+    private PaymentResponse paymentFallback(PaymentRequest request,
+                                             MaxRetriesExceededException ex) {
+        log.error("All {} retries exhausted for payment", ex.getMaxAttempts());
+        return PaymentResponse.failed("Payment failed after retries");
+    }
+}
+
+=== RETRY + IDEMPOTENCY KEYS ===
+
+Problem: Retrying POST /orders might create duplicate orders.
+Solution: Include an idempotency key in the request.
+
+Client:
+  String idempotencyKey = UUID.randomUUID().toString();
+  headers.set("Idempotency-Key", idempotencyKey);
+
+Server:
+  Check if idempotencyKey already processed → return cached result
+  Otherwise: process + store idempotencyKey + result in Redis
+
+This makes the operation safe to retry.
+
+=== RETRY WITH CIRCUIT BREAKER ===
+
+Best practice: combine both
+  - Retry handles transient failures (few retries with backoff)
+  - Circuit Breaker detects persistent failures (stop retrying, open circuit)
+
+Recommended order: Retry wraps CircuitBreaker
+  @Retry → @CircuitBreaker → actual call
+
+Execution: retry calls circuit breaker → if CB allows, call downstream
+If CB is OPEN → retry gets CallNotPermittedException → doesn't retry (fail fast)
+
+=== SPRING RETRY ===
+
+Spring Retry is an alternative to Resilience4j Retry:
+
+@Retryable(
+    value = {IOException.class, TimeoutException.class},
+    maxAttempts = 3,
+    backoff = @Backoff(delay = 1000, multiplier = 2, random = true)
+)
+public String callService() { ... }
+
+@Recover
+public String recover(IOException ex) {
+    return "fallback response";
+}
+
+Spring Retry is simpler but has less features than Resilience4j.
+Resilience4j preferred for microservices due to better metrics integration.
+
+=== RETRY METRICS ===
+
+resilience4j.retry.calls{name="payment-service", kind="successful_without_retry"}
+resilience4j.retry.calls{name="payment-service", kind="successful_with_retry"}
+resilience4j.retry.calls{name="payment-service", kind="failed_with_retry"}
+resilience4j.retry.calls{name="payment-service", kind="failed_without_retry"}
+
+Alert: high "failed_with_retry" → persistent failures, investigate downstream.
+Alert: high "successful_with_retry" → transient issues, may indicate instability.

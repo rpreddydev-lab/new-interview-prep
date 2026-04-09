@@ -1,0 +1,151 @@
+RESILIENCE PATTERNS — INTERVIEW QUESTIONS
+==========================================
+
+=== CIRCUIT BREAKER QUESTIONS ===
+
+Q1: Explain the Circuit Breaker pattern and its states.
+A:  Circuit Breaker monitors calls to a downstream service and stops sending
+    requests when failures exceed a threshold, giving the service time to recover.
+
+    States:
+    - CLOSED: Normal operation. Calls pass through. Failure/slow-call rate tracked.
+    - OPEN: Failure threshold exceeded. Calls immediately rejected (fail fast).
+      After a wait duration, transitions to HALF_OPEN.
+    - HALF_OPEN: Allows limited calls (permittedNumberOfCallsInHalfOpenState).
+      If they succeed → CLOSED. If they fail → OPEN again.
+
+    Without CB: slow/failing downstream holds threads, cascades failure.
+    With CB: fast-fail → threads freed → rest of system stays healthy.
+
+Q2: What is the difference between COUNT_BASED and TIME_BASED sliding windows?
+A:  COUNT_BASED: last N calls tracked (e.g., last 10 calls)
+    TIME_BASED: calls in last N seconds (e.g., last 60 seconds)
+    COUNT_BASED is simpler and more predictable.
+    TIME_BASED is better for high-volume services where recent behavior matters more.
+
+Q3: What does slowCallRateThreshold do?
+A:  In addition to failure rate, Resilience4j also tracks slow calls.
+    If >X% of calls take longer than slowCallDurationThreshold, the circuit opens.
+    This catches "slow is the new down" scenarios where service isn't failing
+    but is degrading performance.
+
+Q4: How do you combine Circuit Breaker with Retry?
+A:  Use Retry as outer decorator, Circuit Breaker as inner.
+    Order: @Retry → @CircuitBreaker → call
+    If CB is OPEN, it throws CallNotPermittedException.
+    Retry treats this as a failure and does NOT retry (it's in ignoreExceptions).
+    This prevents retry storms against an open circuit.
+
+=== RETRY QUESTIONS ===
+
+Q5: When should you NOT use Retry?
+A:  - Non-idempotent operations (POST /orders) without idempotency keys
+    - Non-transient errors: 400, 401, 403, 404 (retrying won't help)
+    - When the downstream is already overloaded (retrying makes it worse)
+    - When combined with CB that's OPEN (CB handles it)
+
+Q6: What is exponential backoff with jitter and why is jitter important?
+A:  Exponential backoff: delay doubles with each retry (1s, 2s, 4s).
+    This gives downstream more time to recover.
+
+    Jitter: adds randomness to the delay (1s ± random, 2s ± random).
+    Without jitter, ALL clients retry at the SAME time (thundering herd).
+    With jitter, retries are spread out → less load spike on downstream.
+
+Q7: What is an idempotency key and when do you need it with Retry?
+A:  When retrying POST requests (creating resources), duplicates can be created.
+    Idempotency key: client generates unique UUID per operation.
+    Server checks if this key was already processed → returns same result.
+    Makes non-idempotent operations safe to retry.
+
+=== BULKHEAD QUESTIONS ===
+
+Q8: Explain Bulkhead pattern and its two types in Resilience4j.
+A:  Bulkhead limits concurrent calls to isolate resource usage per downstream.
+    Prevents one slow service from exhausting all threads (cascade prevention).
+
+    Semaphore Bulkhead: counting semaphore, runs in caller's thread.
+    Thread Pool Bulkhead: separate dedicated thread pool per service.
+
+    Semaphore: lightweight, simpler, caller thread blocked.
+    Thread Pool: true isolation, higher overhead, supports async patterns.
+
+Q9: How do you size a Bulkhead?
+A:  Little's Law: Concurrency = Throughput × Latency
+    If service handles 500 RPS and downstream avg latency is 200ms:
+    Concurrent calls needed = 500 × 0.2 = 100
+    Set maxConcurrentCalls = 100-120 (add 20% buffer).
+    Monitor rejected calls metric — if high, increase size.
+
+=== RATE LIMITER QUESTIONS ===
+
+Q10: Difference between Rate Limiter and Bulkhead?
+A:  Bulkhead: limits CONCURRENT calls (at any moment in time)
+    Rate Limiter: limits CALLS PER TIME PERIOD (throughput over time)
+
+    Example: maxConcurrentCalls=10 → at most 10 simultaneous calls
+             limitForPeriod=100 per second → at most 100 calls in 1 second
+
+    They're complementary — use both:
+    Rate Limiter: controls overall throughput
+    Bulkhead: controls concurrent execution
+
+Q11: Why is Resilience4j Rate Limiter not sufficient for distributed rate limiting?
+A:  Resilience4j Rate Limiter is IN-MEMORY per JVM instance.
+    With 3 app instances, each allows 10 req/s = 30 req/s total.
+    For true distributed rate limiting need centralized state:
+    - Redis + Bucket4j (distributed rate limiting with Redis backend)
+    - API Gateway (Kong, AWS API Gateway, Spring Cloud Gateway with Redis)
+    - Service Mesh (Istio)
+
+=== TIME LIMITER QUESTIONS ===
+
+Q12: Why use @TimeLimiter instead of just setting timeouts on the HTTP client?
+A:  HTTP client timeouts (connect + read) cover basic cases.
+    @TimeLimiter enforces a TOTAL execution time limit including:
+    - Connection setup
+    - Request/response
+    - Any async processing
+    It integrates with other Resilience4j patterns (CB counts timeouts as failures).
+    For reactive code (CompletableFuture/Mono), it cancels the async computation.
+
+Q13: What does cancelRunningFuture=true do?
+A:  When timeout occurs, it calls future.cancel(true) which sends an interrupt signal.
+    This releases resources (threads, connections) immediately.
+    With false: caller gets TimeoutException but future keeps running (wasting resources).
+    Always use true unless you need the future to complete for audit/logging.
+
+=== PATTERN COMBINATION QUESTIONS ===
+
+Q14: What is the recommended order for combining Resilience4j patterns?
+A:  Outer → Inner (decorating order):
+    Bulkhead → Rate Limiter → Circuit Breaker → Retry → Time Limiter → call
+
+    Execution (when calling): outermost triggers innermost
+    Rate Limiter checks quota → Bulkhead checks concurrency → CB checks state →
+    TimeLimiter enforces timeout → call made → if fails, Retry retries.
+
+    In Spring via annotations, last annotation applied = outermost.
+    Or control order with @Order or explicit decoration.
+
+Q15: How do you handle a scenario where a downstream service is completely down?
+A:  Layered defense:
+    1. Time Limiter: don't wait too long for response (2s max)
+    2. Retry: retry 2x with backoff (for transient issues)
+    3. Circuit Breaker: after 50% failures → open, stop calling
+    4. Bulkhead: don't let it consume all threads even before CB opens
+    5. Fallback: return cached data, default response, or friendly error
+    6. Alerting: Prometheus alert on circuit open → PagerDuty
+
+    Result: first few requests retry, CB opens quickly, all subsequent fail fast,
+    system remains healthy, service team gets alerted.
+
+=== QUICK REFERENCE TABLE ===
+
+Pattern         | Protects       | Key Config               | Exception Thrown
+----------------|----------------|--------------------------|---------------------------
+Circuit Breaker | Downstream     | failureRateThreshold     | CallNotPermittedException
+Retry           | Transient fail | maxAttempts, waitDuration| MaxRetriesExceededException
+Bulkhead        | Thread pool    | maxConcurrentCalls       | BulkheadFullException
+Rate Limiter    | API quota      | limitForPeriod           | RequestNotPermitted
+Time Limiter    | Slow calls     | timeoutDuration          | TimeoutException

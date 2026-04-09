@@ -1,0 +1,213 @@
+KAFKA STREAMS INTERACTIVE QUERIES
+===================================
+
+=== CONCEPT ===
+
+Kafka Streams materializes aggregation results into local STATE STORES.
+Interactive Queries (IQ) allow you to query these state stores directly —
+without re-reading from Kafka topics.
+
+This turns Kafka Streams into a QUERYABLE real-time database.
+
+Use cases:
+  - Real-time dashboards: "What's the current order count per region?"
+  - REST API backed by streaming aggregations
+  - Leaderboards, counters, running totals
+  - Cache of latest values per key
+
+=== STATE STORES ===
+
+Types:
+  - KeyValueStore: one value per key (latest, aggregated)
+  - WindowStore: values partitioned by time window
+  - SessionStore: session windows
+
+Backed by:
+  - RocksDB (default, persistent on disk)
+  - In-memory store (faster, not fault-tolerant alone)
+
+Each Kafka Streams instance holds a PARTITION of the state store.
+For distributed query, you need to route to the right instance.
+
+=== BASIC INTERACTIVE QUERY ===
+
+Stream topology:
+  KStream<String, Order> orders = builder.stream("orders");
+  KTable<String, Long> orderCounts = orders
+      .groupBy((key, order) -> order.getRegion())
+      .count(Materialized.as("order-counts-store"));  // named store!
+
+Query the store:
+  // Get the ReadOnlyKeyValueStore
+  ReadOnlyKeyValueStore<String, Long> store =
+      streams.store(
+          StoreQueryParameters.fromNameAndType(
+              "order-counts-store",
+              QueryableStoreTypes.keyValueStore()
+          )
+      );
+
+  // Query by key
+  Long count = store.get("us-east");  // count for us-east region
+
+  // Iterate all entries
+  KeyValueIterator<String, Long> all = store.all();
+  while (all.hasNext()) {
+      KeyValue<String, Long> kv = all.next();
+      System.out.println(kv.key + " = " + kv.value);
+  }
+  all.close();  // always close iterator!
+
+  // Range query
+  KeyValueIterator<String, Long> range = store.range("us-east", "us-west");
+
+=== REST API BACKED BY IQ ===
+
+@RestController
+@RequestMapping("/api/stats")
+public class OrderStatsController {
+
+    private final KafkaStreams streams;
+
+    @GetMapping("/regions/{region}")
+    public ResponseEntity<Long> getOrderCount(@PathVariable String region) {
+        ReadOnlyKeyValueStore<String, Long> store;
+        try {
+            store = streams.store(
+                StoreQueryParameters.fromNameAndType(
+                    "order-counts-store",
+                    QueryableStoreTypes.keyValueStore()
+                )
+            );
+        } catch (InvalidStateStoreException e) {
+            // Store not ready yet (streams starting or rebalancing)
+            return ResponseEntity.status(503).build();
+        }
+
+        Long count = store.get(region);
+        if (count == null) return ResponseEntity.notFound().build();
+        return ResponseEntity.ok(count);
+    }
+
+    @GetMapping("/regions")
+    public Map<String, Long> getAllRegions() {
+        ReadOnlyKeyValueStore<String, Long> store = streams.store(
+            StoreQueryParameters.fromNameAndType(
+                "order-counts-store",
+                QueryableStoreTypes.keyValueStore()
+            )
+        );
+
+        Map<String, Long> result = new HashMap<>();
+        try (KeyValueIterator<String, Long> it = store.all()) {
+            it.forEachRemaining(kv -> result.put(kv.key, kv.value));
+        }
+        return result;
+    }
+}
+
+=== WINDOWED STORE QUERIES ===
+
+Topology with windowed aggregation:
+  KTable<Windowed<String>, Long> windowedCounts = orders
+      .groupBy((k, v) -> v.getRegion())
+      .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(5)))
+      .count(Materialized.as("windowed-order-counts"));
+
+Query window store:
+  ReadOnlyWindowStore<String, Long> windowStore = streams.store(
+      StoreQueryParameters.fromNameAndType(
+          "windowed-order-counts",
+          QueryableStoreTypes.windowStore()
+      )
+  );
+
+  Instant now = Instant.now();
+  Instant fiveMinAgo = now.minus(5, ChronoUnit.MINUTES);
+
+  // Query all windows for a key in time range
+  WindowStoreIterator<Long> it = windowStore.fetch("us-east", fiveMinAgo, now);
+  while (it.hasNext()) {
+      KeyValue<Long, Long> kv = it.next();  // key=windowStart, value=count
+      System.out.println("Window " + Instant.ofEpochMilli(kv.key) + ": " + kv.value);
+  }
+  it.close();
+
+=== DISTRIBUTED INTERACTIVE QUERIES ===
+
+In a multi-instance Kafka Streams app, each instance holds SOME partitions.
+A key's data may be on a DIFFERENT instance than the one receiving the HTTP request.
+
+1. Discover which host owns the key:
+   KeyQueryMetadata metadata = streams.queryMetadataForKey(
+       "order-counts-store",
+       "us-east",              // key
+       Serdes.String().serializer()
+   );
+
+   HostInfo owner = metadata.activeHost();
+   // owner.host() and owner.port() tell you which instance has this data
+
+2. If request came to wrong instance, forward to correct one:
+   @GetMapping("/regions/{region}")
+   public ResponseEntity<Long> getOrderCount(@PathVariable String region) {
+       KeyQueryMetadata metadata = streams.queryMetadataForKey(
+           "order-counts-store", region, Serdes.String().serializer());
+
+       HostInfo thisHost = new HostInfo("localhost", 8080);
+       if (!metadata.activeHost().equals(thisHost)) {
+           // Proxy to the correct instance
+           String url = "http://" + metadata.activeHost().host() + ":" +
+                        metadata.activeHost().port() + "/api/stats/regions/" + region;
+           return restTemplate.getForEntity(url, Long.class);
+       }
+
+       // We own this partition — query local store
+       ReadOnlyKeyValueStore<String, Long> store = streams.store(...);
+       return ResponseEntity.ok(store.get(region));
+   }
+
+Configure app server info so Kafka Streams knows this instance's address:
+  props.put(StreamsConfig.APPLICATION_SERVER_CONFIG, "localhost:8080");
+
+=== STORE NOT READY — HANDLING ===
+
+During startup or rebalancing, stores may not be available.
+Always handle InvalidStateStoreException:
+
+  private ReadOnlyKeyValueStore<String, Long> getStore() {
+      int retries = 3;
+      while (retries-- > 0) {
+          try {
+              return streams.store(
+                  StoreQueryParameters.fromNameAndType(
+                      "order-counts-store",
+                      QueryableStoreTypes.keyValueStore()
+                  )
+              );
+          } catch (InvalidStateStoreException e) {
+              Thread.sleep(1000);
+          }
+      }
+      throw new ServiceUnavailableException("Store not ready");
+  }
+
+Also check streams state:
+  if (streams.state() != KafkaStreams.State.RUNNING) {
+      return ResponseEntity.status(503).body("Streams not running");
+  }
+
+=== TESTING INTERACTIVE QUERIES ===
+
+Use TopologyTestDriver for unit testing:
+  TopologyTestDriver driver = new TopologyTestDriver(topology, props);
+  TestInputTopic<String, Order> input =
+      driver.createInputTopic("orders", stringSerde, orderSerde);
+
+  input.pipeInput("key1", new Order("us-east", 100.0));
+
+  ReadOnlyKeyValueStore<String, Long> store =
+      driver.getKeyValueStore("order-counts-store");
+
+  assertThat(store.get("us-east")).isEqualTo(1L);
+  driver.close();

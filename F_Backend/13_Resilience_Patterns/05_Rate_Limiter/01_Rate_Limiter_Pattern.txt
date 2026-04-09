@@ -1,0 +1,166 @@
+RATE LIMITER PATTERN
+====================
+
+=== CONCEPT ===
+
+Rate Limiter restricts the number of calls to a service within a time window.
+It protects DOWNSTREAM services from being overwhelmed by too many requests.
+
+Key distinction from Bulkhead:
+  Bulkhead: limits CONCURRENT calls (at any point in time)
+  Rate Limiter: limits calls PER TIME PERIOD (throughput control)
+
+Use cases:
+  - Respect third-party API quotas (e.g., 100 calls/minute to payment gateway)
+  - Protect own service from overload (server-side rate limiting)
+  - Fair usage across tenants in multi-tenant apps
+  - Cost control for expensive external API calls
+
+=== RESILIENCE4J RATE LIMITER CONFIGURATION ===
+
+application.yml:
+  resilience4j:
+    ratelimiter:
+      instances:
+        github-api:
+          limitForPeriod: 10           # max calls allowed per refresh period
+          limitRefreshPeriod: 1s       # period length (resets to limitForPeriod)
+          timeoutDuration: 100ms       # how long to wait for a permission
+                                       # 0ms = fail immediately if limit exceeded
+
+Result: max 10 calls per second to github-api.
+If 11th call comes in within the same second:
+  - Waits up to 100ms for permission
+  - If not available → RequestNotPermitted exception
+
+=== ANNOTATION USAGE ===
+
+@Service
+public class GithubClient {
+
+    @RateLimiter(name = "github-api", fallbackMethod = "githubFallback")
+    public List<Repository> getRepositories(String username) {
+        return githubApi.fetchRepos(username);
+    }
+
+    private List<Repository> githubFallback(String username,
+                                              RequestNotPermitted ex) {
+        log.warn("Rate limit exceeded for github-api: {}", ex.getMessage());
+        return Collections.emptyList();  // or return cached data
+    }
+}
+
+=== PROGRAMMATIC USAGE ===
+
+@Component
+public class ThrottledService {
+    private final RateLimiter rateLimiter;
+
+    public ThrottledService(RateLimiterRegistry registry) {
+        this.rateLimiter = registry.rateLimiter("github-api");
+    }
+
+    public void doWork() {
+        // Check permission without waiting
+        boolean acquired = rateLimiter.acquirePermission();
+        if (!acquired) {
+            throw new RateLimitExceededException("Too many requests");
+        }
+        callDownstream();
+    }
+
+    // Or with timeout:
+    public void doWorkWithWait() {
+        boolean acquired = rateLimiter.acquirePermission(Duration.ofMillis(200));
+        // ...
+    }
+}
+
+=== RATE LIMITER ALGORITHMS ===
+
+Resilience4j uses ATOMIC PERIOD (sliding window based on fixed periods).
+
+Common algorithms in general:
+
+1. FIXED WINDOW COUNTER
+   Count requests per fixed window (e.g., 0-60s, 60-120s).
+   Simple but allows burst at window boundaries (99 req at :59, 99 req at :01).
+
+2. SLIDING WINDOW LOG
+   Track timestamp of each request. Count requests in last N seconds.
+   Accurate but memory intensive.
+
+3. SLIDING WINDOW COUNTER
+   Blend of fixed windows using weighted count.
+   Good accuracy, memory efficient.
+
+4. TOKEN BUCKET (most common)
+   Tokens accumulate at constant rate. Each request consumes a token.
+   Allows short bursts. AWS API Gateway, etc.
+
+5. LEAKY BUCKET
+   Requests queue and are processed at constant rate.
+   Smooths traffic, no bursts allowed.
+
+Resilience4j uses Token Bucket-like semantics internally.
+
+=== SERVER-SIDE VS CLIENT-SIDE RATE LIMITING ===
+
+Client-side (using Resilience4j):
+  Service A limits HOW OFTEN it calls Service B.
+  Respects B's rate limits proactively.
+  Configured in A's code.
+
+Server-side (API Gateway, Spring):
+  Service B limits incoming calls.
+  Spring Cloud Gateway: RequestRateLimiterGatewayFilter with Redis backend.
+  Bucket4j: Redis-backed distributed rate limiting.
+
+  application.yml (Spring Cloud Gateway):
+    filters:
+      - name: RequestRateLimiter
+        args:
+          redis-rate-limiter.replenishRate: 10
+          redis-rate-limiter.burstCapacity: 20
+          redis-rate-limiter.requestedTokens: 1
+
+=== DISTRIBUTED RATE LIMITING ===
+
+Resilience4j RateLimiter is IN-MEMORY per JVM instance.
+If running 3 instances of a service → each allows 10 req/s = 30 req/s total.
+
+For true distributed rate limiting:
+  - Use Redis with Lua scripts (Bucket4j + Redis)
+  - API Gateway layer (Kong, AWS API Gateway)
+  - Service Mesh (Istio rate limiting)
+
+Bucket4j + Redis example:
+  Bucket bucket = Bucket.builder()
+      .addLimit(Bandwidth.classic(10, Refill.greedy(10, Duration.ofSeconds(1))))
+      .build();
+  ConsultatoryProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+  if (!probe.isConsumed()) {
+      return ResponseEntity.status(429)
+          .header("X-Rate-Limit-Retry-After-Seconds",
+                  String.valueOf(probe.getNanosToWaitForRefill() / 1_000_000_000))
+          .build();
+  }
+
+=== HTTP RATE LIMIT RESPONSE ===
+
+Standard response for rate limiting:
+  HTTP 429 Too Many Requests
+
+Headers:
+  X-RateLimit-Limit: 100
+  X-RateLimit-Remaining: 0
+  X-RateLimit-Reset: 1705000000     (Unix timestamp when limit resets)
+  Retry-After: 30                   (seconds to wait)
+
+=== RATE LIMITER METRICS ===
+
+resilience4j.ratelimiter.available.permissions{name="github-api"}
+resilience4j.ratelimiter.waiting.threads{name="github-api"}
+
+Alert: waiting.threads increasing → rate limit too tight or downstream too slow.
+Alert: available.permissions always 0 → consider increasing limitForPeriod.

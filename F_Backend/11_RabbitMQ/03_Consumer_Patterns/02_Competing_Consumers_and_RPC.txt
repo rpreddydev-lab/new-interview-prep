@@ -1,0 +1,107 @@
+COMPETING CONSUMERS, RPC, AND RELIABILITY PATTERNS
+====================================================
+
+=== COMPETING CONSUMERS (Worker Queues) ===
+
+Setup:
+- One queue, multiple consumer instances
+- Each message delivered to exactly one consumer (load balanced)
+- Consumers process independently and in parallel
+
+Message Distribution:
+- Default: round-robin across all consumers
+- With QoS (prefetchCount): fair dispatch — idle consumers get next message
+
+Java Example (Spring AMQP):
+  @RabbitListener(queues = "task-queue", concurrency = "3-10")
+  public void processTask(Task task) {
+      // process task
+      // ack is automatic with Spring AMQP default settings
+  }
+
+Scaling:
+- Start more consumer instances to scale out
+- prefetchCount=1 ensures work is evenly distributed when tasks vary in duration
+
+=== RPC PATTERN ===
+
+RabbitMQ RPC uses:
+1. reply_to: temporary reply queue (or use Direct Reply-To: "amq.rabbitmq.reply-to")
+2. correlation_id: UUID to match response to request
+
+Direct Reply-To (pseudo-queue):
+- No need to create/delete reply queues
+- "amq.rabbitmq.reply-to" is a built-in pseudo-queue per connection
+- More efficient than creating temporary queues
+
+RPC Flow:
+  Client:
+    correlationId = UUID.randomUUID()
+    publish(exchange="", routingKey="rpc-queue",
+            props={replyTo="amq.rabbitmq.reply-to", correlationId=correlationId},
+            body=request)
+    wait for message on "amq.rabbitmq.reply-to" with matching correlationId
+
+  Server:
+    consume from "rpc-queue"
+    process request
+    publish(exchange="", routingKey=message.replyTo,
+            props={correlationId=message.correlationId},
+            body=response)
+
+Spring AMQP RPC:
+  RabbitTemplate.convertSendAndReceive("rpc-queue", request)
+  — handles correlation ID and reply queue automatically
+
+=== RETRY PATTERN WITH BACKOFF ===
+
+Option 1: Dead-Letter + TTL Queue (classic approach)
+  Main queue     (x-dead-letter-exchange: retry-exchange)
+  Retry queue    (x-message-ttl: 5000, x-dead-letter-exchange: main-exchange)
+  Dead queue     (permanent failures after N retries)
+
+Flow: message fails → nacked → DLX → retry queue → TTL expires → republished → main queue
+
+Track retry count via x-death header count field.
+
+Option 2: Spring AMQP with RetryTemplate
+  @Bean
+  SimpleRabbitListenerContainerFactory factory(ConnectionFactory cf) {
+      var factory = new SimpleRabbitListenerContainerFactory();
+      factory.setConnectionFactory(cf);
+      factory.setAdviceChain(RetryInterceptorBuilder.stateless()
+          .maxAttempts(3)
+          .backOffPolicy(new ExponentialBackOffPolicy())
+          .build());
+      return factory;
+  }
+
+=== PRIORITY QUEUES ===
+
+Declare with: x-max-priority = N (max 255, practical limit 10)
+Publish with: AMQP Basic Properties priority = 5
+
+Messages with higher priority values are consumed first.
+If all messages have same priority → FIFO.
+
+Use case: urgent notifications queue, critical alerts.
+
+=== CONSISTENT HASH EXCHANGE (plugin) ===
+
+- Routes messages based on consistent hashing of routing key
+- Used for sharding messages across multiple queues deterministically
+- Require "rabbitmq_consistent_hash_exchange" plugin enabled
+
+=== QUORUM QUEUES (Recommended for Reliability) ===
+
+- Replicated across multiple nodes using Raft consensus
+- Survives minority node failures
+- Must be durable by definition
+- Preferred over classic mirrored queues (deprecated in 3.x)
+
+Declare:  x-queue-type = "quorum"
+
+Limitations:
+- No x-message-ttl per-message (only per-queue via policy)
+- No priority support
+- Better safe: use for any queue where message loss is not acceptable

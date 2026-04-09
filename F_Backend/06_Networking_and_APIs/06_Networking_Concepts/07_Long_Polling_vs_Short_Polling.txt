@@ -1,0 +1,211 @@
+LONG POLLING VS SHORT POLLING VS SSE VS WEBSOCKETS
+====================================================
+
+=== OVERVIEW ===
+
+Challenge: HTTP is request-response (client always initiates).
+For real-time updates, several patterns exist with different trade-offs.
+
+=== SHORT POLLING ===
+
+Client repeatedly polls server at fixed interval.
+
+Client:
+  setInterval(() => {
+      fetch('/api/notifications')
+          .then(r => r.json())
+          .then(data => updateUI(data));
+  }, 5000);  // every 5 seconds
+
+Server: immediately returns whatever is available (even if nothing new).
+
+Pros:
+  + Simple to implement (standard HTTP)
+  + Works everywhere (no special infrastructure)
+  + Stateless server
+
+Cons:
+  - High overhead: 95% of requests return "no new data"
+  - Latency = polling interval (5s delay for 5s polling)
+  - Wastes bandwidth and server resources
+  - Not suitable for real-time requirements
+
+Use when: updates are infrequent and real-time isn't critical.
+
+=== LONG POLLING ===
+
+Client makes a request; server HOLDS the connection open until data is available
+or a timeout occurs. When data arrives, server responds. Client immediately re-polls.
+
+Client:
+  function poll() {
+      fetch('/api/notifications/poll?timeout=30')   // 30s timeout
+          .then(r => r.json())
+          .then(data => {
+              if (data.hasUpdates) processUpdates(data);
+              poll();  // immediately re-poll after receiving response
+          })
+          .catch(() => setTimeout(poll, 1000));  // retry on error
+  }
+
+Server (Spring):
+  @GetMapping("/notifications/poll")
+  public DeferredResult<ResponseEntity<Notifications>> poll(
+          @RequestParam(defaultValue = "30") int timeout) {
+
+      DeferredResult<ResponseEntity<Notifications>> result =
+          new DeferredResult<>(timeout * 1000L,
+              ResponseEntity.ok(Notifications.empty()));  // timeout response
+
+      // Register: when new notification arrives, complete result
+      notificationBroker.subscribe(result::setResult);
+
+      return result;  // Spring holds connection open
+  }
+
+Server (Spring WebFlux — reactive):
+  @GetMapping(value = "/notifications/poll",
+              produces = MediaType.APPLICATION_JSON_VALUE)
+  public Mono<Notifications> poll() {
+      return notificationSink.asFlux()
+          .next()                        // wait for next emission
+          .timeout(Duration.ofSeconds(30))
+          .onErrorReturn(TimeoutException.class, Notifications.empty());
+  }
+
+Pros:
+  + Near real-time (responds when data arrives, not on schedule)
+  + Standard HTTP — works through proxies, firewalls, load balancers
+  + No persistent connection management
+  + Simpler than WebSockets
+
+Cons:
+  - Server holds open connections (resource usage)
+  - Not truly real-time (slight delay for re-poll after response)
+  - More complex than short polling
+  - Server must handle many concurrent held connections
+
+Use when: need near-real-time, can't use WebSockets or SSE (infrastructure limits).
+
+=== SERVER-SENT EVENTS (SSE) ===
+
+Server pushes events to client over a single long-lived HTTP connection.
+One-directional: server → client only.
+
+Server (Spring):
+  @GetMapping(value = "/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+  public SseEmitter streamEvents() {
+      SseEmitter emitter = new SseEmitter(Long.MAX_VALUE);
+
+      executor.submit(() -> {
+          try {
+              while (!Thread.currentThread().isInterrupted()) {
+                  emitter.send(SseEmitter.event()
+                      .id(UUID.randomUUID().toString())
+                      .name("notification")
+                      .data(new Notification("New message arrived"))
+                      .reconnectTime(3000));
+                  Thread.sleep(1000);
+              }
+          } catch (Exception e) {
+              emitter.completeWithError(e);
+          }
+      });
+      return emitter;
+  }
+
+Client (JavaScript):
+  const evtSource = new EventSource('/events');
+  evtSource.addEventListener('notification', (event) => {
+      const data = JSON.parse(event.data);
+      updateUI(data);
+  });
+  evtSource.onerror = () => {
+      // EventSource auto-reconnects!
+  };
+
+Pros:
+  + Simple — standard HTTP, EventSource API
+  + Auto-reconnect built into browser
+  + Multiplexed event types
+  + Works through most proxies (HTTP)
+  + Efficient: single connection, server pushes
+
+Cons:
+  - One-directional (server → client only)
+  - HTTP/1.1: browsers limit to 6 connections per domain (HTTP/2 solves this)
+  - Not suitable for bidirectional communication
+
+Use when: server needs to push updates to many clients (live feeds, notifications, progress).
+
+=== WEBSOCKETS ===
+
+Full-duplex bidirectional communication over a single TCP connection.
+Starts as HTTP, upgrades to WebSocket protocol.
+
+Server (Spring WebSocket):
+  @Configuration
+  @EnableWebSocketMessageBroker
+  public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+      @Override
+      public void registerStompEndpoints(StompEndpointRegistry registry) {
+          registry.addEndpoint("/ws").withSockJS();
+      }
+      @Override
+      public void configureMessageBroker(MessageBrokerRegistry registry) {
+          registry.setApplicationDestinationPrefixes("/app");
+          registry.enableSimpleBroker("/topic", "/queue");
+      }
+  }
+
+  @Controller
+  public class ChatController {
+      @MessageMapping("/chat.send")
+      @SendTo("/topic/chat")
+      public ChatMessage send(ChatMessage message) {
+          return message;
+      }
+  }
+
+Client (JavaScript with STOMP):
+  const client = new StompJs.Client({ brokerURL: 'ws://localhost:8080/ws' });
+  client.onConnect = () => {
+      client.subscribe('/topic/chat', (msg) => {
+          displayMessage(JSON.parse(msg.body));
+      });
+  };
+  client.activate();
+
+Pros:
+  + True bidirectional
+  + Low latency (no HTTP overhead after handshake)
+  + Efficient for high-frequency messages (gaming, trading)
+
+Cons:
+  - Stateful (hard to scale horizontally — need sticky sessions or message broker)
+  - More complex to implement and operate
+  - Some proxies/firewalls block WebSocket upgrades
+  - Not auto-reconnecting (must implement manually)
+
+Use when: real-time bidirectional communication (chat, gaming, collaborative editing, live trading).
+
+=== COMPARISON TABLE ===
+
+Feature              | Short Poll | Long Poll | SSE    | WebSocket
+---------------------|------------|-----------|--------|----------
+Direction            | Client→Server req | Client→Server req | Server→Client | Bidirectional
+Real-time            | No (interval delay) | Near (sub-second) | Yes | Yes
+Overhead             | High | Medium | Low | Low (after handshake)
+Server complexity    | Low | Medium | Medium | High
+Client complexity    | Low | Low | Low | Medium-High
+Firewall friendly    | ✅ | ✅ | ✅ | Sometimes blocked
+Auto-reconnect       | N/A | Manual | ✅ Built-in | Manual
+Scalability          | Easy | Easy | Easy | Hard (sticky sessions)
+Best for             | Occasional updates | Near-realtime notifications | Server push feeds | Chat, gaming, collab
+
+=== DECISION GUIDE ===
+
+Need real-time bidirectional? → WebSocket
+Server pushes only (notifications, live feeds)? → SSE (simpler than WebSocket)
+Near-real-time, infrastructure restrictions? → Long Polling
+Infrequent updates, simplicity over efficiency? → Short Polling

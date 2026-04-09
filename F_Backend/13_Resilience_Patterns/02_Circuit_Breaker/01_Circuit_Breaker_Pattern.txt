@@ -1,0 +1,154 @@
+CIRCUIT BREAKER PATTERN
+========================
+
+=== CONCEPT ===
+
+The Circuit Breaker pattern prevents an application from repeatedly trying to
+execute an operation that is likely to fail, allowing it to continue without
+waiting for the failure to be fixed.
+
+Named after an electrical circuit breaker — trips when overloaded.
+
+=== THREE STATES ===
+
+CLOSED (normal operation):
+- All calls pass through to the downstream service
+- Failures are counted in a sliding window
+- When failure rate exceeds threshold → transition to OPEN
+
+OPEN (circuit tripped):
+- All calls are immediately rejected (fail fast) without calling downstream
+- Returns fallback or throws CallNotPermittedException
+- After wait duration → transition to HALF-OPEN
+
+HALF-OPEN (probing):
+- Limited number of calls are allowed through to test recovery
+- If calls succeed → transition back to CLOSED (circuit healed)
+- If calls fail → transition back to OPEN (still broken)
+
+State Machine:
+  CLOSED ─(failure rate > threshold)──→ OPEN
+  OPEN   ─(wait duration elapsed)────→ HALF-OPEN
+  HALF-OPEN ─(probe success)─────────→ CLOSED
+  HALF-OPEN ─(probe failure)─────────→ OPEN
+
+=== SLIDING WINDOW TYPES ===
+
+COUNT-BASED: evaluates last N calls
+  - failureRateThreshold=50, slidingWindowSize=10
+  - Open when 5+ of last 10 calls failed
+
+TIME-BASED: evaluates calls in last N seconds
+  - failureRateThreshold=50, slidingWindowSize=10 (seconds)
+  - Open when 50%+ of calls in last 10 seconds failed
+
+=== RESILIENCE4J CONFIGURATION ===
+
+application.yml:
+  resilience4j:
+    circuitbreaker:
+      instances:
+        payment-service:
+          slidingWindowType: COUNT_BASED
+          slidingWindowSize: 10
+          failureRateThreshold: 50          # % failure to open
+          slowCallRateThreshold: 80         # % slow calls to open
+          slowCallDurationThreshold: 2000ms # what counts as "slow"
+          waitDurationInOpenState: 30s      # time in OPEN before HALF-OPEN
+          permittedNumberOfCallsInHalfOpenState: 5  # probes
+          minimumNumberOfCalls: 5           # min calls before evaluation
+          automaticTransitionFromOpenToHalfOpenEnabled: true
+          recordExceptions:
+            - java.io.IOException
+            - java.net.SocketTimeoutException
+          ignoreExceptions:
+            - com.myapp.BusinessException  # don't count as failure
+
+=== ANNOTATION-BASED USAGE ===
+
+@Service
+public class PaymentClient {
+
+    @CircuitBreaker(name = "payment-service", fallbackMethod = "fallback")
+    public PaymentResponse charge(PaymentRequest request) {
+        return externalPaymentApi.charge(request);
+    }
+
+    // Fallback signature must match original method signature + Exception param
+    private PaymentResponse fallback(PaymentRequest request, CallNotPermittedException ex) {
+        log.warn("Circuit OPEN for payment-service");
+        return PaymentResponse.queued("Payment queued for retry");
+    }
+
+    private PaymentResponse fallback(PaymentRequest request, Exception ex) {
+        log.error("Payment failed, returning fallback", ex);
+        return PaymentResponse.failed("Payment temporarily unavailable");
+    }
+}
+
+=== PROGRAMMATIC USAGE ===
+
+CircuitBreakerRegistry registry = CircuitBreakerRegistry.ofDefaults();
+CircuitBreaker cb = registry.circuitBreaker("payment-service");
+
+// Functional style
+Supplier<PaymentResponse> supplier = () -> externalApi.charge(request);
+Supplier<PaymentResponse> decorated = CircuitBreaker.decorateSupplier(cb, supplier);
+Supplier<PaymentResponse> withFallback = Decorators.ofSupplier(decorated)
+    .withFallback(Arrays.asList(CallNotPermittedException.class),
+                  ex -> PaymentResponse.queued("Queued"));
+
+Try<PaymentResponse> result = Try.ofSupplier(withFallback);
+
+=== CIRCUIT BREAKER EVENTS ===
+
+cb.getEventPublisher()
+    .onStateTransition(event ->
+        log.warn("Circuit {} state: {} → {}",
+            event.getCircuitBreakerName(),
+            event.getStateTransition().getFromState(),
+            event.getStateTransition().getToState()));
+
+=== CIRCUIT BREAKER WITH SPRING CLOUD ===
+
+@Service
+public class OrderService {
+
+    private final CircuitBreakerFactory cbFactory;
+
+    public Order getOrder(String id) {
+        return cbFactory.create("order-service")
+            .run(() -> inventoryClient.getOrder(id),
+                 throwable -> getOrderFallback(id, throwable));
+    }
+
+    private Order getOrderFallback(String id, Throwable t) {
+        return new Order(id, "UNKNOWN", "Service unavailable");
+    }
+}
+
+=== MONITORING ===
+
+Metrics:
+  resilience4j.circuitbreaker.state{name="payment-service"} = 0 (CLOSED), 1 (OPEN), 2 (HALF_OPEN)
+  resilience4j.circuitbreaker.failure.rate{name="payment-service"}
+
+Grafana alert: circuit breaker state != CLOSED → page on-call
+
+=== INTERVIEW QUESTIONS ===
+
+Q: What problem does the Circuit Breaker solve?
+A: Prevents cascade failures. Without it, a slow/failed downstream service causes
+   calling service threads to block waiting for timeout, eventually exhausting
+   thread pool and making the calling service also unavailable.
+
+Q: What is the difference between OPEN and HALF-OPEN states?
+A: OPEN: all calls rejected immediately (no downstream calls). HALF-OPEN: limited
+   probe calls allowed to test if downstream recovered. If probes succeed →
+   CLOSED; if fail → back to OPEN.
+
+Q: Should Circuit Breaker or Retry be the outer decorator?
+A: Retry should be outer. If Retry wraps CircuitBreaker, multiple retry attempts
+   accumulate failures faster, causing circuit to open sooner on transient errors.
+   Retry(CircuitBreaker(fn)) — retry counts at CB level; CB(Retry(fn)) — retries
+   might all fail before CB counts them.

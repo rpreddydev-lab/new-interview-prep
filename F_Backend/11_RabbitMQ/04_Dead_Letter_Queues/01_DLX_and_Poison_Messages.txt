@@ -1,0 +1,98 @@
+DEAD LETTER QUEUES AND POISON MESSAGES
+========================================
+
+=== DEAD LETTER EXCHANGE (DLX) ===
+
+A dead-letter exchange receives messages that:
+1. Are rejected (basicNack/basicReject with requeue=false)
+2. Expire due to TTL (x-message-ttl or per-message expiration)
+3. Are dropped because queue is full (x-max-length with reject-publish overflow)
+
+Setup:
+  Main queue arguments:
+    x-dead-letter-exchange:    "dlx"           (exchange to route dead letters to)
+    x-dead-letter-routing-key: "dead.orders"   (optional, overrides original key)
+
+  Dead letter queue:
+    Bound to "dlx" exchange with routing key "dead.orders"
+
+=== DLX HEADERS ===
+
+Dead-lettered messages get x-death array header added:
+  {
+    "queue": "original-queue",
+    "reason": "rejected" | "expired" | "maxlen",
+    "count": 1,
+    "time": <timestamp>,
+    "routing-keys": ["original.routing.key"],
+    "exchange": "original-exchange"
+  }
+
+Each re-dead-lettering increments the count for that queue entry.
+
+=== DEAD LETTER PROCESSING PATTERNS ===
+
+Pattern 1: Inspect and Alert
+  Dead letters go to a monitoring queue.
+  Ops team inspects failed messages in management UI.
+  Alert triggered if DLQ size exceeds threshold.
+
+Pattern 2: Retry with Backoff
+  DLQ is actually a "wait" queue with TTL:
+    x-message-ttl: 30000 (30 seconds)
+    x-dead-letter-exchange: "main-exchange"
+  After TTL, message republished to main queue — automatic retry.
+
+  Multi-level retry:
+    wait-30s-queue → main-queue → wait-5m-queue → main-queue → dlq-permanent
+
+Pattern 3: Republish to Original Queue
+  Consumer reads from DLQ, modifies message if needed, republishes.
+  Add retry counter to prevent infinite loops.
+
+=== POISON MESSAGES ===
+
+A poison message is one that always fails processing, causing infinite loop:
+  Message → Queue → Consumer → Exception → Nack → Requeue → Queue → ...
+
+Prevention Strategies:
+1. Use requeue=false in nack → route to DLX
+2. Check x-death count header; if count > N, send to permanent DLQ
+3. Use Spring AMQP's RejectAndDontRequeueException to force nack without requeue
+4. Apply retry policy with max attempts before dead-lettering
+
+Spring AMQP Poison Message Handling:
+  @RabbitListener(queues = "task-queue")
+  public void handle(Message message) {
+      Long retryCount = getDeathCount(message);  // read x-death header
+      if (retryCount != null && retryCount >= 3) {
+          throw new AmqpRejectAndDontRequeueException("Max retries exceeded");
+      }
+      try {
+          process(message);
+      } catch (Exception e) {
+          throw new AmqpRejectAndDontRequeueException("Processing failed", e);
+      }
+  }
+
+=== QUORUM QUEUES AND DELIVERY LIMIT ===
+
+Quorum queues have built-in delivery limit:
+  x-delivery-limit: 3
+
+After 3 failed deliveries, message is dead-lettered automatically.
+No need to manually check x-death count.
+
+=== MONITORING DEAD LETTER QUEUES ===
+
+- Set up alert when DLQ depth > 0
+- Use management API: GET /api/queues/vhost/dlq-name
+- Tools: Datadog, Prometheus (rabbitmq_exporter), CloudWatch
+- Regularly drain and analyze DLQ messages — they indicate processing bugs
+
+=== STREAM QUEUES AS DLX ===
+
+RabbitMQ Streams can be used as the dead-letter target:
+- Persistent, replayable log of all failed messages
+- Allows reprocessing failed messages at any time
+- Good for audit trail of failures

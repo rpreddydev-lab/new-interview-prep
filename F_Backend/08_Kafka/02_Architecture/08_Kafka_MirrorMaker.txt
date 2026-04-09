@@ -1,0 +1,160 @@
+KAFKA MIRRORMAKER 2 — CROSS-DATACENTER REPLICATION
+====================================================
+
+=== CONCEPT ===
+
+MirrorMaker 2 (MM2) is Kafka's built-in cross-datacenter (geo-replication) tool.
+It replicates topics, consumer group offsets, and metadata between Kafka clusters.
+Based on Kafka Connect framework.
+
+Use cases:
+  - Active-Passive disaster recovery (DR)
+  - Active-Active geo-distributed deployments
+  - Data aggregation (multiple regional clusters → central cluster)
+  - Cloud migration (on-prem → cloud Kafka)
+
+=== MIRRORMAKER 1 VS MIRRORMAKER 2 ===
+
+MirrorMaker 1 (MM1):
+  - Simple consumer + producer bridge
+  - No offset sync (consumer groups don't migrate cleanly)
+  - No topic config sync
+  - No bidirectional replication
+  - Manual configuration of each topic
+
+MirrorMaker 2 (MM2):
+  - Built on Kafka Connect (distributed, fault-tolerant)
+  - Automatic offset translation between clusters
+  - Syncs topic configurations and ACLs
+  - Supports bidirectional replication with cycle detection
+  - Auto-discovers new topics (regex patterns)
+  - Part of Apache Kafka since 2.4
+
+=== ARCHITECTURE ===
+
+MM2 runs as a Kafka Connect cluster with three built-in connectors:
+
+1. MirrorSourceConnector: replicates topics from source → target
+2. MirrorCheckpointConnector: syncs consumer group offsets
+3. MirrorHeartbeatConnector: monitors replication health/lag
+
+Topic naming convention:
+  Source cluster: primary
+  Target cluster: secondary
+  Replicated topics on target: primary.my-topic (prefixed with source alias)
+
+=== CONFIGURATION ===
+
+MirrorMaker 2 as standalone process (connect-mirror-maker.properties):
+
+  # Cluster aliases
+  clusters = us-east, us-west
+
+  # Connection details for each cluster
+  us-east.bootstrap.servers = us-east-kafka:9092
+  us-west.bootstrap.servers = us-west-kafka:9092
+
+  # Replication flow: us-east → us-west
+  us-east->us-west.enabled = true
+  us-east->us-west.topics = .*              # replicate all topics
+  us-east->us-west.topics.exclude = __.consumer_offsets, __.*  # exclude internal
+
+  # Bidirectional: us-west → us-east
+  us-west->us-east.enabled = true
+
+  # Replication factor for replicated topics on target
+  replication.factor = 3
+
+  # Offset lag threshold for alerting
+  checkpoints.topic.replication.factor = 3
+  heartbeats.topic.replication.factor = 3
+
+Start:
+  bin/connect-mirror-maker.sh connect-mirror-maker.properties
+
+=== AS KAFKA CONNECT CONNECTOR ===
+
+Deploy MM2 source connector via Kafka Connect REST API:
+  POST http://connect-cluster:8083/connectors
+
+  {
+    "name": "us-east-to-us-west-mirror",
+    "config": {
+      "connector.class": "org.apache.kafka.connect.mirror.MirrorSourceConnector",
+      "source.cluster.alias": "us-east",
+      "source.cluster.bootstrap.servers": "us-east-kafka:9092",
+      "target.cluster.bootstrap.servers": "us-west-kafka:9092",
+      "topics": "orders.*,payments.*",
+      "tasks.max": "4",
+      "replication.factor": "3",
+      "producer.override.acks": "all"
+    }
+  }
+
+=== OFFSET TRANSLATION (REBALANCING TO DR CLUSTER) ===
+
+Problem: Consumer group "order-processor" at offset 5000 on us-east.
+After failover to us-west, what offset to start from?
+
+MM2 solution:
+  MirrorCheckpointConnector stores offset mappings in __consumer_offsets.
+  Translated offsets available in topic: us-east.checkpoints.internal
+
+  Consumer uses RemoteClusterUtils to translate offsets during failover:
+    Map<TopicPartition, OffsetAndMetadata> translated =
+        RemoteClusterUtils.translateOffsets(
+            properties,
+            "us-east",               // source cluster alias
+            "order-processor",       // consumer group
+            Duration.ofSeconds(10)
+        );
+    consumer.assign(translated.keySet());
+    consumer.commitSync(translated);
+
+=== MONITORING REPLICATION LAG ===
+
+Key metrics (JMX / Prometheus via JMX Exporter):
+
+kafka.connect:type=MirrorSourceConnector
+  replication-latency-ms — end-to-end latency of replication
+  record-count — number of records replicated
+
+kafka.connect:type=MirrorCheckpointConnector
+  checkpoint-latency-ms — offset checkpoint lag
+
+Alert thresholds (example):
+  replication-latency-ms > 60000 (1 minute) → WARNING
+  replication-latency-ms > 300000 (5 minutes) → CRITICAL
+
+=== ACTIVE-ACTIVE SETUP ===
+
+Both clusters accept writes; MM2 replicates bidirectionally.
+
+Cycle detection: MM2 prevents infinite replication loops.
+  us-east produces to orders → replicated to us-west as us-east.orders
+  us-west produces to orders → replicated to us-east as us-west.orders
+  us-east.orders on us-west is NOT replicated back (cycle detection)
+
+Consumers on each cluster read local topics (lower latency).
+Consumers needing global view read: orders, us-west.orders combined.
+
+=== ACTIVE-PASSIVE (DR) ===
+
+Normal: all traffic to us-east.
+DR: if us-east fails, failover to us-west.
+
+1. us-east producers redirect to us-west (DNS/load balancer change)
+2. us-west consumers already have offset translations via MM2
+3. Consumers seek to translated offsets on us-west
+4. Processing continues with minimal message loss (based on replication lag)
+
+RTO (Recovery Time Objective): minutes (manual failover) or seconds (automated)
+RPO (Recovery Point Objective): based on replication lag (typically seconds)
+
+=== LIMITATIONS ===
+
+1. Replicated topics get prefix (us-east.orders) — consumers must handle this
+2. Offset translation is approximate — small re-processing or gaps possible
+3. Exactly-once semantics across clusters is very difficult
+4. Active-active requires careful conflict resolution for stateful processing
+5. MirrorMaker 2 replication is asynchronous — not zero data loss
