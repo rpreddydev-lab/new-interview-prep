@@ -1,0 +1,415 @@
+========================================================
+SPRING SECURITY — METHOD-LEVEL SECURITY
+========================================================
+
+Method security allows you to apply authorization rules directly on Java
+methods using annotations. This is more granular than HTTP-level security
+and can protect service-layer methods regardless of how they're called.
+
+HTTP-level security:  Guards HTTP endpoints (URL patterns)
+Method-level security: Guards individual methods in any Spring bean
+
+========================================================
+1. ENABLING METHOD SECURITY
+========================================================
+
+In Spring Security 6 / Spring Boot 3:
+
+@Configuration
+@EnableMethodSecurity(
+    prePostEnabled = true,   // @PreAuthorize, @PostAuthorize (default: true)
+    securedEnabled = true,   // @Secured
+    jsr250Enabled = true     // @RolesAllowed
+)
+public class SecurityConfig {
+    // ...
+}
+
+Spring Security 5 (legacy):
+@EnableGlobalMethodSecurity(prePostEnabled = true) // DEPRECATED in SS6
+
+Important: @EnableMethodSecurity enables prePostEnabled by default.
+Adding the annotation without parameters is sufficient for @PreAuthorize.
+
+========================================================
+2. @PreAuthorize
+========================================================
+
+@PreAuthorize evaluates a SpEL expression BEFORE the method executes.
+If the expression returns false, an AccessDeniedException is thrown.
+
+Basic usage:
+
+@Service
+public class OrderService {
+
+    // Must be authenticated
+    @PreAuthorize("isAuthenticated()")
+    public List<Order> getMyOrders(String userId) { ... }
+
+    // Must be anonymous (useful for login/register endpoints)
+    @PreAuthorize("isAnonymous()")
+    public void register(RegisterRequest request) { ... }
+
+    // Role-based (hasRole auto-prefixes "ROLE_")
+    @PreAuthorize("hasRole('ADMIN')")
+    public void deleteAllOrders() { ... }
+
+    // Multiple roles (OR)
+    @PreAuthorize("hasAnyRole('MANAGER', 'ADMIN')")
+    public List<Order> getAllOrders() { ... }
+
+    // Authority-based (exact string match)
+    @PreAuthorize("hasAuthority('orders:delete')")
+    public void deleteOrder(Long orderId) { ... }
+
+    // Scope-based (OAuth2)
+    @PreAuthorize("hasAuthority('SCOPE_orders:read')")
+    public List<Order> getOrders() { ... }
+
+    // Method parameter access via SpEL
+    @PreAuthorize("principal.username == #username or hasRole('ADMIN')")
+    public UserProfile getProfile(String username) { ... }
+
+    // Complex SpEL expression
+    @PreAuthorize("""
+        hasRole('ADMIN') or
+        (hasRole('USER') and #order.userId == authentication.name)
+        """)
+    public void updateOrder(Order order) { ... }
+}
+
+SpEL Security expressions available in @PreAuthorize:
+
+Expression                          Description
+----------------------------------- ----------------------------------------
+hasRole('ROLE')                     Checks for ROLE_ + argument
+hasAnyRole('ROLE1', 'ROLE2')        OR check across multiple roles
+hasAuthority('authority')           Exact authority string check
+hasAnyAuthority('a', 'b')           OR check across multiple authorities
+isAuthenticated()                   User is logged in (not anonymous)
+isAnonymous()                       User is not logged in
+isFullyAuthenticated()              Not anonymous, not remember-me
+principal                           The current principal (UserDetails/OidcUser/Jwt)
+authentication                      The full Authentication object
+#paramName                          Access method parameter value
+returnObject                        (PostAuthorize only) method return value
+
+========================================================
+3. @PostAuthorize
+========================================================
+
+@PostAuthorize evaluates AFTER the method executes.
+Use when you need to check the RETURN VALUE.
+
+// Only return if the order belongs to the current user or admin
+@PostAuthorize("""
+    returnObject.userId == authentication.name or
+    hasRole('ADMIN')
+    """)
+public Order getOrderById(Long id) {
+    return orderRepository.findById(id).orElseThrow();
+}
+
+// Return null instead of throwing if access denied:
+@PostFilter("filterObject.ownerId == authentication.name")
+public List<Order> getAllOrders() {
+    return orderRepository.findAll(); // Post-filtered
+}
+
+Important: @PostAuthorize STILL runs the method. If the method has side effects
+(e.g., writes to DB), those happen even if access is later denied.
+
+========================================================
+4. @PreFilter AND @PostFilter
+========================================================
+
+@PreFilter: Filters a collection input parameter before method executes
+@PostFilter: Filters a collection return value after method executes
+
+// Only process items owned by the current user
+@PreFilter("filterObject.ownerId == authentication.name")
+public void processOrders(List<Order> orders) { ... }
+
+// Only return items owned by the current user
+@PostFilter("filterObject.userId == authentication.name")
+public List<Order> getOrders() {
+    return orderRepository.findAll();
+}
+
+Note: @PostFilter loads ALL data from DB then filters in Java.
+For large datasets, this is inefficient — prefer filtering at the query level.
+Spring Data Security Expressions (Spring Data + Spring Security) can push
+security into queries: @Query("SELECT o FROM Order o WHERE o.userId = ?#{authentication.name}")
+
+========================================================
+5. @Secured
+========================================================
+
+@Secured is a simpler, less powerful alternative to @PreAuthorize.
+It only supports role/authority checking (no SpEL).
+
+@Secured("ROLE_ADMIN")
+public void adminOnly() { ... }
+
+@Secured({"ROLE_USER", "ROLE_ADMIN"})  // OR condition
+public void userOrAdmin() { ... }
+
+Requires: @EnableMethodSecurity(securedEnabled = true)
+Limitation: Can't use method parameters or complex expressions.
+Prefer @PreAuthorize for new code.
+
+========================================================
+6. @RolesAllowed (JSR-250)
+========================================================
+
+JSR-250 standard annotation, similar to @Secured:
+
+@RolesAllowed("ADMIN")
+public void adminOnly() { ... }
+
+@RolesAllowed({"USER", "ADMIN"})  // Does NOT auto-prefix ROLE_!
+public void userOrAdmin() { ... }
+
+Requires: @EnableMethodSecurity(jsr250Enabled = true)
+Note: @RolesAllowed does NOT add "ROLE_" prefix (unlike @Secured and hasRole()).
+The authority must exactly match what's in the SecurityContext.
+
+========================================================
+7. CUSTOM PERMISSION EVALUATOR
+========================================================
+
+When security logic is too complex for SpEL, implement PermissionEvaluator:
+
+// Usage in @PreAuthorize:
+@PreAuthorize("hasPermission(#orderId, 'Order', 'read')")
+public Order getOrder(Long orderId) { ... }
+
+@PreAuthorize("hasPermission(#order, 'write')")
+public Order updateOrder(Order order) { ... }
+
+// Implementation:
+@Component
+public class OrderPermissionEvaluator implements PermissionEvaluator {
+
+    private final OrderRepository orderRepository;
+
+    // Called when target object (actual entity) is passed
+    @Override
+    public boolean hasPermission(Authentication auth,
+                                  Object targetDomainObject,
+                                  Object permission) {
+        if (targetDomainObject instanceof Order order) {
+            String username = auth.getName();
+            String perm = permission.toString();
+
+            return switch (perm) {
+                case "read" -> order.getUserId().equals(username)
+                    || hasRole(auth, "ADMIN");
+                case "write" -> order.getUserId().equals(username)
+                    || hasRole(auth, "MANAGER");
+                case "delete" -> hasRole(auth, "ADMIN");
+                default -> false;
+            };
+        }
+        return false;
+    }
+
+    // Called when target ID + type are passed (lazy load)
+    @Override
+    public boolean hasPermission(Authentication auth,
+                                  Serializable targetId,
+                                  String targetType,
+                                  Object permission) {
+        if ("Order".equals(targetType)) {
+            Order order = orderRepository.findById((Long) targetId).orElse(null);
+            if (order == null) return false;
+            return hasPermission(auth, order, permission);
+        }
+        return false;
+    }
+
+    private boolean hasRole(Authentication auth, String role) {
+        return auth.getAuthorities().stream()
+            .anyMatch(a -> a.getAuthority().equals("ROLE_" + role));
+    }
+}
+
+// Register the evaluator:
+@Bean
+public MethodSecurityExpressionHandler methodSecurityExpressionHandler(
+        OrderPermissionEvaluator permissionEvaluator) {
+    DefaultMethodSecurityExpressionHandler handler =
+        new DefaultMethodSecurityExpressionHandler();
+    handler.setPermissionEvaluator(permissionEvaluator);
+    return handler;
+}
+
+========================================================
+8. SPRING SECURITY ON REPOSITORY LAYER
+========================================================
+
+Method security can also be applied to Spring Data repositories:
+
+public interface OrderRepository extends JpaRepository<Order, Long> {
+
+    // Only admins can call this
+    @PreAuthorize("hasRole('ADMIN')")
+    List<Order> findAll();
+
+    // Users can only find their own orders
+    @PostFilter("filterObject.userId == authentication.name or hasRole('ADMIN')")
+    List<Order> findByStatus(String status);
+}
+
+Spring Data Integration (@EnableSpringDataWebSupport + security integration):
+
+// Automatically inject current user into query:
+@Query("SELECT o FROM Order o WHERE o.userId = ?#{authentication.name}")
+List<Order> findCurrentUserOrders();
+
+========================================================
+9. HANDLING METHOD SECURITY EXCEPTIONS
+========================================================
+
+When @PreAuthorize fails, Spring throws AccessDeniedException.
+How it surfaces:
+
+1. From a @RestController method:
+   → ExceptionTranslationFilter catches it
+   → Returns 403 Forbidden (if authenticated) or 401 Unauthorized (if not)
+
+2. From a @Service method called directly:
+   → Exception propagates up the call stack
+   → Handle in @ControllerAdvice
+
+@RestControllerAdvice
+public class SecurityExceptionHandler {
+
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<ErrorResponse> handleAccessDenied(AccessDeniedException ex) {
+        return ResponseEntity.status(HttpStatus.FORBIDDEN)
+            .body(new ErrorResponse("ACCESS_DENIED", "Insufficient permissions"));
+    }
+}
+
+Note: Do NOT catch AccessDeniedException in @Service — let it propagate to
+the ExceptionTranslationFilter or @ControllerAdvice.
+
+========================================================
+10. CLASS-LEVEL @PreAuthorize
+========================================================
+
+Apply @PreAuthorize at the class level for default security:
+
+@RestController
+@RequestMapping("/api/admin")
+@PreAuthorize("hasRole('ADMIN')")  // All methods in class require ADMIN
+public class AdminController {
+
+    @GetMapping("/users")
+    public List<User> getAllUsers() { ... }  // Inherits ADMIN requirement
+
+    @DeleteMapping("/users/{id}")
+    @PreAuthorize("hasRole('SUPER_ADMIN')")  // Method-level overrides class-level
+    public void deleteUser(@PathVariable Long id) { ... }
+
+    @GetMapping("/health")
+    @PreAuthorize("permitAll()")  // Override to allow all
+    public String health() { return "OK"; }
+}
+
+========================================================
+11. METHOD SECURITY ORDERING
+========================================================
+
+Spring Security method security uses AOP (Aspect-Oriented Programming).
+
+Order of evaluation:
+  1. @PreFilter (if present)
+  2. @PreAuthorize (if present) — if fails, stop here
+  3. Method executes
+  4. @PostAuthorize (if present) — if fails, throw exception
+  5. @PostFilter (if present)
+
+AOP proxy considerations:
+  - Self-calls within the same bean DO NOT go through the proxy!
+  - @PreAuthorize won't work if method calls itself within the same class
+  - Solution: Inject the bean into itself or restructure code
+
+// PROBLEM — self-call bypasses security:
+@Service
+public class OrderService {
+    public void createBulkOrders(List<Order> orders) {
+        orders.forEach(this::createOrder);  // self-call! @PreAuthorize skipped!
+    }
+
+    @PreAuthorize("hasRole('USER')")
+    public void createOrder(Order order) { ... }
+}
+
+// SOLUTION — inject self:
+@Service
+public class OrderService {
+    @Autowired
+    private OrderService self;  // Inject through proxy
+
+    public void createBulkOrders(List<Order> orders) {
+        orders.forEach(self::createOrder);  // Goes through proxy ✓
+    }
+
+    @PreAuthorize("hasRole('USER')")
+    public void createOrder(Order order) { ... }
+}
+
+========================================================
+12. COMMON INTERVIEW QUESTIONS
+========================================================
+
+Q: What is the difference between HTTP security and method security?
+A: HTTP security (authorizeHttpRequests) applies at the HTTP request level,
+   based on URL patterns and HTTP methods. Method security (@PreAuthorize)
+   applies at the Java method level, independent of how the method is called.
+   Method security works even when called from within the same JVM (e.g.,
+   message-driven beans, scheduled tasks), while HTTP security only applies
+   to web requests.
+
+Q: Why doesn't @PreAuthorize work on self-invocations?
+A: Spring Security's method security uses Spring AOP proxies. When a method
+   calls another method on the SAME bean (self-invocation), it bypasses the
+   proxy and calls the raw object directly. The security interceptor never runs.
+   Solutions: inject the bean into itself (via @Autowired), or use AspectJ
+   weaving (compile-time AOP) instead of proxy-based AOP.
+
+Q: What is the difference between @PreAuthorize and @Secured?
+A: @Secured: Simple role checking only, no SpEL, just string literals.
+   @PreAuthorize: Full SpEL support — can access method parameters (#param),
+   check return values (returnObject), combine conditions, call beans
+   (@beanName.method()). @PreAuthorize is always preferred for new code.
+
+Q: How do you implement record-level (row-level) security in Spring?
+A: Use @PostAuthorize to check return value against the current user, OR
+   implement a custom PermissionEvaluator with hasPermission() that loads
+   the entity and checks ownership. For large datasets, use Spring Data JPA
+   with @Query("... WHERE userId = ?#{authentication.name}") to filter
+   at the database level.
+
+Q: What does @PostFilter do and when would you use it?
+A: @PostFilter runs a SpEL expression against each element of a returned
+   collection, keeping only elements where the expression is true (filterObject
+   variable). Use it for small collections. For large datasets, prefer
+   database-level filtering to avoid loading all data into memory.
+
+Q: How do you test method security?
+A: Use @WithMockUser or @WithUserDetails in tests to set up a mock
+   SecurityContext. Example:
+   @Test
+   @WithMockUser(roles = "ADMIN")
+   void adminCanDelete() {
+       assertDoesNotThrow(() -> service.delete(1L));
+   }
+
+Q: Can you apply @PreAuthorize to a Spring Data repository method?
+A: Yes. Spring Data repository interfaces are Spring beans and are also
+   proxied by Spring AOP. @PreAuthorize on repository methods is valid and
+   is intercepted before the actual query executes.

@@ -1,0 +1,383 @@
+================================================================
+SOCKJS + STOMP WITH SPRING BOOT
+================================================================
+
+Raw WebSocket provides only a binary/text channel with no routing
+or messaging semantics. STOMP (Simple Text Oriented Messaging Protocol)
+adds a publish-subscribe model on top. SockJS provides WebSocket
+fallbacks for environments that don't support it.
+
+================================================================
+1. WHAT IS STOMP?
+================================================================
+
+STOMP is a simple messaging protocol with these commands:
+  CONNECT     — establish a STOMP session
+  SUBSCRIBE   — subscribe to a topic/queue
+  SEND        — send a message to a destination
+  UNSUBSCRIBE — cancel a subscription
+  DISCONNECT  — end the session
+
+STOMP destinations are path-like:
+  /topic/...   — broadcast (pub/sub, multiple subscribers)
+  /queue/...   — point-to-point (one subscriber)
+  /user/queue/... — user-specific messages (Spring Security integration)
+  /app/...     — routes to @MessageMapping handler in Spring Boot
+
+================================================================
+2. WHAT IS SOCKJS?
+================================================================
+
+SockJS is a browser JavaScript library that provides a WebSocket-like
+API but falls back to HTTP-based transports (XHR streaming, long
+polling) when WebSocket is unavailable:
+
+  WebSocket → XHR streaming → long-polling
+
+This makes it work behind corporate firewalls/proxies that block
+WebSocket connections. Spring Boot has built-in SockJS support.
+
+================================================================
+3. DEPENDENCIES
+================================================================
+
+NPM:
+  npm install @stomp/stompjs sockjs-client
+
+Vite note: SockJS uses CommonJS. Add to vite.config.js:
+  optimizeDeps: { include: ['sockjs-client'] }
+
+================================================================
+4. CONNECTING WITH STOMP + SOCKJS
+================================================================
+
+  import { Client } from '@stomp/stompjs';
+  import SockJS from 'sockjs-client';
+
+  const stompClient = new Client({
+    // Use SockJS factory instead of raw ws:// URL
+    webSocketFactory: () => new SockJS('https://api.example.com/ws'),
+
+    // Auth headers sent in STOMP CONNECT frame
+    connectHeaders: {
+      Authorization: `Bearer ${getToken()}`,
+    },
+
+    reconnectDelay: 5000, // ms to wait before reconnecting
+
+    onConnect: (frame) => {
+      console.log('STOMP connected', frame);
+
+      // Subscribe after connection
+      stompClient.subscribe('/topic/notifications', (message) => {
+        const data = JSON.parse(message.body);
+        console.log('Notification:', data);
+      });
+    },
+
+    onDisconnect: () => {
+      console.log('STOMP disconnected');
+    },
+
+    onStompError: (frame) => {
+      console.error('STOMP error', frame.headers['message']);
+    },
+  });
+
+  // Activate (connect)
+  stompClient.activate();
+
+  // Deactivate (disconnect gracefully)
+  stompClient.deactivate();
+
+================================================================
+5. REACT HOOK FOR STOMP
+================================================================
+
+  // src/hooks/useStompClient.js
+  import { useEffect, useRef, useCallback } from 'react';
+  import { Client } from '@stomp/stompjs';
+  import SockJS from 'sockjs-client';
+
+  export function useStompClient(url, { onConnect } = {}) {
+    const clientRef = useRef(null);
+
+    useEffect(() => {
+      const client = new Client({
+        webSocketFactory: () => new SockJS(url),
+        connectHeaders: {
+          Authorization: `Bearer ${getToken()}`,
+        },
+        reconnectDelay: 5000,
+        onConnect: (frame) => {
+          console.log('[STOMP] Connected');
+          onConnect?.(client, frame);
+        },
+        onStompError: (frame) => {
+          console.error('[STOMP] Error', frame);
+        },
+      });
+
+      client.activate();
+      clientRef.current = client;
+
+      return () => {
+        client.deactivate();
+      };
+    }, [url]);
+
+    const subscribe = useCallback((destination, callback) => {
+      if (!clientRef.current?.connected) return;
+      return clientRef.current.subscribe(destination, (message) => {
+        callback(JSON.parse(message.body));
+      });
+    }, []);
+
+    const send = useCallback((destination, body) => {
+      if (!clientRef.current?.connected) return;
+      clientRef.current.publish({
+        destination,
+        body: JSON.stringify(body),
+      });
+    }, []);
+
+    return { subscribe, send };
+  }
+
+================================================================
+6. SUBSCRIBING AND RECEIVING MESSAGES
+================================================================
+
+  function NotificationBell() {
+    const [count, setCount] = useState(0);
+    const { subscribe } = useStompClient('https://api.example.com/ws', {
+      onConnect: (client) => {
+        // Subscribe to broadcast topic
+        client.subscribe('/topic/notifications', (message) => {
+          const notif = JSON.parse(message.body);
+          setCount(prev => prev + 1);
+          toast.info(notif.message);
+        });
+
+        // Subscribe to user-specific queue
+        client.subscribe('/user/queue/alerts', (message) => {
+          const alert = JSON.parse(message.body);
+          toast.warning(alert.message);
+        });
+      },
+    });
+
+    return <span>🔔 {count}</span>;
+  }
+
+================================================================
+7. SENDING MESSAGES TO SPRING BOOT
+================================================================
+
+REACT — send to /app/... prefix (routes to @MessageMapping):
+
+  const { send } = useStompClient(...);
+
+  // In a chat component
+  const sendMessage = (text) => {
+    send('/app/chat.send', {
+      roomId: 'general',
+      text,
+      sender: currentUser.username,
+    });
+  };
+
+SPRING BOOT BACKEND:
+
+  @Controller
+  public class ChatController {
+
+    @MessageMapping("/chat.send")
+    @SendTo("/topic/chat/general")
+    public ChatMessage handleMessage(ChatMessage message) {
+      // Broadcast to all subscribers of /topic/chat/general
+      message.setTimestamp(Instant.now());
+      return message;
+    }
+
+    @MessageMapping("/chat.send.room")
+    public void handleRoomMessage(
+        @Payload ChatMessage message,
+        @Header("simpSessionId") String sessionId
+    ) {
+      // Send to specific room topic
+      messagingTemplate.convertAndSend(
+          "/topic/chat/" + message.getRoomId(), message);
+    }
+  }
+
+  // For user-specific messages:
+  @MessageMapping("/user.message")
+  public void sendToUser(@Payload DirectMessage message) {
+    messagingTemplate.convertAndSendToUser(
+        message.getRecipient(),
+        "/queue/messages",
+        message
+    );
+    // Goes to: /user/{recipient}/queue/messages
+  }
+
+================================================================
+8. SPRING BOOT WEBSOCKET CONFIGURATION
+================================================================
+
+  @Configuration
+  @EnableWebSocketMessageBroker
+  public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+      registry.addEndpoint("/ws")
+          .setAllowedOrigins("http://localhost:5173", "https://app.example.com")
+          .withSockJS(); // enables SockJS fallback
+    }
+
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry config) {
+      // Routes starting with /app go to @MessageMapping methods
+      config.setApplicationDestinationPrefixes("/app");
+
+      // In-memory broker for /topic (broadcast) and /queue (point-to-point)
+      config.enableSimpleBroker("/topic", "/queue");
+
+      // For user-specific destinations (/user/queue/...)
+      config.setUserDestinationPrefix("/user");
+    }
+  }
+
+FOR PRODUCTION — replace in-memory broker with RabbitMQ or ActiveMQ:
+  config.enableStompBrokerRelay("/topic", "/queue")
+      .setRelayHost("localhost")
+      .setRelayPort(61613)
+      .setClientLogin("guest")
+      .setClientPasscode("guest");
+
+================================================================
+9. AUTHENTICATION WITH STOMP
+================================================================
+
+Authenticate in the STOMP CONNECT headers, not just at the HTTP level:
+
+  @Component
+  public class AuthChannelInterceptor implements ChannelInterceptor {
+    @Autowired
+    private JwtTokenValidator jwtValidator;
+
+    @Override
+    public Message<?> preSend(Message<?> message, MessageChannel channel) {
+      StompHeaderAccessor accessor =
+          MessageHeaderAccessor.getAccessor(message, StompHeaderAccessor.class);
+
+      if (StompCommand.CONNECT.equals(accessor.getCommand())) {
+        String authHeader = accessor.getFirstNativeHeader("Authorization");
+        if (authHeader != null && authHeader.startsWith("Bearer ")) {
+          String token = authHeader.substring(7);
+          Authentication auth = jwtValidator.validate(token);
+          accessor.setUser(auth); // sets the Principal for /user/ routing
+        }
+      }
+      return message;
+    }
+  }
+
+  @Configuration
+  public class WebSocketSecurityConfig extends AbstractSecurityWebSocketMessageBrokerConfigurer {
+    @Override
+    protected void configureInbound(MessageSecurityMetadataSourceRegistry messages) {
+      messages
+          .simpSubscribeDestMatchers("/user/**").authenticated()
+          .simpDestMatchers("/app/**").authenticated()
+          .anyMessage().authenticated();
+    }
+
+    @Override
+    protected boolean sameOriginDisabled() {
+      return true; // disable CSRF for WS in dev
+    }
+  }
+
+================================================================
+10. COMPLETE CHAT COMPONENT EXAMPLE
+================================================================
+
+  function ChatRoom({ roomId }) {
+    const [messages, setMessages] = useState([]);
+    const [input, setInput] = useState('');
+    const clientRef = useRef(null);
+
+    useEffect(() => {
+      const client = new Client({
+        webSocketFactory: () => new SockJS('https://api.example.com/ws'),
+        connectHeaders: { Authorization: `Bearer ${getToken()}` },
+        reconnectDelay: 5000,
+        onConnect: () => {
+          client.subscribe(`/topic/chat/${roomId}`, (msg) => {
+            setMessages(prev => [...prev, JSON.parse(msg.body)]);
+          });
+        },
+      });
+
+      client.activate();
+      clientRef.current = client;
+
+      return () => client.deactivate();
+    }, [roomId]);
+
+    const sendMessage = () => {
+      if (!input.trim() || !clientRef.current?.connected) return;
+      clientRef.current.publish({
+        destination: '/app/chat.send',
+        body: JSON.stringify({ roomId, text: input }),
+      });
+      setInput('');
+    };
+
+    return (
+      <div>
+        <div>{messages.map(m => <p key={m.id}>{m.sender}: {m.text}</p>)}</div>
+        <input value={input} onChange={e => setInput(e.target.value)} />
+        <button onClick={sendMessage}>Send</button>
+      </div>
+    );
+  }
+
+================================================================
+11. INTERVIEW QUESTIONS
+================================================================
+
+Q: What does STOMP add over raw WebSocket?
+A: STOMP adds a messaging layer: destinations (routing), message
+   headers, and a publish-subscribe model. It lets you subscribe to
+   specific topics and send to specific handlers, instead of
+   managing routing yourself. Spring Boot's @MessageMapping
+   integrates directly with STOMP.
+
+Q: Why use SockJS instead of plain WebSocket?
+A: SockJS provides fallback transports (XHR streaming, long-polling)
+   for environments where WebSocket is blocked (corporate proxies,
+   old browsers). Production apps often use SockJS to maximize
+   compatibility. In Spring, add .withSockJS() to the endpoint.
+
+Q: What is the difference between /topic and /queue in STOMP?
+A: /topic is broadcast (pub/sub): all subscribers receive each message.
+   /queue is point-to-point: typically one consumer per message.
+   /user/queue is user-specific: routes to the specific user's session
+   only (Spring manages the session mapping automatically).
+
+Q: How do you authenticate a STOMP connection?
+A: Include the JWT in the connectHeaders (Authorization header).
+   Implement ChannelInterceptor.preSend() to validate the token on
+   STOMP CONNECT command. Call accessor.setUser(auth) to set the
+   Principal, which is required for /user/ destination routing.
+
+Q: How would you scale WebSocket connections beyond one server?
+A: Use an external message broker (RabbitMQ, ActiveMQ) with
+   enableStompBrokerRelay instead of the in-memory simple broker.
+   All server instances connect to the same broker. Sticky sessions
+   (load balancer) are not required — the broker relays messages
+   to the right server.

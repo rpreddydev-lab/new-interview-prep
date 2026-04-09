@@ -1,0 +1,188 @@
+================================================================
+Dirty Checking and Flush Mode
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHAT IS DIRTY CHECKING?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Hibernate's automatic detection of changes to managed entities.
+
+When an entity enters the persistence context (loaded via find/query),
+Hibernate stores a snapshot of its original state.
+
+On flush, Hibernate compares the current state with the snapshot:
+  If different → generate and execute an UPDATE SQL statement
+  If same → no SQL emitted
+
+This is why you don't need to explicitly call save() on a managed entity:
+  @Transactional
+  public void updateUserEmail(Long id, String newEmail) {
+      User user = userRepo.findById(id).get();   // entity is managed
+      user.setEmail(newEmail);                   // dirty — snapshot mismatch
+      // NO save() needed! Hibernate auto-flushes the UPDATE on commit
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. HOW DIRTY CHECKING WORKS INTERNALLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Entity loaded → Hibernate stores a "hydrated state" copy
+2. flush() called → Hibernate walks through ALL managed entities
+3. For each entity, compare field by field to hydrated snapshot
+4. Changed fields → generate UPDATE SET col1=? WHERE id=?
+
+Cost:
+  - O(N × fields) comparison for N entities in the session
+  - Large sessions with hundreds of entities → noticeable CPU + memory overhead
+
+Optimizations:
+  @DynamicUpdate  — only include changed columns in UPDATE (Hibernate)
+  @DynamicInsert  — only include non-null columns in INSERT (Hibernate)
+  @Transactional(readOnly=true) — skip dirty checking entirely
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. @DYNAMICUPDATE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Without @DynamicUpdate (default):
+  UPDATE users SET email=?, first_name=?, last_name=?, status=?, ...
+  (ALL columns included even if only email changed)
+
+With @DynamicUpdate:
+  @Entity
+  @DynamicUpdate   // Hibernate-specific
+  public class User { ... }
+  // SQL: UPDATE users SET email=? WHERE id=?  (only changed columns)
+
+Benefits:
+  - Reduces data sent over the wire
+  - Avoids overwriting concurrent updates to other columns
+  - Important for wide tables with many columns
+
+Caveat: @DynamicUpdate requires comparing state on every flush to
+determine which columns changed — slightly more CPU but often a
+net win for wide entities.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. WHAT IS FLUSH MODE?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Flush mode controls WHEN Hibernate synchronizes the persistence context
+(writes buffered SQL) to the DB.
+
+FlushModeType (JPA):
+  AUTO     (default) — flush before any query that might need fresh data
+  COMMIT   — only flush at transaction commit
+
+Hibernate FlushMode (more granular):
+  ALWAYS   — flush before EVERY query (even if not needed)
+  AUTO     — flush before a query if it might read stale data (smart default)
+  COMMIT   — only flush at commit
+  MANUAL   — never flush automatically (application must call flush() explicitly)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. FLUSH MODE IN DETAIL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+AUTO (default):
+  @Transactional
+  public void process() {
+      userRepo.save(new User("Alice"));   // queued for INSERT (pending in 1LC)
+      long count = userRepo.count();      // AUTO: flushes INSERT before count query
+      // count = 1 (Alice is visible in the query)
+  }
+
+COMMIT:
+  em.setFlushMode(FlushModeType.COMMIT);
+  @Transactional
+  public void process() {
+      userRepo.save(new User("Alice"));
+      long count = userRepo.count();   // Alice NOT flushed yet — count is stale!
+      // Alice committed at transaction end, not visible during tx queries
+  }
+
+MANUAL:
+  session.setHibernateFlushMode(FlushMode.MANUAL);
+  // Application must call session.flush() explicitly
+  // Useful for read-only reporting sessions where no writes should occur
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. WHEN TO CHANGE FLUSH MODE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Use COMMIT when:
+  - Many reads interleaved with writes; you know reads don't need pending writes
+  - Batch processing where you want to defer SQL until end
+  - Reduces unnecessary pre-flush before read queries
+
+Use MANUAL when:
+  - Read-only reporting sessions (no writes intended)
+  - Custom batch processing with explicit flush control
+
+Setting in Spring:
+  @Transactional
+  public void batchReport() {
+      EntityManager em = ...;
+      em.setFlushMode(FlushModeType.COMMIT);
+      // or
+      em.unwrap(Session.class).setHibernateFlushMode(FlushMode.MANUAL);
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. WHEN DIRTY CHECKING CAN SURPRISE YOU
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Surprise 1: Accidental updates
+  @Transactional
+  public User getUser(Long id) {
+      User user = userRepo.findById(id).get();
+      user.setLastSeenAt(LocalDateTime.now());  // modifies entity!
+      return user;  // UPDATE fired on flush even though intent was GET-only
+  }
+  Fix: use @Transactional(readOnly=true) or return a DTO
+
+Surprise 2: After bulk update, 1LC is stale
+  userRepo.updateAllEmailsToLowercase();  // @Modifying bulk update
+  User u = userRepo.findById(1L).get();   // reads from 1LC — STALE!
+  System.out.println(u.getEmail());       // old uppercase email!
+  Fix: use @Modifying(clearAutomatically=true) or call em.clear()
+
+Surprise 3: CascadeType.MERGE + dirty checking
+  Detached entity merged back → Hibernate compares vs DB state
+  → may trigger unexpected UPDATEs on nested objects
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. INTERVIEW QUICK HITS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is dirty checking in Hibernate?
+A: Dirty checking is Hibernate's automatic detection of changes to managed
+   entities within the persistence context. On flush, Hibernate compares
+   each entity's current state to its original snapshot (hydrated state).
+   If different, it generates an UPDATE SQL without requiring explicit save().
+
+Q: When does Hibernate flush the persistence context?
+A: With FlushMode.AUTO (default): before executing a query that might
+   return stale data (e.g., a SELECT after a pending INSERT on the same table).
+   Also at transaction commit. With FlushMode.COMMIT: only at commit.
+   With FlushMode.MANUAL: only when flush() is called explicitly.
+
+Q: What is @DynamicUpdate?
+A: A Hibernate annotation that generates UPDATE statements with only the
+   modified columns instead of all columns. Without it, every UPDATE sends
+   all entity fields. @DynamicUpdate reduces network data and avoids
+   overwriting concurrent updates to other columns.
+
+Q: Why might an entity get updated without calling save()?
+A: Because of dirty checking. If you load a managed entity, modify its
+   fields, and flush occurs (before a query or at commit), Hibernate
+   detects the change via snapshot comparison and generates an UPDATE.
+   Use @Transactional(readOnly=true) to prevent dirty checking on read-only
+   operations, or return a DTO copy that's not tracked.
+
+Q: What is the danger of FlushMode.COMMIT?
+A: With FlushMode.COMMIT, Hibernate doesn't flush pending writes before
+   read queries. If you saved an entity and then query for it in the same
+   transaction, the query may return stale results (the entity is in 1LC
+   but not yet in DB). Usually FlushMode.AUTO is the safer default.

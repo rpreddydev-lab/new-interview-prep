@@ -1,0 +1,447 @@
+========================================================
+SPRING SECURITY — CORS AND CSRF
+========================================================
+
+CORS (Cross-Origin Resource Sharing) and CSRF (Cross-Site Request Forgery)
+are two distinct web security concerns that Spring Security handles.
+They are frequently confused but address different problems.
+
+  CORS:  Browser policy — controls which origins can call your API
+  CSRF:  Attack vector — prevents unauthorized cross-site state changes
+
+========================================================
+PART 1: CORS
+========================================================
+
+1.1 WHAT IS CORS?
+-----------------
+
+Same-Origin Policy (SOP): Browsers block JavaScript from making HTTP requests
+to a DIFFERENT origin (protocol + host + port combination) than the page.
+
+Example:
+  Frontend: https://app.example.com (origin A)
+  API:       https://api.example.com (origin B) ← Different origin!
+
+Without CORS headers, the browser blocks the request with:
+  "Access to fetch at 'https://api.example.com/orders' from origin
+   'https://app.example.com' has been blocked by CORS policy"
+
+CORS is NOT a server-side security mechanism — it's a browser enforcement.
+Direct HTTP clients (Postman, cURL, services) are NOT subject to CORS.
+
+CORS Headers:
+  Response header                         Purpose
+  ------------------------------------- ------------------------------------------
+  Access-Control-Allow-Origin           Which origins are allowed
+  Access-Control-Allow-Methods          Which HTTP methods are allowed
+  Access-Control-Allow-Headers          Which request headers are allowed
+  Access-Control-Allow-Credentials      Whether cookies/auth headers are sent
+  Access-Control-Expose-Headers         Headers client JS can access
+  Access-Control-Max-Age                Preflight cache duration (seconds)
+
+Preflight Request:
+  For "complex" requests (non-GET/POST, custom headers, with credentials),
+  the browser sends an OPTIONS preflight request first. The server must
+  respond with appropriate CORS headers before the actual request is sent.
+
+  OPTIONS /api/orders HTTP/1.1
+  Origin: https://app.example.com
+  Access-Control-Request-Method: POST
+  Access-Control-Request-Headers: Content-Type, Authorization
+
+  HTTP/1.1 200 OK
+  Access-Control-Allow-Origin: https://app.example.com
+  Access-Control-Allow-Methods: GET, POST, PUT, DELETE
+  Access-Control-Allow-Headers: Content-Type, Authorization
+  Access-Control-Max-Age: 3600
+
+1.2 SPRING SECURITY CORS CONFIGURATION
+---------------------------------------
+
+Spring Security must be configured to allow preflight requests and add CORS headers
+BEFORE the security filter chain applies.
+
+// Method 1: CorsConfigurationSource bean (recommended)
+@Bean
+public CorsConfigurationSource corsConfigurationSource() {
+    CorsConfiguration config = new CorsConfiguration();
+    config.setAllowedOrigins(List.of(
+        "https://app.example.com",
+        "https://admin.example.com"
+    ));
+    // For development only:
+    // config.setAllowedOriginPatterns(List.of("http://localhost:*"));
+
+    config.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+    config.setAllowedHeaders(List.of(
+        "Authorization", "Content-Type", "Accept", "X-Requested-With"
+    ));
+    config.setExposedHeaders(List.of("X-Total-Count", "Link"));
+    config.setAllowCredentials(true);  // Required for cookies/Authorization header
+    config.setMaxAge(3600L);           // Preflight cache: 1 hour
+
+    UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+    source.registerCorsConfiguration("/api/**", config);
+
+    // Different config for public endpoints:
+    CorsConfiguration publicConfig = new CorsConfiguration();
+    publicConfig.setAllowedOrigins(List.of("*"));
+    publicConfig.setAllowedMethods(List.of("GET"));
+    source.registerCorsConfiguration("/public/**", publicConfig);
+
+    return source;
+}
+
+// Wire into SecurityFilterChain:
+.cors(cors -> cors.configurationSource(corsConfigurationSource()))
+
+// Or use the auto-detected bean:
+.cors(Customizer.withDefaults())  // Spring finds CorsConfigurationSource bean automatically
+
+// Method 2: @CrossOrigin on controller (simple, per-controller)
+@RestController
+@CrossOrigin(origins = "https://app.example.com",
+             methods = {RequestMethod.GET, RequestMethod.POST},
+             allowedHeaders = {"Authorization", "Content-Type"})
+public class OrderController {
+    // ...
+}
+
+// Method 3: @CrossOrigin on specific method
+@GetMapping("/orders")
+@CrossOrigin(origins = "*", maxAge = 3600)
+public List<Order> getOrders() { ... }
+
+IMPORTANT: When using Spring Security, always configure CORS via
+Spring Security's .cors() — NOT just @CrossOrigin. Spring Security's
+CorsFilter must run BEFORE the authentication filters.
+
+1.3 ALLOWING ALL ORIGINS (DEVELOPMENT ONLY)
+--------------------------------------------
+
+// DO NOT USE IN PRODUCTION:
+config.setAllowedOrigins(List.of("*"));
+// or:
+config.addAllowedOriginPattern("*");
+
+Note: allowCredentials(true) cannot be combined with allowedOrigins("*").
+For credentialed requests, you must specify exact origins.
+
+1.4 CORS WITH WILDCARDS
+-----------------------
+
+Spring 6 supports origin patterns:
+config.setAllowedOriginPatterns(List.of(
+    "https://*.example.com",    // Any subdomain
+    "http://localhost:[*]"      // Any localhost port
+));
+
+========================================================
+PART 2: CSRF
+========================================================
+
+2.1 WHAT IS CSRF?
+-----------------
+
+Cross-Site Request Forgery: An attacker tricks a logged-in user into
+unknowingly submitting a malicious request to a trusted site.
+
+Attack scenario:
+  1. User logs into bank.example.com (session cookie set)
+  2. User visits malicious attacker.com (open in another tab)
+  3. attacker.com has hidden form:
+     <form action="https://bank.example.com/transfer" method="POST">
+       <input name="amount" value="10000">
+       <input name="to" value="attacker-account">
+     </form>
+     <script>document.forms[0].submit();</script>
+  4. Browser sends POST to bank.example.com WITH the session cookie!
+  5. Bank processes the transfer thinking it's the legitimate user.
+
+CSRF works because:
+  - Cookies are automatically sent with every request to the domain
+  - Browser's SOP doesn't prevent FORM submissions cross-origin
+    (only restricts reading responses)
+
+2.2 CSRF PROTECTION MECHANISMS
+--------------------------------
+
+Synchronizer Token Pattern (classic):
+  - Server generates a random CSRF token per session
+  - Token embedded in forms (hidden field) or custom header
+  - Server validates token on every state-changing request (POST, PUT, DELETE)
+  - Attacker can't forge the token (no access to the page DOM)
+
+SameSite Cookie Attribute (modern):
+  - SameSite=Strict: Cookie sent only for same-site requests (strictest)
+  - SameSite=Lax: Cookie sent for same-site + top-level navigation GETs (default in modern browsers)
+  - SameSite=None: Cookie sent cross-site (requires Secure flag)
+  - Mitigates CSRF without needing synchronizer tokens
+
+Double Submit Cookie:
+  - Server sets CSRF token in a cookie (readable by JS)
+  - Client reads cookie, sends token in request header
+  - Server compares header value vs cookie value
+  - Attacker can't read cookie (SOP prevents JS access cross-origin)
+
+2.3 SPRING SECURITY CSRF — DEFAULT BEHAVIOR
+--------------------------------------------
+
+Spring Security enables CSRF protection by default for:
+  - All state-changing HTTP methods: POST, PUT, DELETE, PATCH
+  - NOT for: GET, HEAD, OPTIONS, TRACE
+
+Default implementation uses HttpSessionCsrfTokenRepository:
+  - Generates random token per session
+  - Stores in HttpSession
+  - Client must send in:
+    - Request parameter: _csrf
+    - Or header: X-CSRF-TOKEN
+
+2.4 CSRF FOR SERVER-SIDE RENDERED APPS (FORMS)
+-----------------------------------------------
+
+For Thymeleaf/JSP apps, include CSRF token in every form:
+
+// Thymeleaf — automatic:
+<form method="post" th:action="@{/transfer}">
+    <input type="hidden" th:name="${_csrf.parameterName}" th:value="${_csrf.token}"/>
+    <!-- OR Thymeleaf auto-injects if th:action is used -->
+</form>
+
+// JSP:
+<form method="post" action="/transfer">
+    <input type="hidden" name="${_csrf.parameterName}" value="${_csrf.token}"/>
+</form>
+
+// Spring Security config (enable CSRF for form-based apps):
+.csrf(csrf -> csrf
+    .csrfTokenRepository(HttpSessionCsrfTokenRepository.withHttpOnlyFalse())
+    // OR:
+    .csrfTokenRepository(new HttpSessionCsrfTokenRepository())
+)
+
+2.5 CSRF FOR REST APIS — WHEN TO DISABLE
+-----------------------------------------
+
+For stateless REST APIs using JWT (Bearer tokens), CSRF protection can be disabled:
+
+WHY it's safe to disable CSRF for stateless JWT APIs:
+  - JWT tokens are typically stored in memory or localStorage
+  - They're sent in the Authorization header, NOT a cookie
+  - Browsers don't auto-send Authorization headers for cross-origin requests
+  - Without a cookie to forge, CSRF attacks don't apply
+
+.csrf(csrf -> csrf.disable())  // Safe for stateless JWT-based REST APIs
+
+WARNING: DO NOT disable CSRF if you:
+  - Use cookie-based session authentication
+  - Store tokens in cookies
+  - Have form-based login
+
+2.6 CSRF FOR SPA (ANGULAR / REACT) WITH COOKIE-BASED AUTH
+----------------------------------------------------------
+
+If your SPA uses HttpOnly cookies (not Bearer tokens), use CookieCsrfTokenRepository:
+
+// Angular uses X-XSRF-TOKEN header by default
+// Spring Security's CookieCsrfTokenRepository sets XSRF-TOKEN cookie (non-HttpOnly)
+// Angular JS reads the cookie and sends it as X-XSRF-TOKEN header
+
+@Bean
+public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http
+        .csrf(csrf -> csrf
+            .csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())
+            .csrfTokenRequestHandler(new XorCsrfTokenRequestAttributeHandler())
+        );
+    return http.build();
+}
+
+CookieCsrfTokenRepository:
+  - Sets XSRF-TOKEN cookie (readable by JS)
+  - Expects X-XSRF-TOKEN header on mutating requests
+  - Angular HttpClient sends this header automatically
+  - Axios: Must be configured manually
+
+// Axios CSRF setup:
+axios.defaults.xsrfCookieName = 'XSRF-TOKEN';
+axios.defaults.xsrfHeaderName = 'X-XSRF-TOKEN';
+
+2.7 CSRF TOKEN IN CUSTOM HEADER (React/fetch)
+---------------------------------------------
+
+Manual CSRF token in React:
+
+// 1. Get CSRF token from endpoint or meta tag
+const response = await fetch('/api/csrf-token');
+const { token } = await response.json();
+
+// 2. Include in subsequent requests
+await fetch('/api/orders', {
+    method: 'POST',
+    headers: {
+        'Content-Type': 'application/json',
+        'X-CSRF-TOKEN': token
+    },
+    body: JSON.stringify(orderData)
+});
+
+// Spring endpoint to serve CSRF token:
+@GetMapping("/api/csrf-token")
+public CsrfTokenDto getCsrfToken(CsrfToken csrfToken) {
+    return new CsrfTokenDto(csrfToken.getToken());
+}
+
+========================================================
+3. CORS + CSRF + OAUTH2 — COMPLETE EXAMPLE
+========================================================
+
+// Full example: Stateless JWT API with CORS for SPA frontend
+
+@Configuration
+@EnableWebSecurity
+public class ApiSecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            // Authorization
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()  // Allow preflight
+                .requestMatchers("/public/**").permitAll()
+                .anyRequest().authenticated()
+            )
+
+            // OAuth2 JWT Resource Server
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(Customizer.withDefaults())
+            )
+
+            // CORS — must be before security filters
+            .cors(cors -> cors.configurationSource(corsConfigurationSource()))
+
+            // CSRF — disabled (stateless JWT, no cookies)
+            .csrf(AbstractHttpConfigurer::disable)
+
+            // Stateless session
+            .sessionManagement(session -> session
+                .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            );
+
+        return http.build();
+    }
+
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration config = new CorsConfiguration();
+        config.setAllowedOrigins(List.of(
+            "https://app.example.com",
+            "http://localhost:3000"  // local dev
+        ));
+        config.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+        config.setAllowedHeaders(List.of("Authorization", "Content-Type", "Accept"));
+        config.setAllowCredentials(true);
+        config.setMaxAge(3600L);
+
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", config);
+        return source;
+    }
+}
+
+========================================================
+4. SECURITY HEADERS (BONUS)
+========================================================
+
+Spring Security adds several security-related HTTP headers by default:
+
+.headers(headers -> headers
+    // Prevents clickjacking — refuse to be embedded in iframes
+    .frameOptions(frame -> frame.deny())  // or .sameOrigin()
+
+    // Prevents browsers from MIME-sniffing response type
+    .contentTypeOptions(Customizer.withDefaults())
+
+    // Force HTTPS (HSTS) — browser won't downgrade to HTTP
+    .httpStrictTransportSecurity(hsts -> hsts
+        .maxAgeInSeconds(31536000)     // 1 year
+        .includeSubDomains(true)
+        .preload(true)
+    )
+
+    // Content Security Policy — restricts resources browser can load
+    .contentSecurityPolicy(csp -> csp
+        .policyDirectives(
+            "default-src 'self'; " +
+            "script-src 'self' 'unsafe-inline'; " +  // Avoid unsafe-inline in prod
+            "style-src 'self' 'unsafe-inline'; " +
+            "img-src 'self' data: https:; " +
+            "connect-src 'self' https://api.example.com"
+        )
+    )
+
+    // Referrer Policy
+    .referrerPolicy(referrer -> referrer
+        .policy(ReferrerPolicyHeaderWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN)
+    )
+
+    // Permissions Policy (formerly Feature Policy)
+    .permissionsPolicy(permissions -> permissions
+        .policy("camera=(), microphone=(), geolocation=()")
+    )
+)
+
+Default headers added by Spring Security (without any config):
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  X-XSS-Protection: 0 (disabled — modern browsers have built-in XSS protection)
+  Cache-Control: no-cache, no-store, max-age=0, must-revalidate
+  Pragma: no-cache
+  Expires: 0
+
+========================================================
+5. COMMON INTERVIEW QUESTIONS
+========================================================
+
+Q: What is the difference between CORS and CSRF?
+A: CORS is a browser mechanism that controls which origins can read API responses.
+   It's a security policy to prevent malicious scripts from stealing data.
+   CSRF is an attack where an unauthorized party tricks a user into making an
+   unintended request. They address different problems: CORS is about reading
+   cross-origin data, CSRF is about forging state-changing requests.
+
+Q: Why is it safe to disable CSRF protection for REST APIs using JWT?
+A: CSRF exploits the browser's automatic inclusion of session cookies in requests.
+   If tokens are stored in memory/localStorage and sent via Authorization header,
+   browsers won't automatically include them in cross-origin requests. Without the
+   automatic token submission behavior, CSRF attacks don't apply.
+
+Q: How does Spring Security handle CORS preflight requests?
+A: When Spring Security's CORS filter is configured (via .cors()), it intercepts
+   OPTIONS requests and responds with the appropriate CORS headers without requiring
+   authentication. This is why you need to permit OPTIONS requests OR configure CORS
+   through Spring Security (not just @CrossOrigin), because Spring Security's auth
+   filter would otherwise block unauthenticated OPTIONS requests.
+
+Q: What is CookieCsrfTokenRepository used for?
+A: For SPAs (Angular, React) that need CSRF protection with cookie-based auth.
+   It writes the CSRF token to an accessible cookie (XSRF-TOKEN) that JS can read.
+   The SPA must send the token back in the X-XSRF-TOKEN header. Angular's HttpClient
+   does this automatically. This implements the Double Submit Cookie pattern.
+
+Q: What CORS settings are needed for requests with Authorization headers?
+A: You must set allowCredentials(true) AND specify exact origins (not "*").
+   The Authorization header is considered a "non-simple" header, so it triggers
+   a preflight OPTIONS request. You must include "Authorization" in allowedHeaders.
+
+Q: What security headers does Spring Security add by default?
+A: X-Content-Type-Options: nosniff, X-Frame-Options: DENY, Cache-Control headers,
+   and Pragma/Expires. You can customize these via .headers() in SecurityFilterChain.
+
+Q: Can you use both @CrossOrigin and Spring Security CORS configuration together?
+A: Yes, but Spring Security's CorsFilter must be used for any endpoints protected
+   by Spring Security. @CrossOrigin alone won't work for secured endpoints because
+   Spring Security's filters run before the dispatcher servlet reaches the controller.
+   Best practice: Use Spring Security's CorsConfigurationSource exclusively.

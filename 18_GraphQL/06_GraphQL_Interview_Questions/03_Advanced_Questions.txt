@@ -1,0 +1,208 @@
+================================================================
+ADVANCED GRAPHQL INTERVIEW QUESTIONS — IN DEPTH
+================================================================
+
+Q1: How does GraphQL handle partial errors (partial responses)?
+A: GraphQL returns a "partial response" — both `data` and `errors` can be
+   present simultaneously. If one field's resolver fails, that field becomes
+   null and an entry appears in `errors` with the path. Other fields that
+   succeeded still contain their data.
+   ```json
+   {
+     "data": { "user": null, "posts": [{...}] },
+     "errors": [{ "message": "User not found", "path": ["user"] }]
+   }
+   ```
+   This is fundamentally different from REST where a 500 status means the
+   entire response is an error. In GraphQL, a 200 response can still have
+   errors. Clients must check BOTH `data` and `errors`.
+
+Q2: What is null propagation in GraphQL and why is it dangerous?
+A: When a non-null (!) field resolver returns null or throws, GraphQL
+   propagates null to the nearest nullable parent. If that parent is also
+   non-null, it propagates further up. In the worst case, the entire `data`
+   becomes null.
+   Example: Query.user (!) → User.name (!) — if name resolver returns null,
+   User.name fails → User becomes null → Query.user fails → data is null.
+   Danger: overly aggressive non-null annotations can cause total data loss
+   from a single field error. Design recommendation: use non-null only when
+   you are 100% certain a field will never be null.
+
+Q3: What is the execution model for GraphQL — specifically how resolvers run?
+A: GraphQL executes queries in breadth-first order:
+   1. Root resolvers (Query.users, etc.) run first.
+   2. For each parent, child field resolvers run for the returned objects.
+   3. Leaf scalars are coerced.
+   For queries: root resolvers can run in PARALLEL.
+   For mutations: root resolvers run SERIALLY (left to right).
+   Async resolvers (returning CompletableFuture/Mono/Flux) allow the engine
+   to continue and batch concurrent resolution. DataLoader exploits this by
+   collecting all load() calls in one tick before firing the batch.
+
+Q4: How would you design a GraphQL API for real-time notifications?
+A: Use subscriptions over WebSocket:
+   Schema:
+   ```graphql
+   type Subscription {
+     notificationAdded(userId: ID!): Notification!
+   }
+   ```
+   Server: @SubscriptionMapping returning Flux<Notification>.
+   Backend fan-out: Sinks.Many<Notification> or Redis Pub/Sub for multi-instance.
+   Client filters: server-side filter on the Flux to match userId.
+   Auth: validate user at WebSocket connection_init, store user in session.
+   Alternatives: Server-Sent Events (simpler, HTTP/2, unidirectional);
+   polling (simple, no WS needed, higher latency).
+   When to use subscriptions: low-latency (trading, gaming, chat);
+   When to use polling: moderate latency acceptable (notifications, status).
+
+Q5: What is the difference between a subscription and a live query?
+A: Subscription: event-driven. Client subscribes to a specific event
+   (e.g., "messageAdded to room 5"). Server pushes data when that event fires.
+   Client must define what event to listen for.
+   Live Query: query-driven. Client sends a regular query; server detects when
+   results would change and pushes updates. Client writes a normal query —
+   the server handles real-time semantics.
+   Live queries are harder to implement (server must track query results and
+   detect invalidation). Most implementations use subscriptions. Apollo
+   Live Queries are an experimental proposal.
+
+Q6: How do you version a GraphQL API?
+A: The GraphQL philosophy is "versionless" or "continuous evolution":
+   (1) Add new fields freely (backward-compatible additions)
+   (2) Mark old fields @deprecated(reason: "...") instead of removing
+   (3) Only remove deprecated fields after migration period
+   (4) Use @experimental / @preview directives for unstable fields
+   Breaking changes to avoid: removing fields, changing types, making
+   nullable fields non-null, changing argument types.
+   If breaking changes are unavoidable: create a new root field with
+   a new signature; operate both in parallel during migration; sunset the old.
+   URL versioning (/graphql/v2) is possible but not idiomatic.
+
+Q7: What security vulnerabilities are specific to GraphQL?
+A: (1) Introspection exposure: reveals full schema to attackers. Disable in prod.
+   (2) N+1 amplification DoS: craft queries that trigger N×M DB operations.
+       Mitigate: DataLoader, complexity limits, depth limits.
+   (3) Batching attacks: send 100 mutations in one request. Mitigate: rate limiting.
+   (4) Field-level unauthorized access: not using proper auth on every field.
+   (5) Denial of Service via recursive queries: User.friends.friends.friends...
+       Mitigate: depth limiting.
+   (6) Mass assignment via input types: allow fields to be set that shouldn't.
+       Mitigate: explicit allowed field lists in input types.
+   (7) Information leakage via error messages: expose stack traces.
+       Mitigate: error masking (custom exception resolver).
+
+Q8: How do you implement optimistic locking or concurrency control in GraphQL mutations?
+A: Standard approach: include a version field in input types.
+   ```graphql
+   input UpdatePostInput {
+     id: ID!
+     title: String!
+     version: Int!   # from last read
+   }
+   ```
+   Server-side (JPA @Version):
+   ```java
+   @Entity
+   public class Post {
+     @Version
+     private int version;  // Hibernate checks this on update
+   }
+   ```
+   If the version doesn't match, Hibernate throws OptimisticLockException.
+   Map to GraphQL error: `CONCURRENT_MODIFICATION`.
+   Client re-fetches the latest version and retries if needed.
+
+Q9: What is schema stitching and when is it used?
+A: Schema stitching combines multiple GraphQL schemas into one.
+   Use cases: (1) Merging schemas from different services.
+   (2) Adding fields from one service to types in another.
+   (3) Delegating queries to the appropriate sub-service.
+   Schema stitching was a pre-federation approach. Issues: complex merge
+   logic, hard to maintain, single gateway becomes a bottleneck.
+   Modern alternative: Apollo Federation (each service owns its own schema
+   slice and declares how they connect).
+
+Q10: How would you implement cursor-based pagination?
+A: ```java
+   @QueryMapping
+   public Connection<Post> posts(@Argument Integer first, @Argument String after) {
+     Long afterId = decodeCursor(after);  // Base64-decode cursor to ID
+
+     // Fetch first+1 to determine hasNextPage
+     List<Post> results = postRepository.findTop(first + 1, afterId);
+
+     boolean hasNextPage = results.size() > first;
+     List<Post> items = hasNextPage ? results.subList(0, first) : results;
+
+     List<Edge<Post>> edges = items.stream().map(p ->
+       Edge.create(p, encodeCursor(p.getId()))
+     ).collect(Collectors.toList());
+
+     return Connection.create(edges, PageInfo.builder()
+       .hasNextPage(hasNextPage)
+       .hasPreviousPage(afterId != null)
+       .startCursor(edges.isEmpty() ? null : edges.get(0).getCursor())
+       .endCursor(edges.isEmpty() ? null : edges.getLast().getCursor())
+       .build());
+   }
+   ```
+   Cursor = opaque identifier (usually base64-encoded ID or timestamp).
+   Never return count or page numbers — use hasNextPage to drive pagination.
+
+Q11: What is defer and stream in GraphQL?
+A: @defer: tells the server to return part of the response immediately and
+   stream deferred fields separately. Useful for fields that are slow to resolve
+   (recommendations, analytics) — show fast data first.
+   ```graphql
+   query {
+     user { name email }
+     ... @defer { expensiveAnalytics { ... } }
+   }
+   ```
+   @stream: like @defer but for list fields — stream list items incrementally.
+   ```graphql
+   query { longList @stream { id title } }
+   ```
+   Both use multipart HTTP responses (chunked transfer encoding).
+   Still experimental/draft in GraphQL spec. Spring for GraphQL has partial support.
+
+Q12: What is the difference between graphql-java and Spring for GraphQL?
+A: graphql-java is the core execution engine — parses and executes GraphQL
+   documents, manages the type system, runs resolvers. It's the foundation.
+   Spring for GraphQL is a Spring-flavored integration layer on top:
+   - Annotation-based controllers (@QueryMapping, etc.)
+   - Spring Boot autoconfiguration
+   - HTTP/WebSocket transport integration
+   - DataLoader support via @BatchMapping
+   - Spring Security integration
+   - GraphQlTester for testing
+   graphql-java = engine; Spring for GraphQL = framework using the engine.
+
+Q13: How would you implement a multipart upload with validation and virus scanning?
+A: Flow:
+   (1) Receive file via GraphQL Upload scalar (MultipartFile)
+   (2) Validate: check content type, file size, extension whitelist
+   (3) Content sniff: read magic bytes to verify actual file type
+   (4) Virus scan: send to ClamAV or cloud-based scanner
+   (5) On clean: store in S3/Azure Blob with a random UUID key
+   (6) Return URL or file metadata
+   For large files: use pre-signed URL pattern — client uploads directly
+   to S3 without passing through the GraphQL server.
+
+Q14: How do you handle authorization for subscriptions?
+A: Subscriptions use WebSocket. Auth happens at connection time via the
+   `connection_init` message (part of the graphql-ws protocol).
+   The client sends a token in the connection_init payload:
+   ```json
+   { "type": "connection_init", "payload": { "authToken": "Bearer ..." } }
+   ```
+   Server implements WebSocketGraphQlInterceptor.handleConnectionInitialization:
+   validates the token, stores user in session attributes. The session context
+   persists for the lifetime of the WebSocket connection. Per-subscription
+   auth checks (who can subscribe to what) happen in @SubscriptionMapping
+   by checking the session-level user.
+
+================================================================
+END OF FILE
+================================================================

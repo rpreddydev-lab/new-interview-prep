@@ -1,0 +1,408 @@
+================================================================
+HTTP/2 AND STREAMING IN gRPC
+================================================================
+
+----------------------------------------------------------------
+1. WHY gRPC REQUIRES HTTP/2
+----------------------------------------------------------------
+
+HTTP/1.1 limitations that drove HTTP/2 adoption:
+
+  1. Head-of-line blocking:
+     - HTTP/1.1 processes requests sequentially per connection
+     - Slow request blocks all others behind it
+     - Browsers open 6-8 parallel connections as a workaround
+
+  2. Redundant headers:
+     - Every request sends full headers (cookies, auth tokens)
+     - Same headers repeated thousands of times = wasted bandwidth
+     - A Cookie header alone can be 2KB+ on every request
+
+  3. Text-based protocol:
+     - HTTP/1.1 headers are plaintext, wasteful to parse
+
+  4. No server push:
+     - Server can ONLY respond; it cannot initiate data transfer
+
+  5. No multiplexing:
+     - One request per connection per time (without keep-alive tricks)
+
+HTTP/2 solutions:
+  ✅ Binary framing layer
+  ✅ Header compression (HPACK)
+  ✅ Multiplexing (many requests on one connection)
+  ✅ Server push
+  ✅ Stream prioritization
+  ✅ Full-duplex: both sides can send simultaneously
+
+gRPC MANDATES HTTP/2 because:
+  - Native multiplexing is required for concurrent RPCs
+  - HTTP/2 trailers carry gRPC status codes (crucial for error handling)
+  - Streaming requires full-duplex HTTP/2 streams
+  - HPACK header compression reduces metadata overhead
+
+----------------------------------------------------------------
+2. HTTP/2 FRAMING LAYER
+----------------------------------------------------------------
+
+HTTP/2 uses binary framing. All communication is broken into
+small units called FRAMES. Each frame has:
+  - 24-bit length
+  - 8-bit type
+  - 8-bit flags
+  - 31-bit stream identifier
+  - Frame payload (variable length)
+
+Frame Types:
+  DATA        (0x0) - Carries message body (request or response data)
+  HEADERS     (0x1) - HTTP headers (also used for trailers with END_HEADERS)
+  PRIORITY    (0x2) - Stream dependency and weight
+  RST_STREAM  (0x3) - Abruptly terminate a stream (cancellation)
+  SETTINGS    (0x4) - Connection settings (initial window size, etc.)
+  PUSH_PROMISE(0x5) - Server push announcement
+  PING        (0x6) - Connection health check / latency measurement
+  GOAWAY      (0x7) - Graceful connection shutdown
+  WINDOW_UPDATE(0x8)- Flow control (increase receive window)
+  CONTINUATION(0x9) - Continue HEADERS frame if too large
+
+Stream Identifier:
+  - Each HTTP/2 stream has a unique odd integer ID (client-initiated)
+  - Stream ID 0 = connection-level (SETTINGS, PING, GOAWAY)
+  - Each new request increments by 2 (1, 3, 5, 7, ...)
+  - Server-initiated streams use even IDs
+  - Once IDs are exhausted (~2^31), connection must be recycled
+
+----------------------------------------------------------------
+3. HTTP/2 MULTIPLEXING
+----------------------------------------------------------------
+
+Multiplexing = multiple request/response pairs interleaved on
+ONE TCP connection simultaneously.
+
+HTTP/1.1 (without pipelining):
+  Connection 1: [REQ1]----[RESP1]
+  Connection 2: [REQ2]----[RESP2]
+  Connection 3: [REQ3]----[RESP3]
+  → 3 TCP connections, 3 TLS handshakes
+
+HTTP/2 multiplexing:
+  Connection:
+    Stream 1: [REQ1-H][REQ1-D] .... [RESP1-H][RESP1-D]
+    Stream 3:      [REQ2-H][REQ2-D] .... [RESP2-H][RESP2-D]
+    Stream 5:           [REQ3-H] ....       [RESP3-H][RESP3-D]
+  → 1 TCP connection, 1 TLS handshake, all requests concurrent
+
+Benefits for gRPC:
+  - 100s of simultaneous RPC calls on one connection
+  - Connection establishment cost (TCP + TLS) paid once
+  - Low latency for connection-heavy microservice traffic
+
+----------------------------------------------------------------
+4. HEADER COMPRESSION (HPACK)
+----------------------------------------------------------------
+
+HPACK algorithm:
+  - Static table: 61 predefined common header name/value pairs
+  - Dynamic table: recently used header name/value pairs (both sides)
+  - Huffman encoding: compress string values
+
+gRPC headers sent in HEADERS frame:
+  :method         POST
+  :path           /com.example.OrderService/CreateOrder
+  :scheme         https
+  :authority      api.example.com
+  content-type    application/grpc
+  grpc-timeout    5S
+  authorization   Bearer eyJ...
+
+First request: all headers sent
+Subsequent requests: only differences sent (e.g., just :path changes)
+→ ~85% reduction in header overhead for repeated calls
+
+gRPC-specific headers:
+  Request:
+    content-type: application/grpc (required) or application/grpc+proto
+    grpc-timeout: 5S, 100m, 200u (seconds, milliseconds, microseconds)
+    grpc-encoding: gzip (if compression used)
+
+  Response HEADERS frame:
+    :status: 200 (HTTP status, always 200 for gRPC)
+    content-type: application/grpc
+
+  Response TRAILERS frame (sent at end of stream):
+    grpc-status: 0 (OK), 1 (CANCELLED), etc.
+    grpc-message: "Error description if non-zero status"
+
+Key insight: In gRPC, the grpc-status is in HTTP/2 TRAILERS
+(not headers). This is why browsers cannot use regular gRPC —
+browsers don't expose HTTP/2 trailers to JavaScript.
+
+----------------------------------------------------------------
+5. FLOW CONTROL
+----------------------------------------------------------------
+
+HTTP/2 has two levels of flow control:
+  1. Stream-level: each stream has a receive window
+  2. Connection-level: total bytes in flight across all streams
+
+Flow control prevents a fast sender from overwhelming a slow receiver.
+
+  Sender:                         Receiver:
+  - Tracks receiver's window      - Advertises window size
+  - Cannot send more than window  - Sends WINDOW_UPDATE to increase
+  - Blocks when window exhausted  - Receives and processes data
+
+Initial window size: 65,535 bytes (default)
+Can be increased via SETTINGS frame (up to 2^31 - 1 bytes)
+
+gRPC implication:
+  - Streaming responses can be flow-controlled
+  - Server won't blast 10GB of data if client can't keep up
+  - Applications should NOT implement their own flow control on top
+  - Back-pressure naturally propagates through the pipeline
+
+----------------------------------------------------------------
+6. gRPC MESSAGE FRAMING (ON TOP OF HTTP/2)
+----------------------------------------------------------------
+
+gRPC adds its own framing ON TOP of HTTP/2 DATA frames:
+
+Each gRPC message is prefixed with 5 bytes:
+  Byte 0:    Compression flag (0 = not compressed, 1 = compressed)
+  Bytes 1-4: Message length (big-endian uint32)
+  Bytes 5+:  Serialized protobuf message
+
+  [ 0x00 ][ 0x00 ][ 0x00 ][ 0x00 ][ 0x7D ][ ... protobuf bytes ... ]
+     ^           ^--- message length = 125 bytes ---^         ^--- data
+     compression=0
+
+Why this extra framing?
+  - One HTTP/2 DATA frame can contain multiple gRPC messages
+    (or one gRPC message split across multiple DATA frames)
+  - The 5-byte prefix tells the decoder where each message starts/ends
+  - HTTP/2 doesn't know about application-level message boundaries
+
+----------------------------------------------------------------
+7. THE FOUR STREAMING MODES
+----------------------------------------------------------------
+
+7.1 UNARY RPC
+  Client sends ONE request, server sends ONE response.
+  
+  Proto definition:
+    rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse);
+  
+  HTTP/2 frames:
+    Client → Server: HEADERS[stream=1, END_HEADERS] + DATA[stream=1, END_STREAM]
+    Server → Client: HEADERS[stream=1] + DATA[stream=1] + HEADERS[stream=1, END_STREAM, trailers]
+  
+  Use cases: Standard request/response operations (create, get, update, delete)
+  
+  Timeline:
+    CLIENT                    SERVER
+    ──────────────────────────────────
+    |--- HEADERS (req meta) →|
+    |--- DATA (request body)→|
+    |   END_STREAM ─────────→|        ← server knows request is complete
+    |                         |  (server processes)
+    |←── HEADERS (200 OK)  ──|
+    |←── DATA (response)    ─|
+    |←── TRAILERS (status=0)─|        ← stream ends
+
+7.2 SERVER STREAMING RPC
+  Client sends ONE request, server sends MANY responses (a stream).
+  
+  Proto definition:
+    rpc ListOrderHistory(ListRequest) returns (stream Order);
+  
+  HTTP/2 frames:
+    Client → Server: HEADERS + DATA [END_STREAM]  (single request)
+    Server → Client: HEADERS + DATA + DATA + DATA + ... + HEADERS[trailers]
+  
+  Use cases:
+    - Stock price feeds (client subscribes, server pushes updates)
+    - File download (server sends chunks)
+    - Query results (server streams database rows)
+    - Real-time notifications
+  
+  Timeline:
+    CLIENT                    SERVER
+    ──────────────────────────────────
+    |--- HEADERS ────────────→|
+    |--- DATA (request) ─────→|
+    |   END_STREAM ──────────→|
+    |←── HEADERS (200 OK) ───|
+    |←── DATA (response 1) ──|
+    |←── DATA (response 2) ──|
+    |←── DATA (response 3) ──|
+    |   ... (continues)       |
+    |←── TRAILERS (status=0) ─|       ← stream ends when server is done
+
+7.3 CLIENT STREAMING RPC
+  Client sends MANY requests, server sends ONE response at the end.
+  
+  Proto definition:
+    rpc UploadOrderBatch(stream CreateOrderRequest) returns (BatchResult);
+  
+  HTTP/2 frames:
+    Client → Server: HEADERS + DATA + DATA + DATA + ... + DATA[END_STREAM]
+    Server → Client: HEADERS + DATA + HEADERS[trailers]
+  
+  Use cases:
+    - File upload (client sends chunks)
+    - Batch data ingestion (client sends 1000 records, server returns summary)
+    - Aggregation (client sends sensor readings, server returns average)
+    - Log streaming (client sends log lines, server responds when buffer full)
+  
+  Timeline:
+    CLIENT                    SERVER
+    ──────────────────────────────────
+    |--- HEADERS ────────────→|
+    |--- DATA (request 1) ───→|
+    |--- DATA (request 2) ───→|
+    |--- DATA (request 3) ───→|
+    |   END_STREAM ──────────→|        ← client signals done
+    |                         |  (server processes all received)
+    |←── HEADERS (200 OK) ───|
+    |←── DATA (response) ────|
+    |←── TRAILERS (status=0) ─|
+
+7.4 BIDIRECTIONAL STREAMING RPC
+  Both client and server can send multiple messages independently.
+  Both streams run concurrently on the same HTTP/2 stream.
+  
+  Proto definition:
+    rpc Chat(stream ChatMessage) returns (stream ChatMessage);
+  
+  HTTP/2 frames:
+    Client → Server: HEADERS + DATA... (any time)
+    Server → Client: HEADERS + DATA... (any time)
+    Either side sends END_STREAM to close their half of the stream
+  
+  Use cases:
+    - Real-time chat
+    - Online multiplayer games (client sends moves, server sends updates)
+    - Collaborative editing
+    - IoT: device sends sensor data, server sends configuration commands
+    - Trading platforms: client sends orders, server sends fills
+  
+  Timeline:
+    CLIENT                    SERVER
+    ──────────────────────────────────
+    |--- HEADERS ────────────→|
+    |←── HEADERS (200 OK) ───|
+    |--- DATA (msg 1) ───────→|
+    |←── DATA (reply 1) ─────|
+    |--- DATA (msg 2) ───────→|
+    |←── DATA (reply 2) ─────|
+    |--- DATA (msg 3) ───────→|
+    |                         |
+    |   END_STREAM ──────────→|  ← client done sending
+    |←── DATA (final reply) ─|
+    |←── TRAILERS ───────────|   ← server done sending
+
+Order of sends is independent: client and server don't need to
+take turns. They can send at any time while the stream is open.
+
+----------------------------------------------------------------
+8. HTTP/2 AND TLS
+----------------------------------------------------------------
+
+gRPC over HTTP/2 uses TLS by default (gRPC-C++ and Java enforce this).
+HTTP/2 over cleartext (h2c) is technically in the spec but:
+  - Not recommended for production
+  - Used in testing/local environments
+  - Some gRPC implementations disable h2c by default
+
+ALPN (Application-Layer Protocol Negotiation):
+  - TLS extension that negotiates the application protocol
+  - Client sends: ["h2", "http/1.1"] in ClientHello
+  - Server responds with "h2" if supported
+  - This is how gRPC clients upgrade from HTTP/1.1 to HTTP/2
+
+----------------------------------------------------------------
+9. CONNECTION MANAGEMENT
+----------------------------------------------------------------
+
+Channel:
+  - A gRPC Channel represents a virtual connection to a server
+  - It manages one or more underlying HTTP/2 connections
+  - Handles connection establishment, health checking, load balancing
+  - Thread-safe: share one channel across many threads
+
+Channel State Machine:
+  IDLE → CONNECTING → READY → TRANSIENT_FAILURE → IDLE
+                           ↘ SHUTDOWN
+
+  IDLE:              No active connections (initial state or after all done)
+  CONNECTING:        Establishing TCP + TLS + HTTP/2 connection
+  READY:             Connection established, can make RPCs
+  TRANSIENT_FAILURE: Connection failed, will retry
+  SHUTDOWN:          Channel is closed permanently
+
+Keepalive:
+  - gRPC sends HTTP/2 PING frames to detect dead connections
+  - Configurable:
+    GRPC_ARG_KEEPALIVE_TIME_MS        (how often to ping, default: 2 hours!)
+    GRPC_ARG_KEEPALIVE_TIMEOUT_MS     (timeout waiting for pong)
+    GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS (ping even with no active streams)
+  
+  Why long default? Firewalls drop idle TCP connections.
+  Recommendation: Set to 60s in production microservice environments.
+
+Max Message Size:
+  Default: 4MB (can be configured)
+  gRPC_MAX_RECEIVE_MESSAGE_LENGTH
+  For large payloads, use streaming instead.
+
+----------------------------------------------------------------
+10. PERFORMANCE IMPLICATIONS
+----------------------------------------------------------------
+
+HTTP/2 multiplexing means:
+  - You don't need connection pools the way HTTP/1.1 REST services do
+  - One channel (one HTTP/2 connection) per server is usually sufficient
+  - gRPC Java uses Netty under the hood (event-loop based, non-blocking)
+
+Latency characteristics:
+  - First RPC: ~TCP RTT + TLS handshake + request/response
+  - Subsequent RPCs: ~request/response only (connection already up)
+  - With streaming: latency is the streaming throughput
+
+Stream concurrency:
+  - HTTP/2 spec default: 100 concurrent streams per connection
+  - Can be increased via SETTINGS_MAX_CONCURRENT_STREAMS
+  - Beyond this, requests queue on client side
+
+----------------------------------------------------------------
+11. INTERVIEW KEY POINTS
+----------------------------------------------------------------
+
+Q: Why does gRPC require HTTP/2?
+A: gRPC requires HTTP/2 because it relies on:
+   1. HTTP/2 trailers to carry gRPC status codes
+   2. Full-duplex streams for bidirectional streaming
+   3. Multiplexing for concurrent RPCs on one connection
+   4. HPACK header compression for metadata efficiency
+
+Q: What is the difference between HTTP/2 streams and gRPC streams?
+A: HTTP/2 streams are the underlying transport mechanism — each
+   request/response pair gets a stream ID. gRPC streaming (server/client/bidi)
+   is an application-level concept where multiple protobuf messages
+   are sent over a single HTTP/2 stream using 5-byte length prefixes.
+
+Q: How does flow control work in gRPC?
+A: gRPC inherits HTTP/2's flow control. Each HTTP/2 stream and the
+   connection itself has a receive window. If a consumer is slow,
+   the window fills up, and the sender must pause. This provides
+   natural back-pressure without needing custom application logic.
+
+Q: How does gRPC handle connection failures?
+A: The gRPC channel has a state machine. On failure, it enters
+   TRANSIENT_FAILURE and applies exponential backoff before reconnecting.
+   In-flight RPCs can be configured with retry policies to automatically
+   retry on transient failures (UNAVAILABLE status code).
+
+================================================================
+END OF FILE
+================================================================

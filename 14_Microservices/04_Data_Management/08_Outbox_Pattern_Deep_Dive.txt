@@ -1,0 +1,293 @@
+================================================================================
+OUTBOX PATTERN — RELIABLE EVENT PUBLISHING
+================================================================================
+
+THE DUAL WRITE PROBLEM
+-----------------------
+In event-driven microservices, a service must:
+  1. Update its database (local transaction)
+  2. Publish an event to Kafka/RabbitMQ (external call)
+
+The danger: These are TWO separate operations. Either can fail independently.
+
+Scenario 1: DB update succeeds, Kafka publish fails
+  → Order created in DB but no event sent
+  → Inventory service never knows about the order
+  → System inconsistency
+
+Scenario 2: Kafka publish succeeds, DB update fails (or rollback)
+  → Event published but order not in DB
+  → Inventory reserves stock for a non-existent order
+
+Both scenarios cause data inconsistency.
+
+The Naive (Wrong) Approach:
+  @Transactional
+  public void createOrder(CreateOrderRequest request) {
+    orderRepository.save(order);            // Step 1: DB write
+    kafkaTemplate.send("orders", event);   // Step 2: Kafka publish
+    // If Kafka fails here → inconsistency!
+    // If app crashes between 1 and 2 → inconsistency!
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+THE OUTBOX PATTERN SOLUTION
+=============================
+
+The key insight: Write the event to the DATABASE as part of the same local
+transaction that updates the business data. Then a separate process reads
+from the DB and publishes to the message broker.
+
+The outbox table acts as a "staging area" for events:
+  1. Business logic + event written in ONE atomic DB transaction
+  2. Outbox relay reads events and publishes to Kafka
+  3. After successful Kafka publish, mark event as processed (or delete)
+
+         Application                         DB Transaction (ATOMIC)
+         ────────────                         ──────────────────────
+         Create Order   ─────────────────→  INSERT INTO orders (id=1, status=PENDING)
+                        ─────────────────→  INSERT INTO outbox (event=OrderCreated, ...)
+                                              ↑ Committed together
+
+         Outbox Relay   ─── Read outbox ──→  SELECT * FROM outbox WHERE processed=false
+                        ─── Publish ──────→  Kafka: OrderCreated event
+                        ─── Mark done ────→  UPDATE outbox SET processed=true
+
+────────────────────────────────────────────────────────────────────────────────
+
+OUTBOX TABLE DESIGN
+=====================
+
+  CREATE TABLE outbox_events (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    aggregate_id  BIGINT NOT NULL,
+    aggregate_type VARCHAR(100) NOT NULL,  -- 'ORDER', 'PAYMENT', etc.
+    event_type    VARCHAR(200) NOT NULL,   -- 'OrderCreatedEvent'
+    event_data    JSONB NOT NULL,          -- Serialized event payload
+    topic         VARCHAR(200) NOT NULL,   -- Kafka topic to publish to
+    created_at    TIMESTAMP NOT NULL DEFAULT NOW(),
+    processed_at  TIMESTAMP,              -- NULL = not yet published
+    processed     BOOLEAN DEFAULT FALSE,
+    retry_count   INT DEFAULT 0,
+    last_error    TEXT
+  );
+
+  CREATE INDEX idx_outbox_unprocessed ON outbox_events (processed, created_at)
+    WHERE processed = FALSE;
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING BOOT IMPLEMENTATION
+============================
+
+Outbox Entity:
+  @Entity
+  @Table(name = "outbox_events")
+  public class OutboxEvent {
+    @Id
+    private UUID id = UUID.randomUUID();
+    private Long aggregateId;
+    private String aggregateType;
+    private String eventType;
+    @Column(columnDefinition = "jsonb")
+    private String eventData;
+    private String topic;
+    private LocalDateTime createdAt = LocalDateTime.now();
+    private LocalDateTime processedAt;
+    private boolean processed = false;
+    private int retryCount = 0;
+    private String lastError;
+  }
+
+  @Repository
+  public interface OutboxRepository extends JpaRepository<OutboxEvent, UUID> {
+    List<OutboxEvent> findByProcessedFalseOrderByCreatedAtAsc();
+    List<OutboxEvent> findTop100ByProcessedFalseOrderByCreatedAtAsc();
+  }
+
+Order Service (writes business data + outbox in ONE transaction):
+  @Service
+  public class OrderService {
+
+    @Autowired private OrderRepository orderRepository;
+    @Autowired private OutboxRepository outboxRepository;
+    @Autowired private ObjectMapper objectMapper;
+
+    @Transactional  // ONE transaction covers both writes
+    public Order createOrder(CreateOrderRequest request) {
+      // Step 1: Save business entity
+      Order order = Order.builder()
+        .userId(request.getUserId())
+        .status(OrderStatus.PENDING)
+        .total(calculateTotal(request.getItems()))
+        .build();
+      orderRepository.save(order);
+
+      // Step 2: Write event to outbox (SAME transaction)
+      OrderCreatedEvent event = new OrderCreatedEvent(
+        order.getId(), order.getUserId(), order.getTotal()
+      );
+
+      OutboxEvent outboxEvent = new OutboxEvent();
+      outboxEvent.setAggregateId(order.getId());
+      outboxEvent.setAggregateType("ORDER");
+      outboxEvent.setEventType("OrderCreatedEvent");
+      outboxEvent.setEventData(objectMapper.writeValueAsString(event));
+      outboxEvent.setTopic("order-events");
+      outboxRepository.save(outboxEvent);
+
+      // Both committed together — atomically!
+      return order;
+    }
+  }
+
+Outbox Relay (reads and publishes):
+  @Component
+  @Slf4j
+  public class OutboxRelayService {
+
+    @Autowired private OutboxRepository outboxRepository;
+    @Autowired private KafkaTemplate<String, String> kafkaTemplate;
+
+    @Scheduled(fixedDelay = 100)  // Poll every 100ms
+    @Transactional
+    public void processOutbox() {
+      List<OutboxEvent> unprocessed = outboxRepository
+        .findTop100ByProcessedFalseOrderByCreatedAtAsc();
+
+      for (OutboxEvent event : unprocessed) {
+        try {
+          // Publish to Kafka
+          kafkaTemplate.send(event.getTopic(), 
+            event.getAggregateId().toString(),  // Key (for partitioning)
+            event.getEventData()                // Payload
+          ).get(5, TimeUnit.SECONDS);           // Wait for acknowledgment
+
+          // Mark as processed
+          event.setProcessed(true);
+          event.setProcessedAt(LocalDateTime.now());
+          outboxRepository.save(event);
+
+        } catch (Exception e) {
+          log.error("Failed to publish outbox event {}: {}", event.getId(), e.getMessage());
+          event.setRetryCount(event.getRetryCount() + 1);
+          event.setLastError(e.getMessage());
+          outboxRepository.save(event);
+          // Will be retried on next poll
+        }
+      }
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+CDC-BASED OUTBOX (DEBEZIUM)
+=============================
+
+Instead of polling the outbox table, use Change Data Capture (CDC) to stream
+DB changes directly to Kafka via Debezium.
+
+Debezium captures database transaction log (WAL for PostgreSQL, binlog for MySQL)
+and streams every INSERT/UPDATE/DELETE to a Kafka topic.
+
+Benefits over polling:
+  - Near real-time (no polling delay)
+  - No load on application (no scheduled job)
+  - Guaranteed at-least-once delivery
+  - Works even if application is down
+
+Docker Compose for Debezium:
+  debezium:
+    image: debezium/connect:2.4
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: debezium
+      CONFIG_STORAGE_TOPIC: debezium.configs
+      OFFSET_STORAGE_TOPIC: debezium.offsets
+      STATUS_STORAGE_TOPIC: debezium.status
+
+  # Register PostgreSQL connector (REST API):
+  POST http://debezium:8083/connectors
+  {
+    "name": "order-outbox-connector",
+    "config": {
+      "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+      "database.hostname": "postgres",
+      "database.port": "5432",
+      "database.user": "order_user",
+      "database.password": "password",
+      "database.dbname": "order_db",
+      "table.include.list": "public.outbox_events",
+      "topic.prefix": "order-service",
+      "transforms": "outbox",
+      "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+      "transforms.outbox.table.field.event.type": "event_type",
+      "transforms.outbox.route.topic.replacement": "${routedByValue}"
+    }
+  }
+
+Debezium Outbox Event Router:
+  - Reads from outbox_events table via WAL
+  - Routes to Kafka topic based on event_type column
+  - Marks processed via offset tracking
+  - No polling, no application-level scheduler needed
+
+────────────────────────────────────────────────────────────────────────────────
+
+EXACTLY-ONCE SEMANTICS CONSIDERATION
+======================================
+
+Outbox guarantees AT-LEAST-ONCE delivery:
+  - Event is guaranteed to be published (retry on failure)
+  - May be published more than once (duplicate detection needed)
+
+Consumers MUST be idempotent:
+  @KafkaListener(topics = "order-events")
+  @Transactional
+  public void onOrderEvent(OrderCreatedEvent event, @Header KafkaHeaders.RECEIVED_MESSAGE_KEY String key) {
+    // Check for duplicate processing
+    if (processedEventsRepository.existsById(key)) {
+      log.info("Duplicate event ignored: {}", key);
+      return;
+    }
+    // Process event
+    inventoryService.reserveItems(event.orderId(), event.items());
+    // Mark as processed
+    processedEventsRepository.save(new ProcessedEvent(key, Instant.now()));
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is the dual write problem?
+A: When a service must write to its database AND publish a message to a broker,
+   either operation can fail independently, causing inconsistency. Database commit
+   can succeed while message publish fails (or vice versa), leaving the system
+   in an inconsistent state.
+
+Q: How does the Outbox Pattern solve the dual write problem?
+A: Write both the business entity AND the outbox event in the same local DB
+   transaction (atomic). A separate relay process reads the outbox table and
+   publishes to the message broker. If publish fails, the relay retries — the
+   event is never lost because it's committed in the database.
+
+Q: What is Debezium and how does it help?
+A: Debezium is a CDC (Change Data Capture) tool that reads the database
+   transaction log (WAL/binlog) and streams changes to Kafka. Instead of polling
+   the outbox table, Debezium streams inserts in near real-time. Eliminates
+   polling overhead and works even when the application is down.
+
+Q: Does Outbox Pattern guarantee exactly-once delivery?
+A: No — it guarantees at-least-once delivery. Events may be published more than
+   once (on retry). Consumers must be idempotent: track processed event IDs
+   and ignore duplicates.
+
+Q: How do you clean up the outbox table?
+A: Delete processed events after a retention period (e.g., 7 days for debugging).
+   Use a scheduled job or DB partition pruning. Keep recent processed events for
+   debugging, delete older ones to control table size.
+
+================================================================================

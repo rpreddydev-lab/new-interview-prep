@@ -1,0 +1,236 @@
+================================================================================
+  KAFKA STREAMS — WINDOWING
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHY WINDOWING?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Stateful aggregations (count, aggregate, reduce) without windowing compute results
+over the ENTIRE history — an unbounded table.
+
+Windowing allows you to scope aggregations to a TIME INTERVAL:
+  - "How many orders per customer IN THE LAST 5 MINUTES?"
+  - "Click rate per minute"
+  - "Fraud detection: > 3 failed transactions per 10-minute window"
+
+Time in Kafka Streams:
+  - Event time: timestamp embedded in the Kafka record (when the event occurred)
+  - Ingestion time: when the broker received the record
+  - Wall clock time: current system time
+
+  Kafka Streams uses EVENT TIME by default (record.timestamp()).
+  Event time enables correct windowing even for out-of-order or late-arriving records.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. TUMBLING WINDOWS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Fixed-size, non-overlapping windows that tile the time axis.
+Each event belongs to EXACTLY ONE window.
+
+  [00:00 - 01:00] [01:00 - 02:00] [02:00 - 03:00] ...
+
+Example: count orders per customer per 5-minute window
+
+  KTable<Windowed<String>, Long> orderCounts =
+    orders
+      .groupBy((k, order) -> order.getCustomerId())
+      .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(5)))
+      .count(Materialized.as("order-counts-5min"));
+
+  // Windowed key contains: key + window start/end
+  orderCounts
+    .toStream()
+    .map((windowedKey, count) ->
+      new KeyValue<>(
+        windowedKey.key() + "@" + windowedKey.window().startTime(),
+        count))
+    .to("order-counts-output");
+
+Output window keys:
+  - Windowed<K> wraps the original key plus Window (start, end timestamps)
+  - [customer-1 @ 00:00 → 05:00] → 12 orders
+  - [customer-1 @ 05:00 → 10:00] → 8 orders
+
+Grace period:
+  // Allow late records up to 1 minute after window close
+  TimeWindows.ofSizeAndGrace(Duration.ofMinutes(5), Duration.ofMinutes(1))
+  // "no grace" = window closes immediately when wall clock passes window end
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. HOPPING WINDOWS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Fixed-size windows that ADVANCE by a smaller step (overlap).
+Each event may belong to MULTIPLE windows.
+
+  Window size: 10 minutes, Advance: 5 minutes
+  [00:00 - 10:00]
+       [05:00 - 15:00]
+            [10:00 - 20:00]
+                 [15:00 - 25:00]
+
+  An event at t=07:00 appears in windows [00:00-10:00] and [05:00-15:00]
+
+Use case: "clicks in any rolling 10-minute window, updated every 5 minutes"
+
+  KTable<Windowed<String>, Long> clicks =
+    clickStream
+      .groupByKey()
+      .windowedBy(
+        TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(10))
+          .advanceBy(Duration.ofMinutes(5))
+      )
+      .count();
+
+  // More windows → more state → more output updates
+  // Memory usage proportional to: windowSize / advanceBy ratio
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. SLIDING WINDOWS (Event-time sliding)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Sliding windows create a WINDOW PER PAIR OF EVENTS that are within timeDifference
+of each other. Used for KStream-KStream joins (not for aggregations).
+
+  SlidingWindows.ofTimeDifferenceWithNoGrace(Duration.ofMinutes(5))
+  
+  // All events within 5 minutes of each other are in the same window
+
+Used in stream-stream joins:
+  logins.join(
+    purchases,
+    (login, purchase) -> correlate(login, purchase),
+    JoinWindows.ofTimeDifferenceWithNoGrace(Duration.ofMinutes(5))
+  );
+  // A login at t=10 can join with any purchase at t=5 to t=15
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. SESSION WINDOWS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Session windows group events by periods of ACTIVITY separated by INACTIVITY gaps.
+Window size is dynamic — determined by actual event timing.
+
+  Inactivity gap: 30 minutes
+  
+  Events for user-1:
+    t=10:00 → [session: 10:00 - 10:00]
+    t=10:05 → [session: 10:00 - 10:05] (extended)
+    t=10:25 → [session: 10:00 - 10:25] (extended)
+    --- 35-minute gap ---
+    t=11:00 → [new session: 11:00 - 11:00]
+
+  Two distinct sessions: 10:00-10:25 and 11:00+
+
+Use case: user activity sessions, browsing sessions, connection sessions
+
+  KTable<Windowed<String>, Long> sessionCounts =
+    events
+      .groupByKey()
+      .windowedBy(SessionWindows.ofInactivityGapWithNoGrace(Duration.ofMinutes(30)))
+      .count();
+
+Session merging: when a new event bridges two existing sessions, Kafka Streams
+MERGES them into one. The smaller session is deleted (tombstoned), the merged
+session is created. This requires the state store to hold all active sessions.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. GRACE PERIOD AND LATE DATA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Out-of-order events arrive AFTER their window should have closed.
+Kafka Streams uses a GRACE PERIOD to tolerate late arrivals.
+
+  TimeWindows.ofSizeAndGrace(Duration.ofMinutes(5), Duration.ofMinutes(1))
+    - Window: [00:00 - 05:00]
+    - Closes at 05:00 event time
+    - Grace period: accept records until 06:00 event time
+    - After grace expires: late records DROPPED
+
+  Window lifecycle:
+    OPEN → records being collected
+    CLOSED (after window end + grace) → state released, late records dropped
+
+Stream time:
+  - Kafka Streams tracks "stream time" = maximum event timestamp seen so far
+  - Stream time only advances FORWARD (never backward)
+  - A window closes when stream time advances past: window_end + grace_period
+  - If all consumers are idle (no new records), stream time stops → windows never close
+    → Use a punctuation or periodic heartbeat record to advance stream time
+
+Handling late data:
+  - Accept with grace period: balance latency vs correctness
+  - Emit intermediate results: downstream consumers get updated output as late data arrives
+  - Drop: close window immediately (ofSizeWithNoGrace) for latency-sensitive use cases
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. WINDOW STATE STORE MANAGEMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Window state stores hold data per (key, window) pair.
+Old windows are automatically cleaned up after they close + grace period expires.
+
+Memory considerations:
+  - Tumbling: 1 record per key per window → predictable memory
+  - Hopping: overlap_ratio × tumbling memory (e.g., 10-min window / 1-min step = 10×)
+  - Session: unbounded per user (can grow large for active users with many sessions)
+
+Interactive queries on window stores:
+  ReadOnlyWindowStore<String, Long> windowStore =
+    streams.store(StoreQueryParameters.fromNameAndType(
+      "order-counts-5min", QueryableStoreTypes.windowStore()));
+
+  // Query a specific window
+  WindowStoreIterator<Long> results =
+    windowStore.fetch("customer-1",
+      Instant.parse("2026-01-01T10:00:00Z"),
+      Instant.parse("2026-01-01T10:05:00Z"));
+
+  while (results.hasNext()) {
+    KeyValue<Long, Long> entry = results.next();
+    System.out.println("window start=" + entry.key + ", count=" + entry.value);
+  }
+  results.close();
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the difference between tumbling, hopping, and session windows?
+A: Tumbling windows are fixed-size and non-overlapping; each event belongs to exactly
+   one window. Hopping windows are fixed-size but slide by a smaller step (overlap),
+   so an event can belong to multiple windows. Session windows are dynamic — they
+   group events within an activity period, separated by inactivity gaps. Window size
+   is determined by actual event timing, not a fixed duration.
+
+Q: What is "stream time" in Kafka Streams and how does it affect windowing?
+A: Stream time is the maximum event timestamp observed so far in the input stream.
+   It advances forward as new records arrive. Windows close when stream time passes
+   window_end + grace_period. If no new records arrive (idle consumer), stream time
+   stops advancing — open windows never close and state keeps accumulating. Fix:
+   inject periodic heartbeat records or use wall-clock punctuations to advance time.
+
+Q: How does Kafka Streams handle late-arriving events?
+A: Each window type supports a GRACE PERIOD — a buffer after the window closes
+   during which late records are still accepted (e.g., ofSizeAndGrace(5min, 1min)).
+   After the grace period expires, late records for that window are DROPPED. Setting
+   grace too large → more state memory; too small → more dropped late records.
+   The output is updated each time a late record arrives (KTable emits a new value).
+
+Q: Why do hopping windows use more memory than tumbling windows?
+A: With hopping windows, each event belongs to multiple windows (overlap ratio =
+   windowSize / advanceBy). A 10-minute window advancing every 1 minute = ratio of 10.
+   The state store must hold 10× more window entries compared to a tumbling window
+   of the same size. For memory-constrained environments, prefer tumbling windows or
+   wider advance intervals.
+
+Q: How do session windows handle merging?
+A: If a new event arrives that bridges two existing sessions (its time is within
+   the inactivity gap of both), Kafka Streams MERGES the two sessions into one.
+   It tombstones the two separate session entries and creates a new merged session
+   spanning the combined time range. This merge operation is expensive (deletes +
+   creates in state store) and must be handled by the Kafka Streams session merger
+   callback in the aggregate function.

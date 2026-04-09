@@ -1,0 +1,325 @@
+================================================================
+AWS COMPUTE — LAMBDA SERVERLESS
+Complete Interview Preparation Guide
+================================================================
+
+1. WHAT IS AWS LAMBDA?
+================================================================
+
+AWS Lambda is a serverless compute service that runs your code in response to
+events without provisioning or managing servers. You only pay for the compute
+time your code consumes.
+
+Key characteristics:
+  - No server management
+  - Auto-scaling: handles 1 to 10,000+ concurrent executions automatically
+  - Pay per request + execution duration (no idle cost)
+  - Max execution time: 15 minutes
+  - Multiple runtimes: Java, Python, Node.js, Ruby, Go, .NET, custom runtime
+
+================================================================
+2. LAMBDA FUNDAMENTALS
+================================================================
+
+FUNCTION COMPONENTS:
+  - Handler: entry point function that AWS invokes
+  - Execution Role: IAM role granting Lambda permissions to call other services
+  - Environment Variables: key-value config (secrets should use Secrets Manager)
+  - Memory: 128 MB to 10,240 MB (CPU allocated proportionally)
+  - Timeout: 1 second to 15 minutes (900 seconds)
+  - Concurrency: max simultaneous executions
+
+HANDLER FORMAT:
+  Java: com.example.Handler::handleRequest
+  Node.js: index.handler (exports.handler function in index.js)
+  Python: lambda_function.lambda_handler
+
+================================================================
+3. LAMBDA IN JAVA (AWS SDK v2)
+================================================================
+
+// Basic Java Lambda handler - RequestHandler interface
+import com.amazonaws.services.lambda.runtime.Context;
+import com.amazonaws.services.lambda.runtime.RequestHandler;
+
+public class MyLambdaHandler implements RequestHandler<Map<String,String>, String> {
+    
+    @Override
+    public String handleRequest(Map<String, String> event, Context context) {
+        context.getLogger().log("Event: " + event);
+        
+        String name = event.getOrDefault("name", "World");
+        return "Hello, " + name + "!";
+    }
+}
+
+// API Gateway Proxy Integration
+import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyRequestEvent;
+import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyResponseEvent;
+
+public class ApiHandler implements 
+    RequestHandler<APIGatewayProxyRequestEvent, APIGatewayProxyResponseEvent> {
+    
+    private final DynamoDbClient dynamoDb = DynamoDbClient.create();  // Created ONCE (outside handler)
+    
+    @Override
+    public APIGatewayProxyResponseEvent handleRequest(
+            APIGatewayProxyRequestEvent request, Context context) {
+        
+        String body = request.getBody();
+        String path = request.getPath();
+        Map<String, String> headers = request.getHeaders();
+        
+        // Process...
+        
+        return new APIGatewayProxyResponseEvent()
+            .withStatusCode(200)
+            .withHeaders(Map.of("Content-Type", "application/json"))
+            .withBody("{\"message\": \"success\"}");
+    }
+}
+
+// pom.xml dependencies:
+// aws-lambda-java-core: 1.2.3
+// aws-lambda-java-events: 3.11.3
+// aws-java-sdk-lambda (or aws-sdk-java-v2 for specific services)
+
+================================================================
+4. LAMBDA EVENT SOURCES (TRIGGERS)
+================================================================
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ TRIGGER SOURCE          │ INVOCATION TYPE                       │
+  ├─────────────────────────────────────────────────────────────────┤
+  │ API Gateway             │ Sync (RequestResponse)                │
+  │ Application Load Balancer│ Sync                                 │
+  │ S3 (event notification) │ Async (Event)                        │
+  │ DynamoDB Streams        │ Stream (pull-based, sync-like)        │
+  │ SQS                     │ Stream (batch processing)            │
+  │ SNS                     │ Async                                 │
+  │ EventBridge (CloudWatch)│ Async                                 │
+  │ Kinesis                 │ Stream (batch)                        │
+  │ Cognito                 │ Sync                                  │
+  │ CloudFront (Lambda@Edge)│ Sync                                  │
+  │ CloudFormation          │ Async                                 │
+  │ Schedule (EventBridge)  │ Async                                 │
+  └─────────────────────────────────────────────────────────────────┘
+
+INVOCATION TYPES:
+  Synchronous (RequestResponse): Caller waits for Lambda to complete
+  Asynchronous (Event): Lambda queued; caller doesn't wait; retries on failure (2x)
+  Stream-based: Lambda polls the stream/queue (SQS, Kinesis, DynamoDB)
+
+================================================================
+5. COLD STARTS AND WARM STARTS
+================================================================
+
+COLD START:
+  First invocation of a Lambda function (or after long idle period):
+  1. AWS provisions a new execution environment (container)
+  2. Downloads and initializes the runtime (JVM for Java)
+  3. Loads your JAR/deployment package
+  4. Executes INIT code (static initializers, Spring context)
+  5. Executes handler method
+
+  Cold start penalty: 
+    Node.js/Python: ~100-500ms
+    Java: 1-10 seconds (JVM startup + class loading)
+    Java + Spring Boot: 5-20+ seconds (!!)
+
+WARM START:
+  Subsequent invocations reuse the existing execution environment
+  (the container stays warm for a period after the last invocation)
+  
+  Handler executes immediately — only handler code runs
+
+MINIMIZING JAVA COLD STARTS:
+  1. Initialize SDK clients OUTSIDE the handler (static or instance fields)
+     → SDK clients are reused across invocations on same container
+  
+  2. Avoid Spring Boot on Lambda — use micronaut or quarkus instead
+     or use Lambda SnapStart (see below)
+  
+  3. Use Provisioned Concurrency (see below)
+  
+  4. Minimize JAR size (use shaded JAR with only required dependencies)
+  
+  5. Use Lambda SnapStart (Java 11+, Corretto)
+
+LAMBDA SNAPSTART (Java):
+  - Takes a snapshot of initialized execution environment
+  - On cold start, restores from snapshot instead of initializing from scratch
+  - Reduces cold start from seconds to milliseconds
+  - Enable: set SnapStart=PublishedVersions on function config
+
+CODE PATTERN (initialize outside handler):
+  public class MyHandler implements RequestHandler<SQSEvent, Void> {
+      
+      // ✅ CORRECT: Initialize once, reused across warm invocations
+      private static final DynamoDbClient dynamoDb = DynamoDbClient.builder()
+          .region(Region.US_EAST_1)
+          .build();
+      
+      private static final SqsClient sqsClient = SqsClient.create();
+      
+      @Override
+      public Void handleRequest(SQSEvent event, Context context) {
+          // dynamoDb and sqsClient already initialized (warm)
+          for (SQSEvent.SQSMessage msg : event.getRecords()) {
+              processMessage(msg.getBody());
+          }
+          return null;
+      }
+  }
+
+================================================================
+6. CONCURRENCY AND THROTTLING
+================================================================
+
+  CONCURRENCY = number of function invocations running simultaneously
+
+  TYPES:
+    Reserved Concurrency: max concurrency for THIS function (throttles if exceeded)
+    Provisioned Concurrency: pre-initialized execution environments
+    Account-level default: 1,000 concurrent executions per region (soft limit)
+                           Request increase via AWS Support
+
+  RESERVED CONCURRENCY:
+    - Guarantees the function CAN use this amount (not taken by other functions)
+    - ALSO acts as a throttle maximum (prevents function from scaling beyond limit)
+    - Set to 0 to disable all invocations (useful to stop a runaway function)
+
+  PROVISIONED CONCURRENCY:
+    - Pre-warms N execution environments (no cold starts)
+    - Cost: additional charge for provisioned concurrency hours
+    - Best for: latency-sensitive APIs, Java functions, black friday events
+    - Can auto-scale provisioned concurrency with Application Auto Scaling
+
+  THROTTLING:
+    When Lambda runs out of concurrency, it returns:
+    - Sync: 429 TooManyRequests error
+    - Async: Events retried for up to 6 hours (exponential backoff)
+    - SQS: Messages remain in queue until processed
+
+================================================================
+7. LAMBDA LAYERS
+================================================================
+
+  Layers are ZIP archives containing libraries, dependencies, or custom runtimes.
+  Shared across multiple functions.
+
+  Benefits:
+    - Reduce deployment package size (function code < 50MB compressed)
+    - Share common libraries (logging, utilities) across functions
+    - Manage dependencies separately from function code
+
+  Limits:
+    - Max 5 layers per function
+    - Total unzipped size (function + layers): 250 MB
+
+  Creating a Java dependency layer:
+    # Create layer structure
+    mkdir -p layer/java/lib
+    cp target/dependency/*.jar layer/java/lib/
+    cd layer && zip -r ../layer.zip java/
+    
+    aws lambda publish-layer-version \
+      --layer-name CommonLibs \
+      --zip-file fileb://layer.zip \
+      --compatible-runtimes java17
+
+================================================================
+8. LAMBDA WITH SQS (Important Pattern)
+================================================================
+
+  ARCHITECTURE:
+    SQS Queue → Lambda (event source mapping) → Process messages
+    
+    - Lambda polls SQS automatically (no need to call ReceiveMessage)
+    - Processes batches of messages (batch size: 1-10,000)
+    - On success: Lambda deletes messages from queue
+    - On failure: messages return to queue, then DLQ after maxReceiveCount
+    
+    Java SQS Handler:
+    import com.amazonaws.services.lambda.runtime.events.SQSEvent;
+    
+    public class SQSHandler implements RequestHandler<SQSEvent, Void> {
+        @Override
+        public Void handleRequest(SQSEvent event, Context context) {
+            for (SQSEvent.SQSMessage message : event.getRecords()) {
+                String body = message.getBody();
+                String messageId = message.getMessageId();
+                
+                try {
+                    processMessage(body);
+                } catch (Exception e) {
+                    // For partial failures, throw to return message to queue
+                    // Or use SQSBatchResponse for partial batch failures
+                    throw new RuntimeException("Failed to process: " + messageId, e);
+                }
+            }
+            return null;
+        }
+    }
+    
+    // For partial batch failure handling:
+    import com.amazonaws.services.lambda.runtime.events.SQSBatchResponse;
+    
+    public SQSBatchResponse handleRequest(SQSEvent event, Context context) {
+        List<SQSBatchResponse.BatchItemFailure> failures = new ArrayList<>();
+        for (SQSEvent.SQSMessage message : event.getRecords()) {
+            try {
+                processMessage(message.getBody());
+            } catch (Exception e) {
+                failures.add(SQSBatchResponse.BatchItemFailure.builder()
+                    .withItemIdentifier(message.getMessageId())
+                    .build());
+            }
+        }
+        return SQSBatchResponse.builder().withBatchItemFailures(failures).build();
+    }
+
+================================================================
+9. INTERVIEW QUESTIONS
+================================================================
+
+Q: What is a Lambda cold start and how do you mitigate it?
+A: A cold start occurs when Lambda must provision a new execution environment,
+   download the runtime, load your code, and run initialization code before
+   executing the handler. For Java, this can take 1-10+ seconds due to JVM startup.
+   Mitigation: 1) Initialize SDK clients as static fields (reused on warm invocations).
+   2) Use Provisioned Concurrency for latency-sensitive functions. 3) Use Lambda
+   SnapStart (Java 11+ on Corretto) to snapshot and restore initialized environments.
+   4) Avoid heavy frameworks (Spring Boot) — use lightweight alternatives.
+
+Q: What are the Lambda concurrency limits?
+A: Default account limit is 1,000 concurrent executions per region (can be increased).
+   Reserved Concurrency sets the maximum for a specific function (also prevents other
+   functions from stealing its capacity). Provisioned Concurrency pre-initializes
+   a set number of environments to eliminate cold starts. When the limit is exceeded,
+   synchronous invocations get 429 errors; async invocations are retried.
+
+Q: How does Lambda handle failures with SQS?
+A: Lambda automatically polls SQS and processes batches. On success, Lambda
+   deletes the messages. On failure (exception), messages return to the queue
+   (not deleted) and are retried. After maxReceiveCount retries, messages go
+   to the Dead Letter Queue (DLQ) for manual inspection. With partial batch
+   failure support (SQSBatchResponse), you can mark only failed messages to
+   return to queue while successfully processed messages are deleted.
+
+Q: What is the difference between synchronous and asynchronous Lambda invocation?
+A: Synchronous (API Gateway, ALB): The caller WAITS for Lambda to complete
+   and gets the return value. Errors are immediately returned to the caller.
+   Asynchronous (S3, SNS, EventBridge): Lambda queues the event and immediately
+   returns to the caller (status 202). Lambda retries failed invocations up to 2
+   times. After retries, events go to a DLQ. Stream-based (SQS, Kinesis):
+   Lambda polls the source and processes batches; handles retries differently.
+
+Q: Why is the Lambda execution role important and what happens without one?
+A: The execution role is an IAM role that Lambda assumes to call other AWS services.
+   Without it (or without proper permissions), Lambda cannot: write logs to CloudWatch,
+   read from SQS, write to DynamoDB, call other AWS APIs. At minimum, Lambda needs
+   AWSLambdaBasicExecutionRole (CloudWatch Logs write). Add specific permissions for
+   each AWS service the function needs to access.
+
+================================================================

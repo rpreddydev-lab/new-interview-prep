@@ -1,0 +1,362 @@
+================================================================================
+TIMEOUTS AND RETRIES — IN DEPTH
+================================================================================
+
+WHAT ARE TIMEOUTS AND RETRIES?
+--------------------------------
+In distributed systems, a service call can fail in two ways:
+  1. Fast failure: network error, connection refused, 4xx/5xx response
+  2. Slow failure: connection hangs, server too slow to respond
+
+Timeouts prevent slow failures from cascading (a hanging call blocks a thread).
+Retries recover from transient fast failures (brief network hiccup, 503, etc.)
+
+The combination of good timeout + retry strategy is essential to building
+resilient microservices. Without them, your system is fragile.
+
+================================================================================
+1. TYPES OF TIMEOUTS
+================================================================================
+
+CONNECT TIMEOUT:
+  How long to wait to establish a TCP connection to the server.
+  If server is down or unreachable: connection is refused quickly (OS returns
+  RST), but if a firewall silently drops packets, connect timeout prevents
+  waiting forever.
+  Typical value: 2-5 seconds
+
+READ TIMEOUT (Response Timeout):
+  How long to wait after connection is established for the server to start
+  sending data (first byte), or between data chunks.
+  Guards against a server that accepted the connection but is too slow to
+  respond.
+  Typical value: 5-30 seconds depending on operation
+
+WRITE TIMEOUT:
+  How long to wait for a write to the socket to complete.
+  Rarely an issue unless sending large request bodies.
+  Typical value: 10-30 seconds
+
+REQUEST TIMEOUT (End-to-End):
+  Total wall-clock time for the entire request/response cycle.
+  Caps the overall duration regardless of individual connect/read timeouts.
+  Useful at the service level: "this operation must complete in < N seconds".
+
+IDLE TIMEOUT:
+  How long an HTTP keep-alive connection can stay idle before being closed.
+  Prevents stale connections.
+
+TIMEOUT HIERARCHY (most specific wins, if both set):
+  RequestTimeout >= ConnectTimeout + ReadTimeout + WriteTimeout
+
+================================================================================
+2. CONFIGURING TIMEOUTS IN SPRING BOOT
+================================================================================
+
+WEBCLIENT TIMEOUT CONFIGURATION:
+  @Bean
+  public WebClient webClient() {
+      HttpClient httpClient = HttpClient.create()
+          .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 3000)   // connect
+          .responseTimeout(Duration.ofSeconds(10))               // read/response
+          .doOnConnected(conn ->
+              conn.addHandlerLast(new ReadTimeoutHandler(10, TimeUnit.SECONDS))
+                  .addHandlerLast(new WriteTimeoutHandler(10, TimeUnit.SECONDS))
+          );
+      
+      return WebClient.builder()
+          .clientConnector(new ReactorClientHttpConnector(httpClient))
+          .build();
+  }
+  
+  // Usage with per-request timeout override:
+  Mono<Order> order = webClient.get()
+      .uri("http://order-service/orders/{id}", orderId)
+      .retrieve()
+      .bodyToMono(Order.class)
+      .timeout(Duration.ofSeconds(5));   // per-request timeout cap
+
+RESTTEMPLATE TIMEOUT (legacy):
+  @Bean
+  public RestTemplate restTemplate() {
+      HttpComponentsClientHttpRequestFactory factory =
+          new HttpComponentsClientHttpRequestFactory();
+      factory.setConnectTimeout(3000);       // 3s connect
+      factory.setReadTimeout(10000);         // 10s read
+      factory.setConnectionRequestTimeout(2000); // get conn from pool
+      return new RestTemplate(factory);
+  }
+
+SPRING MVC / SERVER-SIDE TIMEOUT:
+  # Servlet container timeout (Tomcat)
+  server.tomcat.connection-timeout: 20000  # 20s; close idle connections
+  
+  # Spring MVC async timeout
+  spring.mvc.async.request-timeout: 30000  # 30s; for DeferredResult/Callable
+  
+  # WebFlux response timeout
+  spring.webflux.request-timeout: 30s
+
+APPLICATION PROPERTIES PATTERN:
+  app:
+    timeouts:
+      user-service:
+        connect: 3000
+        read: 5000
+      payment-service:
+        connect: 3000
+        read: 15000    # payments need more time
+      search-service:
+        connect: 2000
+        read: 3000     # fast or degrade gracefully
+
+================================================================================
+3. RETRY PATTERNS
+================================================================================
+
+WHEN TO RETRY:
+  ✅ SAFE to retry:
+     - Network timeouts (transient)
+     - 503 Service Unavailable
+     - 429 Too Many Requests (after Retry-After delay)
+     - 502 Bad Gateway (proxy error)
+  
+  ❌ DO NOT retry:
+     - 400 Bad Request (client bug; retrying won't help)
+     - 401 Unauthorized / 403 Forbidden
+     - 404 Not Found
+     - 409 Conflict (idempotency issue — depends on design)
+     - 422 Unprocessable Entity
+     - Non-idempotent operations (POST creating an order — unless idempotency key)
+
+RETRY STRATEGIES:
+
+1. IMMEDIATE RETRY:
+   // Only for very transient errors; usually bad practice
+   retry(3)
+
+2. FIXED DELAY:
+   // Retry after a constant delay
+   retry after 1s, 1s, 1s
+   // Problem: if many clients retry simultaneously → thundering herd
+
+3. EXPONENTIAL BACKOFF:
+   // Double the delay each attempt
+   attempt 1: wait 1s
+   attempt 2: wait 2s
+   attempt 3: wait 4s
+   attempt 4: wait 8s (cap at max, e.g., 60s)
+   
+   delay = min(cap, base × 2^attempt)
+
+4. EXPONENTIAL BACKOFF WITH JITTER (best practice):
+   // Spread retries to avoid thundering herd
+   delay = min(cap, base × 2^attempt) × random(0.5, 1.5)
+   // or: random(0, min(cap, base × 2^attempt))
+   
+   Full jitter (AWS recommendation):
+   sleep = random_between(0, min(cap, base × 2^attempt))
+
+================================================================================
+4. RESILIENCE4J RETRY IMPLEMENTATION
+================================================================================
+
+MAVEN DEPENDENCY:
+  <dependency>
+      <groupId>io.github.resilience4j</groupId>
+      <artifactId>resilience4j-spring-boot3</artifactId>
+  </dependency>
+
+YAML CONFIGURATION:
+  resilience4j:
+    retry:
+      instances:
+        orderService:
+          max-attempts: 3              # total attempts (not extra retries)
+          wait-duration: 1s            # base wait
+          enable-exponential-backoff: true
+          exponential-backoff-multiplier: 2  # base × 2^n
+          exponential-max-wait-duration: 30s # cap
+          retry-exceptions:
+            - java.net.SocketTimeoutException
+            - org.springframework.web.client.ResourceAccessException
+            - feign.RetryableException
+          ignore-exceptions:
+            - com.example.exception.ClientErrorException
+
+ANNOTATION-BASED USAGE:
+  @Service
+  public class OrderService {
+      private final WebClient webClient;
+      
+      @Retry(name = "orderService", fallbackMethod = "getOrderFallback")
+      public Order getOrder(String orderId) {
+          return webClient.get()
+              .uri("/orders/{id}", orderId)
+              .retrieve()
+              .bodyToMono(Order.class)
+              .block();
+      }
+      
+      // Fallback method (same signature + exception parameter)
+      private Order getOrderFallback(String orderId, Exception ex) {
+          log.warn("Order service unavailable, returning cached order. id={}", orderId);
+          return orderCache.get(orderId)
+              .orElseThrow(() -> new ServiceUnavailableException("Order service down"));
+      }
+  }
+
+PROGRAMMATIC RETRY WITH JITTER:
+  RetryConfig config = RetryConfig.custom()
+      .maxAttempts(4)
+      .intervalFunction(IntervalFunction.ofExponentialRandomBackoff(
+          Duration.ofMillis(500),   // base
+          2.0,                       // multiplier
+          0.3,                       // randomization factor (±30%)
+          Duration.ofSeconds(30)     // max interval
+      ))
+      .retryOnException(e -> e instanceof TimeoutException || e instanceof ServiceUnavailableException)
+      .build();
+  
+  Retry retry = Retry.of("orderService", config);
+  Supplier<Order> decoratedSupplier = Retry.decorateSupplier(retry,
+      () -> orderClient.getOrder(orderId));
+  
+  Order order = Try.ofSupplier(decoratedSupplier)
+      .recover(throwable -> fallbackOrder(orderId))
+      .get();
+
+================================================================================
+5. COMBINING TIMEOUT AND RETRY
+================================================================================
+
+IMPORTANT: Each retry attempt should have its own timeout.
+  Total timeout budget = per-attempt-timeout × max-attempts (roughly)
+  Set a global deadline to ensure the caller doesn't wait too long.
+
+  // Pattern: per-attempt timeout + total deadline
+  Duration perAttemptTimeout = Duration.ofSeconds(5);
+  Duration globalDeadline = Duration.ofSeconds(12);  // 2-3 attempts at 5s
+  
+  webClient.get()
+      .uri("/api/data")
+      .retrieve()
+      .bodyToMono(Data.class)
+      .timeout(perAttemptTimeout)                   // per-attempt
+      .retry(2)                                      // retry up to 2 times
+      .timeout(globalDeadline);                      // hard cap on total time
+
+Layered timeout strategy:
+  API Gateway level: 30s timeout (user-facing)
+  Service-to-service: 5s per attempt, 3 retries, 15s cap
+  DB query: 3s query timeout; HikariCP 30s connection timeout
+
+================================================================================
+6. CIRCUIT BREAKER + RETRY INTERACTION
+================================================================================
+
+Circuit breaker prevents retrying a known-failed service:
+  CLOSED   → retries allowed
+  OPEN     → fail fast, no retries (circuit breaker short-circuits)
+  HALF-OPEN → allow one trial request
+
+Order of decorators matters (outer → inner):
+  @CircuitBreaker + @Retry: CircuitBreaker wraps Retry
+    → Retry attempts, then CB counts all failures
+    → If CB opens, subsequent calls fail fast without retrying
+  
+  Recommended:
+    CircuitBreaker (outermost) → Retry → Timeout (innermost)
+  
+  resilience4j.decorators order in annotations: inside-out
+  @Retry → applied first (innermost)
+  @CircuitBreaker → applied last (outermost)
+  
+  // Spring processes in reverse annotation order:
+  @CircuitBreaker(name = "orderService")
+  @Retry(name = "orderService")
+  @TimeLimiter(name = "orderService")  // innermost
+  public CompletableFuture<Order> getOrder(String id) { ... }
+
+================================================================================
+7. TIMEOUT AND RETRY BEST PRACTICES
+================================================================================
+
+1. DIFFERENTIATE TIMEOUTS BY SERVICE:
+   Fast services (cache, read): 100-500ms
+   Normal services: 1-5s
+   Heavy operations (PDF, ML): 30-120s
+
+2. PROPAGATE DEADLINES:
+   Use gRPC deadlines or HTTP headers to pass remaining budget downstream.
+   // Add remaining deadline in header
+   Duration remaining = deadline.minus(Duration.between(start, Instant.now()));
+   request.header("X-Request-Deadline-Ms", remaining.toMillis());
+
+3. IDEMPOTENCY KEYS FOR RETRIED MUTATIONS:
+   POST /payments with header Idempotency-Key: <uuid>
+   Server caches result; duplicate requests return same result.
+   Prevents double charges on retry.
+
+4. LOG RETRY ATTEMPTS:
+   resilience4j.retry.instances.orderService.event-consumer-buffer-size: 10
+   @EventListener
+   public void onRetryEvent(RetryOnRetryEvent event) {
+       log.warn("Retry attempt {} for {}", event.getNumberOfRetryAttempts(),
+                event.getName());
+   }
+
+5. ALERT ON HIGH RETRY RATES:
+   metric: resilience4j.retry.calls{kind="failed_with_retry"}
+   High retries indicate an underlying service is struggling.
+
+================================================================================
+8. INTERVIEW QUESTIONS — TIMEOUTS AND RETRIES
+================================================================================
+
+Q1: What is the difference between connect timeout and read timeout?
+    Connect timeout is how long to wait for the TCP handshake to complete — it
+    fires when the server is completely unreachable or a firewall silently drops
+    packets. Read timeout (response timeout) fires when the server accepted the
+    connection but takes too long to respond — it catches slow or hung servers.
+    In Spring WebClient, you set connect timeout via ChannelOption and response
+    timeout via httpClient.responseTimeout(). Both are needed because a server
+    can be reachable (connect succeeds) but still too slow (read timeout fires).
+
+Q2: Why use exponential backoff with jitter instead of fixed-delay retries?
+    Fixed-delay retries from many clients retry at the same intervals, creating
+    synchronized traffic spikes — the "thundering herd" problem. If 1000 clients
+    retry after exactly 1s, the server receives 1000 requests at t=1s (when it
+    was already struggling). Exponential backoff with jitter spreads retries
+    randomly over a time window. AWS uses "full jitter" — sleep = random(0,
+    min(cap, base × 2^n)). This distributes load and gives the overloaded
+    service time to recover.
+
+Q3: What operations should you NOT retry automatically?
+    Non-idempotent operations should not be blindly retried because they may
+    have succeeded on the first attempt and retrying would create duplicates
+    (double charges, duplicate records). Also, 4xx client errors should not be
+    retried — a 400 Bad Request, 401, 403, or 404 will fail again because
+    retrying doesn't fix client-side bugs or missing resources. Only retry on
+    transient infrastructure errors (timeouts, 503, network issues) or when
+    you have idempotency keys ensuring retries are safe.
+
+Q4: How do you prevent a retry storm when a downstream service is overloaded?
+    Use a circuit breaker: after a threshold of failures, the circuit opens and
+    subsequent calls fail fast without retrying — giving the downstream service
+    time to recover. Combine with: 1) exponential backoff with jitter on retries,
+    2) rate limiting on outbound calls, 3) setting a maximum retry attempts (e.g.,
+    3), and 4) respecting Retry-After headers from 429 responses. In Resilience4j,
+    @CircuitBreaker wraps @Retry so when the circuit opens, no more retries are
+    attempted.
+
+Q5: How do you handle retries safely for POST requests (non-idempotent)?
+    Use an idempotency key: the client generates a UUID and sends it in a header
+    (Idempotency-Key or X-Idempotency-Key). The server stores the result of the
+    first successful processing keyed by this UUID (in Redis or DB). If the same
+    idempotency key arrives again, the server returns the cached result without
+    re-processing. This makes POST effectively idempotent from the client's
+    perspective. Stripe, PayPal, and most payment APIs require this pattern.
+    The idempotency key should be unique per logical operation, not per HTTP call.
+
+================================================================================

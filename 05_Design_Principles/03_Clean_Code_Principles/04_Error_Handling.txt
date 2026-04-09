@@ -1,0 +1,244 @@
+================================================================
+  ERROR HANDLING — CLEAN CODE
+================================================================
+
+  "Error handling is important, but if it obscures logic,
+   it's wrong." — Robert C. Martin
+
+  Clean error handling separates the happy path from error paths,
+  makes failures explicit, and communicates intent clearly.
+
+----------------------------------------------------------------
+RULE 1: PREFER EXCEPTIONS OVER ERROR CODES
+----------------------------------------------------------------
+
+  // BAD: error codes — callers must check after every call
+  int result = deleteFile(path);
+  if (result == -1) {
+      logger.error("File not found");
+  } else if (result == -2) {
+      logger.error("No permission");
+  }
+  // Caller can ignore this check — silently swallowed error
+
+  // GOOD: exceptions — force caller to handle (checked) or propagate
+  try {
+      deleteFile(path);
+  } catch (FileNotFoundException e) {
+      logger.error("File not found: {}", path, e);
+  } catch (PermissionException e) {
+      logger.error("No permission to delete: {}", path, e);
+  }
+
+  With error codes: caller is ALLOWED to ignore the error.
+  With exceptions: caller MUST handle or propagate.
+
+----------------------------------------------------------------
+RULE 2: WRITE THE TRY-CATCH FIRST
+----------------------------------------------------------------
+
+  Define the happy path, then the exception scope.
+  A try block is like a transaction: either succeeds or is rolled back.
+
+  @Test
+  void deleteFileNotFound() {
+      try {
+          fileService.delete("nonexistent.txt");
+          fail("Expected FileNotFoundException");  // or: assertThrows
+      } catch (FileNotFoundException expected) {
+          // test passes
+      }
+  }
+
+  // Production: define scope clearly
+  public List<Record> loadRecords(Path file) throws DataLoadException {
+      try {
+          return parseFile(file);          // might throw IOException
+      } catch (IOException e) {
+          throw new DataLoadException("Failed to load: " + file, e);
+      }
+  }
+
+----------------------------------------------------------------
+RULE 3: USE UNCHECKED EXCEPTIONS FOR PROGRAMMING ERRORS
+----------------------------------------------------------------
+
+  Checked exceptions (must declare in throws or catch):
+    Good for: recoverable conditions (file not found, network timeout)
+    Callers CAN handle them: retry, fallback, alert user
+
+  Unchecked (RuntimeException):
+    Good for: programming errors, contract violations, unexpected states
+    Callers CANNOT recover: NullPointerException, IllegalArgumentException
+
+  Java best practice:
+    Checked: IOException, SQLException — recoverable external failures
+    Unchecked: NullPointerException, IndexOutOfBoundsException, IllegalStateException
+
+  // Good use of unchecked — precondition violation:
+  public void deposit(double amount) {
+      if (amount <= 0) throw new IllegalArgumentException("Amount must be positive");
+      this.balance += amount;
+  }
+  // Caller can't "recover" from passing negative amount — it's a programming bug.
+
+  // Good use of checked — external system failure:
+  public Response callExternalApi() throws ApiException { ... }
+  // Caller should handle: retry, use cached response, show error message.
+
+  SPRING BOOT CONVENTION: use unchecked exceptions in services.
+  Use @ControllerAdvice / @ExceptionHandler to map to HTTP responses.
+
+----------------------------------------------------------------
+RULE 4: DON'T RETURN NULL — USE OPTIONAL OR THROW
+----------------------------------------------------------------
+
+  // BAD: returns null — forces null checks everywhere
+  public Order findOrderById(String id) {
+      if (/* not found */) return null;
+      return order;
+  }
+
+  // Every caller:
+  Order order = findOrderById(id);
+  if (order != null) { ... }  // easy to forget — NullPointerException waiting
+
+  // GOOD option 1: Optional
+  public Optional<Order> findOrderById(String id) {
+      if (/* not found */) return Optional.empty();
+      return Optional.of(order);
+  }
+  // Caller explicitly handles absence:
+  findOrderById(id).ifPresent(order -> process(order));
+  Order order = findOrderById(id).orElseThrow(() -> new OrderNotFoundException(id));
+
+  // GOOD option 2: throw descriptive exception (when absence is always an error)
+  public Order getOrderById(String id) {
+      return repository.findById(id)
+          .orElseThrow(() -> new OrderNotFoundException(id));
+  }
+
+  // GOOD option 3: Null Object (for injected dependencies, see design patterns)
+  public Logger getLogger() {
+      return logger != null ? logger : NullLogger.INSTANCE;
+  }
+
+----------------------------------------------------------------
+RULE 5: DON'T PASS NULL
+----------------------------------------------------------------
+
+  // BAD: passing null to method — deferred NullPointerException
+  processor.process(order, null);  // what was null supposed to be?
+
+  // GOOD: use Optional parameter for truly optional values
+  processor.process(order, Optional.empty());
+
+  // BETTER: split into two methods
+  processor.processWithDiscount(order, discount);
+  processor.processWithoutDiscount(order);
+
+  // Use @NonNull annotations to document and enforce:
+  public void process(@NonNull Order order, @NonNull Customer customer) {
+      Objects.requireNonNull(order, "order must not be null");
+      Objects.requireNonNull(customer, "customer must not be null");
+  }
+
+----------------------------------------------------------------
+RULE 6: PROVIDE CONTEXT IN EXCEPTIONS
+----------------------------------------------------------------
+
+  // BAD: no context
+  throw new RuntimeException("Failed");
+
+  // GOOD: meaningful message with relevant data
+  throw new OrderProcessingException(
+      String.format("Failed to process order %s for customer %s: %s",
+          order.getId(), order.getCustomerId(), cause.getMessage()),
+      cause  // preserve original cause for stack trace
+  );
+
+  Custom exceptions: define per meaningful failure category
+  OrderNotFoundException extends RuntimeException
+  PaymentDeclinedException extends RuntimeException
+  InsufficientStockException extends RuntimeException
+
+  Spring: map to HTTP status with @ResponseStatus:
+  @ResponseStatus(HttpStatus.NOT_FOUND)
+  public class OrderNotFoundException extends RuntimeException { ... }
+
+----------------------------------------------------------------
+RULE 7: FAIL FAST
+----------------------------------------------------------------
+
+  Detect errors at the ENTRY POINT, not deep in the call stack.
+
+  // BAD: null propagates deep before exploding
+  public void updateShipment(Order order) {
+      Customer customer = order.getCustomer();  // might be null
+      Address address = customer.getShippingAddress();  // NPE here if customer null
+      // NPE is far from the root cause
+  }
+
+  // GOOD: guard at entry
+  public void updateShipment(Order order) {
+      Objects.requireNonNull(order, "order required");
+      Objects.requireNonNull(order.getCustomer(), "order must have customer");
+      // Proceed with valid inputs
+  }
+
+  Bean Validation at API boundaries:
+  @PostMapping("/orders")
+  public ResponseEntity<Order> createOrder(@Valid @RequestBody CreateOrderRequest request) {
+      // @Valid throws MethodArgumentNotValidException before entering method body
+  }
+
+----------------------------------------------------------------
+TRY-WITH-RESOURCES (ALWAYS FOR CLOSEABLE)
+----------------------------------------------------------------
+
+  // BAD: finally block managing resource cleanup
+  InputStream in = null;
+  try {
+      in = new FileInputStream(path);
+      // read...
+  } finally {
+      if (in != null) {
+          try { in.close(); } catch (IOException ignored) { }
+      }
+  }
+
+  // GOOD: try-with-resources (AutoCloseable)
+  try (InputStream in = new FileInputStream(path)) {
+      // read... — in.close() called automatically even on exception
+  } catch (IOException e) {
+      throw new DataReadException("Failed to read: " + path, e);
+  }
+
+  Multiple resources: all closed in reverse order of declaration.
+  try (Connection conn = ds.getConnection();
+       PreparedStatement ps = conn.prepareStatement(sql)) {
+      // both closed automatically
+  }
+
+----------------------------------------------------------------
+INTERVIEW Q&A
+----------------------------------------------------------------
+
+  Q: When should you use checked vs unchecked exceptions?
+  A: Checked: recoverable conditions from external systems (IO, network).
+     Caller can handle: retry, fallback, user message.
+     Unchecked: programming errors, contract violations.
+     Caller cannot recover: fix the code.
+     Spring Boot convention: unchecked in services, @ControllerAdvice maps to HTTP.
+
+  Q: Why is returning null considered bad practice?
+  A: Callers must null-check or risk NullPointerException at an unrelated location.
+     The failure is silent and deferred. Use Optional for values that may be absent,
+     throw for conditions that are always errors, and Null Object for default behavior.
+
+  Q: What is fail fast?
+  A: Detect and throw errors at the earliest possible point — usually at method
+     entry points. Prevents errors from propagating deep and creating misleading
+     stack traces. Bean Validation at API boundaries is fail-fast for web requests.
+
+================================================================

@@ -1,0 +1,227 @@
+================================================================================
+REDIS PIPELINING — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. WHAT IS PIPELINING?
+───────────────────────
+  Redis Pipelining is a client-side technique to send multiple commands
+  to the server in a single network round trip, without waiting for
+  individual replies.
+
+  Normal request-response:
+    Client → PING     → wait → Server: PONG
+    Client → SET k v  → wait → Server: OK
+    Client → GET k    → wait → Server: "v"
+    Total RTTs: 3
+
+  With pipelining:
+    Client → PING, SET k v, GET k  (all at once)
+    Server → PONG, OK, "v"         (all at once)
+    Total RTTs: 1
+
+  Pipeline = send N commands, receive N responses in 1 round trip.
+
+  KEY POINT: Pipelining is a CLIENT-side optimization.
+  The server processes each command individually in order.
+  It does NOT batch them atomically on the server side.
+
+
+2. WHY IT MATTERS: RTT MATH
+─────────────────────────────
+  RTT (Round-Trip Time): Time for a packet to travel client→server→client.
+  Even on localhost: ~0.1ms. On LAN: ~1ms. Cross-region: ~50–100ms.
+
+  Without pipelining (cross-region, 50ms RTT):
+    1000 commands × 50ms = 50,000ms = 50 seconds
+
+  With pipelining (1000 commands, 1 round trip):
+    1 × 50ms + server processing = ~50ms
+
+  Redis can process ~1 million SET operations/sec.
+  Without pipelining, network is the bottleneck, not Redis.
+  Pipelining removes the network bottleneck.
+
+
+3. HOW PIPELINING WORKS
+────────────────────────
+  Client perspective:
+    1. Open connection to Redis
+    2. Buffer all commands locally (don't flush each one)
+    3. Send entire buffer to Redis in one write() syscall
+    4. Read all responses in one read() syscall
+
+  Server perspective:
+    1. Reads multiple commands from socket buffer
+    2. Executes them one-by-one in order
+    3. Writes all responses to output buffer
+    4. Flushes output buffer to client
+
+  Pipelining does NOT change:
+    - Command execution order (still sequential)
+    - Atomicity (each command is still individual)
+    - Error handling (one command failing doesn't stop others)
+
+
+4. REDIS-CLI PIPELINING
+────────────────────────
+  Batch import via --pipe flag:
+    # Generate 100k SET commands and pipe them
+    (for i in $(seq 1 100000); do echo "SET key:$i value:$i"; done) \
+      | redis-cli --pipe
+
+  Output:
+    All data transferred. Waiting for last reply...
+    ERR: 0, Replied: 100000, Data: 3400000 bytes
+
+
+5. JAVA PIPELINING — RedisTemplate
+─────────────────────────────────────
+  // Spring Data Redis pipelining
+  List<Object> results = redisTemplate.executePipelined(
+      new SessionCallback<List<Object>>() {
+          @Override
+          public List<Object> execute(RedisOperations operations) {
+              for (int i = 1; i <= 1000; i++) {
+                  operations.opsForValue().set("key:" + i, "value:" + i);
+              }
+              return null; // result collected by executePipelined
+          }
+      }
+  );
+  // results.get(0) ... results.get(999) contain replies
+
+  // Lettuce async pipelining (auto-batching)
+  StatefulRedisConnection<String, String> conn = client.connect();
+  RedisAsyncCommands<String, String> async = conn.async();
+  async.setAutoFlushCommands(false);   // disable auto-flush
+  List<RedisFuture<?>> futures = new ArrayList<>();
+  for (int i = 0; i < 1000; i++) {
+      futures.add(async.set("key:" + i, "value:" + i));
+  }
+  async.flushCommands();               // send all buffered
+  LettuceFutures.awaitAll(5, TimeUnit.SECONDS, futures.toArray(new RedisFuture[0]));
+  async.setAutoFlushCommands(true);    // re-enable
+
+
+6. PIPELINE vs MULTI/EXEC vs LUA
+──────────────────────────────────
+  Feature               │ Pipeline          │ MULTI/EXEC        │ Lua Script
+  ──────────────────────┼───────────────────┼───────────────────┼──────────────────
+  Client-side batching  │ Yes               │ Yes (combined)    │ No
+  Server-side atomicity │ No                │ Yes               │ Yes
+  Conditional logic     │ No                │ No                │ Yes
+  Interleaving allowed  │ Yes               │ No                │ No
+  Reduce RTTs           │ Yes               │ Yes               │ Yes (EVAL=1 RTT)
+  Network overhead      │ Lowest            │ Low               │ Low
+  Error handling        │ Per-command       │ Per-command       │ Lua-controlled
+  Rollback              │ No                │ No                │ No
+  Use case              │ Bulk operations   │ Atomic batch      │ Complex atomic logic
+
+
+7. PIPELINE + MULTI/EXEC TOGETHER
+────────────────────────────────────
+  You can pipeline the MULTI, commands, and EXEC in a single network round trip:
+
+    Client sends (one write):
+      MULTI
+      SET key1 val1
+      INCR counter
+      EXEC
+
+    Server executes atomically, sends responses in one reply.
+
+  This combines:
+    - 1 RTT (pipeline benefit)
+    - Atomic execution (MULTI/EXEC benefit)
+
+  Most Redis clients (Jedis, Lettuce, redis-py) do this automatically
+  when you call pipeline.multi().exec().
+
+
+8. PIPELINE CHUNK SIZE
+────────────────────────
+  Don't pipeline millions of commands at once.
+  Large pipelines buffer data in memory on both client and server.
+
+  Recommended chunk size: 1,000 – 10,000 commands per pipeline batch.
+
+  Example (chunked pipeline):
+    List<String> keys = getAllKeys();  // 1M keys
+    int batchSize = 1000;
+    for (int i = 0; i < keys.size(); i += batchSize) {
+        List<String> batch = keys.subList(i, Math.min(i + batchSize, keys.size()));
+        redisTemplate.executePipelined((SessionCallback<?>) ops -> {
+            for (String key : batch) {
+                ops.opsForValue().get(key);
+            }
+            return null;
+        });
+    }
+
+
+9. WHEN NOT TO USE PIPELINING
+───────────────────────────────
+  ✗ When commands depend on each other's results:
+      SET user:counter 0     ← must know result to branch
+      INCR user:counter      ← result depends on SET
+      → Use Lua for dependent command sequences
+
+  ✗ When real-time response is needed for each command:
+      Interactive user-facing reads shouldn't pipeline
+      (introduces latency waiting for batch to fill)
+
+  ✗ When atomicity is required between commands:
+      Pipeline doesn't prevent interleaving
+      → Use MULTI/EXEC or Lua
+
+
+10. PERFORMANCE BENCHMARK
+───────────────────────────
+  Test: 1 million SET operations, LAN (0.5ms RTT)
+
+  Without pipeline:   ~2,000 ops/sec
+                      (limited by 0.5ms per round trip)
+
+  With pipeline (1000/batch): ~500,000 ops/sec
+                              (Redis's throughput limit, not network)
+
+  With pipeline (10000/batch): ~800,000 ops/sec
+                               (larger batches amortize more overhead)
+
+  Pipeline effectively eliminates the RTT bottleneck and pushes Redis
+  to its CPU/memory processing limits.
+
+
+11. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: What is Redis pipelining and why use it?
+  A: Pipelining is a client-side technique to send multiple commands to Redis
+     in a single network round trip. Without pipelining, each command requires
+     one RTT, making bulk operations network-bound. With pipelining, N commands
+     require only ~1 RTT regardless of N, making bulk operations 100x–1000x
+     faster over high-latency networks.
+
+  Q: Is pipelining atomic?
+  A: No. Pipelining is purely a client-side optimization to reduce RTTs.
+     The server still executes each command individually, and other clients'
+     commands can interleave between pipelined commands. For atomicity,
+     use MULTI/EXEC (atomic batch) or Lua scripting.
+
+  Q: How does pipelining differ from MULTI/EXEC?
+  A: Pipeline = client sends multiple commands in one network write (reduces RTT,
+     no server-side atomicity). MULTI/EXEC = server queues commands and executes
+     them atomically (no interleaving). You can combine both: pipeline the
+     MULTI+commands+EXEC in one network round trip to get both benefits.
+
+  Q: What's the ideal pipeline batch size?
+  A: 1,000 to 10,000 commands. Too small = not enough RTT amortization.
+     Too large = excessive memory usage buffering on client and server, and
+     late replies for the first commands in the batch. Profile your workload.
+
+  Q: When would you NOT use pipelining?
+  A: When commands depend on each other's results (need to read a value before
+     deciding the next command). Also avoid for real-time interactive workloads
+     where per-command latency matters. Use Lua scripting for dependent
+     atomic command sequences.
+
+================================================================================

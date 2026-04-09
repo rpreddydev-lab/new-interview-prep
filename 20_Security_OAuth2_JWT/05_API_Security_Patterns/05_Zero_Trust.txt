@@ -1,0 +1,423 @@
+========================================================
+ZERO TRUST ARCHITECTURE
+========================================================
+
+Zero Trust is a security model based on the principle:
+  "Never trust, always verify."
+
+Traditional ("Castle and Moat") security:
+  - Trust everything INSIDE the perimeter (internal network)
+  - Block everything OUTSIDE the perimeter
+  - Once inside, free to move laterally
+
+Zero Trust:
+  - Trust NO ONE by default — inside or outside the network
+  - Verify every request explicitly, every time
+  - Assume breach: operate as if perimeter is already breached
+  - Least privilege access for every identity
+
+The shift was triggered by:
+  - Cloud migration (no clear perimeter)
+  - Remote work (users not on corporate network)
+  - SaaS applications (data leaves the perimeter)
+  - Insider threats
+  - Sophisticated lateral movement attacks
+
+========================================================
+1. ZERO TRUST CORE PRINCIPLES
+========================================================
+
+1. VERIFY EXPLICITLY
+   Every request must be authenticated and authorized using ALL available signals:
+     - Identity (who is the user/service?)
+     - Device health (is the device compliant?)
+     - Location (expected geography?)
+     - Service (which API is being called?)
+     - Time (normal business hours or anomalous?)
+     - Risk score (behavioral analysis)
+
+2. LEAST PRIVILEGE ACCESS
+   Grant minimum permissions required. Time-bound where possible.
+     - JIT (Just-In-Time) access: Request access when needed, auto-expire
+     - JEA (Just Enough Access): Exactly the permissions needed
+     - No standing privileges for admin actions
+
+3. ASSUME BREACH
+   Design assuming the perimeter is already compromised:
+     - Encrypt all traffic (even internal: mTLS)
+     - Segment networks (micro-segmentation)
+     - Log and monitor all activity (SIEM)
+     - Limit blast radius (least privilege contains damage)
+
+========================================================
+2. ZERO TRUST BUILDING BLOCKS
+========================================================
+
+┌────────────────────────────────────────────────────────────┐
+│                    ZERO TRUST ARCHITECTURE                  │
+│                                                             │
+│  Identity Provider  →  Policy Engine  →  Policy Enforcer   │
+│  (who is it?)          (should they?)     (enforce it)      │
+│                                                             │
+│  Components:                                                │
+│  - IAM (Identity Provider): Keycloak, Azure AD, Okta       │
+│  - Policy Engine: OPA, AWS IAM, Azure RBAC                  │
+│  - Policy Enforcer: API Gateway, Service Mesh, WAF          │
+│  - Continuous Verification: SIEM, UEBA, behavior analysis   │
+│  - Encrypted Transport: mTLS for all service communication  │
+│  - Micro-segmentation: NetworkPolicies, Security Groups     │
+└────────────────────────────────────────────────────────────┘
+
+IDENTITY is the new perimeter in Zero Trust:
+  - User identity: OIDC/SAML SSO + MFA
+  - Service identity: mTLS certificates, SPIFFE/SPIRE
+  - Device identity: Certificate-based device enrollment
+  - Workload identity: Kubernetes Service Account, AWS IAM Roles for Services
+
+========================================================
+3. ZERO TRUST IN MICROSERVICES
+========================================================
+
+In a microservices architecture, Zero Trust means:
+
+1. Service-to-Service Authentication (mTLS or JWT)
+   - Each service has a cryptographic identity
+   - All inter-service calls are authenticated
+   - No "trusted internal" calls
+
+2. Authorization on Every Call
+   - Each service validates the caller's identity AND permissions
+   - Even calls from "trusted" internal services are authorized
+
+3. Token Propagation
+   - User context (JWT) is passed through the call chain
+   - Each service validates the JWT independently
+   - Authorization decisions made per-service
+
+4. API Gateway as Entry Point
+   - All external traffic enters via API Gateway
+   - Gateway authenticates, authorizes, rate limits, logs
+
+Zero Trust Token Flow:
+
+  User → [Auth] → JWT
+  User → API Gateway → validates JWT → forwards to Service A
+  Service A → Service B (with user JWT + service cert) → Service B validates both
+  Service B → Database (with service-specific credentials)
+
+Spring Security patterns for Zero Trust:
+
+// Every service independently validates JWT:
+@Configuration
+public class ZeroTrustResourceServerConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(jwt -> jwt
+                    .decoder(jwtDecoder())
+                    .jwtAuthenticationConverter(converter())
+                )
+            )
+            // NEVER trust any IP range implicitly:
+            .authorizeHttpRequests(auth -> auth
+                .anyRequest().authenticated()  // ALWAYS verify
+            );
+        return http.build();
+    }
+}
+
+// Service-level authorization: validate caller service + user scopes
+@RestController
+@RequestMapping("/api/internal/orders")
+public class InternalOrderController {
+
+    // Requires BOTH: valid service cert (mTLS) AND user permission
+    @PreAuthorize("hasAuthority('ROLE_payment-service') and hasAuthority('SCOPE_orders:read')")
+    @GetMapping("/{userId}")
+    public List<Order> getOrdersForUser(@PathVariable String userId,
+                                         @AuthenticationPrincipal Jwt jwt) {
+        // Verify the JWT subject matches the requested user
+        if (!jwt.getSubject().equals(userId) && !isServiceAccount(jwt)) {
+            throw new AccessDeniedException("User can only access own orders");
+        }
+        return orderService.findByUserId(userId);
+    }
+}
+
+========================================================
+4. OPA (OPEN POLICY AGENT) FOR ZERO TRUST AUTHORIZATION
+========================================================
+
+OPA is a general-purpose policy engine. Decouples policy from application code.
+Policies written in Rego language.
+
+Architecture:
+  Application → OPA Agent (sidecar) → Policy Decision
+                     ↑
+              Policy files (Rego)
+
+OPA in Spring Boot:
+
+@Service
+public class OpaAuthorizationService {
+
+    private final WebClient opaClient;
+
+    public boolean isAllowed(String subject, String resource, String action,
+                              Map<String, Object> context) {
+        // Request to OPA
+        Map<String, Object> input = Map.of(
+            "user", subject,
+            "resource", resource,
+            "action", action,
+            "context", context
+        );
+
+        Map response = opaClient.post()
+            .uri("/v1/data/myapp/authz/allow")
+            .bodyValue(Map.of("input", input))
+            .retrieve()
+            .bodyToMono(Map.class)
+            .block();
+
+        return Boolean.TRUE.equals(((Map)response.get("result")));
+    }
+}
+
+// OPA Rego policy example:
+// package myapp.authz
+//
+// default allow = false
+//
+// allow {
+//     input.action == "read"
+//     input.user.roles[_] == "admin"
+// }
+//
+// allow {
+//     input.action == "read"
+//     input.resource.owner == input.user.id
+// }
+
+// Use in controller:
+@GetMapping("/orders/{id}")
+public Order getOrder(@PathVariable Long id,
+                       @AuthenticationPrincipal Jwt jwt) {
+    Order order = orderRepo.findById(id).orElseThrow();
+    if (!opaService.isAllowed(jwt.getSubject(), "order:" + id, "read",
+            Map.of("order_owner", order.getUserId()))) {
+        throw new AccessDeniedException("OPA denied access");
+    }
+    return order;
+}
+
+========================================================
+5. ZERO TRUST NETWORK ARCHITECTURE
+========================================================
+
+Micro-segmentation:
+  - Divide network into small segments
+  - Each segment isolated: services can only communicate if explicitly allowed
+  - Kubernetes NetworkPolicies implement this at pod level
+
+Example Kubernetes NetworkPolicy (Zero Trust):
+# Default deny all ingress:
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: production
+spec:
+  podSelector: {}  # Applies to all pods
+  policyTypes:
+    - Ingress
+    - Egress
+
+# Allow only specific traffic:
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-payment-to-order
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: order-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: payment-service
+      ports:
+        - protocol: TCP
+          port: 8080
+
+Service Mesh (Istio/Linkerd):
+  - Automatic mTLS between all services (wire encryption)
+  - AuthorizationPolicies for service-level access control
+  - Observability: traces, metrics, access logs for all calls
+  - Traffic management: circuit breakers, retries, timeouts
+
+========================================================
+6. CONTINUOUS VERIFICATION (BEHAVIORAL ANALYTICS)
+========================================================
+
+Zero Trust doesn't just verify at login — it continuously monitors:
+
+Signals analyzed:
+  - Unusual access time (3am for normally 9-5 user)
+  - Geographic impossibility (logged in from NYC, now Tokyo in 1 hour)
+  - Unusual resource access (user suddenly accessing sensitive tables)
+  - Failed authentication attempts (brute force indicator)
+  - Large data exports (potential exfiltration)
+
+Tools:
+  - SIEM: Splunk, ELK Stack, Azure Sentinel
+  - UEBA: User and Entity Behavior Analytics
+  - EDR: Endpoint Detection and Response
+
+Spring Security audit events:
+// Listen for Spring Security events:
+@EventListener
+public void onAuthenticationSuccess(AuthenticationSuccessEvent event) {
+    auditLog.info("Authentication SUCCESS: user={}, ip={}, timestamp={}",
+        event.getAuthentication().getName(),
+        extractIp(event),
+        Instant.now()
+    );
+}
+
+@EventListener
+public void onAuthenticationFailure(AbstractAuthenticationFailureEvent event) {
+    auditLog.warn("Authentication FAILURE: user={}, reason={}, ip={}",
+        event.getAuthentication().getName(),
+        event.getException().getMessage(),
+        extractIp(event)
+    );
+    // Trigger anomaly detection if too many failures
+    bruteForceDetector.recordFailure(event.getAuthentication().getName());
+}
+
+@EventListener
+public void onAccessDenied(AuthorizationDeniedEvent event) {
+    auditLog.warn("ACCESS DENIED: user={}, resource={}, roles={}",
+        event.getAuthentication().getName(),
+        event.getAuthorizationDecision(),
+        event.getAuthentication().getAuthorities()
+    );
+}
+
+========================================================
+7. ZERO TRUST MATURITY MODEL
+========================================================
+
+Level 1 — Traditional (No Zero Trust):
+  - Perimeter-based security (VPN)
+  - Implicit trust for internal traffic
+  - No MFA for internal apps
+
+Level 2 — Basic:
+  - MFA enforced for all users
+  - Identity verification on every request (OAuth2/OIDC)
+  - Encrypted traffic (HTTPS everywhere)
+
+Level 3 — Intermediate:
+  - mTLS for service-to-service communication
+  - Network micro-segmentation
+  - Centralized logging and alerting
+
+Level 4 — Advanced:
+  - Service mesh with automatic mTLS (Istio)
+  - Just-In-Time access (Vault, PAM)
+  - Behavioral analytics (UEBA)
+  - Continuous compliance monitoring
+
+Level 5 — Optimal:
+  - OPA for centralized, dynamic policy enforcement
+  - Automated threat response
+  - Risk-based adaptive authentication
+  - Full audit trail, real-time anomaly detection
+
+========================================================
+8. ZERO TRUST CHECKLIST FOR SPRING MICROSERVICES
+========================================================
+
+Identity:
+  ✓ All user auth via OIDC/OAuth2 (no local passwords)
+  ✓ MFA enforced for all human users
+  ✓ Service-to-service: mTLS or OAuth2 client credentials
+  ✓ Short-lived tokens (access tokens < 15 min)
+
+Authorization:
+  ✓ JWT validated on every service (not trusted blindly)
+  ✓ @PreAuthorize on every non-public method
+  ✓ Least privilege: minimal scopes/roles per service
+  ✓ Resource-level access control (ABAC/OPA for sensitive data)
+
+Network:
+  ✓ HTTPS everywhere (no plain HTTP)
+  ✓ mTLS for internal service communication
+  ✓ NetworkPolicies: default deny, explicit allow
+  ✓ No direct DB access from public internet
+
+Secrets:
+  ✓ No hardcoded credentials anywhere
+  ✓ Dynamic secrets via Vault
+  ✓ Rotation automated
+
+Monitoring:
+  ✓ All auth events logged (success, failure, access denied)
+  ✓ Log shipping to SIEM
+  ✓ Anomaly detection alerts
+  ✓ Regular access reviews
+
+========================================================
+9. COMMON INTERVIEW QUESTIONS
+========================================================
+
+Q: What is Zero Trust and how does it differ from traditional security?
+A: Zero Trust: "Never trust, always verify." Every request is authenticated and
+   authorized regardless of network location. Traditional security trusts internal
+   traffic implicitly (perimeter model). With Zero Trust, a service on the same
+   network still must present credentials and get authorized for each call.
+   This contains lateral movement if one service is compromised.
+
+Q: What are the three core principles of Zero Trust?
+A: 1) Verify explicitly: Authenticate every request with all available signals
+   (identity, device health, location, risk score).
+   2) Least privilege: Grant minimum access needed, time-bound, just-in-time.
+   3) Assume breach: Design as if already compromised. Encrypt internal traffic,
+   segment networks, limit blast radius.
+
+Q: How do you implement Zero Trust between microservices?
+A: Layer 1: mTLS — cryptographic service identity, all traffic encrypted.
+   Layer 2: OAuth2 token propagation — user JWT passes through the call chain,
+   each service independently validates it.
+   Layer 3: Service-level authorization — services only accept calls from known
+   peer services (validated by cert CN or JWT audience/client_id).
+   Layer 4: Network policies — only explicitly allowed traffic flows.
+
+Q: What role does OPA play in Zero Trust?
+A: OPA (Open Policy Agent) externalizes authorization logic from application code.
+   Services query OPA with request context (who, what, where, when) and OPA
+   evaluates Rego policies to return allow/deny. This centralizes policy management,
+   enables consistent enforcement across services, and allows policy updates
+   without redeployment.
+
+Q: Why is "assume breach" important in Zero Trust?
+A: Because perimeters will eventually be breached (supply chain attacks, insider
+   threats, zero-days). Assuming breach forces you to: 1) encrypt internal traffic
+   (mTLS) so a network sniffer gains nothing, 2) implement least privilege so a
+   compromised service can't access everything, 3) monitor and detect lateral
+   movement, and 4) segment the blast radius.
+
+Q: How does Istio service mesh enforce Zero Trust in Kubernetes?
+A: Istio injects Envoy sidecars that intercept all pod traffic. Istio CA issues
+   SPIFFE certificates to each service. All inter-pod communication uses automatic
+   mTLS (STRICT mode). AuthorizationPolicies define which service identities can
+   call which services. The application code doesn't change — security is enforced
+   at the infrastructure layer.

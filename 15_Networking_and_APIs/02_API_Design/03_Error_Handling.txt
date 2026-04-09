@@ -1,0 +1,372 @@
+================================================================================
+ERROR HANDLING — IN DEPTH
+================================================================================
+
+================================================================================
+1. PRINCIPLES OF GOOD API ERROR HANDLING
+================================================================================
+
+PRINCIPLE 1: NEVER hide errors with 200 OK
+  ❌ HTTP 200 OK { "success": false, "error": "User not found" }
+  ✅ HTTP 404 Not Found { "error": "USER_NOT_FOUND", "message": "User not found" }
+
+PRINCIPLE 2: Be consistent across all endpoints
+  Same error format everywhere. Client code parses one structure.
+
+PRINCIPLE 3: Machine-readable + Human-readable
+  Machine code: "VALIDATION_FAILED" (for programmatic handling)
+  Human message: "The email address format is invalid" (for debugging)
+
+PRINCIPLE 4: Don't expose internals
+  ❌ "com.example.app.UserRepository threw NullPointerException at line 42"
+  ✅ "An unexpected error occurred. Reference: req-abc123"
+  Log internally with full stack trace; return safe message to client.
+
+PRINCIPLE 5: Include correlation IDs
+  Return requestId in every error response.
+  Enables client to report the exact request to support.
+  Enables engineers to find log entry in production.
+
+PRINCIPLE 6: Include field-level errors for validation
+  Don't just say "validation failed" — say WHICH field and WHAT rule.
+
+================================================================================
+2. STANDARD ERROR RESPONSE FORMAT
+================================================================================
+
+RECOMMENDED STRUCTURE:
+  {
+    "error": "VALIDATION_FAILED",        // Machine-readable error code (UPPER_SNAKE_CASE)
+    "message": "Request validation failed", // Human-readable message
+    "requestId": "req-550e8400",         // Correlation ID for tracing
+    "timestamp": "2026-04-08T10:00:00Z", // When error occurred
+    "path": "/api/v1/users",             // Which endpoint was called
+    "details": [                         // Optional: per-field errors (validation)
+      {
+        "field": "email",
+        "code": "INVALID_FORMAT",
+        "message": "Must be a valid email address",
+        "rejectedValue": "not-an-email"
+      },
+      {
+        "field": "age",
+        "code": "OUT_OF_RANGE",
+        "message": "Must be between 0 and 150",
+        "rejectedValue": -5
+      }
+    ]
+  }
+
+MINIMAL STRUCTURE (for simple errors):
+  {
+    "error": "NOT_FOUND",
+    "message": "User with id 42 not found",
+    "requestId": "req-abc123"
+  }
+
+PROBLEM DETAILS — RFC 7807 / RFC 9457 (Standard):
+  {
+    "type": "https://api.example.com/errors/validation-failed",
+    "title": "Validation Failed",
+    "status": 400,
+    "detail": "One or more fields failed validation",
+    "instance": "/api/v1/users",
+    "traceId": "req-abc123",
+    "errors": [
+      { "field": "email", "message": "Invalid format" }
+    ]
+  }
+  
+  Content-Type: application/problem+json
+  
+  Spring Boot 3+ includes RFC 7807 Problem Details support:
+  spring.mvc.problemdetails.enabled=true
+
+================================================================================
+3. ERROR CODE TAXONOMY
+================================================================================
+
+Define an error code catalog for your API:
+
+CATEGORY: VALIDATION (4xx)
+  VALIDATION_FAILED     : One or more fields are invalid
+  MISSING_REQUIRED_FIELD: Required field absent
+  INVALID_FORMAT        : Field format invalid (email, phone, date)
+  OUT_OF_RANGE          : Numeric/date value outside allowed range
+  INVALID_ENUM_VALUE    : Unrecognized enum value
+  MAX_LENGTH_EXCEEDED   : String too long
+  INVALID_JSON          : Request body not valid JSON
+
+CATEGORY: AUTHENTICATION (401)
+  AUTHENTICATION_REQUIRED  : No credentials provided
+  INVALID_CREDENTIALS      : Wrong username/password
+  TOKEN_EXPIRED            : JWT/Bearer token expired
+  TOKEN_INVALID            : Token signature invalid or malformed
+  ACCOUNT_DISABLED         : Account is locked/disabled
+
+CATEGORY: AUTHORIZATION (403)
+  INSUFFICIENT_PERMISSIONS : Not allowed to perform this action
+  FORBIDDEN_RESOURCE       : Accessing another user's resource
+  PLAN_LIMIT_EXCEEDED      : Feature requires paid plan
+
+CATEGORY: RESOURCE (404/409/410)
+  NOT_FOUND            : Resource doesn't exist
+  ALREADY_EXISTS       : Duplicate resource (by unique key)
+  CONFLICT             : State conflict (wrong order status, stale write)
+  GONE                 : Resource permanently deleted
+
+CATEGORY: RATE LIMITING (429)
+  RATE_LIMIT_EXCEEDED  : Too many requests
+  QUOTA_EXCEEDED       : Monthly/daily quota exhausted
+
+CATEGORY: SERVER (5xx)
+  INTERNAL_ERROR       : Unexpected server error
+  SERVICE_UNAVAILABLE  : Temporary outage
+  DEPENDENCY_FAILED    : Upstream service failure
+
+================================================================================
+4. SPRING BOOT — GLOBAL EXCEPTION HANDLING
+================================================================================
+
+@RestControllerAdvice
+public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    // --- Validation Errors ---
+    @Override
+    protected ResponseEntity<Object> handleMethodArgumentNotValid(
+            MethodArgumentNotValidException ex,
+            HttpHeaders headers, HttpStatusCode status, WebRequest request) {
+        
+        List<ErrorDetail> details = ex.getBindingResult().getFieldErrors().stream()
+            .map(fe -> new ErrorDetail(fe.getField(), "INVALID_VALUE", fe.getDefaultMessage(),
+                                      String.valueOf(fe.getRejectedValue())))
+            .toList();
+        
+        return ResponseEntity.badRequest().body(
+            buildError("VALIDATION_FAILED", "Request validation failed", 
+                       getRequestUri(request), details));
+    }
+    
+    // --- @RequestParam / @PathVariable constraint violations ---
+    @ExceptionHandler(ConstraintViolationException.class)
+    public ResponseEntity<ErrorResponse> handleConstraintViolation(
+            ConstraintViolationException ex, HttpServletRequest req) {
+        
+        List<ErrorDetail> details = ex.getConstraintViolations().stream()
+            .map(cv -> new ErrorDetail(
+                cv.getPropertyPath().toString(),
+                "CONSTRAINT_VIOLATION",
+                cv.getMessage(),
+                String.valueOf(cv.getInvalidValue())))
+            .toList();
+        
+        return ResponseEntity.badRequest().body(
+            buildError("VALIDATION_FAILED", "Constraint violation", req.getRequestURI(), details));
+    }
+
+    // --- Resource Not Found ---
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ErrorResponse> handleNotFound(
+            ResourceNotFoundException ex, HttpServletRequest req) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+            .body(buildError("NOT_FOUND", ex.getMessage(), req.getRequestURI(), null));
+    }
+
+    // --- Business Rule / Conflict ---
+    @ExceptionHandler(BusinessRuleException.class)
+    public ResponseEntity<ErrorResponse> handleBusinessRule(
+            BusinessRuleException ex, HttpServletRequest req) {
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+            .body(buildError(ex.getErrorCode(), ex.getMessage(), req.getRequestURI(), null));
+    }
+
+    // --- Duplicate Resource ---
+    @ExceptionHandler(DuplicateResourceException.class)
+    public ResponseEntity<ErrorResponse> handleDuplicate(
+            DuplicateResourceException ex, HttpServletRequest req) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+            .body(buildError("ALREADY_EXISTS", ex.getMessage(), req.getRequestURI(), null));
+    }
+
+    // --- Access Denied ---
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<ErrorResponse> handleAccessDenied(
+            AccessDeniedException ex, HttpServletRequest req) {
+        return ResponseEntity.status(HttpStatus.FORBIDDEN)
+            .body(buildError("INSUFFICIENT_PERMISSIONS", 
+                             "You don't have permission to access this resource",
+                             req.getRequestURI(), null));
+    }
+
+    // --- Generic Fallback ---
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ErrorResponse> handleGeneral(
+            Exception ex, HttpServletRequest req) {
+        String requestId = (String) req.getAttribute("requestId");
+        log.error("Unhandled exception for requestId={} path={}", requestId, req.getRequestURI(), ex);
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+            .body(buildError("INTERNAL_ERROR",
+                             "An unexpected error occurred. Please contact support with reference: " + requestId,
+                             req.getRequestURI(), null));
+    }
+
+    private ErrorResponse buildError(String code, String message, String path, List<ErrorDetail> details) {
+        return new ErrorResponse(code, message, generateRequestId(), 
+                                 Instant.now().toString(), path, details);
+    }
+}
+
+CUSTOM EXCEPTION CLASSES:
+  public class ResourceNotFoundException extends RuntimeException {
+      public ResourceNotFoundException(String message) { super(message); }
+  }
+  
+  public class BusinessRuleException extends RuntimeException {
+      private final String errorCode;
+      public BusinessRuleException(String errorCode, String message) {
+          super(message);
+          this.errorCode = errorCode;
+      }
+  }
+
+ERROR RESPONSE RECORD:
+  public record ErrorResponse(
+      String error,
+      String message,
+      String requestId,
+      String timestamp,
+      String path,
+      List<ErrorDetail> details
+  ) {}
+  
+  public record ErrorDetail(
+      String field,
+      String code,
+      String message,
+      String rejectedValue
+  ) {}
+
+================================================================================
+5. RFC 7807 PROBLEM DETAILS (Spring Boot 3+)
+================================================================================
+
+Spring Boot 3.x supports RFC 7807 Problem Details automatically.
+
+application.properties:
+  spring.mvc.problemdetails.enabled=true
+
+Custom Problem Detail:
+  @ExceptionHandler(UserNotFoundException.class)
+  public ProblemDetail handleUserNotFound(UserNotFoundException ex, HttpServletRequest req) {
+      ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
+      pd.setTitle("User Not Found");
+      pd.setType(URI.create("https://api.example.com/errors/not-found"));
+      pd.setProperty("requestId", UUID.randomUUID().toString());
+      pd.setProperty("timestamp", Instant.now().toString());
+      return pd;
+  }
+
+================================================================================
+6. SECURITY CONSIDERATIONS IN ERROR HANDLING
+================================================================================
+
+DON'T REVEAL ENUMERATION ATTACK SURFACE:
+  ❌ 404: "No user with email alice@example.com exists"
+  ✅ 401: "Invalid credentials"  (same message for wrong email AND wrong password)
+  
+  Enumeration attack: Attacker probes API with email addresses to find valid accounts.
+
+DON'T EXPOSE INTERNAL PATHS:
+  ❌ "Error in /home/app/service/UserRepository.java:42"
+  ✅ "Internal error. Reference: req-abc123"
+
+DON'T EXPOSE DB ERRORS:
+  ❌ "ORA-00001: unique constraint (APP.EMAIL_UNIQUE) violated"
+  ✅ "Email address is already in use"
+
+DON'T REVEAL TECHNOLOGY STACK:
+  ❌ "java.lang.NullPointerException"
+  ❌ Server: Apache Tomcat/10.1  (disable/change Server header)
+  ✅ Generic message with requestId only
+
+LOGGING:
+  Log full details server-side (stack traces, DB errors, user info).
+  Return safe summary to client.
+  Use structured logging (JSON format for log aggregators):
+  { "level": "ERROR", "requestId": "req-abc", "path": "/users", "error": "NullPointerException", ... }
+
+================================================================================
+7. CLIENT-SIDE ERROR HANDLING PATTERNS
+================================================================================
+
+Clients should handle errors gracefully:
+
+RETRY LOGIC:
+  5xx errors (503, 504): Retry with exponential backoff
+  429 Too Many Requests: Retry after Retry-After seconds
+  4xx errors: Don't retry (client error, fix the request first)
+
+EXPONENTIAL BACKOFF:
+  Attempt 1: immediately
+  Attempt 2: after 1 second
+  Attempt 3: after 2 seconds
+  Attempt 4: after 4 seconds
+  Attempt 5: after 8 seconds + jitter (±random ms to prevent thundering herd)
+
+FEIGN CLIENT ERROR HANDLING (Spring):
+  @Component
+  public class UserServiceErrorDecoder implements ErrorDecoder {
+      @Override
+      public Exception decode(String methodKey, Response response) {
+          return switch (response.status()) {
+              case 404 -> new UserNotFoundException("User not found");
+              case 409 -> new ConflictException("Resource conflict");
+              case 429 -> new RateLimitException("Rate limit exceeded");
+              default  -> new ServiceException("Service error: " + response.status());
+          };
+      }
+  }
+
+================================================================================
+8. INTERVIEW QUESTIONS — ERROR HANDLING
+================================================================================
+
+Q1: How do you design a consistent error format for a REST API?
+    Define a standard error object with: machine-readable error code
+    (VALIDATION_FAILED), human-readable message, requestId for correlation,
+    timestamp, path, and optional field-level details for validation errors.
+    Use @RestControllerAdvice in Spring to centralize handling.
+    Never return 200 with error in body. Always use appropriate HTTP status codes.
+
+Q2: What is RFC 7807 Problem Details?
+    RFC 7807 (updated by RFC 9457) standardizes error responses for HTTP APIs.
+    Defines a "problem document" with: type (URI identifying the problem),
+    title, status (HTTP code), detail (human-readable description), instance
+    (specific occurrence URI). Content-Type: application/problem+json.
+    Spring Boot 3+ supports it natively.
+
+Q3: How do you prevent error messages from leaking sensitive information?
+    Return generic messages with correlation IDs (requestId) to clients.
+    Log full details (stack traces, user IDs, DB errors) server-side in
+    structured logs. Don't expose: exception class names, file paths, DB schema
+    details, or technology stack. For auth failures, use the same generic
+    "Invalid credentials" message regardless of whether email or password was wrong.
+
+Q4: How does @RestControllerAdvice work in Spring?
+    @RestControllerAdvice is a global exception handling component that applies
+    across all @RestController classes. Methods annotated with @ExceptionHandler
+    catch specific exception types thrown from controllers. It centralizes error
+    handling, ensuring consistent error format without try-catch in every controller.
+    It also allows handling framework-thrown exceptions (e.g., 405 Method Not Allowed).
+
+Q5: What's the difference between 400, 422, and 409 errors?
+    400 Bad Request: Syntactically invalid request — can't parse JSON, missing
+    required header, malformed request structure.
+    422 Unprocessable Entity: Syntactically valid but semantically wrong — fails
+    business rules (negative amount, invalid state transition, referential integrity).
+    409 Conflict: Request conflicts with current state — duplicate resource,
+    stale ETag, conflicting concurrent modification.
+
+================================================================================

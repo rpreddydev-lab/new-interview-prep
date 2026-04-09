@@ -1,0 +1,286 @@
+================================================================
+CACHING STRATEGIES
+================================================================
+
+WHAT IS CACHING?
+-----------------
+Caching is storing frequently accessed data in a faster storage tier
+(usually in-memory) to reduce latency and database load.
+
+Cache Hit:  Data found in cache — return immediately (fast path)
+Cache Miss: Data NOT in cache — fetch from DB, store in cache, return
+
+Typical cache latency: 0.1–1 ms (Redis in-memory)
+Typical DB latency:    5–100 ms (SSD-backed)
+Speedup:               10x–100x
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHERE TO CACHE (Cache Tiers)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. CLIENT-SIDE CACHE (Browser)
+   - Browser caches HTTP responses (Cache-Control, ETag, Last-Modified)
+   - Service Worker caches for offline-capable PWAs
+   - No server load at all for cached resources
+   - Headers:
+     Cache-Control: max-age=3600   (cache for 1 hour)
+     Cache-Control: no-cache       (always validate with server)
+     Cache-Control: no-store       (never cache)
+     ETag: "abc123"                (content hash for validation)
+
+2. CDN CACHE (Edge Cache)
+   - Geographically distributed — cache at edge nodes near users
+   - Best for: static assets (JS, CSS, images), public API responses
+   - Providers: Cloudflare, AWS CloudFront, Fastly, Akamai
+   - TTL configured per content type
+   - Cache invalidation via purge API
+
+3. APPLICATION-LEVEL CACHE (In-Process)
+   - Local in-memory cache within the application process
+   - Libraries: Guava Cache (Java), functools.lru_cache (Python), Node-cache
+   - Extremely fast (no network hop) — nanosecond latency
+   - Small size (limited by process memory)
+   - Not shared across multiple instances → stale data risk
+   - Best for: Infrequently changing data, computed results, config
+
+4. DISTRIBUTED CACHE (Out-of-Process)
+   - Shared cache accessed by all service instances over network
+   - Redis, Memcached, Amazon ElastiCache
+   - Shared state = consistent view across all instances
+   - Network latency: ~0.5–1ms within same datacenter
+   - Can be scaled horizontally (Redis Cluster)
+   - Best for: Session data, user data, hot items in feeds
+
+5. DATABASE QUERY CACHE
+   - Some DBs cache query results internally (MySQL query cache — deprecated)
+   - ORMs may cache: Hibernate L2 cache, ActiveRecord cache
+   - Less common in modern stacks; prefer explicit Redis cache
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CACHING STRATEGIES (Write Patterns)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. CACHE-ASIDE (Lazy Loading) ← Most Common
+   Application manages cache explicitly.
+
+   READ:
+     data = cache.get(key)
+     if data is None:
+         data = db.query(key)
+         cache.set(key, data, ttl=300)
+     return data
+
+   WRITE:
+     db.update(key, value)
+     cache.delete(key)    ← Invalidate, not update
+
+   Pros:  Only caches what's actually requested (efficient)
+          Cache failure doesn't break app (just hits DB)
+          Works with any DB
+   Cons:  Cache miss on first request (cold start)
+          Risk of stale data between invalidation and next read
+          Cache stampede on miss (many requests hit DB simultaneously)
+
+2. WRITE-THROUGH
+   Write to cache AND DB synchronously.
+
+   WRITE:
+     db.update(key, value)
+     cache.set(key, value)   ← Update cache immediately
+
+   READ: Same as cache-aside but no misses for recently written data
+
+   Pros:  Cache always has fresh data for recently written keys
+          No stale data issue for writes
+   Cons:  Write latency increases (must write two places)
+          Cache may fill with data that's never read (wasted space)
+
+3. WRITE-BEHIND (Write-Back)
+   Write to cache first; asynchronously flush to DB.
+
+   WRITE:
+     cache.set(key, value)   ← Write to cache immediately
+     queue.push(WriteJob)    ← Async DB write
+
+   READ: Read from cache (always fresh if in cache)
+
+   Pros:  Very fast writes (no DB latency on write path)
+          Can batch DB writes (throughput optimization)
+   Cons:  Data loss risk (if cache fails before DB write)
+          Complex — need durable queue for write jobs
+          DB may be temporarily stale (not suitable for all data)
+   Best:  Write-heavy workloads, counters, metrics
+
+4. REFRESH-AHEAD (Proactive Refresh)
+   Asynchronously refresh cache before TTL expires.
+
+   Logic: If TTL < threshold% remaining, trigger background refresh
+   
+   Pros:  Users always get fast response (cache never goes cold)
+          No blocking waits for cache miss
+   Cons:  May refresh data that's never read again (wasted work)
+          Complex implementation
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CACHE EVICTION POLICIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When cache is full, which entry to evict?
+
+LRU (Least Recently Used) ← Default for most use cases
+  Evict the item that was accessed least recently.
+  Works well for temporal locality (recently accessed = likely accessed again).
+  Redis: maxmemory-policy allkeys-lru
+
+LFU (Least Frequently Used)
+  Evict the item accessed fewest times overall.
+  Better for stable popularity (popular items stay forever).
+  Good for: CDN (popular content stays, rare content is evicted).
+  Redis: maxmemory-policy allkeys-lfu
+
+FIFO (First In, First Out)
+  Evict the oldest inserted item.
+  Simple, but ignores access patterns.
+  Rarely used in practice.
+
+MRU (Most Recently Used)
+  Evict the most recently used item.
+  Counterintuitive but useful for scan patterns (batch processing
+  that touches data once — no benefit to cache it).
+
+Random Replacement
+  Evict a random item.
+  Simple to implement, surprisingly effective in practice.
+
+TTL (Time To Live)
+  Evict after fixed time regardless of access patterns.
+  Best for data that becomes stale (session tokens, rate limit counters).
+  Can combine with LRU: evict expired items first, then LRU.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CACHE PROBLEMS AND SOLUTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROBLEM 1: CACHE STAMPEDE (Thundering Herd)
+When a cache entry expires and many concurrent requests all miss and
+simultaneously hit the database.
+
+Solutions:
+  a) Lock/Mutex: First miss acquires a lock, fetches from DB, populates cache.
+     Others wait. (Redis SET NX = set if not exists)
+  b) Probabilistic Early Expiration: Stochastically refresh before TTL expires
+     based on how long the computation takes.
+  c) Promise/Future pattern: First request starts fetch; subsequent requests
+     get a promise that resolves when data is ready.
+  d) Background refresh: Never delete from cache; refresh asynchronously.
+
+PROBLEM 2: CACHE AVALANCHE
+Many cache entries expire at the same time, causing a flood of DB requests.
+
+Solutions:
+  a) Jitter: Add random offset to TTL.
+     ttl = base_ttl + random.randint(-30, 30) seconds
+  b) Stagger TTL by key category: User data TTL=300s, product data TTL=600s
+  c) Use distributed lock to stagger refresh across instances
+
+PROBLEM 3: CACHE PENETRATION
+Requests for data that doesn't exist in DB (so cache never holds it).
+Attacker can exploit: send requests for non-existent IDs → every request
+hits DB.
+
+Solutions:
+  a) Cache negative results: cache.set(key, NULL, ttl=60)
+     Return NULL for missing keys instead of hitting DB again.
+  b) Bloom Filter: Probabilistic data structure that quickly checks if a key
+     MIGHT exist in DB. False positives OK; false negatives are not.
+     If bloom filter says "no" → return immediately without DB query.
+
+PROBLEM 4: CACHE INCONSISTENCY
+Cache and DB have different values.
+
+Solutions:
+  a) Short TTL: Data expires quickly; consistency window is small.
+  b) Event-driven invalidation: When DB updates, publish event to invalidate cache.
+  c) Write-through: Always update cache and DB together.
+  d) Accept eventual consistency: For many use cases, slight staleness is OK.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REDIS DEEP DIVE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Redis (Remote Dictionary Server) is the industry standard distributed cache.
+
+Data Structures:
+  STRING  → Simple key-value, counters, session tokens
+  HASH    → Object attributes (user profile fields)
+  LIST    → Ordered sequences, message queues, activity log
+  SET     → Unique collections, tags, friend lists
+  SORTED SET → Leaderboards, rate limiting, priority queues
+  BITMAP  → Tracking daily active users (bit per user_id)
+  HyperLogLog → Approximate unique count (low memory)
+  Streams → Append-only log, event streaming (like Kafka lite)
+
+Key Redis Features:
+  - Persistence: RDB (snapshot) + AOF (append-only file) for durability
+  - Replication: Master-replica for read scaling and HA
+  - Cluster: Horizontal scaling via sharding (16,384 hash slots)
+  - Pub/Sub: Simple message passing between services
+  - Lua scripts: Atomic multi-step operations
+  - Transactions: MULTI/EXEC for atomic batch commands
+  - Expiry: TTL on any key (SETEX, EXPIRE)
+
+Redis Cluster:
+  - 16,384 hash slots distributed across nodes
+  - Each key maps to a slot: CRC16(key) % 16384
+  - Minimum 3 masters for cluster (each with replica)
+  - Automatic resharding when nodes are added/removed
+
+Redis Sentinel:
+  - HA for single-master Redis (non-cluster)
+  - Monitors master, promotes replica if master fails
+  - Clients connect to Sentinel which tells them current master
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MEMCACHED vs REDIS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌──────────────────────┬─────────────────────┬─────────────────────┐
+│ Feature              │ Redis               │ Memcached           │
+├──────────────────────┼─────────────────────┼─────────────────────┤
+│ Data structures      │ Many (String, Hash, │ String only         │
+│                      │ List, Set, ZSet...)  │                     │
+│ Persistence          │ Yes (RDB + AOF)     │ No                  │
+│ Replication          │ Yes                 │ No                  │
+│ Cluster              │ Yes                 │ Client-side only    │
+│ Pub/Sub              │ Yes                 │ No                  │
+│ Lua scripting        │ Yes                 │ No                  │
+│ Memory efficiency    │ Slightly higher     │ Very efficient      │
+│ Multi-threading      │ Single (main) +     │ Fully multi-thread  │
+│                      │ IO threads in v6+   │                     │
+│ Use today            │ ✓ (preferred)       │ Legacy systems      │
+└──────────────────────┴─────────────────────┴─────────────────────┘
+
+Choose Redis almost always. Memcached only if you need maximum simplicity
+and maximum CPU efficiency for pure string caching.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CACHE SIZING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+80/20 Rule (Pareto Principle):
+  20% of data accounts for 80% of reads.
+  → Size cache to hold top 20% of data set for ~80% hit rate.
+
+If total dataset = 1TB, then 200GB cache → 80% cache hit rate.
+  (Real applications often have higher skew — top 1% = 90% of reads)
+
+Hit Rate vs Miss Rate:
+  Each cache miss = DB query (costly)
+  Target: ≥ 90% hit rate for most production systems
+
+Cache Warming:
+  On service startup, pre-populate cache with hot data.
+  Options:
+    a) Lazy warming: Cache fills up naturally as requests come in
+    b) Proactive warming: Background job pre-loads known hot data before
+       service goes live (especially important after deployments)

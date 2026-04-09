@@ -1,0 +1,265 @@
+================================================================
+  SPRING BATCH — USE CASES AND PATTERNS
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. COMMON REAL-WORLD USE CASES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Use Case              | Description
+----------------------|----------------------------------------------------
+ETL (Nightly jobs)    | Extract from source DB → transform → load to DWH
+File ingestion        | Parse CSV/XML from SFTP/S3, validate, persist to DB
+Data migration        | Move millions of rows between schemas or databases
+Billing/payroll       | Process all account charges at month-end
+Notification dispatch | Send batch email/SMS to all active users
+Report generation     | Aggregate large datasets, export to PDF/Excel
+Data purge            | Delete old records beyond retention window
+Reconciliation        | Compare two data sources and flag discrepancies
+DB denormalization    | Rebuild pre-aggregated tables nightly for reporting
+Subscription renewal  | Check all subscriptions for upcoming expiry
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. SCHEDULING WITH @Scheduled
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Service
+public class BatchScheduler {
+
+    private final JobLauncher jobLauncher;
+    private final Job importOrdersJob;
+
+    @Scheduled(cron = "0 0 2 * * *")  // every night at 2am
+    public void runImportJob() throws Exception {
+        JobParameters params = new JobParametersBuilder()
+            .addLocalDate("run.date", LocalDate.now())
+            .toJobParameters();
+
+        JobExecution execution = jobLauncher.run(importOrdersJob, params);
+        log.info("Import job completed: {}", execution.getStatus());
+    }
+}
+
+@SpringBootApplication
+@EnableScheduling
+@EnableBatchProcessing  // Spring Boot 3.x: auto-configured
+public class BatchApplication { ... }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. FILE INGESTION PIPELINE (Full Example)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Complete pipeline for processing a daily orders.csv file:
+
+@Configuration
+public class OrderImportJobConfig {
+
+    // Step 1: Validate file exists
+    @Bean
+    public Step validateStep(JobRepository jobRepository,
+                             PlatformTransactionManager txManager,
+                             FileValidationTasklet tasklet) {
+        return new StepBuilder("validateStep", jobRepository)
+            .tasklet(tasklet, txManager)
+            .build();
+    }
+
+    // Step 2: Process CSV → DB
+    @Bean
+    public Step importStep(JobRepository jobRepository,
+                           PlatformTransactionManager txManager,
+                           FlatFileItemReader<RawOrder> reader,
+                           OrderItemProcessor processor,
+                           JdbcBatchItemWriter<Order> writer) {
+        return new StepBuilder("importStep", jobRepository)
+            .<RawOrder, Order>chunk(500, txManager)
+            .reader(reader)
+            .processor(processor)
+            .writer(writer)
+            .faultTolerant()
+            .skip(ValidationException.class)
+            .skipLimit(100)
+            .listener(new ItemReadListener<RawOrder>() {
+                @Override
+                public void onReadError(Exception ex) {
+                    log.error("Read error: {}", ex.getMessage());
+                }
+            })
+            .build();
+    }
+
+    // Step 3: Archive processed file
+    @Bean
+    public Step archiveStep(JobRepository jobRepository,
+                            PlatformTransactionManager txManager,
+                            ArchiveFileTasklet archiveTasklet) {
+        return new StepBuilder("archiveStep", jobRepository)
+            .tasklet(archiveTasklet, txManager)
+            .build();
+    }
+
+    // Job: validate → import → archive
+    @Bean
+    public Job orderImportJob(JobRepository jobRepository,
+                              Step validateStep,
+                              Step importStep,
+                              Step archiveStep) {
+        return new JobBuilder("orderImportJob", jobRepository)
+            .start(validateStep)
+            .next(importStep)
+            .next(archiveStep)
+            .listener(new JobExecutionListener() {
+                @Override
+                public void afterJob(JobExecution ex) {
+                    log.info("Job finished. Status: {}, Items: {}",
+                        ex.getStatus(),
+                        ex.getStepExecutions().stream()
+                            .mapToLong(StepExecution::getWriteCount).sum());
+                }
+            })
+            .build();
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. HTTP-TRIGGERED BATCH JOB
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@RestController
+@RequestMapping("/api/batch")
+public class BatchController {
+
+    private final JobLauncher asyncJobLauncher;  // configured with async executor
+    private final Job importOrdersJob;
+
+    @PostMapping("/import")
+    public ResponseEntity<String> triggerImport(@RequestParam String date) throws Exception {
+        JobParameters params = new JobParametersBuilder()
+            .addLocalDate("run.date", LocalDate.parse(date))
+            .addLong("timestamp", System.currentTimeMillis())
+            .toJobParameters();
+
+        JobExecution execution = asyncJobLauncher.run(importOrdersJob, params);
+        return ResponseEntity.accepted()
+            .body("Job launched with ID: " + execution.getJobId());
+    }
+
+    @GetMapping("/status/{executionId}")
+    public ResponseEntity<BatchStatus> getStatus(
+        @PathVariable Long executionId,
+        @Autowired JobExplorer jobExplorer) {
+
+        JobExecution execution = jobExplorer.getJobExecution(executionId);
+        if (execution == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok(execution.getStatus());
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. TESTING SPRING BATCH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@SpringBatchTest
+@SpringBootTest
+@Testcontainers
+class OrderImportJobTest {
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+
+    @Autowired
+    private JobLauncherTestUtils jobLauncherTestUtils;
+
+    @Autowired
+    private JobRepositoryTestUtils jobRepositoryTestUtils;
+
+    @Autowired
+    private OrderRepository orderRepository;
+
+    @AfterEach
+    void cleanUp() {
+        jobRepositoryTestUtils.removeJobExecutions();  // clean batch metadata
+        orderRepository.deleteAll();
+    }
+
+    @Test
+    void shouldImportOrdersFromCsv() throws Exception {
+        // Place test CSV file
+        JobParameters params = new JobParametersBuilder()
+            .addString("input.file", "src/test/resources/test-orders.csv")
+            .toJobParameters();
+
+        JobExecution execution = jobLauncherTestUtils.launchJob(params);
+
+        assertThat(execution.getStatus()).isEqualTo(BatchStatus.COMPLETED);
+        assertThat(orderRepository.count()).isEqualTo(3);  // 3 rows in test CSV
+    }
+
+    @Test
+    void shouldSkipInvalidOrders() throws Exception {
+        JobParameters params = new JobParametersBuilder()
+            .addString("input.file", "src/test/resources/orders-with-bad-rows.csv")
+            .toJobParameters();
+
+        JobExecution execution = jobLauncherTestUtils.launchJob(params);
+
+        // Job completes despite bad rows (skipped)
+        assertThat(execution.getStatus()).isEqualTo(BatchStatus.COMPLETED);
+
+        StepExecution step = execution.getStepExecutions().iterator().next();
+        assertThat(step.getSkipCount()).isGreaterThan(0);
+    }
+
+    @Test
+    void shouldRunSingleStep() throws Exception {
+        JobExecution execution = jobLauncherTestUtils.launchStep("importStep",
+            new JobParametersBuilder()
+                .addString("input.file", "src/test/resources/test-orders.csv")
+                .toJobParameters());
+
+        assertThat(execution.getStatus()).isEqualTo(BatchStatus.COMPLETED);
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: How do you trigger a Spring Batch job from an HTTP endpoint?
+A: Inject JobLauncher and the Job bean into a @RestController. Build
+   JobParameters including a timestamp parameter (to allow re-triggering
+   the same job). Call jobLauncher.run(job, params). For non-blocking
+   HTTP responses, configure an async JobLauncher with a thread pool executor
+   so the HTTP thread returns immediately with the execution ID.
+
+Q: What is JobExplorer and when is it useful?
+A: JobExplorer provides read-only access to the batch metadata stored in
+   JobRepository. Use it to query job execution history, check the status of
+   a specific execution, list job instances for a job name, or monitor running
+   jobs from an admin endpoint. JobOperator extends this with control operations
+   (stop, restart, abandon).
+
+Q: How do you test a Spring Batch job?
+A: Use @SpringBatchTest which auto-configures JobLauncherTestUtils (for launching
+   the full job or a specific step) and JobRepositoryTestUtils (for cleanup).
+   Use @SpringBootTest to load the full context, @Testcontainers for a real DB
+   (to validate actual SQL), and prepare test input files in src/test/resources.
+   Assert on BatchStatus and verify DB state via repositories.
+
+Q: What is the difference between BatchStatus and ExitStatus?
+A: BatchStatus is the internal framework status of a job/step execution:
+   STARTING, STARTED, STOPPING, STOPPED, FAILED, COMPLETED, ABANDONED.
+   ExitStatus is the string-based exit code used for conditional flow
+   decisions. You can customize ExitStatus (e.g., "TOO_MANY_SKIPS") in a
+   StepExecutionListener.afterStep() to branch job flow based on business rules.
+
+Q: How do you handle a file that arrives late (after the job has run)?
+A: Options: (1) Use Spring Batch restart — the job is parameterized by date,
+   so run it again with the same date once the file arrives (add a run.attempt
+   parameter to force a new execution). (2) Build a polling step using a
+   Tasklet that repeatedly checks for the file and returns CONTINUABLE until
+   found. (3) Use a message-triggered approach: file arrival triggers an event
+   (S3 → SQS/SNS → @SqsListener) that launches the job.

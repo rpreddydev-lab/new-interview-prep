@@ -1,0 +1,362 @@
+================================================================
+INTEGRATION TESTING — KAFKA INTEGRATION TESTING
+Complete Interview Preparation Guide
+================================================================
+
+1. KAFKA TESTING OPTIONS
+================================================================
+
+Option              | Description                        | Use When
+--------------------|------------------------------------|-----------
+EmbeddedKafka       | In-process Kafka (no Docker)       | Unit/fast tests
+KafkaContainer      | Real Kafka via Testcontainers       | Full integration
+MockConsumer/Producer| Mockito mock of Kafka clients      | Unit tests only
+Awaitility          | Async assertion helper              | All async tests
+
+================================================================
+2. DEPENDENCIES
+================================================================
+
+  <!-- Spring Kafka (includes EmbeddedKafka) -->
+  <dependency>
+      <groupId>org.springframework.kafka</groupId>
+      <artifactId>spring-kafka</artifactId>
+  </dependency>
+  
+  <dependency>
+      <groupId>org.springframework.kafka</groupId>
+      <artifactId>spring-kafka-test</artifactId>
+      <scope>test</scope>
+  </dependency>
+  
+  <!-- Testcontainers Kafka (for real Kafka) -->
+  <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>kafka</artifactId>
+      <scope>test</scope>
+  </dependency>
+  
+  <!-- Awaitility for async assertions -->
+  <dependency>
+      <groupId>org.awaitility</groupId>
+      <artifactId>awaitility</artifactId>
+      <scope>test</scope>
+  </dependency>
+
+================================================================
+3. EMBEDDEDKAFKA — IN-PROCESS KAFKA
+================================================================
+
+@EmbeddedKafka starts a lightweight Kafka broker in the test JVM.
+No Docker needed. Fast to start.
+
+TEST PRODUCER:
+  @SpringBootTest
+  @EmbeddedKafka(
+      partitions = 1,
+      topics = {"orders", "notifications"},
+      brokerProperties = {"listeners=PLAINTEXT://localhost:9092"}
+  )
+  class OrderEventProducerTest {
+      
+      @Autowired KafkaTemplate<String, OrderEvent> kafkaTemplate;
+      
+      // Real consumer to verify what was sent
+      @Autowired EmbeddedKafkaBroker embeddedKafkaBroker;
+      
+      @Test
+      void shouldPublishOrderCreatedEvent() throws Exception {
+          // Consumer setup
+          Map<String, Object> consumerProps = KafkaTestUtils.consumerProps(
+              "test-group", "true", embeddedKafkaBroker
+          );
+          Consumer<String, String> consumer = new DefaultKafkaConsumerFactory<>(
+              consumerProps, new StringDeserializer(), new StringDeserializer()
+          ).createConsumer();
+          embeddedKafkaBroker.consumeFromAnEmbeddedTopic(consumer, "orders");
+          
+          // Act: produce an event
+          OrderEvent event = new OrderEvent("ord-1", "CREATED", "cust-1", Instant.now());
+          kafkaTemplate.send("orders", "ord-1", event).get();
+          
+          // Assert: consume and verify
+          ConsumerRecords<String, String> records = KafkaTestUtils.getRecords(consumer);
+          
+          assertEquals(1, records.count());
+          ConsumerRecord<String, String> record = records.iterator().next();
+          assertEquals("ord-1", record.key());
+          
+          ObjectMapper mapper = new ObjectMapper();
+          OrderEvent received = mapper.readValue(record.value(), OrderEvent.class);
+          assertEquals("CREATED", received.getType());
+          assertEquals("cust-1", received.getCustomerId());
+          
+          consumer.close();
+      }
+  }
+
+TEST CONSUMER:
+  @SpringBootTest
+  @EmbeddedKafka(partitions = 1, topics = {"payments"})
+  class PaymentEventConsumerTest {
+      
+      @Autowired KafkaTemplate<String, String> kafkaTemplate;
+      @Autowired PaymentEventConsumer paymentConsumer;
+      @Autowired OrderRepository orderRepository;
+      
+      @Test
+      void shouldUpdateOrderStatusOnPaymentEvent() throws Exception {
+          // Seed test order
+          Order order = orderRepository.save(new Order("ord-1", OrderStatus.PENDING));
+          
+          // Produce payment confirmed event
+          PaymentEvent event = new PaymentEvent("ord-1", "PAYMENT_CONFIRMED", "ch_123");
+          String json = new ObjectMapper().writeValueAsString(event);
+          
+          kafkaTemplate.send("payments", "ord-1", json);
+          
+          // Wait for consumer to process (async!)
+          await().atMost(Duration.ofSeconds(5))
+              .untilAsserted(() -> {
+                  Order updated = orderRepository.findById("ord-1").orElseThrow();
+                  assertEquals(OrderStatus.PAID, updated.getStatus());
+              });
+      }
+  }
+
+================================================================
+4. AWAITILITY — ASYNC ASSERTIONS
+================================================================
+
+Awaitility polls until a condition is true or a timeout is reached.
+Essential for Kafka consumer tests (async processing).
+
+BASIC USAGE:
+  import static org.awaitility.Awaitility.*;
+  import static java.time.Duration.*;
+  
+  // Wait up to 5 seconds for condition to be true
+  await()
+      .atMost(ofSeconds(5))
+      .untilAsserted(() -> {
+          assertEquals("PAID", orderRepository.findById("ord-1")
+              .orElseThrow().getStatus().name());
+      });
+  
+  // Wait with polling interval
+  await()
+      .pollInterval(ofMillis(500))
+      .atMost(ofSeconds(10))
+      .until(() -> notificationRepository.countByOrderId("ord-1") == 2);
+  
+  // Wait with initial delay
+  await()
+      .pollDelay(ofMillis(200))  // wait before first poll
+      .atMost(ofSeconds(5))
+      .untilAsserted(() -> verify(emailService, times(1)).send(any()));
+
+AWAITILITY WITH MOCKITO:
+  await().atMost(ofSeconds(3))
+      .untilAsserted(() -> 
+          verify(notificationService, times(1)).sendPushNotification(eq("ord-1"), any())
+      );
+
+================================================================
+5. TESTCONTAINERS KAFKA — REAL KAFKA
+================================================================
+
+  @SpringBootTest
+  @Testcontainers
+  class OrderKafkaIT {
+      
+      @Container
+      static KafkaContainer kafka = 
+          new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.4.0"));
+      
+      @DynamicPropertySource
+      static void kafkaProperties(DynamicPropertyRegistry registry) {
+          registry.add("spring.kafka.bootstrap-servers", kafka::getBootstrapServers);
+      }
+      
+      @Autowired KafkaTemplate<String, String> kafkaTemplate;
+      @Autowired OrderService orderService;
+      @Autowired OrderRepository orderRepository;
+      
+      @Test
+      void orderPlacedEventShouldTriggerInventoryUpdate() throws Exception {
+          // Place order — internally publishes "orders" topic message
+          Order order = orderService.placeOrder(new PlaceOrderRequest("cust-1", "SKU-001", 2));
+          
+          // Wait for inventory consumer to process
+          await().atMost(ofSeconds(10))
+              .untilAsserted(() -> {
+                  InventoryRecord inv = inventoryRepository.findBySku("SKU-001").orElseThrow();
+                  assertEquals(initialStock - 2, inv.getAvailableCount());
+              });
+      }
+  }
+
+================================================================
+6. TESTING KAFKA WITH COUNTERS AND LATCHES
+================================================================
+
+Using CountDownLatch for synchronization:
+  @Component
+  @KafkaListener(topics = "orders")
+  class TestOrderConsumer {
+      
+      private CountDownLatch latch = new CountDownLatch(1);
+      private List<OrderEvent> receivedEvents = new ArrayList<>();
+      
+      @KafkaHandler
+      public void handle(OrderEvent event) {
+          receivedEvents.add(event);
+          latch.countDown();
+      }
+      
+      public CountDownLatch getLatch() { return latch; }
+      public List<OrderEvent> getReceivedEvents() { return receivedEvents; }
+      public void reset(int count) {
+          latch = new CountDownLatch(count);
+          receivedEvents.clear();
+      }
+  }
+  
+  @SpringBootTest
+  @EmbeddedKafka(topics = "orders")
+  class OrderPublisherTest {
+      
+      @Autowired OrderPublisher orderPublisher;
+      @Autowired TestOrderConsumer testConsumer;
+      
+      @Test
+      void shouldPublishOrderEvent() throws InterruptedException {
+          testConsumer.reset(1);
+          
+          orderPublisher.publishOrderCreated("ord-1", "cust-1");
+          
+          boolean received = testConsumer.getLatch().await(5, TimeUnit.SECONDS);
+          
+          assertTrue(received, "Event not received within timeout");
+          assertEquals(1, testConsumer.getReceivedEvents().size());
+          assertEquals("ord-1", testConsumer.getReceivedEvents().get(0).getOrderId());
+      }
+  }
+
+================================================================
+7. TESTING KAFKA ERROR HANDLING AND DLT
+================================================================
+
+  @SpringBootTest
+  @EmbeddedKafka(topics = {"orders", "orders.DLT"})
+  class KafkaErrorHandlingTest {
+      
+      @Autowired KafkaTemplate<String, String> kafkaTemplate;
+      
+      @Test
+      void shouldSendToDLTAfterMaxRetries() throws Exception {
+          // Send malformed message that will fail deserialization
+          kafkaTemplate.send("orders", "bad-message-json");
+          
+          // Wait for DLT delivery (after retries)
+          Map<String, Object> consumerProps = KafkaTestUtils.consumerProps(
+              "dlt-test-group", "true", embeddedKafkaBroker
+          );
+          Consumer<String, String> dltConsumer = new DefaultKafkaConsumerFactory<>(
+              consumerProps, new StringDeserializer(), new StringDeserializer()
+          ).createConsumer();
+          embeddedKafkaBroker.consumeFromAnEmbeddedTopic(dltConsumer, "orders.DLT");
+          
+          await().atMost(ofSeconds(10))
+              .untilAsserted(() -> {
+                  ConsumerRecords<String, String> dltRecords = 
+                      KafkaTestUtils.getRecords(dltConsumer, 1000L);
+                  assertTrue(dltRecords.count() > 0, "Expected message in DLT");
+              });
+          
+          dltConsumer.close();
+      }
+  }
+
+================================================================
+8. TESTING KAFKA HEADERS AND METADATA
+================================================================
+
+  @Test
+  void shouldIncludeCorrelationIdInKafkaHeaders() throws Exception {
+      Consumer<String, String> consumer = createConsumer("orders");
+      
+      // Produce with correlation ID
+      ProducerRecord<String, String> record = new ProducerRecord<>("orders", "ord-1", payload);
+      record.headers().add("X-Correlation-Id", "test-corr-123".getBytes());
+      kafkaTemplate.send(record).get();
+      
+      // Consume and verify header
+      ConsumerRecords<String, String> consumed = KafkaTestUtils.getRecords(consumer);
+      ConsumerRecord<String, String> received = consumed.iterator().next();
+      
+      Header correlationHeader = received.headers().lastHeader("X-Correlation-Id");
+      assertNotNull(correlationHeader);
+      assertEquals("test-corr-123", new String(correlationHeader.value()));
+      
+      consumer.close();
+  }
+
+================================================================
+9. PROPERTY CONFIGURATION FOR EMBEDDED KAFKA
+================================================================
+
+  # application-test.yml
+  spring:
+    kafka:
+      bootstrap-servers: ${spring.embedded.kafka.brokers}  # auto-injected by EmbeddedKafka
+      consumer:
+        group-id: test-group
+        auto-offset-reset: earliest   # ← IMPORTANT: consume from beginning in tests
+        key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+        value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      producer:
+        key-serializer: org.apache.kafka.common.serialization.StringSerializer
+        value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+
+  # auto.offset.reset=earliest is critical for tests:
+  # Without it, consumer might not see messages sent before it subscribed
+
+================================================================
+10. INTERVIEW QUESTIONS
+================================================================
+
+Q: How do you test a Kafka producer in Spring Boot?
+A: Use @EmbeddedKafka to start an in-process broker. Start a KafkaConsumer
+   manually using KafkaTestUtils.consumerProps(). Publish a message via
+   KafkaTemplate, then KafkaTestUtils.getRecords() to consume and verify.
+
+Q: How do you test a Kafka consumer?
+A: Use @EmbeddedKafka and publish a message via KafkaTemplate. Since consumers
+   are async, use Awaitility.await() to poll until the expected state change
+   occurs (e.g., a DB record updated, a service method called).
+
+Q: Why is auto.offset.reset=earliest important in Kafka tests?
+A: By default, consumers start from the latest offset — they miss messages
+   already in the topic. With earliest, they start from the beginning,
+   ensuring they consume messages published before the consumer was started.
+
+Q: What is Awaitility and why is it used with Kafka tests?
+A: Awaitility is a library for async assertions. Kafka consumer processing
+   is asynchronous — the test can't synchronously block on it. Awaitility
+   polls the condition periodically (e.g., every 500ms) until it's true
+   or a timeout is reached (e.g., 5 seconds).
+
+Q: When would you use Testcontainers Kafka vs EmbeddedKafka?
+A: EmbeddedKafka — fast, no Docker, good for most consumer/producer tests.
+   Testcontainers Kafka — real Confluent Kafka, needed when testing Kafka
+   Stream topologies, Schema Registry, specific broker configs, or when
+   you need to ensure behavior matches production exactly.
+
+Q: What is a Dead Letter Topic (DLT) and how do you test it?
+A: A DLT receives messages that failed processing after max retries.
+   In tests, publish a message that will fail (e.g., bad JSON, throws
+   an exception in the handler). After the retry count is exceeded,
+   consume from the DLT topic and verify the message arrived there.
+
+================================================================

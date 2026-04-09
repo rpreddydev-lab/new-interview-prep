@@ -1,0 +1,612 @@
+================================================================
+CLIENT STREAMING RPC - COMPLETE GUIDE
+================================================================
+
+----------------------------------------------------------------
+1. WHAT IS CLIENT STREAMING RPC?
+----------------------------------------------------------------
+
+Client streaming RPC:
+  - Client sends a STREAM of requests (zero or more messages)
+  - Server sends exactly ONE response when client finishes
+  - Server waits for all client messages before responding (typically)
+
+Proto definition:
+  rpc MethodName (stream RequestMessage) returns (ResponseMessage);
+                  ^^^^^^
+              "stream" keyword before request type
+
+HTTP/2 behavior:
+  - Single HTTP/2 stream
+  - Client: HEADERS + DATA + DATA + ... + DATA [END_STREAM]
+  - Server: HEADERS + DATA + TRAILERS [END_STREAM]
+  
+  The server cannot send its response until after receiving
+  all client messages (unless it uses early termination).
+
+Common use cases:
+  ✅ File upload (client sends file chunks, server returns metadata)
+  ✅ Batch data ingestion (client streams 1000 records, server returns summary)
+  ✅ Sensor data aggregation (IoT device streams readings, server returns averages)
+  ✅ Log streaming (client streams log lines, server returns ack)
+  ✅ Real-time data accumulation (collects data before processing)
+
+Note: Client streaming is the LEAST common of the four patterns.
+Often replaced by:
+  - Unary with repeated fields (for small known-size batches)
+  - Bidirectional streaming (if server needs to send feedback per message)
+
+----------------------------------------------------------------
+2. PROTO DEFINITION
+----------------------------------------------------------------
+
+syntax = "proto3";
+package com.example.upload.v1;
+
+option java_package = "com.example.upload.v1";
+option java_multiple_files = true;
+
+// ── FILE UPLOAD ───────────────────────────────────────────────
+
+message FileChunk {
+  bytes  data      = 1;
+  string filename  = 2;  // only in first chunk
+  string mime_type = 3;  // only in first chunk
+  int64  offset    = 4;
+}
+
+message UploadFileResponse {
+  string file_id        = 1;
+  int64  bytes_received = 2;
+  string checksum       = 3;
+  string url            = 4;
+}
+
+// ── BATCH ORDER CREATION ──────────────────────────────────────
+
+message CreateOrderRequest {
+  string customer_id  = 1;
+  string product_id   = 2;
+  int32  quantity     = 3;
+  int64  price_cents  = 4;
+}
+
+message BatchCreateResult {
+  int32  total_received = 1;
+  int32  success_count  = 2;
+  int32  failure_count  = 3;
+  repeated string created_order_ids = 4;
+  repeated string failed_product_ids = 5;
+}
+
+// ── SENSOR DATA STREAMING ─────────────────────────────────────
+
+message SensorReading {
+  string sensor_id  = 1;
+  double value      = 2;
+  string unit       = 3;  // "celsius", "pascal", "rpm"
+  int64  timestamp_ms = 4;
+}
+
+message SensorSummary {
+  string sensor_id  = 1;
+  double avg_value  = 2;
+  double min_value  = 3;
+  double max_value  = 4;
+  int32  count      = 5;
+}
+
+// ── SERVICES ─────────────────────────────────────────────────
+
+service FileService {
+  rpc UploadFile(stream FileChunk) returns (UploadFileResponse);
+}
+
+service OrderService {
+  rpc BatchCreateOrders(stream CreateOrderRequest) returns (BatchCreateResult);
+}
+
+service SensorService {
+  rpc StreamSensorReadings(stream SensorReading) returns (SensorSummary);
+}
+
+----------------------------------------------------------------
+3. SERVER IMPLEMENTATION (JAVA)
+----------------------------------------------------------------
+
+The key difference from unary: the server returns a StreamObserver<REQUEST>,
+NOT void. This StreamObserver handles the incoming stream from the client.
+
+// ── FILE UPLOAD SERVER ────────────────────────────────────────
+
+@GrpcService
+public class FileServiceImpl extends FileServiceGrpc.FileServiceImplBase {
+  
+  @Override
+  public StreamObserver<FileChunk> uploadFile(StreamObserver<UploadFileResponse> responseObserver) {
+    
+    // Return a StreamObserver for the CLIENT'S requests
+    return new StreamObserver<FileChunk>() {
+      
+      // State accumulated across multiple onNext() calls
+      private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+      private String filename;
+      private String mimeType;
+      private long bytesReceived = 0;
+      private final MessageDigest digest;
+      
+      {
+        try {
+          digest = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+          throw new RuntimeException(e);
+        }
+      }
+      
+      @Override
+      public void onNext(FileChunk chunk) {
+        // Called for EACH chunk sent by the client
+        byte[] data = chunk.getData().toByteArray();
+        
+        if (bytesReceived == 0) {
+          // First chunk: capture metadata
+          filename = chunk.getFilename();
+          mimeType = chunk.getMimeType();
+        }
+        
+        try {
+          buffer.write(data);
+          digest.update(data);
+          bytesReceived += data.length;
+          log.debug("Received chunk: {} bytes (total: {})", data.length, bytesReceived);
+        } catch (IOException e) {
+          // Signal error by calling onError on the responseObserver
+          responseObserver.onError(
+              Status.INTERNAL.withDescription("Failed to process chunk").asException());
+        }
+      }
+      
+      @Override
+      public void onError(Throwable t) {
+        // Client sent an error (network issue, client crash, etc.)
+        log.error("Client error during upload", t);
+        // Clean up any partial upload
+        buffer.reset();
+      }
+      
+      @Override
+      public void onCompleted() {
+        // Client finished sending all chunks
+        try {
+          // Save the complete file
+          String checksum = Hex.encodeHexString(digest.digest());
+          String fileId = fileStorage.save(filename, mimeType, buffer.toByteArray());
+          
+          // Send the single response
+          responseObserver.onNext(UploadFileResponse.newBuilder()
+              .setFileId(fileId)
+              .setBytesReceived(bytesReceived)
+              .setChecksum(checksum)
+              .setUrl("https://storage.example.com/files/" + fileId)
+              .build());
+          
+          responseObserver.onCompleted();
+          
+        } catch (Exception e) {
+          responseObserver.onError(
+              Status.INTERNAL.withDescription("Failed to save file").asException());
+        }
+      }
+    };
+  }
+}
+
+// ── BATCH ORDER SERVER ────────────────────────────────────────
+
+@GrpcService
+public class OrderServiceImpl extends OrderServiceGrpc.OrderServiceImplBase {
+  
+  private final OrderRepository orderRepository;
+  
+  @Override
+  public StreamObserver<CreateOrderRequest> batchCreateOrders(
+      StreamObserver<BatchCreateResult> responseObserver) {
+    
+    return new StreamObserver<CreateOrderRequest>() {
+      
+      // Accumulate results
+      private int totalReceived = 0;
+      private int successCount = 0;
+      private int failureCount = 0;
+      private final List<String> createdIds = new ArrayList<>();
+      private final List<String> failedIds = new ArrayList<>();
+      
+      @Override
+      public void onNext(CreateOrderRequest request) {
+        totalReceived++;
+        
+        try {
+          // Process each order request as it arrives
+          // Can also batch these and commit in onCompleted()
+          String orderId = orderRepository.createOrder(
+              request.getCustomerId(),
+              request.getProductId(),
+              request.getQuantity(),
+              request.getPriceCents());
+          
+          createdIds.add(orderId);
+          successCount++;
+          
+        } catch (Exception e) {
+          // Non-fatal: count failure but continue processing other orders
+          failedIds.add(request.getProductId());
+          failureCount++;
+          log.warn("Failed to create order for product: {}", request.getProductId(), e);
+        }
+      }
+      
+      @Override
+      public void onError(Throwable t) {
+        // Client error: roll back or mark partial batch as failed
+        log.error("Client streaming error in batch create", t);
+        // Optionally rollback all created orders in this batch
+      }
+      
+      @Override
+      public void onCompleted() {
+        // All orders received — send summary
+        responseObserver.onNext(BatchCreateResult.newBuilder()
+            .setTotalReceived(totalReceived)
+            .setSuccessCount(successCount)
+            .setFailureCount(failureCount)
+            .addAllCreatedOrderIds(createdIds)
+            .addAllFailedProductIds(failedIds)
+            .build());
+        
+        responseObserver.onCompleted();
+      }
+    };
+  }
+}
+
+// ── SENSOR DATA SERVER ────────────────────────────────────────
+
+@GrpcService
+public class SensorServiceImpl extends SensorServiceGrpc.SensorServiceImplBase {
+  
+  @Override
+  public StreamObserver<SensorReading> streamSensorReadings(
+      StreamObserver<SensorSummary> responseObserver) {
+    
+    return new StreamObserver<SensorReading>() {
+      
+      private String sensorId;
+      private double sum = 0;
+      private double min = Double.MAX_VALUE;
+      private double max = Double.MIN_VALUE;
+      private int count = 0;
+      
+      @Override
+      public void onNext(SensorReading reading) {
+        if (sensorId == null) sensorId = reading.getSensorId();
+        
+        double v = reading.getValue();
+        sum += v;
+        min = Math.min(min, v);
+        max = Math.max(max, v);
+        count++;
+      }
+      
+      @Override
+      public void onError(Throwable t) {
+        log.error("Sensor stream error", t);
+      }
+      
+      @Override
+      public void onCompleted() {
+        if (count == 0) {
+          responseObserver.onError(
+              Status.INVALID_ARGUMENT.withDescription("No readings received").asException());
+          return;
+        }
+        
+        responseObserver.onNext(SensorSummary.newBuilder()
+            .setSensorId(sensorId)
+            .setAvgValue(sum / count)
+            .setMinValue(min)
+            .setMaxValue(max)
+            .setCount(count)
+            .build());
+        
+        responseObserver.onCompleted();
+      }
+    };
+  }
+}
+
+----------------------------------------------------------------
+4. CLIENT IMPLEMENTATION - ASYNC STUB
+----------------------------------------------------------------
+
+NOTE: There is NO BlockingStub for client streaming.
+BlockingStub only handles responses, not request streams.
+You MUST use AsyncStub for client streaming.
+
+@Component
+public class FileServiceClient {
+  
+  private final FileServiceGrpc.FileServiceStub asyncStub;
+  
+  public FileServiceClient(ManagedChannel channel) {
+    this.asyncStub = FileServiceGrpc.newStub(channel);
+  }
+  
+  public CompletableFuture<UploadFileResponse> uploadFile(Path filePath) throws IOException {
+    
+    CompletableFuture<UploadFileResponse> resultFuture = new CompletableFuture<>();
+    
+    // 1. Call the RPC method — get back a StreamObserver for SENDING requests
+    StreamObserver<FileChunk> requestObserver = asyncStub
+        .withDeadlineAfter(60, TimeUnit.SECONDS)
+        .uploadFile(new StreamObserver<UploadFileResponse>() {
+          
+          // This handles the ONE response from the server
+          @Override
+          public void onNext(UploadFileResponse response) {
+            resultFuture.complete(response);
+          }
+          
+          @Override
+          public void onError(Throwable t) {
+            resultFuture.completeExceptionally(t);
+          }
+          
+          @Override
+          public void onCompleted() {
+            // onNext was already called; nothing to do
+          }
+        });
+    
+    // 2. Send chunks to the server using requestObserver
+    try {
+      String filename = filePath.getFileName().toString();
+      String mimeType = Files.probeContentType(filePath);
+      int chunkSize = 64 * 1024;  // 64KB
+      long offset = 0;
+      boolean first = true;
+      
+      try (InputStream is = Files.newInputStream(filePath)) {
+        byte[] buffer = new byte[chunkSize];
+        int bytesRead;
+        
+        while ((bytesRead = is.read(buffer)) != -1) {
+          byte[] data = bytesRead < buffer.length
+              ? Arrays.copyOf(buffer, bytesRead)
+              : buffer;
+          
+          FileChunk.Builder chunkBuilder = FileChunk.newBuilder()
+              .setData(ByteString.copyFrom(data))
+              .setOffset(offset);
+          
+          if (first) {
+            chunkBuilder.setFilename(filename).setMimeType(mimeType);
+            first = false;
+          }
+          
+          // 3. Send each chunk
+          requestObserver.onNext(chunkBuilder.build());
+          offset += bytesRead;
+        }
+      }
+      
+      // 4. Signal that all chunks have been sent
+      requestObserver.onCompleted();
+      
+    } catch (IOException e) {
+      // 5. Signal error if something went wrong during sending
+      requestObserver.onError(e);
+      resultFuture.completeExceptionally(e);
+    }
+    
+    return resultFuture;
+  }
+}
+
+// ── BATCH ORDER CLIENT ────────────────────────────────────────
+
+@Component
+public class BatchOrderClient {
+  
+  private final OrderServiceGrpc.OrderServiceStub asyncStub;
+  
+  public void batchCreateOrders(List<OrderRequest> orders) throws InterruptedException {
+    
+    CountDownLatch latch = new CountDownLatch(1);
+    AtomicReference<BatchCreateResult> result = new AtomicReference<>();
+    AtomicReference<Throwable> error = new AtomicReference<>();
+    
+    // Get the request stream observer
+    StreamObserver<CreateOrderRequest> requestObserver =
+        asyncStub.batchCreateOrders(new StreamObserver<BatchCreateResult>() {
+          @Override
+          public void onNext(BatchCreateResult r) { result.set(r); }
+          @Override
+          public void onError(Throwable t) { error.set(t); latch.countDown(); }
+          @Override
+          public void onCompleted() { latch.countDown(); }
+        });
+    
+    // Send all orders
+    for (OrderRequest order : orders) {
+      requestObserver.onNext(CreateOrderRequest.newBuilder()
+          .setCustomerId(order.customerId())
+          .setProductId(order.productId())
+          .setQuantity(order.quantity())
+          .setPriceCents(order.priceCents())
+          .build());
+    }
+    
+    // Signal completion
+    requestObserver.onCompleted();
+    
+    // Wait for server response
+    latch.await(30, TimeUnit.SECONDS);
+    
+    if (error.get() != null) {
+      throw new RuntimeException("Batch create failed", error.get());
+    }
+    
+    BatchCreateResult r = result.get();
+    System.out.printf("Batch complete: %d success, %d failed%n",
+        r.getSuccessCount(), r.getFailureCount());
+  }
+}
+
+----------------------------------------------------------------
+5. EARLY TERMINATION (SERVER RESPONDS BEFORE CLIENT FINISHES)
+----------------------------------------------------------------
+
+Sometimes the server needs to stop the stream early (e.g., error
+in one of the received messages).
+
+Server-side early termination:
+  @Override
+  public StreamObserver<CreateOrderRequest> batchCreateOrders(
+      StreamObserver<BatchCreateResult> responseObserver) {
+    
+    return new StreamObserver<CreateOrderRequest>() {
+      private boolean terminated = false;
+      
+      @Override
+      public void onNext(CreateOrderRequest request) {
+        if (terminated) return;  // ignore subsequent messages after error
+        
+        if (request.getCustomerId().isBlank()) {
+          // Error: terminate immediately, don't wait for more messages
+          responseObserver.onError(
+              Status.INVALID_ARGUMENT
+                  .withDescription("customer_id is required")
+                  .asException());
+          terminated = true;  // mark as terminated
+          return;
+        }
+        
+        // Normal processing...
+      }
+      
+      @Override
+      public void onCompleted() {
+        if (terminated) return;
+        // Send result...
+      }
+    };
+  }
+
+Client-side behavior on early termination:
+  - Server calls onError() on the responseObserver
+  - Client's requestObserver.onNext() will throw StatusRuntimeException
+  - Client should handle this exception
+
+----------------------------------------------------------------
+6. THREADING MODEL
+----------------------------------------------------------------
+
+Key point: For client streaming, thread safety matters!
+
+The StreamObserver returned from the RPC method is called from
+the gRPC thread pool. However:
+  - onNext() calls are sequential (never concurrent for one stream)
+  - onCompleted() and onError() are also called once
+  - You don't need to synchronize access within a single stream's observer
+
+But: the responseObserver passed to the server method is shared.
+Be careful if you call responseObserver from different threads.
+
+Safe pattern (server side):
+  return new StreamObserver<FileChunk>() {
+    // These are all called from the same gRPC thread — no sync needed
+    private List<byte[]> chunks = new ArrayList<>();
+    
+    @Override
+    public void onNext(FileChunk chunk) {
+      chunks.add(chunk.getData().toByteArray());  // safe: single thread
+    }
+    
+    @Override
+    public void onCompleted() {
+      // Process and respond — also single thread
+      byte[] complete = merge(chunks);
+      responseObserver.onNext(buildResponse(complete));
+      responseObserver.onCompleted();
+    }
+  };
+
+----------------------------------------------------------------
+7. COMPARISON: CLIENT STREAMING vs ALTERNATIVES
+----------------------------------------------------------------
+
+Client streaming vs Unary with repeated field:
+
+  // Unary with repeated (simple, for small batches < 4MB)
+  rpc BatchCreate(BatchCreateRequest) returns (BatchCreateResult);
+  message BatchCreateRequest { repeated CreateOrderRequest orders = 1; }
+  
+  // Client streaming (for large or streaming batches)
+  rpc BatchCreate(stream CreateOrderRequest) returns (BatchCreateResult);
+  
+  Use unary when:
+    - Batch size is known and small (< 4MB, < 1000 items)
+    - Simpler to implement and reason about
+  
+  Use client streaming when:
+    - Batch is very large (millions of records)
+    - Data is generated over time (can't wait to collect all)
+    - Processing should start before all data is received
+    - Memory-efficient streaming is needed
+
+Client streaming vs Bidirectional streaming:
+
+  Use client streaming when:
+    - Server needs to process ALL data before responding
+    - No per-message feedback needed from server
+  
+  Use bidi streaming when:
+    - Server needs to send acknowledgment per message
+    - Server needs to send intermediate results
+    - Real-time feedback loop is needed
+
+----------------------------------------------------------------
+8. INTERVIEW KEY POINTS
+----------------------------------------------------------------
+
+Q: Why is there no BlockingStub for client streaming RPCs?
+A: BlockingStub can only handle synchronous request/response patterns.
+   For client streaming, the client must be able to send multiple
+   messages over time, which requires a non-blocking StreamObserver.
+   The blocking paradigm doesn't map to "send a stream of messages"
+   — you'd need to hold an Iterator open for writing, which doesn't
+   make sense in the blocking model.
+
+Q: In client streaming, what is the return type of the server-side method?
+A: The server method returns a StreamObserver<REQUEST_TYPE>. This
+   StreamObserver is the "inbox" for the client's stream. The server
+   framework calls onNext() for each message, onError() if the client
+   fails, and onCompleted() when the client calls requestObserver.onCompleted().
+   The server sends its response using the responseObserver passed in
+   as a parameter.
+
+Q: What if the server encounters an error midway through receiving the client stream?
+A: The server calls responseObserver.onError(status) to terminate the
+   stream early. After this, subsequent calls to requestObserver.onNext()
+   on the client side will throw a StatusRuntimeException. The client
+   should handle this exception and stop sending.
+
+Q: How do you ensure atomicity for batch operations in client streaming?
+A: Use a transaction that spans the entire stream. Start a transaction
+   in the StreamObserver's constructor or first onNext(). Commit in
+   onCompleted() or rollback in onError(). This ensures all-or-nothing
+   semantics for the batch.
+
+================================================================
+END OF FILE
+================================================================

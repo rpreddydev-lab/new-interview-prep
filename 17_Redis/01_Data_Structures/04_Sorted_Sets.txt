@@ -1,0 +1,289 @@
+================================================================================
+REDIS SORTED SETS (ZSET) — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. OVERVIEW
+────────────
+A Redis Sorted Set is an ordered collection of unique string members, each
+associated with a floating-point score. Members are:
+  - Unique (like Set)
+  - Ordered by score (ascending by default)
+  - When scores are equal: ordered lexicographically
+
+Sorted Sets are probably the most powerful and interview-discussed Redis type.
+They combine:
+  - O(1) score lookup (via hashtable)
+  - O(log N) rank query (via skiplist)
+  - O(log N + M) range query (via skiplist)
+
+
+2. INTERNAL ENCODING — THE DUAL STRUCTURE
+───────────────────────────────────────────
+  listpack: when ≤128 members AND each member ≤64 bytes
+    - Contiguous memory: [member, score, member, score, …]
+    - O(N) operations (but N is small, so fast in practice)
+    - OBJECT ENCODING key → "listpack"
+
+  skiplist + hashtable: for larger sorted sets
+    The MOST IMPORTANT internal structure to understand for interviews!
+
+    Skiplist:
+      - A probabilistic data structure (not a balanced BST)
+      - Sorted by score → supports O(log N) rank, range, and insert
+      - Multiple levels of forward pointers (expected O(log N) traversal)
+      - Structure: each node has [score, member, forward pointers per level]
+
+    Hashtable (alongside skiplist):
+      - Maps member → score
+      - O(1) score lookup (ZSCORE command)
+      - O(1) membership check
+
+    BOTH structures maintained simultaneously, pointing to the same nodes.
+    This is why both ZSCORE (O(1)) and ZRANK (O(log N)) are fast.
+
+  Thresholds:
+    zset-max-listpack-entries  128
+    zset-max-listpack-value     64
+
+
+3. CORE COMMANDS
+─────────────────
+
+  Add / Update:
+    ZADD key [NX|XX] [GT|LT] [CH] [INCR] score member [score member …]
+      NX:   Only add new members (don't update existing)
+      XX:   Only update existing (don't add new)
+      GT:   Update only if new score > current score (useful for HWM)
+      LT:   Update only if new score < current score
+      CH:   Return count of CHANGED (added + updated) vs default (added only)
+      INCR: Treat score as increment (like ZINCRBY)
+    ZINCRBY key increment member   → atomically add increment to score
+
+  Remove:
+    ZREM key member [member …]     → remove by member name
+    ZPOPMIN key [count]            → remove and return lowest score members
+    ZPOPMAX key [count]            → remove and return highest score members
+    BZPOPMIN key [key…] timeout    → blocking ZPOPMIN
+    BZPOPMAX key [key…] timeout    → blocking ZPOPMAX
+    ZRANGESTORE dst src min max [BYSCORE|BYLEX] [REV] [LIMIT offset count]
+                                    → store range result in dst
+
+  Range Queries:
+    ZRANGE key min max [BYSCORE|BYLEX|BYINDEX] [REV] [LIMIT offset count]
+              [WITHSCORES]
+      (Redis 6.2+ unified range command — replaces older commands)
+
+    Legacy (still valid):
+    ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]
+    ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset count]
+    ZRANGEBYLEX key "[min" "[max" [LIMIT offset count]   (same-score members)
+    ZREVRANGE key stop start [WITHSCORES]
+    ZRANGE key start stop [WITHSCORES]
+
+  Rank / Score:
+    ZRANK key member [WITHSCORE]   → 0-based rank (lowest score = 0)
+    ZREVRANK key member [WITHSCORE]→ rank from highest score
+    ZSCORE key member              → score value or nil. O(1).
+    ZMSCORE key member [member …]  → multiple scores
+
+  Count:
+    ZCARD key                      → total count. O(1).
+    ZCOUNT key min max             → count members with score in [min, max]
+    ZLEXCOUNT key min max          → count members in lex range
+    ZRANGEBYLEX for ZINTERCARD
+
+  Scan:
+    ZSCAN key cursor [MATCH pat] [COUNT n]
+
+  Set Operations:
+    ZUNIONSTORE dst numkeys key [key …] [WEIGHTS …] [AGGREGATE SUM|MIN|MAX]
+    ZINTERSTORE dst numkeys key [key …] [WEIGHTS …] [AGGREGATE SUM|MIN|MAX]
+    ZDIFFSTORE  dst numkeys key [key …]
+    ZUNION numkeys key [key …] [WITHSCORES]     → return without storing
+    ZINTER numkeys key [key …] [WITHSCORES]
+    ZDIFF  numkeys key [key …] [WITHSCORES]
+    ZINTERCARD numkeys key [key…] [LIMIT limit]  → count intersection
+
+
+4. RANGE QUERY SYNTAX IN DETAIL
+─────────────────────────────────
+  Score ranges:
+    ZRANGEBYSCORE key 100 200       → score between 100 and 200 (inclusive)
+    ZRANGEBYSCORE key -inf +inf     → all members
+    ZRANGEBYSCORE key (100 200     → exclusive lower bound
+    ZRANGEBYSCORE key 100 (200     → exclusive upper bound
+    ZRANGEBYSCORE key -inf 100 LIMIT 0 10  → first 10 members with score ≤ 100
+
+  Modern syntax (Redis 6.2+):
+    ZRANGE key 100 200 BYSCORE WITHSCORES
+    ZRANGE key 200 100 BYSCORE REV         → descending order
+    ZRANGE key 0 9                          → by index (0-based)
+    ZRANGE key 0 -1                         → all elements
+
+  Lex ranges (for same-score members):
+    ZADD words 0 "apple" 0 "banana" 0 "cherry" 0 "date"
+    ZRANGEBYLEX words "[b" "[d"       → ["banana", "cherry", "date"]
+    ZRANGEBYLEX words "-" "+"         → all members alphabetically
+    ZRANGEBYLEX words "[c" "+"        → ["cherry", "date"]
+    Note: "[" = inclusive, "(" = exclusive, "-" = -inf, "+" = +inf
+
+
+5. WEIGHTED UNION / INTERSECTION
+───────────────────────────────────
+  ZUNIONSTORE result 2 set1 set2 WEIGHTS 2 1 AGGREGATE MAX
+
+  WEIGHTS: multiply each set's scores before aggregation
+  AGGREGATE:
+    SUM (default): scores are summed
+    MIN: take minimum score
+    MAX: take maximum score
+
+  Example — merge two leaderboards (first game counts double):
+    ZUNIONSTORE combined 2 game1 game2 WEIGHTS 2 1 AGGREGATE SUM
+    ZREVRANGE combined 0 9 WITHSCORES   → top 10 combined
+
+
+6. USE CASES IN DEPTH
+──────────────────────
+
+6a. Leaderboard:
+  ZADD leaderboard 9500 "alice" 8800 "bob" 7200 "charlie"
+  ZINCRBY leaderboard 500 "bob"             → bob's score = 9300
+  ZREVRANGE leaderboard 0 9 WITHSCORES     → top 10 (highest first)
+  ZREVRANK leaderboard "bob"               → bob's rank from top
+  ZCARD leaderboard                        → total players
+
+  Pagination (page 2, 10 per page):
+  ZREVRANGE leaderboard 10 19 WITHSCORES
+
+6b. Rate Limiting (Sliding Window):
+  now = current_ms_timestamp
+  key = "ratelimit:user:42"
+
+  ZADD key now now                           # add request at score=timestamp
+  ZREMRANGEBYSCORE key 0 (now - 60000)      # remove requests older than 60s
+  count = ZCARD key                          # count in last 60s
+  EXPIRE key 60                             # cleanup
+
+  Or with Lua for atomicity:
+  local now = tonumber(ARGV[1])
+  redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - 60000)
+  redis.call('ZADD', KEYS[1], now, now)
+  local count = redis.call('ZCARD', KEYS[1])
+  redis.call('EXPIRE', KEYS[1], 60)
+  return count
+
+6c. Delayed Task Queue (Scheduled Jobs):
+  # Schedule a task for future Unix timestamp
+  ZADD delayed:tasks 1709000000 "task:send-email-123"
+
+  # Worker: get all due tasks
+  now = time.now().unix()
+  ZRANGEBYSCORE delayed:tasks 0 now LIMIT 0 10
+  # For each task:
+  ZREM delayed:tasks "task:send-email-123"
+
+6d. Autocomplete with Sorted Set (ZRANGEBYLEX):
+  # Build trie-like prefix index
+  ZADD autocomplete 0 "redis"
+  ZADD autocomplete 0 "redis-cli"
+  ZADD autocomplete 0 "redisson"
+  ZADD autocomplete 0 "reactive"
+  ZADD autocomplete 0 "react"
+
+  # Search for "red" prefix
+  ZRANGEBYLEX autocomplete "[red" "[red\xff"
+  → ["redis", "redis-cli", "redisson"]
+
+6e. Time-Series / Events by Timestamp:
+  ZADD events:clicks 1709000100 "event:1"
+  ZADD events:clicks 1709000200 "event:2"
+  ZRANGEBYSCORE events:clicks 1709000000 1709000300 → events in time window
+
+6f. Priority Queue:
+  ZADD tasks 10 "low-priority-job"
+  ZADD tasks 100 "high-priority-job"
+  ZPOPMAX tasks 1   → pop highest priority task
+
+6g. Expiring Members (TTL per member):
+  # Store member with score = expiry timestamp
+  ZADD expiring:sessions <future_unix_ts> "session:abc"
+  # Cleanup: remove expired sessions
+  ZREMRANGEBYSCORE expiring:sessions 0 <current_unix_ts>
+  ZCARD expiring:sessions    # active session count
+
+
+7. COMPLEXITY REFERENCE
+────────────────────────
+  Command              │ Complexity
+  ─────────────────────┼──────────────────────────────────────────────────
+  ZADD                 │ O(log N) per element
+  ZINCRBY              │ O(log N)
+  ZREM                 │ O(log N) per element
+  ZSCORE               │ O(1)
+  ZRANK / ZREVRANK     │ O(log N)
+  ZCARD                │ O(1)
+  ZCOUNT               │ O(log N)
+  ZRANGE (by index)    │ O(log N + M) where M = elements returned
+  ZRANGEBYSCORE        │ O(log N + M)
+  ZRANGEBYLEX          │ O(log N + M)
+  ZPOPMIN / ZPOPMAX    │ O(log N) per element
+  ZUNIONSTORE          │ O(N + M*log(M)) N=total elements, M=output size
+  ZINTERSTORE          │ O(N*K + M*log(M)) K=sets, M=output
+  ZDIFF                │ O(L + (N-K)*log(N)) varies by set sizes
+
+
+8. SKIPLIST DEEP DIVE (For Senior Interview Questions)
+───────────────────────────────────────────────────────
+  A skiplist is a linked list with multiple levels:
+    Level 4: head ─────────────────────────────────────────── tail
+    Level 3: head ────────────── [score:50] ─────────────── tail
+    Level 2: head ── [score:10] ─[score:50]── [score:80] ── tail
+    Level 1: head ─ [10] ─ [20] ─[50]─ [60] ─ [80] ─ [90]─ tail
+
+  Each node is randomly assigned a level (probability 1/4 each higher level).
+  Search: start at top level, skip forward until overshot, drop down.
+  Insert: same traversal, then update forward pointers.
+
+  Expected time complexity: O(log N) for search/insert/delete.
+  Space: O(N) expected (each node has average 1.33 pointers).
+
+  Why skiplist instead of balanced BST?
+    1. Simpler implementation (no rotations like AVL/Red-Black trees)
+    2. Easier range queries (just traverse level 1 from the found node)
+    3. Lock-free variants easier to implement
+    4. Salvatore Sanfilippo (Redis creator) preferred its simplicity
+
+
+9. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: Why does Redis use BOTH a skiplist and a hashtable for sorted sets?
+  A: They serve different access patterns:
+     - Skiplist: ordered structure → O(log N) ZRANK, O(log N + M) ZRANGE
+     - Hashtable: O(1) ZSCORE and membership check
+     Both point to the same elements, so memory overhead is minimal for pointers.
+
+  Q: What is the time complexity of ZADD?
+  A: O(log N) per element, where N is the current number of members in the
+     sorted set. This is because the skiplist requires O(log N) traversal to
+     find the correct insertion point.
+
+  Q: How would you implement a leaderboard that shows a player's percentile?
+  A: ZRANK leaderboard player → rank (0-based)
+     ZCARD leaderboard → total players
+     percentile = (total - rank) / total * 100
+     This is O(log N) total.
+
+  Q: How is a sorted set different from a regular Set?
+  A: A sorted set associates each member with a floating-point score, which
+     determines its ordering. Members are still unique (like Set), but are
+     sorted by score. Supports range queries by score or rank. Regular Sets
+     are unordered and only support O(1) membership tests.
+
+  Q: What does ZRANGEBYLEX do and when is it useful?
+  A: When all members have the same score (typically 0), members are sorted
+     lexicographically. ZRANGEBYLEX queries a lex range. Useful for prefix
+     autocomplete (scan all words starting with "re"), alphabetical pagination,
+     or any case where you want sorted string data without numeric scores.
+
+================================================================================

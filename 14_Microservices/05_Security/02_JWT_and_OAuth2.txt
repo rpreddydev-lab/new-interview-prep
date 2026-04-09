@@ -1,0 +1,258 @@
+================================================================================
+JWT AND OAUTH2 IN MICROSERVICES
+================================================================================
+
+OAUTH2 OVERVIEW
+----------------
+OAuth2 is an authorization framework that allows third-party applications to
+obtain limited access to a service on behalf of a user without exposing credentials.
+
+Key Roles:
+  Resource Owner:   The user (owns their data)
+  Client:           Application requesting access (frontend, mobile app)
+  Authorization Server: Issues tokens (Keycloak, Auth0, Okta, Spring Auth Server)
+  Resource Server:  API service that accepts tokens (your microservices)
+
+OAuth2 Grant Types:
+  Authorization Code + PKCE: Web/mobile apps (most secure, most common)
+  Client Credentials:        Service-to-service (machine-to-machine)
+  Password (deprecated):     Direct user credentials (avoid in new systems)
+  Implicit (deprecated):     Old SPAs (replaced by Authorization Code + PKCE)
+  Device Code:               IoT, CLI tools
+
+────────────────────────────────────────────────────────────────────────────────
+
+JSON WEB TOKENS (JWT)
+======================
+
+JWT structure (Base64URL encoded, dot-separated):
+  Header.Payload.Signature
+  eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyMTIzIiwic2NvcGVzIjpbIm9yZGVyOndyaXRlIl19.SIGNATURE
+
+Header (algorithm):
+  { "alg": "RS256", "typ": "JWT" }
+
+Payload (claims):
+  {
+    "sub": "user-123",          // Subject (user ID)
+    "iss": "https://auth.example.com",  // Issuer
+    "aud": "order-service",     // Audience (intended service)
+    "iat": 1704067200,          // Issued at (Unix timestamp)
+    "exp": 1704070800,          // Expiry (Unix timestamp)
+    "jti": "uuid-random",       // JWT ID (for revocation)
+    "roles": ["CUSTOMER"],
+    "scopes": ["order:read", "order:write"],
+    "email": "user@example.com"
+  }
+
+Signature:
+  RS256: RSA private key signs → services verify with public key
+  HS256: Shared secret (avoid in microservices — all services need the secret)
+
+JWT is STATELESS: each service can verify the token locally without calling the
+auth server (using the public key). Scales well.
+
+JWT is NOT revocable (by default): once issued, valid until expiry.
+Mitigate with: short expiry (15 min) + refresh tokens, or token blacklist (Redis).
+
+────────────────────────────────────────────────────────────────────────────────
+
+OAUTH2 FLOW FOR MICROSERVICES
+================================
+
+User Login Flow (Authorization Code + PKCE):
+
+  Browser → Authorization Server: "Login with Google"
+  Auth Server → Browser: Login page
+  User → Auth Server: Credentials
+  Auth Server → Browser: Authorization code (short-lived, single-use)
+  Browser → API Gateway: Exchange code for tokens
+  API Gateway → Auth Server: POST /token (code, code_verifier)
+  Auth Server → API Gateway: { access_token (JWT), refresh_token, id_token }
+  API Gateway → Browser: Stores tokens securely
+
+  Subsequent API calls:
+  Browser → API Gateway: Authorization: Bearer {access_token}
+  API Gateway: Validates JWT (signature + expiry + audience)
+  API Gateway → Order Service: Forwards request (with JWT or extracted claims)
+  Order Service: Validates JWT (or trusts gateway-injected headers)
+
+Service-to-Service Flow (Client Credentials):
+
+  Order Service → Auth Server:
+    POST /token
+    grant_type=client_credentials
+    client_id=order-service
+    client_secret=secret
+    scope=inventory:read
+
+  Auth Server → Order Service: { access_token, expires_in }
+  Order Service → Inventory Service: Authorization: Bearer {service_token}
+  Inventory Service: Validates token (is it from a trusted service with right scope?)
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING SECURITY + JWT RESOURCE SERVER
+========================================
+
+pom.xml:
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+  </dependency>
+
+application.yml (JWT via JWKS endpoint):
+  spring:
+    security:
+      oauth2:
+        resourceserver:
+          jwt:
+            # Auth server exposes public keys at this endpoint
+            jwk-set-uri: https://auth.example.com/.well-known/jwks.json
+            # Or use static public key file:
+            # public-key-location: classpath:public-key.pem
+
+Security Configuration:
+  @Configuration
+  @EnableWebSecurity
+  @EnableMethodSecurity  // Enables @PreAuthorize
+  public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+      http
+        .authorizeHttpRequests(auth -> auth
+          .requestMatchers("/actuator/health").permitAll()
+          .requestMatchers("/api/v1/orders/**").authenticated()
+          .anyRequest().authenticated()
+        )
+        .oauth2ResourceServer(oauth2 -> oauth2
+          .jwt(jwt -> jwt.jwtAuthenticationConverter(jwtAuthConverter()))
+        )
+        .sessionManagement(session -> session
+          .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+        )
+        .csrf(csrf -> csrf.disable());  // Stateless JWT — no CSRF needed
+      return http.build();
+    }
+
+    // Extract roles from JWT "roles" claim
+    @Bean
+    public JwtAuthenticationConverter jwtAuthConverter() {
+      JwtGrantedAuthoritiesConverter converter = new JwtGrantedAuthoritiesConverter();
+      converter.setAuthoritiesClaimName("roles");          // Claim name in JWT
+      converter.setAuthorityPrefix("ROLE_");               // Spring Security prefix
+      
+      JwtAuthenticationConverter jwtConverter = new JwtAuthenticationConverter();
+      jwtConverter.setJwtGrantedAuthoritiesConverter(converter);
+      return jwtConverter;
+    }
+  }
+
+Protected Controller:
+  @RestController
+  @RequestMapping("/api/v1/orders")
+  public class OrderController {
+
+    @GetMapping
+    @PreAuthorize("hasRole('CUSTOMER') or hasRole('ADMIN')")
+    public List<OrderDTO> getMyOrders(@AuthenticationPrincipal Jwt jwt) {
+      String userId = jwt.getSubject();  // "sub" claim
+      return orderService.getOrdersForUser(userId);
+    }
+
+    @PostMapping
+    @PreAuthorize("hasRole('CUSTOMER')")
+    public ResponseEntity<OrderDTO> createOrder(
+        @RequestBody CreateOrderRequest request,
+        @AuthenticationPrincipal Jwt jwt) {
+      
+      String userId = jwt.getSubject();
+      List<String> scopes = jwt.getClaimAsStringList("scope");
+      
+      if (!scopes.contains("order:write")) {
+        throw new AccessDeniedException("Missing scope: order:write");
+      }
+      
+      return ResponseEntity.status(201).body(orderService.createOrder(userId, request));
+    }
+
+    @DeleteMapping("/{id}")
+    @PreAuthorize("hasRole('ADMIN') or @orderSecurityService.isOrderOwner(#id, authentication)")
+    public void cancelOrder(@PathVariable Long id) {
+      orderService.cancel(id);
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+JWT PASSING BETWEEN SERVICES
+================================
+
+Option 1: Forward JWT from API Gateway (recommended for user context)
+  // API Gateway extracts user info and forwards as headers
+  // OR forwards the original Bearer token
+  
+  // In downstream service — trusts the forwarded JWT:
+  String userId = request.getHeader("X-User-Id");
+  String userRoles = request.getHeader("X-User-Roles");
+
+Option 2: Token Exchange (RFC 8693)
+  // Service A exchanges user JWT for a service-specific token
+  // Useful when service needs different scope/audience
+
+Option 3: Service uses its own Service JWT + user ID in body/header
+  // Service authenticates with client_credentials token
+  // Passes userId as a request parameter/header
+
+────────────────────────────────────────────────────────────────────────────────
+
+JWT SECURITY BEST PRACTICES
+==============================
+  ✓ Use RS256 (asymmetric) not HS256 (symmetric) for microservices
+  ✓ Short expiry: access token 15-60 minutes
+  ✓ Use refresh tokens (longer lived, stored securely, rotated)
+  ✓ Validate: signature, expiry (exp), issuer (iss), audience (aud)
+  ✓ Never put sensitive data (passwords, PII) in JWT payload (it's Base64 decoded easily)
+  ✓ Use PKCE with Authorization Code flow for public clients
+  ✓ Rotate signing keys periodically (JWKS endpoint handles key rotation)
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is the difference between OAuth2 and JWT?
+A: OAuth2 is an authorization FRAMEWORK that defines flows for issuing access
+   tokens. JWT is a TOKEN FORMAT — a compact, self-contained way to represent
+   claims. OAuth2 typically uses JWTs as access tokens, but JWT is a format,
+   not a security protocol on its own.
+
+Q: Why use RS256 instead of HS256 for JWTs in microservices?
+A: RS256 uses asymmetric keys — private key (only auth server) to sign, public
+   key (shared with all services) to verify. HS256 uses a shared secret — all
+   services need the secret, increasing attack surface. RS256 is more secure for
+   distributed systems.
+
+Q: How do services validate JWTs without calling the auth server every request?
+A: Services download the public key from the auth server's JWKS endpoint at
+   startup (and periodically refresh). They validate the JWT signature locally
+   using this public key — stateless, no network call needed per request.
+
+Q: What is the difference between Client Credentials and Authorization Code flow?
+A: Client Credentials: service-to-service authentication, no user involved.
+   Service provides client_id and client_secret to get a token.
+   Authorization Code + PKCE: user-facing flow — user logs in, gets a code,
+   exchanges for tokens. Suitable for web/mobile apps.
+
+Q: How do you handle JWT revocation?
+A: JWTs are stateless and can't be directly revoked. Mitigate by: using short
+   expiry (15 min), maintaining a blacklist in Redis for revoked JTI claims,
+   using opaque tokens (reference tokens) for sensitive operations where the
+   auth server is always checked.
+
+================================================================================

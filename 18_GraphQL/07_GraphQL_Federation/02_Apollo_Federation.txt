@@ -1,0 +1,506 @@
+================================================================
+APOLLO FEDERATION — IN DEPTH
+================================================================
+
+1. FEDERATION DIRECTIVES REFERENCE
+================================================================
+
+1.1 @key — Entity Primary Key
+Marks a type as an entity and declares its primary key.
+```graphql
+type User @key(fields: "id") {
+  id: ID!
+  name: String!
+  email: String!
+}
+
+# Composite key example
+type OrderItem @key(fields: "orderId productId") {
+  orderId: ID!
+  productId: ID!
+  quantity: Int!
+}
+```
+Multiple @key directives are allowed (multiple ways to look up entity):
+```graphql
+type User @key(fields: "id") @key(fields: "email") {
+  id: ID!
+  email: String!
+  name: String!
+}
+```
+
+1.2 @external — Field Owned by Another Subgraph
+Used in subgraphs that reference an entity owned elsewhere.
+```graphql
+# Reviews Subgraph — references Product from Products Subgraph
+type Product @key(fields: "id") {
+  id: ID! @external        # owned by Products; only here for reference
+  reviews: [Review!]!      # owned by Reviews Subgraph
+}
+```
+
+1.3 @requires — Requires Fields from Owning Subgraph
+```graphql
+# Shipping Subgraph
+extend type Product @key(fields: "id") {
+  id: ID! @external
+  weight: Float! @external          # need weight from Products subgraph
+  shippingCost: Float! @requires(fields: "weight")
+  # Router will fetch 'weight' from Products before calling this resolver
+}
+```
+Resolver in Shipping Subgraph receives Product with weight already populated.
+
+1.4 @provides — Declares Fields This Subgraph Can Return
+```graphql
+# Orders Subgraph
+type Order {
+  id: ID!
+  product: Product! @provides(fields: "name price")
+}
+
+extend type Product @key(fields: "id") {
+  id: ID! @external
+  name: String! @external    # normally from Products subgraph
+  price: Float! @external    # normally from Products subgraph
+  # @provides above tells Router we can already provide these
+}
+```
+Avoids extra round-trip to Products subgraph to get name and price.
+
+1.5 @shareable (Federation v2) — Multiple Subgraphs Can Resolve Field
+```graphql
+# Both UserProfile Subgraph and UserAuth Subgraph can resolve User.name
+type User @key(fields: "id") {
+  id: ID!
+  name: String! @shareable    # either subgraph can return this
+}
+```
+Without @shareable, a field must belong to exactly one subgraph.
+
+1.6 @override (Federation v2) — Migrate Field Ownership
+```graphql
+# NewProductsSubgraph taking over 'description' from OldProductsSubgraph
+type Product @key(fields: "id") {
+  id: ID!
+  description: String! @override(from: "OldProductsSubgraph")
+}
+```
+Allows gradual migration — once OldProductsSubgraph is updated/removed,
+the @override can be dropped.
+
+1.7 @inaccessible (Federation v2) — Hide from Public API
+```graphql
+type User @key(fields: "id") {
+  id: ID!
+  name: String!
+  internalScore: Float! @inaccessible  # visible to subgraphs, hidden from clients
+}
+```
+
+
+2. ENTITY RESOLUTION MECHANISM
+================================================================
+
+2.1 How Reference Resolvers Work
+When Posts Subgraph returns:
+```json
+{ "post": { "title": "Hello", "author": { "__typename": "User", "id": "42" } } }
+```
+The Router needs `User.name` and `User.email` from Users Subgraph.
+It calls:
+```graphql
+# Router calls Users Subgraph internally
+query {
+  _entities(representations: [{ "__typename": "User", "id": "42" }]) {
+    ... on User {
+      name
+      email
+    }
+  }
+}
+```
+
+2.2 The _entities Query Resolution
+```graphql
+union _Entity = User | Product | Order | ...
+
+extend type Query {
+  _entities(representations: [Any!]!): [_Entity]!
+  _service: _Service!   # returns the SDL of this subgraph
+}
+```
+The Router batches entity fetches — multiple User references from the
+same query are combined into one `_entities` call.
+
+
+3. SPRING FOR GRAPHQL + FEDERATION
+================================================================
+
+3.1 Maven Dependencies
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-graphql</artifactId>
+</dependency>
+<!-- Federation support -->
+<dependency>
+  <groupId>com.apollographql.federation</groupId>
+  <artifactId>federation-graphql-java-support</artifactId>
+  <version>4.1.0</version>
+</dependency>
+```
+
+3.2 Configuration
+```java
+@Configuration
+public class FederationConfig {
+
+  @Bean
+  public GraphQlSourceBuilderCustomizer federationTransformer() {
+    return builder -> builder.schemaFactory((typeDefinitionRegistry, runtimeWiring) -> {
+      SchemaGenerator schemaGenerator = new SchemaGenerator();
+      GraphQLSchema schema = schemaGenerator.makeExecutableSchema(
+          typeDefinitionRegistry, runtimeWiring);
+      // Transform adds _entities and _service queries + validates @key etc.
+      return Federation.transform(schema)
+          .resolveEntityType(env -> {
+            Object src = env.getObject();
+            if (src instanceof User) return env.getSchema().getObjectType("User");
+            if (src instanceof Product) return env.getSchema().getObjectType("Product");
+            return null;
+          })
+          .fetchEntities(env -> {
+            // Dispatch per __typename
+            return env.<List<Map<String,Object>>>getArgument("representations")
+                .stream()
+                .map(rep -> {
+                  String typeName = (String) rep.get("__typename");
+                  if ("User".equals(typeName)) {
+                    Long id = Long.valueOf(rep.get("id").toString());
+                    return userRepository.findById(id).orElse(null);
+                  }
+                  return null;
+                })
+                .collect(Collectors.toList());
+          })
+          .build();
+    });
+  }
+}
+```
+
+3.3 Subgraph Schema File (users-subgraph.graphqls)
+```graphql
+# Import Federation directives
+extend schema @link(url: "https://specs.apollo.dev/federation/v2.0",
+                    import: ["@key", "@external", "@requires", "@provides",
+                             "@shareable", "@override", "@inaccessible"])
+
+type User @key(fields: "id") {
+  id: ID!
+  name: String!
+  email: String!
+  createdAt: DateTime!
+}
+
+type Query {
+  me: User
+  user(id: ID!): User
+}
+```
+
+3.4 Posts Subgraph Schema (posts-subgraph.graphqls)
+```graphql
+extend schema @link(url: "https://specs.apollo.dev/federation/v2.0",
+                    import: ["@key", "@external"])
+
+# Stub reference to User entity from Users Subgraph
+type User @key(fields: "id") {
+  id: ID! @external
+  posts: [Post!]!
+}
+
+type Post @key(fields: "id") {
+  id: ID!
+  title: String!
+  body: String!
+  author: User!
+}
+
+type Query {
+  post(id: ID!): Post
+  posts: [Post!]!
+}
+```
+
+3.5 Posts Subgraph Resolver
+```java
+@Controller
+public class PostResolver {
+
+  private final PostRepository postRepo;
+
+  // Standard query resolver
+  @QueryMapping
+  public Post post(@Argument Long id) {
+    return postRepo.findById(id).orElseThrow();
+  }
+
+  // Reference resolver for User entity (when Posts has a User stub)
+  // The User object comes from the Router with only 'id' set
+  @SchemaMapping(typeName = "User", field = "posts")
+  public List<Post> userPosts(User user) {
+    return postRepo.findByAuthorId(user.getId());
+  }
+
+  // BatchMapping version to avoid N+1
+  @BatchMapping(typeName = "User", field = "posts")
+  public Map<User, List<Post>> userPosts(List<User> users) {
+    List<Long> ids = users.stream().map(User::getId).collect(Collectors.toList());
+    Map<Long, List<Post>> byAuthorId = postRepo.findByAuthorIdIn(ids).stream()
+        .collect(Collectors.groupingBy(Post::getAuthorId));
+    return users.stream()
+        .collect(Collectors.toMap(u -> u, u -> byAuthorId.getOrDefault(u.getId(), List.of())));
+  }
+}
+```
+
+
+4. APOLLO ROUTER CONFIGURATION
+================================================================
+
+4.1 Supergraph Composition (rover CLI)
+```yaml
+# supergraph.yaml
+federation_version: =2.3.0
+subgraphs:
+  users:
+    routing_url: http://users-service:4001/graphql
+    schema:
+      subgraph_url: http://users-service:4001/graphql
+  posts:
+    routing_url: http://posts-service:4002/graphql
+    schema:
+      subgraph_url: http://posts-service:4002/graphql
+```
+
+Compose supergraph schema:
+```bash
+rover supergraph compose --config supergraph.yaml > supergraph.graphql
+```
+
+4.2 Router Configuration (router.yaml)
+```yaml
+supergraph:
+  listen: 0.0.0.0:4000
+
+# Query planning config
+traffic_shaping:
+  router:
+    timeout: 10s
+  subgraphs:
+    all:
+      timeout: 5s
+      deduplicate_query: true   # deduplicate identical subgraph requests
+
+# CORS for browser clients
+cors:
+  allow_any_origin: true
+
+# Telemetry
+telemetry:
+  tracing:
+    otlp:
+      endpoint: http://jaeger:4317
+```
+
+4.3 Docker Compose Setup
+```yaml
+# docker-compose.yml
+services:
+  users-service:
+    image: my/users-service:latest
+    ports: ["4001:4001"]
+
+  posts-service:
+    image: my/posts-service:latest
+    ports: ["4002:4002"]
+
+  apollo-router:
+    image: ghcr.io/apollographql/router:v1.39.0
+    ports: ["4000:4000"]
+    volumes:
+      - ./supergraph.graphql:/dist/config/supergraph.graphql
+      - ./router.yaml:/dist/config/router.yaml
+    command: >
+      --supergraph /dist/config/supergraph.graphql
+      --config /dist/config/router.yaml
+```
+
+
+5. ADVANCED FEDERATION PATTERNS
+================================================================
+
+5.1 Computed Fields with @requires
+```graphql
+# Inventory Subgraph
+extend type Product @key(fields: "id") {
+  id: ID! @external
+  basePrice: Float! @external
+  inventoryCount: Int!
+  # Needs basePrice (from Products) to compute total value
+  totalInventoryValue: Float! @requires(fields: "basePrice")
+}
+```
+```java
+@SchemaMapping(typeName = "Product", field = "totalInventoryValue")
+public Double totalInventoryValue(Product product) {
+  // product.basePrice is populated by Router before calling this
+  return product.getInventoryCount() * product.getBasePrice();
+}
+```
+
+5.2 Optimizing with @provides
+```graphql
+# Orders Subgraph — stores product name in order line items (denormalized)
+type LineItem {
+  quantity: Int!
+  unitPrice: Float!
+  product: Product! @provides(fields: "name")  # We have name stored locally
+}
+
+extend type Product @key(fields: "id") {
+  id: ID! @external
+  name: String! @external   # normally from Products, but we @provide it above
+}
+```
+When resolving LineItem.product.name, the Router uses the Orders subgraph
+directly — no call to Products subgraph needed.
+
+5.3 Subscription in Federated Schema
+Subscriptions in Federation are typically owned by one subgraph and
+are not composed the same way as queries/mutations. The Router
+(Apollo Router) can proxy WebSocket connections to a subgraph.
+```graphql
+# Notifications Subgraph
+type Subscription {
+  orderUpdated(userId: ID!): Order!
+}
+```
+The supergraph exposes this subscription; the Router proxies the WebSocket
+connection to the Notifications subgraph directly.
+
+5.4 Authentication and Authorization in Federation
+Auth is typically handled at the Router level with a plugin/coprocessor:
+```yaml
+# router.yaml
+coprocessor:
+  url: http://auth-service:8080/check
+  router:
+    request:
+      headers: true
+      body: false
+```
+Each subgraph trusts that the Router has already validated the JWT.
+The Router forwards `x-user-id`, `x-user-roles` headers to subgraphs.
+Field-level authorization is still done per subgraph using Spring Security.
+
+
+6. MANAGED FEDERATION WITH APOLLO STUDIO
+================================================================
+
+6.1 Flow
+1. Developers push subgraph schemas to Apollo Studio on deploy:
+   `rover subgraph publish my-graph@staging \
+     --schema users-schema.graphqls \
+     --name users \
+     --routing-url http://users-service/graphql`
+2. Studio validates the new schema against other subgraphs
+3. Studio composes the supergraph schema
+4. Router polls Studio for schema updates (or uses uplink)
+
+6.2 Schema Checks in CI
+```bash
+# Check if your schema change breaks existing queries / composition
+rover subgraph check my-graph@staging \
+  --schema users-schema.graphqls \
+  --name users
+```
+Returns: composition errors, breaking changes detected in operation history,
+field usage statistics.
+
+6.3 Schema Registry Benefits
+  - History of all schema changes
+  - Usage metrics (which fields are queried by clients)
+  - Breaking change detection
+  - Per-subgraph schema versioning
+
+
+7. INTERVIEW QUESTIONS & ANSWERS
+================================================================
+
+Q: What is the @key directive and what does it enable?
+A: @key declares a type as an entity with a primary key. It enables the
+   Router to fetch the entity from its home subgraph when another subgraph
+   references it, using the `_entities` query.
+
+Q: How does Apollo Router differ from Apollo Gateway?
+A: Apollo Router is written in Rust (vs Gateway in Node.js), delivering
+   significantly higher throughput and lower latency. Router also supports
+   the newer Federation v2 directives natively, plus richer configuration
+   for traffic shaping, coprocessors, and observability.
+
+Q: What is the difference between @requires and @provides?
+A: @requires declares that a field in the current subgraph NEEDS specific
+   fields from the entity's home subgraph to be resolved (data flows IN).
+   @provides declares that the current subgraph CAN return certain
+   entity fields without calling the entity's home subgraph (data flows OUT).
+
+Q: What does Federation add to each subgraph schema?
+A: Federation automatically adds:
+   - `_entities(representations: [Any!]!): [_Entity]!` — for entity resolution
+   - `_service: _Service!` — to expose the SDL for schema composition
+   - `scalar _Any`, `union _Entity`, and `scalar _FieldSet`
+
+Q: How do you implement a reference resolver in Java Spring?
+A: You implement the `fetchEntities` function in the Federation transformer
+   configuration, dispatching by `__typename` in the representations list.
+   Each representation contains the key fields; you use them to load entities
+   from your data source.
+
+Q: Can Federation handle circular entity references?
+A: Yes — e.g., User has posts: [Post!]! and Post has author: User!.
+   This is fine because the Router resolves each entity independently.
+   Circular references in schema are common and expected in Federation.
+
+Q: What happens during schema composition if two subgraphs define the
+   same field without @shareable?
+A: Composition fails with an error: the field "Product.name" is defined
+   in both SubgraphA and SubgraphB without being marked @shareable.
+   This is caught at deploy time (before the Router loads the new schema).
+
+Q: What is the "query plan" in Federation?
+A: A query plan is the Router's execution strategy for a given operation.
+   It's a tree of "fetch" and "flatten" nodes that shows which subgraphs
+   are called, in what order (sequential vs parallel), and how entity
+   references are resolved. The Apollo Router Sandbox can visualize query plans.
+
+Q: How does authentication work in a federated graph?
+A: Typically:
+   1. Router validates JWT (via coprocessor or native JWT plugin)
+   2. Router injects user claims as headers (x-user-id, x-roles)
+   3. Each subgraph reads those headers from the request context
+   4. Each subgraph enforces its own field-level authorization
+   Subgraphs trust the Router to have pre-validated auth.
+
+Q: What is Managed Federation and why is it preferred in production?
+A: Managed Federation stores subgraph schemas in Apollo Studio/GraphOS.
+   Benefits: schema validation in CI (rover subgraph check), automatic
+   supergraph composition on publish, Router polls for updates without
+   restart, usage analytics per field, and breaking change detection.
+
+================================================================
+END OF FILE
+================================================================

@@ -1,0 +1,199 @@
+================================================================
+CONSENSUS ALGORITHMS: RAFT AND PAXOS
+================================================================
+
+WHAT IS CONSENSUS?
+-------------------
+Consensus = multiple nodes agreeing on a single value.
+
+This is the fundamental building block for:
+  - Leader election (which node is the primary?)
+  - Replicated state machines (keep nodes in sync)
+  - Distributed locks (only one service holds the lock)
+  - Configuration management (all nodes see same config)
+  - Database commit ordering
+
+Requirements for a consensus algorithm:
+  1. Agreement: All correct nodes decide the same value.
+  2. Validity: The decided value was proposed by some node.
+  3. Termination: Eventually, all correct nodes decide.
+  4. Fault tolerance: Works despite minority of nodes failing.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PAXOS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Invented by Leslie Lamport. Published 1989, recognized 1998.
+Famously difficult to understand ("simple" version is already complex).
+
+ROLES:
+  Proposer:  Proposes values (requests consensus on a value)
+  Acceptor:  Votes on proposals (a node can play all roles)
+  Learner:   Learns the decided value
+
+BASIC PAXOS (single-value consensus):
+
+PHASE 1A — PREPARE:
+  Proposer selects proposal number n (must be unique, higher than any it's used).
+  Sends PREPARE(n) to majority of acceptors.
+
+PHASE 1B — PROMISE:
+  Each acceptor: if n > its highest seen proposal number:
+    Reply PROMISE(n, accepted_n, accepted_v)
+      where accepted_n, accepted_v = the last value it accepted (if any)
+    Promises not to accept any proposal < n in the future.
+  
+  If n is too low (another proposer already running with higher n):
+    Reply NACK(highest_n_seen)
+
+PHASE 2A — ACCEPT:
+  If proposer receives PROMISE from majority:
+    If any acceptor returned an accepted value: must use the highest accepted value.
+    Otherwise: free to propose own value.
+  Sends ACCEPT(n, v) to majority of acceptors.
+
+PHASE 2B — ACCEPTED:
+  Acceptor: if n ≥ its promise:
+    Accepts (n, v). Notifies learners.
+  
+  If majority of acceptors accept (n, v): consensus is reached on v.
+
+MULTI-PAXOS (log replication):
+  Running Basic Paxos for every log entry is expensive (4 messages/entry).
+  Optimization: One node becomes a distinguished leader.
+  Leader runs Phase 1 once for a term (not per entry).
+  Then runs only Phase 2 for each log entry.
+  Reduces to 2 messages per entry when leader is stable.
+
+PROBLEMS WITH PAXOS:
+  ✗ Extremely hard to understand and implement correctly
+  ✗ Many variations and edge cases not covered in original paper
+  ✗ "Multi-Paxos" is underspecified in original paper
+  ✗ Liveness issue: two proposers can keep outbidding each other
+     (dueling proposers — prevented by randomized backoff)
+  
+  "There are two types of people: those who have read the Paxos paper
+   and those who have implemented it." — Developer humor
+
+PAXOS IN PRODUCTION:
+  Google Chubby (internal lock service) — uses Paxos
+  Google Spanner — uses Paxos for replication within a "Paxos group"
+  Apache Zookeeper — uses ZAB (Zookeeper Atomic Broadcast), Paxos variant
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RAFT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Raft (Ongaro & Ousterhout, 2014) was designed to be MORE UNDERSTANDABLE
+than Paxos. It achieves equivalent correctness and performance.
+
+CORE CONCEPTS:
+
+NODES:
+  State: Leader, Follower, Candidate
+  At any time: exactly one Leader (if cluster is healthy).
+  All clients talk to the Leader.
+
+TERMS:
+  Time is divided into "terms" (logical clock).
+  Each term has at most one leader.
+  If a leader fails, a new election starts a new term.
+  Term number is monotonically increasing.
+
+LEADER ELECTION:
+
+Initial state: All nodes are Followers, waiting for heartbeats from Leader.
+
+Election trigger:
+  Follower receives no heartbeat within election timeout (150-300ms).
+  → Converts to Candidate.
+  → Increments term.
+  → Votes for itself.
+  → Sends RequestVote(term, candidateId, lastLogIndex, lastLogTerm) to all nodes.
+
+Voting:
+  Node grants vote if:
+  1. It hasn't voted in this term yet (or already voted for this candidate).
+  2. Candidate's log is at least as up-to-date as the voter's log.
+     (prevents electing a candidate that's missing committed entries)
+  
+  Node grants one vote per term.
+  Once granted, vote cannot be changed.
+
+Election result:
+  Candidate receives majority of votes (N/2 + 1) → becomes Leader.
+  Candidate receives vote from current leader → reverts to Follower.
+  Election timeout expires without majority → increment term, retry.
+  
+  With 5 nodes: need 3 votes to win.
+  With 3 nodes: need 2 votes to win.
+
+Log Replication (Normal Operation):
+
+Leader receives client request:
+  1. Appends entry to its local log (not committed yet).
+  2. Sends AppendEntries(term, leaderCommit, entries) to all Followers.
+  3. Followers append to their local logs.
+  4. Followers ACK to Leader.
+  5. Once majority ACK: Leader commits entry (applies to state machine).
+  6. Leader includes commitIndex in next AppendEntries (heartbeat).
+  7. Followers commit when they learn leader has committed.
+  8. Leader responds to client with result.
+
+GUARANTEES:
+  Log Matching:
+    If two entries in different logs have the same index and term,
+    they are identical, and all preceding entries are identical.
+  
+  Leader Completeness:
+    If a log entry is committed in a given term, it will be present
+    in all future leaders' logs.
+  
+  State Machine Safety:
+    If a server has applied entry at index i, no other server will
+    apply a different entry at index i.
+
+SPLIT VOTES:
+  If candidates split votes (e.g., 2 candidates each get 2 votes with N=4),
+  election restarts with new term after randomized timeout.
+  Randomization prevents repeated ties.
+
+SNAPSHOTTING:
+  Log can grow unbounded. Use snapshotting:
+  Take snapshot of state machine at some log index.
+  Discard all log entries before that index.
+  InstallSnapshot RPC to send snapshot to slow followers.
+
+RAFT IN PRODUCTION:
+  etcd (Kubernetes uses this for all cluster state)
+  CockroachDB (uses Raft for per-range replication)
+  TiKV (Raft-based key-value store)
+  HashiCorp Consul (Raft for cluster management)
+  InfluxDB
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RAFT vs PAXOS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────┬──────────────────────┬──────────────────────┐
+│ Property            │ Paxos                │ Raft                 │
+├─────────────────────┼──────────────────────┼──────────────────────┤
+│ Understandability   │ Very hard            │ Designed to be easy  │
+│ Leader election     │ Not clearly defined  │ Explicit, clear      │
+│ Log replication     │ Multi-Paxos (varies) │ Explicit protocol    │
+│ Membership changes  │ Underspecified       │ Joint consensus       │
+│ Performance         │ Equivalent           │ Equivalent           │
+│ Implementations     │ Many variants        │ Reference impl (etcd)│
+└─────────────────────┴──────────────────────┴──────────────────────┘
+
+INTERVIEW ANSWER:
+  "Raft and Paxos are consensus algorithms used for leader election
+   and log replication in distributed systems. Raft was designed for
+   understandability: it separates leader election (term-based voting),
+   log replication (majority quorum), and safety (leader must have all
+   committed entries before winning election). Paxos achieves the same
+   guarantees but is notoriously hard to implement correctly.
+   
+   In practice, I'd use etcd or Zookeeper rather than implementing
+   consensus from scratch. etcd uses Raft and is the backbone of
+   Kubernetes cluster state."

@@ -1,0 +1,273 @@
+================================================================
+gRPC LOAD BALANCING
+================================================================
+
+----------------------------------------------------------------
+1. WHY LOAD BALANCING IS DIFFERENT FOR gRPC
+----------------------------------------------------------------
+
+gRPC uses long-lived HTTP/2 connections.
+
+Problem with traditional L4 load balancing (e.g., AWS Classic ELB):
+  - L4 LB routes per TCP connection
+  - gRPC multiplexes ALL calls over ONE TCP connection
+  - Result: all RPCs from one client go to ONE server instance
+  - No actual load balancing of requests
+
+HTTP/2 Multiplexing problem:
+  Client ──[single TCP connection]──► LB ──► Server A (all traffic)
+                                           └► Server B (idle)
+
+Solution: L7 (application-layer) load balancing that routes
+at the HTTP/2 request (stream) level, not TCP level.
+
+----------------------------------------------------------------
+2. LOAD BALANCING APPROACHES
+----------------------------------------------------------------
+
+Approach 1: Client-side load balancing (preferred for microservices)
+  - Client resolves all server IPs and maintains connections to each
+  - Client picks a server per RPC using a policy (round-robin, pick-first)
+  - No proxy required
+  - Requires service discovery (DNS, Consul, Eureka, K8s)
+  - Latency: lower (no extra hop)
+
+Approach 2: Proxy load balancing (simpler to deploy)
+  - L7 proxy (Envoy, NGINX, Linkerd, Istio) terminates gRPC connections
+  - Client sends one connection to proxy
+  - Proxy maintains connections to all backends
+  - Proxy routes each gRPC request to a backend
+  - Latency: slightly higher (extra hop)
+
+Approach 3: Look-aside load balancing (gRPC-LB protocol)
+  - Client asks a load balancer service for a list of backends
+  - Client connects directly to backends
+  - Load balancer tracks backend load and provides hints
+  - Used by Google's internal gRPC deployments
+  - Complex; not widely used outside Google
+
+                  ┌──── Client-side LB ──────────────────┐
+                  │                                       │
+  App ──► gRPC Channel ──► Server A
+                  │      ──► Server B (round-robin)
+                  │      ──► Server C
+                  └───────────────────────────────────────┘
+  
+                  ┌──── Proxy LB (Envoy) ─────────────────┐
+                  │                                       │
+  App ──► gRPC Channel ──► Envoy ──► Server A
+                  │              ──► Server B
+                  └───────────────────────────────────────┘
+
+----------------------------------------------------------------
+3. CLIENT-SIDE LOAD BALANCING IN JAVA
+----------------------------------------------------------------
+
+Built-in load balancing policies:
+  - "pick_first" (default): first resolved address, reconnect on failure
+  - "round_robin": distribute RPCs across all addresses equally
+  - "grpclb": gRPC look-aside LB protocol
+  - "rls": Rate Limiting Service (advanced)
+
+Configuration:
+
+// Round-robin with static addresses
+ManagedChannel channel = ManagedChannelBuilder
+    .forTarget("static://192.168.1.10:9090,192.168.1.11:9090,192.168.1.12:9090")
+    .defaultLoadBalancingPolicy("round_robin")
+    .usePlaintext()
+    .build();
+
+// With DNS (resolves all A records and load balances)
+ManagedChannel channel = ManagedChannelBuilder
+    .forTarget("dns:///order-service.example.com:9090")
+    .defaultLoadBalancingPolicy("round_robin")
+    .usePlaintext()
+    .build();
+
+With grpc-spring-boot-starter:
+  grpc:
+    client:
+      order-service:
+        address: "dns:///order-service.default.svc.cluster.local:9090"
+        default-load-balancing-policy: round_robin
+        negotiation-type: plaintext
+
+----------------------------------------------------------------
+4. KUBERNETES AND gRPC LOAD BALANCING
+----------------------------------------------------------------
+
+PROBLEM: Kubernetes Service + regular DNS returns a single ClusterIP.
+All gRPC traffic goes to that VIP, then K8s randomly routes at TCP level.
+This doesn't work well with HTTP/2 multiplexing.
+
+SOLUTIONS:
+
+Option A: Headless Service (client-side LB)
+  # service.yaml
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: order-service
+  spec:
+    clusterIP: None     # ← Headless! Returns all pod IPs via DNS
+    selector:
+      app: order-service
+    ports:
+      - port: 9090
+  
+  # Client config
+  grpc.client.order-service.address=dns:///order-service.default.svc.cluster.local:9090
+  grpc.client.order-service.default-load-balancing-policy=round_robin
+
+  DNS returns all pod IPs → client connects to all pods → true round-robin
+
+Option B: Service Mesh (Envoy/Istio/Linkerd)
+  - Service mesh proxy (Envoy sidecar) intercepts all traffic
+  - Proxy does L7 gRPC load balancing
+  - No code changes needed
+  - Works with regular ClusterIP service
+  
+  # Istio: enable in VirtualService
+  apiVersion: networking.istio.io/v1alpha3
+  kind: DestinationRule
+  metadata:
+    name: order-service
+  spec:
+    host: order-service
+    trafficPolicy:
+      loadBalancer:
+        simple: ROUND_ROBIN
+      connectionPool:
+        http:
+          h2UpgradePolicy: UPGRADE  # force HTTP/2
+
+Option C: Envoy as a standalone proxy
+  - Deploy Envoy as a DaemonSet or sidecar
+  - Envoy does health checking, LB, retries
+  - Client talks to local Envoy (127.0.0.1)
+
+----------------------------------------------------------------
+5. HEALTH CHECKING FOR LOAD BALANCING
+----------------------------------------------------------------
+
+gRPC defines a standard health check protocol: grpc.health.v1.Health
+
+message HealthCheckRequest { string service = 1; }
+message HealthCheckResponse {
+  enum ServingStatus { UNKNOWN=0; SERVING=1; NOT_SERVING=2; SERVICE_UNKNOWN=3; }
+  ServingStatus status = 1;
+}
+service Health {
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc Watch(HealthCheckRequest) returns (stream HealthCheckResponse); // streaming updates
+}
+
+Server health management:
+  @Bean
+  public HealthStatusManager healthStatusManager() {
+    return new HealthStatusManager();
+  }
+  
+  @Bean
+  public GrpcServerConfigurer healthServiceConfigurer(HealthStatusManager health) {
+    return builder -> builder.addService(health.getHealthService());
+  }
+  
+  // Mark service as serving when ready
+  @EventListener(ContextRefreshedEvent.class)
+  public void onReady() {
+    healthStatusManager.setStatus(
+        "com.example.OrderService",
+        HealthCheckResponse.ServingStatus.SERVING);
+  }
+
+Load balancer checks:
+  # grpcurl health check
+  grpcurl -plaintext localhost:9090 grpc.health.v1.Health/Check
+  
+  # With service name
+  grpcurl -plaintext -d '{"service":"com.example.OrderService"}' \
+    localhost:9090 grpc.health.v1.Health/Check
+
+K8s readiness probe:
+  readinessProbe:
+    grpc:
+      port: 9090
+      service: "com.example.OrderService"
+
+----------------------------------------------------------------
+6. CONNECTION MANAGEMENT AND RECONNECTION
+----------------------------------------------------------------
+
+Channel states (gRPC connectivity state machine):
+  IDLE → CONNECTING → READY ↔ TRANSIENT_FAILURE → CONNECTING
+                   ↓
+                 SHUTDOWN
+
+State transitions:
+  - IDLE: No RPCs recently; channel dormant
+  - CONNECTING: Attempting to establish a connection
+  - READY: Connected; RPCs can be made
+  - TRANSIENT_FAILURE: Temporary error; will retry
+  - SHUTDOWN: Channel is being shut down; no more RPCs
+
+Monitoring channel state:
+  ManagedChannel channel = ...;
+  ConnectivityState state = channel.getState(true);  // true = request connection
+  
+  channel.notifyWhenStateChanged(state, () -> {
+    ConnectivityState newState = channel.getState(false);
+    System.out.println("Channel state changed to: " + newState);
+  });
+
+Keep-alive configuration (prevents connection drops):
+  ManagedChannelBuilder
+      .keepAliveTime(30, TimeUnit.SECONDS)     // send keep-alive ping every 30s
+      .keepAliveTimeout(10, TimeUnit.SECONDS)  // wait 10s for ping response
+      .keepAliveWithoutCalls(true)             // keep alive even with no active RPCs
+
+----------------------------------------------------------------
+7. INTERVIEW KEY POINTS
+----------------------------------------------------------------
+
+Q: Why doesn't standard L4 load balancing work well with gRPC?
+A: gRPC uses HTTP/2 which multiplexes multiple RPC calls over a single
+   persistent TCP connection. An L4 load balancer routes at the TCP
+   connection level, not the HTTP/2 stream level. So all gRPC requests
+   from a client go through the same TCP connection to the same backend
+   — effectively no load balancing of requests. You need either an L7
+   proxy (Envoy, Istio) that can route individual HTTP/2 streams, or
+   client-side load balancing where the client manages connections to
+   multiple backends directly.
+
+Q: What is a headless Kubernetes service and why is it useful for gRPC?
+A: A headless service (clusterIP: None) returns all individual pod IP
+   addresses in DNS responses instead of a single virtual IP. With
+   round_robin load balancing policy and a headless service, the gRPC
+   client resolves all pod IPs and maintains connections to each one,
+   distributing RPCs across all pods. This gives true per-request load
+   balancing without requiring a service mesh or external proxy.
+
+Q: What is the gRPC standard health check protocol?
+A: It's the grpc.health.v1.Health service defined in grpc/health/v1/health.proto.
+   It has two methods: Check (unary, returns current status) and Watch
+   (server streaming, pushes status changes). Servers register their
+   services with a HealthStatusManager, which can set each service to
+   SERVING, NOT_SERVING, or SERVICE_UNKNOWN. Load balancers (K8s readiness
+   probes, Envoy, etc.) call Check to determine if a backend should
+   receive traffic.
+
+Q: What happens to in-flight gRPC requests when a server pod is killed?
+A: The TCP connection drops. gRPC detects this via a GOAWAY frame (if
+   the server sends one during graceful shutdown) or a TCP RST. The
+   client receives Status.UNAVAILABLE on all in-flight calls. If the
+   client has retry policies configured (see 04_Retry_Policies.txt),
+   those calls will be retried on another available backend. For
+   graceful draining, the server should call server.shutdown() which
+   sends GOAWAY and waits for in-flight calls to complete before
+   terminating the connection.
+
+================================================================
+END OF FILE
+================================================================

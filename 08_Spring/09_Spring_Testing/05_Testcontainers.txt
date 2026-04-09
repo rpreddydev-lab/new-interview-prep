@@ -1,0 +1,369 @@
+================================================================
+  TESTCONTAINERS IN SPRING BOOT TESTING
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. WHAT IS TESTCONTAINERS?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Testcontainers is a Java library that starts real infrastructure (databases,
+message brokers, search engines) inside Docker containers during tests.
+
+Why use Testcontainers over H2?
+  - Production parity: same PostgreSQL dialect, same MySQL behavior
+  - Tests real migrations (Flyway/Liquibase) against the actual DB engine
+  - Tests Kafka/Redis/Elasticsearch-specific features (not available in-memory)
+  - Catches environment-specific bugs early in CI
+
+Requirement: Docker must be running (Docker Desktop on dev, Docker in CI).
+
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-testcontainers</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>junit-jupiter</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>postgresql</artifactId>
+    <scope>test</scope>
+</dependency>
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. @ServiceConnection — SPRING BOOT 3.1+ AUTO-CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Spring Boot 3.1 introduced @ServiceConnection, which automatically
+registers a container's connection details (URL, user, password) with
+Spring's auto-configuration — no manual property overrides needed.
+
+@SpringBootTest
+@Testcontainers
+class OrderRepositoryTest {
+
+    @Container
+    @ServiceConnection  // auto-configures spring.datasource.* from this container
+    static PostgreSQLContainer<?> postgres =
+        new PostgreSQLContainer<>("postgres:16-alpine");
+
+    @Autowired
+    private OrderRepository orderRepository;
+
+    @Test
+    void shouldSaveAndFindOrder() {
+        Order order = Order.builder()
+            .status(OrderStatus.PENDING)
+            .total(new BigDecimal("99.99"))
+            .build();
+        Order saved = orderRepository.save(order);
+
+        Optional<Order> found = orderRepository.findById(saved.getId());
+        assertThat(found).isPresent();
+        assertThat(found.get().getTotal()).isEqualByComparingTo("99.99");
+    }
+}
+
+// Before @ServiceConnection, you needed:
+@DynamicPropertySource
+static void overrideProperties(DynamicPropertyRegistry registry) {
+    registry.add("spring.datasource.url", postgres::getJdbcUrl);
+    registry.add("spring.datasource.username", postgres::getUsername);
+    registry.add("spring.datasource.password", postgres::getPassword);
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. SHARED CONTAINER — REUSE ACROSS TESTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Static containers are started once per JVM and shared across all test
+classes that reference them, reducing container startup overhead.
+
+// Shared container singleton
+public abstract class PostgresContainerBase {
+
+    @Container
+    static final PostgreSQLContainer<?> POSTGRES =
+        new PostgreSQLContainer<>("postgres:16-alpine")
+            .withDatabaseName("testdb")
+            .withUsername("test")
+            .withPassword("test");
+
+    static {
+        POSTGRES.start();
+    }
+
+    @DynamicPropertySource
+    static void configure(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
+        registry.add("spring.datasource.username", POSTGRES::getUsername);
+        registry.add("spring.datasource.password", POSTGRES::getPassword);
+    }
+}
+
+// Extend in each test class
+@SpringBootTest
+class OrderRepositoryTest extends PostgresContainerBase {
+
+    @Autowired
+    private OrderRepository orderRepository;
+
+    // tests...
+}
+
+@SpringBootTest
+class ProductRepositoryTest extends PostgresContainerBase {
+
+    @Autowired
+    private ProductRepository productRepository;
+
+    // same running container is reused
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. REDIS CONTAINER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>testcontainers</artifactId>  <!-- GenericContainer -->
+    <scope>test</scope>
+</dependency>
+
+@SpringBootTest
+@Testcontainers
+class CacheIntegrationTest {
+
+    @Container
+    @ServiceConnection  // auto-configures spring.data.redis.*
+    static RedisContainer redis = new RedisContainer(
+        DockerImageName.parse("redis:7.2-alpine"));
+
+    @Autowired
+    private ProductService productService;
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    @Test
+    void shouldCacheProductLookup() {
+        // First call — cache miss, hits DB
+        Product p1 = productService.findById(1L);
+
+        // Second call — cache hit
+        Product p2 = productService.findById(1L);
+
+        // Redis key exists
+        Boolean exists = redisTemplate.hasKey("product::1");
+        assertThat(exists).isTrue();
+
+        // Both calls return same data
+        assertThat(p1.getName()).isEqualTo(p2.getName());
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. KAFKA CONTAINER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>kafka</artifactId>
+    <scope>test</scope>
+</dependency>
+
+@SpringBootTest
+@Testcontainers
+class OrderEventProducerTest {
+
+    @Container
+    @ServiceConnection  // auto-configures spring.kafka.bootstrap-servers
+    static KafkaContainer kafka =
+        new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.5.0"));
+
+    @Autowired
+    private KafkaTemplate<String, OrderEvent> kafkaTemplate;
+
+    @Test
+    void shouldProduceOrderEvent() throws Exception {
+        try (KafkaConsumer<String, String> consumer = createConsumer()) {
+            consumer.subscribe(List.of("orders"));
+
+            kafkaTemplate.send("orders", "ORD-001", new OrderEvent("ORD-001", "CREATED"));
+
+            ConsumerRecords<String, String> records = consumer.poll(Duration.ofSeconds(5));
+            assertThat(records.count()).isEqualTo(1);
+            assertThat(records.iterator().next().key()).isEqualTo("ORD-001");
+        }
+    }
+
+    private KafkaConsumer<String, String> createConsumer() {
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers());
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "test-group");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        return new KafkaConsumer<>(props);
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. @DataJpaTest + Testcontainers (No H2)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@DataJpaTest uses H2 by default. To use PostgreSQL instead:
+
+@DataJpaTest
+@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
+@Testcontainers
+class ProductRepositorySliceTest {
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres =
+        new PostgreSQLContainer<>("postgres:16-alpine");
+
+    @Autowired
+    private ProductRepository productRepository;
+
+    @Autowired
+    private TestEntityManager entityManager;
+
+    @Test
+    void shouldFindByCategory() {
+        entityManager.persistAndFlush(
+            Product.builder().name("Widget").category("TOOLS").price(new BigDecimal("9.99")).build());
+        entityManager.persistAndFlush(
+            Product.builder().name("Gadget").category("ELECTRONICS").price(new BigDecimal("49.99")).build());
+
+        List<Product> tools = productRepository.findByCategory("TOOLS");
+
+        assertThat(tools).hasSize(1);
+        assertThat(tools.get(0).getName()).isEqualTo("Widget");
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. FLYWAY / LIQUIBASE WITH TESTCONTAINERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When using Testcontainers, Flyway/Liquibase runs automatically against the
+containerized DB — verifying your migrations work correctly.
+
+// No extra setup needed:
+// spring.flyway.enabled=true (default)
+// Spring Boot auto-runs Flyway before tests start against the Postgres container
+
+// Useful: add @Sql to seed extra test data on top of migrations
+@SpringBootTest
+@Testcontainers
+@Sql(scripts = "/test-data/orders.sql", executionPhase = Sql.ExecutionPhase.BEFORE_TEST_METHOD)
+@Sql(scripts = "/test-data/cleanup.sql", executionPhase = Sql.ExecutionPhase.AFTER_TEST_METHOD)
+class OrderQueryTest {
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+
+    @Autowired
+    private OrderRepository orderRepository;
+
+    @Test
+    void shouldReturnSeededOrders() {
+        List<Order> orders = orderRepository.findAll();
+        assertThat(orders).isNotEmpty();
+    }
+}
+
+// src/test/resources/test-data/orders.sql
+// INSERT INTO orders (status, total) VALUES ('PENDING', 99.99);
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. SPRING BOOT 3.1+ TESTCONTAINERS SUPPORT BEANS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Spring Boot 3.1+ allows declaring Testcontainers as @Bean in a
+@TestConfiguration, with @ServiceConnection — the cleanest approach.
+
+@TestConfiguration(proxyBeanMethods = false)
+public class TestcontainersConfig {
+
+    @Bean
+    @ServiceConnection
+    PostgreSQLContainer<?> postgresContainer() {
+        return new PostgreSQLContainer<>("postgres:16-alpine");
+    }
+
+    @Bean
+    @ServiceConnection
+    RedisContainer redisContainer() {
+        return new RedisContainer(DockerImageName.parse("redis:7.2-alpine"));
+    }
+
+    @Bean
+    @ServiceConnection
+    KafkaContainer kafkaContainer() {
+        return new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.5.0"));
+    }
+}
+
+// Reference in test:
+@SpringBootTest
+@Import(TestcontainersConfig.class)
+class FullIntegrationTest {
+    // uses all three containers
+}
+
+// Also useful: create a TestApplication that imports TestcontainersConfig
+// so you can run the app locally with containers:
+@SpringBootApplication
+public class TestApplication {
+    public static void main(String[] args) {
+        SpringApplication.from(Application::main)
+            .with(TestcontainersConfig.class)
+            .run(args);
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  9. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: Why use Testcontainers instead of H2 for repository tests?
+A: H2 uses its own SQL dialect that may not match PostgreSQL/MySQL, which can
+   cause false positives in tests. Testcontainers starts the actual database
+   engine in Docker, ensuring the same SQL dialect, data types, and constraints
+   as production. It also enables testing Flyway/Liquibase migrations against
+   the real DB engine.
+
+Q: What is @ServiceConnection and what problem does it solve?
+A: @ServiceConnection (Spring Boot 3.1+) is a meta-annotation that tells Spring
+   Boot to auto-configure its connection properties from the container.
+   Previously you had to use @DynamicPropertySource to manually map container
+   URL/port/credentials to Spring properties. @ServiceConnection eliminates that
+   boilerplate for supported container types (PostgreSQL, Redis, Kafka, etc.).
+
+Q: How do you share a Testcontainer across multiple test classes to avoid
+   restarting it for each class?
+A: Declare the container as a static field in a base class and call start()
+   in a static initializer (or use @Container static field with @Testcontainers
+   on the base class). Subclasses share the already-running container.
+   Spring Boot 3.1+ @TestConfiguration + @Bean approach is even cleaner —
+   Spring's context caching reuses the container as long as the ApplicationContext
+   is reused.
+
+Q: How does Testcontainers work in CI pipelines?
+A: CI agents (GitHub Actions, Jenkins) require Docker to be available. On
+   GitHub Actions, Docker is pre-installed. In Kubernetes-based CI, Docker-in-Docker
+   (DinD) or Podman can be used. Testcontainers also supports Ryuk (automatic
+   container cleanup) and TestcontainersCloud for CI environments without Docker.
+
+Q: What is the difference between @Container with static vs instance scope?
+A: static @Container: one container shared for all tests in the class, started
+   once. More efficient for read-heavy tests. instance @Container: a new container
+   for each test method. Provides complete isolation but is much slower. Use
+   static containers with @Transactional or @Sql cleanup to reset state between tests.

@@ -1,0 +1,328 @@
+================================================================
+REFRESH TOKEN FLOW
+================================================================
+
+WHAT IS A REFRESH TOKEN?
+--------------------------
+A refresh token is a long-lived credential used to obtain new access
+tokens WITHOUT requiring the user to re-authenticate.
+
+Access tokens are intentionally short-lived (15 min).
+Refresh tokens enable seamless session continuity (hours/days/weeks).
+
+================================================================
+WHY WE NEED REFRESH TOKENS
+================================================================
+
+PROBLEM:
+  Access tokens must be short-lived (15 min) for security.
+  Asking users to log in every 15 minutes = terrible UX.
+
+SOLUTION:
+  Issue a long-lived refresh token at login.
+  Use it silently to get new short-lived access tokens.
+
+ANALOGY:
+  Access token = hotel room key card (works for your stay, expires)
+  Refresh token = booking confirmation (use it to get a new key card)
+
+================================================================
+REFRESH TOKEN CHARACTERISTICS
+================================================================
+
+PROPERTY              TYPICAL VALUE
+-----------------------------------------
+Lifetime              1 hour to 30 days (session-based)
+Usage                 One request to the token endpoint only
+Storage               Server-side session, HttpOnly cookie, or Keychain
+Scope                 offline_access (required to get a refresh token in some flows)
+Not sent to           Resource servers (only to Authorization Server!)
+Security level        Higher than access token (protect it more carefully)
+
+================================================================
+THE REFRESH TOKEN FLOW
+================================================================
+
+STEP 1: Initial Authentication
+--------------------------------
+User logs in → AS issues BOTH access token AND refresh token.
+
+Response from token endpoint:
+{
+  "access_token": "eyJ...",       ← short-lived (15 min)
+  "token_type": "Bearer",
+  "expires_in": 900,
+  "refresh_token": "8xLOxBtZp8", ← long-lived (7 days)
+  "scope": "openid email"
+}
+
+Client stores:
+  - Access token in memory
+  - Refresh token in HttpOnly cookie or secure storage
+
+STEP 2: Use Access Token
+-------------------------
+Client includes access token in API requests:
+  GET /api/orders
+  Authorization: Bearer eyJ...
+
+STEP 3: Access Token Expires
+------------------------------
+After 15 minutes, access token expires.
+API returns: 401 Unauthorized
+
+STEP 4: Exchange Refresh Token for New Access Token
+-----------------------------------------------------
+Client sends refresh token to token endpoint:
+
+POST /oauth2/token
+Content-Type: application/x-www-form-urlencoded
+
+  grant_type=refresh_token
+  &refresh_token=8xLOxBtZp8
+  &client_id=my-app
+  &client_secret=my-secret   ← if confidential client
+
+STEP 5: AS Issues New Tokens
+------------------------------
+AS validates refresh token (not expired, not revoked, valid client).
+AS issues new access token (and optionally new refresh token if rotation enabled).
+
+{
+  "access_token": "eyJnew...",     ← brand new access token
+  "token_type": "Bearer",
+  "expires_in": 900,
+  "refresh_token": "NewRT123...",  ← new refresh token (if rotation enabled)
+}
+
+Old refresh token is INVALIDATED (rotation).
+Client stores new access token + new refresh token.
+
+STEP 6: Retry Original Request
+--------------------------------
+Client retries with new access token.
+
+================================================================
+COMPLETE LIFECYCLE DIAGRAM
+================================================================
+
+T=0      User logs in
+         AS → access_token (exp: T+15min) + refresh_token (exp: T+7days)
+
+T=14min  Proactive refresh (or wait for 401)
+         Client → POST /token?grant_type=refresh_token&refresh_token=RT1
+         AS → new access_token2 (exp: T+29min) + refresh_token2
+
+T=15min  Original AT expired (already replaced)
+
+T=7days  refresh_token2 expires (assuming rotation)
+         User must re-authenticate (login again)
+
+================================================================
+REFRESH TOKEN ROTATION — CRITICAL SECURITY FEATURE
+================================================================
+
+WITHOUT ROTATION:
+  AT1 (exp: T+15min)
+  RT1 (exp: T+7days) — same RT forever!
+
+  Attacker steals RT1 → can get unlimited access tokens for 7 days.
+  No way to detect theft until user notices.
+
+WITH ROTATION:
+  AT1 + RT1 issued at login
+  AT2 + RT2 issued when AT1 expires (RT1 invalidated)
+  AT3 + RT3 issued when AT2 expires (RT2 invalidated)
+
+  If attacker steals RT1 and tries to use it AFTER RT1 was rotated:
+  → AS: "RT1 was already used and invalidated"
+  → ANOMALY DETECTED → revoke entire session tree
+  → Legitimate user gets 401 → forced to re-login
+  → Intrusion is contained
+
+// Spring Authorization Server — enable rotation
+TokenSettings tokenSettings = TokenSettings.builder()
+    .reuseRefreshTokens(false)              ← false = rotate refresh tokens
+    .refreshTokenTimeToLive(Duration.ofDays(7))
+    .accessTokenTimeToLive(Duration.ofMinutes(15))
+    .build();
+
+================================================================
+SILENT REFRESH STRATEGY
+================================================================
+
+STRATEGY 1: Proactive Refresh (recommended)
+  - Schedule refresh when ~60 seconds before expiry
+  - User never sees a 401
+
+STRATEGY 2: Reactive Refresh (on 401)
+  - Wait for API call to fail with 401
+  - Then refresh and retry
+
+STRATEGY 3: Sliding Window Refresh
+  - Start a timer when receiving access token
+  - Refresh at (expiry - buffer) time
+
+// JavaScript: proactive refresh scheduling
+function scheduleRefresh(expiresIn) {
+    const refreshAt = (expiresIn - 60) * 1000; // 60 seconds before expiry
+    setTimeout(async () => {
+        await refreshAccessToken();
+    }, refreshAt);
+}
+
+// React: Axios interceptor for transparent refresh
+axios.interceptors.response.use(
+    (response) => response,
+    async (error) => {
+        if (error.response?.status === 401 && !error.config._retried) {
+            error.config._retried = true;
+            try {
+                await refreshAccessToken();
+                return axios(error.config); // retry original request
+            } catch (refreshError) {
+                // Refresh failed → redirect to login
+                redirectToLogin();
+            }
+        }
+        return Promise.reject(error);
+    }
+);
+
+================================================================
+REFRESH TOKEN IN SPRING SECURITY (CLIENT SIDE)
+================================================================
+
+Spring Security OAuth2 Client handles refresh automatically!
+You don't need to implement this manually in most cases.
+
+// Spring handles token refresh when using OAuth2AuthorizedClientManager
+@Bean
+public OAuth2AuthorizedClientManager authorizedClientManager(
+        ClientRegistrationRepository clientRegistrationRepository,
+        OAuth2AuthorizedClientRepository authorizedClientRepository) {
+
+    OAuth2AuthorizedClientProvider authorizedClientProvider =
+        OAuth2AuthorizedClientProviderBuilder.builder()
+            .authorizationCode()
+            .refreshToken()           ← auto-refresh enabled
+            .clientCredentials()
+            .build();
+
+    DefaultOAuth2AuthorizedClientManager manager =
+        new DefaultOAuth2AuthorizedClientManager(
+            clientRegistrationRepository, authorizedClientRepository);
+    manager.setAuthorizedClientProvider(authorizedClientProvider);
+    return manager;
+}
+
+// For web apps, Spring auto-refreshes before expiry
+// Access token and refresh token managed transparently
+
+================================================================
+REFRESH TOKEN SECURITY — BEST PRACTICES
+================================================================
+
+STORAGE:
+  ✓ Web App    : HttpOnly, Secure, SameSite=Strict cookie
+  ✓ Mobile     : Platform Keychain/Keystore
+  ✗ NEVER      : localStorage, sessionStorage, JavaScript accessible storage
+  ✗ NEVER      : Plain text in database
+
+SERVER-SIDE REFRESH TOKEN MANAGEMENT:
+  - Store hash(refresh_token) in database (not plaintext)
+  - Link to user account + client + session
+  - Allow user to see and revoke active sessions ("Logged in devices")
+  - Expire on: logout, password change, account suspension
+
+ABSOLUTE SESSION LIFETIME:
+  Even with rotation, enforce an absolute maximum session duration.
+  Example: Regardless of refresh activity, session expires after 30 days.
+
+  TokenSettings.builder()
+      .refreshTokenTimeToLive(Duration.ofDays(30))  ← absolute max
+
+DEVICE/CLIENT BINDING:
+  Optionally bind refresh tokens to device fingerprint or IP.
+  Suspicious change in binding → revoke and alert.
+
+================================================================
+LOGOUT AND REFRESH TOKEN REVOCATION
+================================================================
+
+PROPER LOGOUT:
+  1. Client deletes local tokens (access + refresh)
+  2. Client calls AS revocation endpoint:
+     POST /oauth2/revoke
+       token=refresh_token_value
+       &token_type_hint=refresh_token
+       &client_id=my-app
+       &client_secret=my-secret
+  3. AS invalidates refresh token (and associated access tokens)
+
+WITHOUT CALLING REVOCATION ENDPOINT:
+  - Client-side tokens deleted → local logout
+  - But refresh token still valid at AS → attacker with stolen RT can still use it
+  - ALWAYS call revocation endpoint on logout!
+
+// Spring Security: auto-call revocation on logout
+@Bean
+public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http.logout(logout -> logout
+        .addLogoutHandler(new OidcClientInitiatedLogoutSuccessHandler(
+            clientRegistrationRepository))
+        .logoutSuccessUrl("/")
+    );
+    return http.build();
+}
+
+================================================================
+REFRESH TOKEN SCOPE — offline_access
+================================================================
+
+To receive a refresh token in OIDC flows, clients must request
+the "offline_access" scope.
+
+GET /oauth2/authorize
+  ?scope=openid email offline_access    ← request offline_access
+
+Without offline_access:
+  - AS may issue a refresh token (implementation-defined for pure OAuth2)
+  - OIDC servers typically only issue refresh token if offline_access scope requested
+
+================================================================
+COMMON INTERVIEW QUESTIONS
+================================================================
+
+Q: Why do we need both access tokens and refresh tokens?
+A: Access tokens need to be short-lived for security (can't be revoked).
+   But asking users to re-login every 15 minutes is bad UX. Refresh tokens
+   allow silent renewal of access tokens while being stored more securely
+   (HttpOnly cookies, Keychain) and sent only to the AS.
+
+Q: What is refresh token rotation and why is it important?
+A: On every refresh, issue a new refresh token and invalidate the old one.
+   If a refresh token is stolen and used after the legitimate client
+   already rotated it, the AS detects reuse of an invalid token — an anomaly
+   indicating theft — and revokes the entire session.
+
+Q: Where should refresh tokens be stored?
+A: Web apps: HttpOnly, Secure, SameSite cookie (inaccessible to JavaScript).
+   Mobile: Platform Keychain (iOS) or Keystore (Android). Never in
+   localStorage or sessionStorage (XSS accessible).
+
+Q: What happens if a refresh token expires?
+A: The user must re-authenticate (re-login). The client should handle this
+   gracefully by redirecting to the login page with a "session expired" message.
+
+Q: How does logout work properly with refresh tokens?
+A: Client deletes local tokens AND calls the AS revocation endpoint
+   (POST /oauth2/revoke) with the refresh token. This ensures the AS
+   invalidates the token even if an attacker later obtains it. Client-side
+   deletion alone is insufficient for true logout.
+
+Q: How does Spring Security handle token refresh?
+A: The OAuth2AuthorizedClientManager with a RefreshToken provider
+   automatically detects when access tokens are near expiry and silently
+   refreshes them using the stored refresh token. This is transparent to
+   the application code when using WebClient with OAuth2 filter.

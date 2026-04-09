@@ -1,0 +1,324 @@
+================================================================
+FILE DOWNLOAD FROM REACT
+================================================================
+
+Downloading files from a backend requires special handling when
+the file content is served as an HTTP response body (not a URL
+pointing to a static resource).
+
+================================================================
+1. CORE CONCEPT: BLOB RESPONSE TYPE
+================================================================
+
+When Axios fetches binary data, set responseType: 'blob'.
+This tells Axios to treat the response body as a Blob object
+instead of trying to parse it as JSON.
+
+  const response = await apiClient.get('/files/download/123', {
+    responseType: 'blob',
+  });
+
+  // response.data is a Blob
+  const blob = response.data;
+
+================================================================
+2. TRIGGERING A BROWSER DOWNLOAD
+================================================================
+
+Pattern: create an object URL from the Blob, attach to a hidden
+<a> tag, click it programmatically, then revoke the URL.
+
+  async function downloadFile(fileId, filename) {
+    const response = await apiClient.get(`/files/download/${fileId}`, {
+      responseType: 'blob',
+    });
+
+    // Create a temporary URL pointing to the blob in memory
+    const url = window.URL.createObjectURL(response.data);
+
+    // Create a hidden anchor and click it
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename; // sets the filename in the dialog
+    document.body.appendChild(link);
+    link.click();
+
+    // Clean up — revoke the URL and remove the element
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(url);
+  }
+
+WHY REVOKE?
+  Object URLs hold a reference to Blob data in memory.
+  If not revoked, they remain allocated for the lifetime of the
+  document. Always revoke them after use.
+
+================================================================
+3. EXTRACTING FILENAME FROM RESPONSE HEADERS
+================================================================
+
+The backend can send the suggested filename in the
+Content-Disposition header:
+
+  Content-Disposition: attachment; filename="report-2024.pdf"
+
+  function extractFilename(response) {
+    const disposition = response.headers['content-disposition'];
+    if (disposition) {
+      const match = disposition.match(/filename="?([^";]+)"?/);
+      if (match) return match[1];
+    }
+    return 'download'; // fallback
+  }
+
+  async function downloadWithServerFilename(fileId) {
+    const response = await apiClient.get(`/files/download/${fileId}`, {
+      responseType: 'blob',
+    });
+
+    const filename = extractFilename(response);
+    triggerDownload(response.data, filename);
+  }
+
+  function triggerDownload(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+SPRING BOOT BACKEND:
+  @GetMapping("/files/download/{id}")
+  public ResponseEntity<Resource> downloadFile(@PathVariable Long id) {
+      FileRecord record = fileService.findById(id);
+      Resource resource = new FileSystemResource(record.getPath());
+
+      return ResponseEntity.ok()
+          .header(HttpHeaders.CONTENT_DISPOSITION,
+              "attachment; filename=\"" + record.getOriginalName() + "\"")
+          .contentType(MediaType.parseMediaType(record.getMimeType()))
+          .contentLength(resource.contentLength())
+          .body(resource);
+  }
+
+  NOTE: For CORS to expose the Content-Disposition header to the
+  browser, add it to the exposed headers in CORS config:
+    config.setExposedHeaders(List.of("Content-Disposition"));
+
+================================================================
+4. DOWNLOAD BUTTON COMPONENT
+================================================================
+
+  function DownloadButton({ fileId, filename }) {
+    const [downloading, setDownloading] = useState(false);
+    const [error, setError] = useState(null);
+
+    const handleDownload = async () => {
+      setDownloading(true);
+      setError(null);
+      try {
+        const response = await apiClient.get(`/files/download/${fileId}`, {
+          responseType: 'blob',
+        });
+        const name = filename || extractFilename(response);
+        triggerDownload(response.data, name);
+      } catch (err) {
+        setError('Download failed');
+      } finally {
+        setDownloading(false);
+      }
+    };
+
+    return (
+      <div>
+        <button onClick={handleDownload} disabled={downloading}>
+          {downloading ? 'Downloading...' : '⬇ Download'}
+        </button>
+        {error && <span style={{ color: 'red' }}>{error}</span>}
+      </div>
+    );
+  }
+
+================================================================
+5. DOWNLOAD PROGRESS TRACKING
+================================================================
+
+Axios's onDownloadProgress works similarly to onUploadProgress.
+The server MUST send a Content-Length header for
+event.lengthComputable to be true.
+
+  async function downloadWithProgress(fileId, onProgress) {
+    const response = await apiClient.get(`/files/download/${fileId}`, {
+      responseType: 'blob',
+      onDownloadProgress: (event) => {
+        if (event.lengthComputable) {
+          const percent = Math.round((event.loaded / event.total) * 100);
+          onProgress(percent);
+        }
+      },
+    });
+    return response;
+  }
+
+  function DownloadWithProgress({ fileId }) {
+    const [progress, setProgress] = useState(0);
+    const [downloading, setDownloading] = useState(false);
+
+    const start = async () => {
+      setDownloading(true);
+      setProgress(0);
+      const response = await downloadWithProgress(fileId, setProgress);
+      triggerDownload(response.data, extractFilename(response));
+      setDownloading(false);
+    };
+
+    return (
+      <>
+        <button onClick={start} disabled={downloading}>
+          Download
+        </button>
+        {downloading && <ProgressBar value={progress} />}
+      </>
+    );
+  }
+
+================================================================
+6. DOWNLOADING A CSV / JSON AS A FILE
+================================================================
+
+Sometimes you generate data client-side or receive JSON and want
+to download it as a file:
+
+  function downloadJSON(data, filename = 'data.json') {
+    const json = JSON.stringify(data, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    triggerDownload(blob, filename);
+  }
+
+  function downloadCSV(rows, headers, filename = 'export.csv') {
+    const csvContent = [
+      headers.join(','),
+      ...rows.map(row => headers.map(h => `"${row[h] ?? ''}"`).join(',')),
+    ].join('\n');
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    triggerDownload(blob, filename);
+  }
+
+  // Export table data
+  <button onClick={() => downloadCSV(users, ['id', 'name', 'email'], 'users.csv')}>
+    Export CSV
+  </button>
+
+================================================================
+7. STREAMING LARGE FILE DOWNLOAD WITH FETCH
+================================================================
+
+For very large files, use the Fetch Streams API to process data
+in chunks without loading the whole file into memory first:
+
+  async function streamDownload(url) {
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${getToken()}` },
+    });
+
+    if (!response.ok) throw new Error('Download failed');
+
+    const contentLength = response.headers.get('content-length');
+    const total = contentLength ? parseInt(contentLength) : null;
+    let loaded = 0;
+
+    const reader = response.body.getReader();
+    const chunks = [];
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      loaded += value.length;
+      if (total) {
+        const percent = Math.round((loaded / total) * 100);
+        console.log(`${percent}%`);
+      }
+    }
+
+    // Combine all chunks into a single Blob
+    const blob = new Blob(chunks);
+    triggerDownload(blob, 'large-file.bin');
+  }
+
+================================================================
+8. DOWNLOADING FROM PRESIGNED URLS (S3)
+================================================================
+
+When using AWS S3 or Azure Blob Storage, the backend provides a
+presigned URL that gives temporary direct access to the file.
+The browser downloads directly from the storage provider.
+
+REACT:
+  async function getPresignedUrl(fileId) {
+    const { data } = await apiClient.get(`/files/${fileId}/download-url`);
+    return data.url; // e.g., https://mybucket.s3.amazonaws.com/file?X-Amz-Signature=...
+  }
+
+  async function downloadViaPresignedUrl(fileId) {
+    const url = await getPresignedUrl(fileId);
+    // Simply navigate — browser handles it
+    window.location.href = url;
+    // OR use an anchor click for filename control
+  }
+
+SPRING BOOT (AWS SDK v2):
+  @GetMapping("/files/{id}/download-url")
+  public ResponseEntity<Map<String, String>> getDownloadUrl(@PathVariable Long id) {
+      FileRecord record = fileService.findById(id);
+      String url = s3Service.generatePresignedUrl(record.getS3Key(), Duration.ofMinutes(15));
+      return ResponseEntity.ok(Map.of("url", url));
+  }
+
+  // S3 service
+  public String generatePresignedUrl(String key, Duration expiration) {
+      GetObjectPresignRequest presignRequest = GetObjectPresignRequest.builder()
+          .signatureDuration(expiration)
+          .getObjectRequest(r -> r.bucket(bucket).key(key))
+          .build();
+      return s3Presigner.presignGetObject(presignRequest).url().toString();
+  }
+
+================================================================
+9. INTERVIEW QUESTIONS
+================================================================
+
+Q: How do you download a file from a protected API endpoint?
+A: Use Axios with responseType: 'blob'. The auth token is sent
+   via the Authorization header (handled by interceptors). The
+   response.data is a Blob. Create an object URL from it, attach
+   to a hidden <a> with a download attribute, click it, and revoke
+   the URL.
+
+Q: Why can't you just use window.location.href for authenticated downloads?
+A: window.location.href sends a simple browser GET request without
+   custom headers (like Authorization). Use Axios with responseType
+   blob instead to include the auth token. Presigned URLs are the
+   exception — they embed auth in the URL itself.
+
+Q: How do you get the filename from the server during download?
+A: The server sets Content-Disposition: attachment; filename="report.pdf".
+   Read it from response.headers['content-disposition'] and parse
+   with a regex. CORS must expose this header via
+   setExposedHeaders(List.of("Content-Disposition")).
+
+Q: How does download progress work?
+A: Axios provides onDownloadProgress, which fires as bytes are received.
+   event.loaded / event.total gives the ratio, but event.lengthComputable
+   must be true — which requires the server to send a Content-Length header.
+   Chunked transfer encoding disables this.
+
+Q: When would you use a presigned URL for download instead of streaming through your backend?
+A: Presigned URLs for large files — it reduces backend bandwidth
+   and load, leverages CDN/S3 caching, and allows the browser to
+   download directly from the storage tier at full speed.
+   Use backend streaming when you need audit logging, access
+   control checks at download time, or to hide the storage URL.

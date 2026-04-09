@@ -1,0 +1,411 @@
+================================================================================
+API DESIGN INTERVIEW QUESTIONS — COMPREHENSIVE Q&A
+================================================================================
+
+This file covers API design, versioning, authentication, rate limiting, error
+handling, and real-world API design decisions at senior/staff engineer level.
+
+================================================================================
+SECTION 1: API DESIGN FUNDAMENTALS
+================================================================================
+
+Q: How would you design a REST API for a Twitter-like system?
+A: Identify core resources first:
+   
+   RESOURCES:
+   - Users: /users/{id}
+   - Tweets: /tweets/{id}
+   - Timelines: /users/{id}/timeline
+   - Followers: /users/{id}/followers, /users/{id}/following
+   
+   KEY ENDPOINTS:
+   POST   /tweets                    — create tweet
+   GET    /tweets/{id}               — get single tweet
+   DELETE /tweets/{id}               — delete tweet
+   GET    /users/{id}/timeline       — user's timeline (cursor paginated)
+   POST   /users/{id}/follow         — follow a user
+   DELETE /users/{id}/follow         — unfollow
+   GET    /users/{id}/followers      — get follower list (cursor paginated)
+   GET    /search/tweets?q=keyword   — search tweets
+   
+   PAGINATION (cursor-based, not offset):
+   GET /users/123/timeline?after_id=987654&count=20
+   Response: {"tweets": [...], "next_cursor": "base64_cursor", "has_more": true}
+   
+   Reason: Twitter-scale feeds change rapidly; offset pagination would show
+   duplicates or miss items as new tweets are added.
+   
+   RATE LIMITING:
+   Timeline read: 15 requests / 15 minutes (Twitter-actual)
+   Tweet create: 300 / 3 hours
+   
+   AUTHENTICATION: OAuth 2.0 Bearer Token
+   
+   SPECIAL CONSIDERATIONS:
+   - Fan-out on write vs fan-out on read for timelines
+   - Tweet deletion: 204 No Content; soft-delete in DB
+   - Media uploads: separate multipart endpoint → media_id → include in tweet
+
+Q: What factors do you consider when designing a URL structure?
+A: 
+   1. RESOURCES, NOT ACTIONS:
+      /orders        NOT /getOrders or /fetchOrders
+      /users/{id}    NOT /getUserById/{id}
+      
+   2. NOUN PLURALS:
+      /users, /orders, /products (not /user, /order, /product)
+      
+   3. HIERARCHY FOR CLEAR RELATIONSHIPS:
+      /users/{id}/orders           — orders owned by user
+      /orders/{id}/items           — items in an order
+      Limit to 2-3 levels; go flat after that
+      
+   4. QUERY PARAMS FOR FILTERING, SORTING, PAGINATION:
+      /orders?status=PENDING&sort=created_at:desc&page=2&size=20
+      NOT /pendingOrders or /ordersByDate
+      
+   5. CONSISTENT CASING:
+      kebab-case: /user-addresses (preferred for URLs)
+      NOT camelCase (/userAddresses) or snake_case (/user_addresses)
+      
+   6. VERSIONING:
+      /api/v1/orders — version in path (most practical)
+      
+   7. ACTIONS AS LAST RESORT (when no clean noun mapping):
+      POST /orders/{id}/cancel
+      POST /accounts/{id}/activate
+      POST /payments/{id}/refund
+      
+   8. AVOID TUNNELING HTTP THROUGH POST:
+      POST /api?action=deleteUser  ← wrong
+      DELETE /users/{id}           ← correct
+
+Q: How do you design a file upload API?
+A: Strategy depends on file size:
+   
+   SMALL FILES (<10MB): Multipart form data
+   POST /uploads
+   Content-Type: multipart/form-data; boundary=----WebKitFormBoundary
+   Body: file data + metadata fields
+   Response 201: {"fileId": "abc123", "url": "https://cdn.../abc123.jpg"}
+   
+   LARGE FILES (>10MB): Two-phase upload (presigned URL pattern)
+   Phase 1: Request upload URL
+     POST /uploads/initiate
+     {"filename": "video.mp4", "contentType": "video/mp4", "size": 1073741824}
+     Response: {"uploadId": "xyz", "uploadUrl": "https://s3.../presigned?..."}
+   
+   Phase 2: Client uploads directly to storage
+     PUT <uploadUrl>  (directly to S3/GCS; bypasses your API servers)
+     Client sets Content-Type, uploads binary file
+   
+   Phase 3: Confirm completion
+     POST /uploads/{uploadId}/complete
+     Server verifies file in storage; triggers processing
+   
+   CHUNKED UPLOAD (resumable):
+   POST /uploads/start             → uploadId, chunkSize
+   PUT  /uploads/{id}/chunks/{n}   → upload chunk n
+   POST /uploads/{id}/complete     → assemble chunks
+   GET  /uploads/{id}/status       → check progress (for large files)
+   
+   This handles network interruptions; client can resume from last chunk.
+
+================================================================================
+SECTION 2: AUTHENTICATION AND AUTHORIZATION
+================================================================================
+
+Q: Compare API Key, OAuth 2.0, and JWT for API authentication.
+A: API KEY:
+   - Simple string passed in header (X-API-Key) or query param
+   - Identifies the calling application; no user context
+   - No expiration (or manual rotation)
+   - Easy to implement; hard to revoke without downtime
+   - Use for: server-to-server, simple developer APIs (Stripe, SendGrid)
+   
+   JWT (JSON Web Token):
+   - Signed token encoding claims (userId, roles, expiry)
+   - Stateless: server validates signature, no DB lookup needed
+   - Cannot be revoked before expiry (unless blacklist in Redis)
+   - Short-lived (15 min-1 hr); refresh token for longer sessions
+   - Use for: microservice auth, mobile apps, stateless APIs
+   
+   OAuth 2.0:
+   - Delegated authorization framework (not authentication itself)
+   - User grants app access to their data in another service
+   - Access token (short-lived) + Refresh token (long-lived)
+   - Flows: Authorization Code (web/mobile), Client Credentials (server-to-server),
+     Device Code (TVs), Implicit (deprecated)
+   - OpenID Connect (OIDC) adds authentication on top of OAuth 2.0
+   - Use for: third-party access, "Login with Google/GitHub", delegated APIs
+   
+   RECOMMENDATION:
+   - Public API for developers: API Key
+   - User-facing web/mobile app: OAuth 2.0 + OIDC (JWTs as tokens)
+   - Microservice-to-microservice: JWT with short expiry or mTLS
+
+Q: What is the difference between authentication and authorization?
+A: Authentication (AuthN): verifying WHO you are.
+   "Are you really Alice?" — verified via password, token, certificate.
+   
+   Authorization (AuthZ): verifying WHAT you can do.
+   "Is Alice allowed to delete this order?" — checked against permissions/roles.
+   
+   Authentication must happen first. Authorization uses the authenticated identity.
+   
+   In Spring Security:
+   Authentication: handled by AuthenticationManager, UserDetailsService, JWTs
+   Authorization: handled by @PreAuthorize, SecurityFilterChain, RBAC/ABAC
+   
+   @PreAuthorize("hasRole('ADMIN') or #userId == authentication.principal.id")
+   public void deleteUser(Long userId) { ... }
+   
+   Common mistakes:
+   - Returning 403 when user is not authenticated (should be 401)
+   - Returning 404 to hide existence of resource from unauthorized user
+     (valid security technique to prevent enumeration)
+
+Q: How do you implement role-based access control (RBAC)?
+A: RBAC maps: User → Roles → Permissions → Resources
+   
+   Database schema:
+   users: id, username, email
+   roles: id, name (ADMIN, MANAGER, USER)
+   user_roles: user_id, role_id
+   permissions: id, resource, action (ORDER:READ, ORDER:CREATE, ADMIN:ALL)
+   role_permissions: role_id, permission_id
+   
+   Spring Security RBAC:
+   @Bean
+   public SecurityFilterChain securityFilterChain(HttpSecurity http) {
+       return http
+           .authorizeHttpRequests(auth -> auth
+               .requestMatchers(GET, "/api/orders/**").hasAnyRole("USER", "ADMIN")
+               .requestMatchers(POST, "/api/orders").hasAnyRole("USER", "ADMIN")
+               .requestMatchers(DELETE, "/api/orders/**").hasRole("ADMIN")
+               .requestMatchers("/api/admin/**").hasRole("ADMIN")
+               .anyRequest().authenticated()
+           )
+           .build();
+   }
+   
+   Method-level (fine-grained):
+   @PreAuthorize("hasRole('ADMIN')")
+   public void deleteOrder(Long id) { ... }
+   
+   @PreAuthorize("hasRole('ADMIN') or @orderService.isOwner(#id, authentication.name)")
+   public Order getOrder(Long id) { ... }
+   
+   ABAC (Attribute-Based Access Control) is more flexible:
+   Policies: user.department == resource.department AND action == "READ"
+   Use ABAC for: complex multi-tenant systems, dynamic permissions
+
+================================================================================
+SECTION 3: API DESIGN ADVANCED
+================================================================================
+
+Q: How do you handle API deprecation gracefully?
+A: 1. COMMUNICATE EARLY: announce deprecation at least 6-12 months in advance
+   
+   2. USE DEPRECATION HEADERS:
+   Deprecation: true
+   Deprecation: "Wed, 01 Jan 2025 00:00:00 GMT"
+   Sunset: "Wed, 01 Jul 2025 00:00:00 GMT"          (RFC 8594)
+   Link: <https://api.example.com/v2/users>; rel="successor-version"
+   
+   3. RESPOND TO OLD VERSIONS:
+   - Keep old version running for the full deprecation period
+   - Monitor usage; contact high-traffic API consumers
+   - Log calls to deprecated endpoints; generate migration reports
+   
+   4. MIGRATION GUIDES:
+   - Publish changelog with breaking changes clearly marked
+   - Provide migration scripts or code examples
+   
+   5. SUNSET BEHAVIOR:
+   - After sunset date: return 410 Gone with explanation
+   - Or: redirect to new version (if backward-compatible enough)
+   
+   @Operation(deprecated = true, description = "Deprecated: use /v2/users instead")
+   @Deprecated
+   @GetMapping("/v1/users/{id}")
+   public ResponseEntity<UserV1> getUserV1(@PathVariable Long id) {
+       response.addHeader("Deprecation", "true");
+       response.addHeader("Sunset", "Thu, 01 Jul 2025 00:00:00 GMT");
+       response.addHeader("Link", "</api/v2/users/" + id + ">; rel=\"successor-version\"");
+       return ResponseEntity.ok(userService.getUserV1(id));
+   }
+
+Q: How do you design an idempotent API?
+A: For read operations (GET, HEAD): naturally idempotent.
+   For mutations, add idempotency keys:
+   
+   CLIENT SENDS:
+   POST /payments
+   Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
+   {"amount": 100, "currency": "USD"}
+   
+   SERVER LOGIC:
+   @PostMapping("/payments")
+   public ResponseEntity<Payment> createPayment(
+           @RequestHeader("Idempotency-Key") String idempotencyKey,
+           @RequestBody PaymentRequest request) {
+       
+       // 1. Check if key was already used
+       Optional<Payment> existing = idempotencyStore.get(idempotencyKey);
+       if (existing.isPresent()) {
+           // Return exact same response as original
+           return ResponseEntity.status(existing.get().getResponseStatus())
+                                .body(existing.get());
+       }
+       
+       // 2. Process payment
+       Payment payment = paymentService.process(request);
+       
+       // 3. Store result (with TTL, e.g., 24 hours)
+       idempotencyStore.put(idempotencyKey, payment, Duration.ofHours(24));
+       
+       return ResponseEntity.created(URI.create("/payments/" + payment.getId()))
+                            .body(payment);
+   }
+   
+   KEY RULES:
+   - Idempotency key is client-generated UUID (per operation, not per call)
+   - Same key = same request (same payload; reject mismatches with 422)
+   - Store results for a reasonable TTL (24h is common)
+   - Stripe, PayPal, Square all use this pattern
+
+Q: How do you design a search API?
+A: Simple search (small dataset):
+   GET /products?q=laptop&category=electronics&minPrice=500&maxPrice=2000
+              &brand=dell&sort=price:asc&page=1&size=20
+   
+   Advanced search with POST (complex queries):
+   POST /search/products
+   {
+     "query": {"term": "laptop", "fields": ["name", "description"]},
+     "filters": [
+       {"field": "category", "values": ["electronics", "computers"]},
+       {"field": "price", "range": {"min": 500, "max": 2000}},
+       {"field": "inStock", "value": true}
+     ],
+     "sort": [{"field": "relevance", "order": "desc"},
+              {"field": "price", "order": "asc"}],
+     "facets": ["brand", "category", "priceRange"],
+     "page": {"size": 20, "cursor": null}
+   }
+   
+   Response:
+   {
+     "items": [...],
+     "total": 1523,
+     "facets": {
+       "brand": [{"value": "Dell", "count": 342}, {"value": "HP", "count": 218}],
+       "priceRange": [{"value": "500-1000", "count": 450}]
+     },
+     "nextCursor": "base64cursor"
+   }
+   
+   Backing technology: Elasticsearch/OpenSearch for full-text search with
+   faceting. MySQL FULLTEXT for simple keyword search on small datasets.
+
+================================================================================
+SECTION 4: PERFORMANCE AND SCALABILITY
+================================================================================
+
+Q: How do you reduce API latency?
+A: Multiple layers:
+   
+   1. DATABASE:
+      - Add indexes for common query patterns
+      - N+1 query prevention: use JOIN or batch loading
+      - Caching: Redis for frequently-read, rarely-changed data
+      - Read replicas for read-heavy workloads
+      - Pagination: never load unbounded datasets
+   
+   2. APPLICATION:
+      - Async processing: move heavy work out of request path
+      - Parallel service calls: use CompletableFuture.allOf() or WebFlux Mono.zip()
+      - Connection pooling: reuse DB and HTTP connections
+      - Reduce serialization: efficient DTOs, protobuf for internal services
+   
+   3. NETWORK:
+      - CDN for static assets and cacheable API responses
+      - HTTP/2 multiplexing to reduce connection overhead
+      - GZIP/Brotli compression for large responses
+      - Geographic distribution: deploy in regions near users
+   
+   4. CACHING LAYERS:
+      Browser cache (Cache-Control) → CDN cache → API Gateway cache
+      → Application cache (Redis) → DB query cache
+   
+   5. RESPONSE DESIGN:
+      - Sparse fieldsets: ?fields=id,name (avoid fetching unneeded data)
+      - GraphQL: fetch exactly what clients need
+      - GZIP: 60-80% reduction for JSON responses
+
+Q: What is the N+1 query problem and how do you fix it?
+A: N+1 problem: fetching a list of N items, then querying the DB for each
+   item's related data — total N+1 queries.
+   
+   Example:
+   // BAD: 1 query for orders + N queries for each order's user
+   List<Order> orders = orderRepo.findAll();  // 1 query, 100 orders
+   orders.forEach(order -> 
+       order.setUser(userRepo.findById(order.getUserId())));  // 100 queries
+   
+   SOLUTIONS:
+   
+   1. JOIN fetch (Spring Data JPA):
+   @Query("SELECT o FROM Order o JOIN FETCH o.user WHERE o.status = :status")
+   List<Order> findWithUser(@Param("status") OrderStatus status);
+   
+   2. @EntityGraph:
+   @EntityGraph(attributePaths = {"user", "items"})
+   List<Order> findByStatus(OrderStatus status);
+   
+   3. DTO projection with join:
+   @Query("SELECT new com.example.OrderDto(o.id, o.total, u.name) " +
+          "FROM Order o JOIN o.user u WHERE o.status = :status")
+   List<OrderDto> findOrderSummaries(@Param("status") OrderStatus status);
+   
+   4. Batch loading (for complex scenarios):
+   Hibernate batch fetching: @BatchSize(size = 30) on collection
+   
+   5. At service level: collect IDs, batch fetch, then map
+   List<Order> orders = orderRepo.findAll();
+   Set<Long> userIds = orders.stream().map(Order::getUserId).collect(toSet());
+   Map<Long, User> users = userRepo.findAllById(userIds).stream()
+       .collect(toMap(User::getId, u -> u));
+   orders.forEach(o -> o.setUser(users.get(o.getUserId())));
+
+================================================================================
+SECTION 5: WEBHOOKS AND ASYNC APIs
+================================================================================
+
+Q: How do you design a reliable webhook system?
+A: SENDING SIDE (your API):
+   1. Store webhook event to outbox table (transactional with business logic)
+   2. Async worker picks up events and delivers
+   3. Retry with exponential backoff (immediate, 1m, 5m, 30m, 2h, 24h)
+   4. Sign payloads: X-Signature: HMAC-SHA256(secret, payload)
+   5. Include event metadata: eventId, eventType, timestamp, apiVersion
+   6. Store delivery attempts in DB for debugging
+   
+   RECEIVING SIDE (consuming a webhook):
+   1. Verify signature before processing
+   2. Respond 200 immediately (don't process synchronously)
+   3. Queue event for async processing
+   4. Implement idempotency by eventId (events may be delivered more than once)
+   5. Handle out-of-order delivery (check event timestamp vs current state)
+   
+   REGISTRATION:
+   POST /webhooks
+   {"url": "https://client.com/webhook", "events": ["order.created", "order.shipped"],
+    "secret": "generated_by_server"}
+   
+   DEBUGGING:
+   GET /webhooks/{id}/deliveries   — see delivery history
+   POST /webhooks/{id}/test        — trigger test event
+
+================================================================================

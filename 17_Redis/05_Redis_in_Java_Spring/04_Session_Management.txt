@@ -1,0 +1,241 @@
+================================================================================
+REDIS SESSION MANAGEMENT — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. WHAT IS SESSION MANAGEMENT WITH REDIS?
+───────────────────────────────────────────
+  HTTP sessions store per-user state between requests (login status, cart, preferences).
+  Traditional: sessions stored in application server memory (sticky sessions needed).
+
+  Problem with in-memory sessions:
+    - Multi-instance apps: user hits different server → session not found
+    - Sticky sessions: load balancer must route user to same instance
+    - Instance restarts: session data lost
+    - Horizontal scaling: new instances don't have existing sessions
+
+  Solution: store sessions in Redis.
+    - All instances share the same session store
+    - No sticky sessions needed
+    - Sessions survive instance restarts
+    - Instant horizontal scaling
+
+
+2. SPRING SESSION REDIS SETUP
+───────────────────────────────
+  <dependency>
+    <groupId>org.springframework.session</groupId>
+    <artifactId>spring-session-data-redis</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+  </dependency>
+
+  application.yml:
+    spring:
+      session:
+        store-type: redis
+        timeout: 30m                  # session TTL
+        redis:
+          namespace: "myapp:session"  # key prefix in Redis
+          flush-mode: on-save         # ON_SAVE (default) or IMMEDIATE
+
+  Enable annotation:
+    @SpringBootApplication
+    @EnableRedisHttpSession(maxInactiveIntervalInSeconds = 1800)
+    public class MyApp { ... }
+
+  That's it! Spring Session replaces HttpSession transparently.
+  No code changes needed in controllers.
+
+
+3. HOW SPRING SESSION STORES DATA IN REDIS
+────────────────────────────────────────────
+  Session key pattern:
+    <namespace>:sessions:<sessionId>                    → Hash with session data
+    <namespace>:sessions:expires:<sessionId>            → String (TTL sentinel)
+    <namespace>:sessions:index:org.springframework…:   → Set of session IDs (for findByIndexName)
+
+  Example keys in Redis:
+    spring:session:sessions:abc123def456
+      → Hash: { "sessionAttr:username": "alice", "creationTime": 1705363200000,
+                 "lastAccessedTime": 1705363200000, "maxInactiveInterval": 1800 }
+    spring:session:sessions:expires:abc123def456
+      → String key with TTL (used for expiry notification)
+
+  Session expiry:
+    Spring Session listens to Redis keyspace notifications (__keyevent@0__:expired)
+    When the expires: key expires → Spring fires SessionDestroyedEvent
+    → Triggers SessionDestroyedEvent listeners (e.g., invalidate related resources)
+
+  Required keyspace notifications for expiry:
+    CONFIG SET notify-keyspace-events gxE
+
+
+4. USING SESSION IN CONTROLLER
+────────────────────────────────
+  @RestController
+  public class AuthController {
+
+      @PostMapping("/login")
+      public ResponseEntity<String> login(
+              @RequestBody LoginRequest req,
+              HttpSession session) {
+          User user = authService.authenticate(req.getUsername(), req.getPassword());
+          session.setAttribute("userId", user.getId());
+          session.setAttribute("username", user.getUsername());
+          session.setAttribute("roles", user.getRoles());
+          return ResponseEntity.ok("Logged in");
+      }
+
+      @GetMapping("/profile")
+      public ResponseEntity<User> profile(HttpSession session) {
+          Long userId = (Long) session.getAttribute("userId");
+          if (userId == null) return ResponseEntity.status(401).build();
+          return ResponseEntity.ok(userService.getUser(userId));
+      }
+
+      @PostMapping("/logout")
+      public ResponseEntity<Void> logout(HttpSession session) {
+          session.invalidate();   // removes from Redis
+          return ResponseEntity.ok().build();
+      }
+  }
+  // Spring Session intercepts HttpSession → stores in Redis automatically
+
+
+5. FINDBYINDEXNAME — QUERY BY USER
+────────────────────────────────────
+  Find all active sessions for a user (e.g., show active sessions, force logout):
+
+  @Autowired FindByIndexNameSessionRepository<Session> sessionRepository;
+
+  // Store username as an indexed attribute (Spring Session auto-indexes this)
+  session.setAttribute(FindByIndexNameSessionRepository.PRINCIPAL_NAME_INDEX_NAME,
+      username);
+
+  // Find all sessions for user "alice"
+  Map<String, Session> sessions = sessionRepository.findByPrincipalName("alice");
+
+  // Force logout all sessions for user
+  sessions.keySet().forEach(sessionRepository::deleteById);
+
+
+6. SESSION SERIALIZATION
+──────────────────────────
+  Default: JDK serialization (objects must implement Serializable).
+  Problem: binary, Java-version-sensitive, hard to debug.
+
+  Better: JSON serialization:
+    @Bean
+    public RedisSerializer<Object> springSessionDefaultRedisSerializer() {
+        return new GenericJackson2JsonRedisSerializer();
+    }
+  → Session attributes stored as JSON in Redis
+  → Human-readable in redis-cli, portable
+
+  ⚠ All objects stored in session MUST be JSON-serializable (no circular refs).
+
+
+7. SESSION COOKIE CONFIGURATION
+──────────────────────────────────
+  Spring Session sends session ID via cookie (SESSION cookie by default).
+
+  @Bean
+  public CookieSerializer cookieSerializer() {
+      DefaultCookieSerializer serializer = new DefaultCookieSerializer();
+      serializer.setCookieName("JSESSIONID");    // cookie name
+      serializer.setCookiePath("/");
+      serializer.setDomainNamePattern("^.+?\\.(\\w+\\.[a-z]+)$"); // subdomain sharing
+      serializer.setUseHttpOnlyCookie(true);     // no JS access
+      serializer.setUseSecureCookie(true);       // HTTPS only
+      serializer.setSameSite("Lax");
+      return serializer;
+  }
+
+
+8. FLUSH MODES
+───────────────
+  ON_SAVE (default):
+    Session changes are written to Redis when the response is committed.
+    More efficient: batches all session writes per request.
+
+  IMMEDIATE:
+    Session changes are written to Redis immediately on setAttribute().
+    Use when you need other instances to see session changes in the same request.
+    Example: WebSocket handshake in the same transaction.
+
+
+9. SESSION EVENTS
+──────────────────
+  Spring Session fires events that you can listen to:
+
+  @Component
+  public class SessionEventListener {
+
+      @EventListener
+      public void handleSessionCreated(SessionCreatedEvent event) {
+          String sessionId = event.getSessionId();
+          log.info("Session created: {}", sessionId);
+      }
+
+      @EventListener
+      public void handleSessionDestroyed(SessionDestroyedEvent event) {
+          String sessionId = event.getSessionId();
+          // User logged out or session expired
+          // Clean up user-specific resources
+      }
+
+      @EventListener
+      public void handleSessionExpired(SessionExpiredEvent event) {
+          // Specifically fired on TTL expiry (not explicit invalidation)
+      }
+  }
+
+  Requires keyspace notifications enabled:
+    CONFIG SET notify-keyspace-events gxE
+
+
+10. CLUSTER CONSIDERATIONS
+────────────────────────────
+  Spring Session Redis works with Redis Cluster natively.
+  All session keys have the same pattern → may hash to different slots.
+  
+  Force session keys to one slot (not recommended — defeats cluster purpose):
+    Use hash tags in namespace: {myapp}:session
+    All session keys → same shard → defeats horizontal scaling
+
+  Better: use FINDBYINDEXNAME carefully in cluster
+    Index keys use Set operations → must be in same slot as session data
+    Use hash tags on index keys if needed
+
+
+11. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: Why use Redis for session storage instead of storing in the application?
+  A: In-memory sessions tie users to specific application instances (require sticky
+     sessions). With Redis as shared session store: any instance can serve any user,
+     instances can restart without losing sessions, and scaling out (adding instances)
+     requires no migration. Redis's TTL support handles session expiry automatically.
+
+  Q: How does Spring Session integrate with standard HttpSession?
+  A: Spring Session replaces the servlet container's session with a Redis-backed
+     implementation transparently. Annotating @EnableRedisHttpSession and including
+     the dependency automatically intercepts HttpSession operations. Controllers
+     use HttpSession.setAttribute() / getAttribute() as normal — no code changes.
+
+  Q: How does Spring Session handle session expiry notifications?
+  A: Spring Session stores a separate "expires" key with a TTL for each session.
+     It subscribes to Redis keyspace notifications (notify-keyspace-events gxE).
+     When the expires: key TTL fires, Redis publishes to __keyevent@0__:expired.
+     Spring Session receives this event and fires a SessionDestroyedEvent,
+     allowing cleanup of related resources.
+
+  Q: What's the difference between ON_SAVE and IMMEDIATE flush mode?
+  A: ON_SAVE (default) batches all session attribute changes and writes them to
+     Redis when the HTTP response is committed — more efficient. IMMEDIATE writes
+     each attribute change to Redis synchronously as it happens — use when other
+     systems need to read the session mid-request (e.g., WebSocket handshake
+     checking authentication set in the same HTTP request handling chain).
+
+================================================================================

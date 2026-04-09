@@ -1,0 +1,237 @@
+================================================================================
+REDIS ADVANCED INTERVIEW QUESTIONS
+================================================================================
+
+Q1: Why is Redis single-threaded but still fast?
+──────────────────────────────────────────────────
+  Redis's command processing is single-threaded (one command at a time).
+  Reasons it's still fast:
+    1. In-memory: no disk I/O for data access (RAM is ~100,000× faster than disk).
+    2. Simple operations: most commands are O(1) or O(log N) — trivially fast.
+    3. Non-blocking I/O: event loop (epoll/kqueue) handles thousands of connections.
+    4. No context switches: single-threaded = no thread sync overhead, no lock contention.
+    5. Efficient data structures: skiplist, hashtable, listpack tuned for in-memory perf.
+
+  Redis 6.0+ threads:
+    Multi-threaded I/O for network read/write (io-threads 4).
+    Command execution STILL single-threaded.
+    Only network I/O parallelized.
+
+  Benchmark: Redis processes 100,000–1,000,000+ ops/sec on a single core.
+
+
+Q2: What is the difference between Redis Pub/Sub and Redis Streams?
+─────────────────────────────────────────────────────────────────────
+  Pub/Sub:
+    Fire-and-forget. No persistence. No consumer groups.
+    Message not received by offline subscribers → permanently lost.
+    Fan-out: all subscribers receive all messages.
+    Use: live chat, real-time dashboards, cache invalidation.
+
+  Streams:
+    Append-only persistent log (like Kafka). Messages stored until MAXLEN or MINID.
+    Consumer groups with ACK semantics. Pending messages redelivered.
+    Partitioned consumption: consumer group members each get different messages.
+    Replay from any point in stream.
+    Use: task queues, event sourcing, audit logs, IoT data ingestion.
+
+  Key question: "Can a consumer miss messages if it's briefly offline?"
+    Pub/Sub: YES → use Streams instead.
+    Streams: NO → messages wait in PEL until ACKed.
+
+
+Q3: Explain the WAIT command and when you would use it.
+────────────────────────────────────────────────────────
+  WAIT numreplicas timeout_ms
+  Blocks until numreplicas replicas have acknowledged all previous writes,
+  or until timeout_ms expires.
+  Returns: number of replicas that confirmed replication.
+
+  Use cases:
+    1. Critical writes: before acknowledging a financial transaction, ensure it's
+       replicated: WAIT 1 1000 (at least 1 replica, max 1 second).
+    2. Reducing data loss window: WAIT before considering a write durable.
+    3. Synchronous replica testing: verify replication is healthy.
+
+  Limitations:
+    WAIT doesn't guarantee the write is flushed to replica's DISK (only replica's memory).
+    For full durability: replica needs AOF with appendfsync always.
+    WAIT returns even if timeout expires (returns 0) — no hard failure.
+
+
+Q4: What is PSYNC2 and what problem does it solve?
+────────────────────────────────────────────────────
+  PSYNC (Redis 2.8): partial resync using replication ID + offset.
+    On brief disconnect, replica can resume from where it left off.
+    Problem: after failover, promoted replica has a new replication ID.
+    All other replicas need a FULL RESYNC against the new primary.
+
+  PSYNC2 (Redis 4.0): secondary replication ID.
+    Promoted replica keeps old primary's replication ID as secondary ID.
+    Other replicas can partial-sync using the old ID + their last offset.
+    Result: failover no longer triggers full resync cascade.
+    Critical for large datasets and large replica counts.
+
+
+Q5: What is the Redlock algorithm and is it safe?
+──────────────────────────────────────────────────
+  Redlock: distributed lock algorithm using N (usually 5) independent Redis nodes.
+  Steps:
+    1. Record time T1.
+    2. Acquire lock on all N nodes with TTL.
+    3. Lock is valid if: majority (N/2 + 1) granted it AND total time < TTL.
+    4. Valid TTL = initial_TTL - (T2 - T1).
+    5. Release by deleting from ALL nodes.
+
+  Controversy (Martin Kleppmann, 2016):
+    Process pause (GC, paging) after acquiring lock from majority but before using it:
+    Lock expires → another client acquires → both clients believe they hold the lock.
+    This is NOT prevented by Redlock.
+    Solution: fencing tokens (monotonically increasing number) to detect stale operations.
+
+  Practical verdict:
+    For advisory locks (best-effort, idempotent operations): single Redis + Redisson watchdog is fine.
+    For correctness-critical locks (exactly-once): use ZooKeeper, etcd, or DB transactions.
+
+
+Q6: How do Lua scripts handle errors and partial execution?
+─────────────────────────────────────────────────────────────
+  Lua scripts are atomic in execution (no other commands interleave).
+  But they do NOT provide all-or-nothing semantics for Redis writes.
+
+  Scenario:
+    Script does: SET key1 v1 → then → INCR key2 (where key2 is a string type)
+    The SET succeeds.
+    The INCR fails (WRONGTYPE error).
+    → key1 is SET, key2 is NOT incremented.
+    → Partial write: key1 changed, key2 not. NO ROLLBACK.
+
+  This differs from RDBMS transactions. Redis doesn't support rollback.
+  Script atom icity only means: no other client sees interleaved state DURING execution.
+
+  Use redis.pcall() to handle errors gracefully:
+    local result = redis.pcall('INCR', 'maybe-string-key')
+    if result.err then
+      -- handle error without aborting script
+    end
+
+
+Q7: What are keyspace notifications used for in practice?
+──────────────────────────────────────────────────────────
+  Primary use cases:
+    1. Session expiry cleanup: subscribe to __keyevent@0__:expired.
+       When session:user:42 expires → clean up related data.
+    2. Delayed task execution: SET task:order:42 "" EX 1800.
+       On expiry: cancel unpaid order.
+    3. Cache invalidation across services: subscribe to set/del events on specific keys.
+    4. Audit logging: record all DEL and EXPIRE events.
+
+  Critical caveat:
+    Pub/Sub semantics: fire-and-forget.
+    If subscriber is offline: event is MISSED.
+    Not suitable for guaranteed task execution → use Redis Streams or sorted-set scheduler.
+
+  Enable: CONFIG SET notify-keyspace-events Ex (or Kx, KEg$, etc.)
+
+
+Q8: What is the difference between AOF appendfsync always, everysec, and no?
+─────────────────────────────────────────────────────────────────────────────
+  always: every write command is fsync'd to disk before reply is sent.
+    Data loss: 0 (on crash, only inflight command may be lost).
+    Performance: very slow (~1000 ops/sec, disk I/O is bottleneck).
+
+  everysec (default): writes buffered; fsync'd to disk every ~1 second.
+    Data loss: up to ~1 second of writes on crash.
+    Performance: good (~100,000+ ops/sec).
+
+  no: writes to OS page cache; OS decides when to flush (typically 30s).
+    Data loss: up to ~30 seconds.
+    Performance: fastest (no fsync overhead).
+
+  Production recommendation: everysec (best balance).
+  For financial: always (accept performance hit) OR RDB + WAIT replica.
+
+
+Q9: Describe a race condition in Cache-Aside and how to fix it.
+────────────────────────────────────────────────────────────────
+  Race condition on write:
+    Thread A: reads DB → gets old value V1 (DB has already been updated to V2 by Thread B)
+    Thread B: updates DB to V2 → deletes cache key
+    Thread A: stores V1 in cache
+    → Cache now has stale V1; it stays until TTL expires.
+
+  Solutions:
+    1. Cache invalidation on write (delete, not update): DEL key on write.
+       Smaller race window (miss rather than stale).
+    2. Short TTL: stale data self-heals quickly.
+    3. Cache-on-write (Write-Through): always write DB + update cache together.
+       Only one writer at a time for cache population.
+    4. Versioned keys: cache:product:42:v5 → on DB update, key becomes v6.
+       Old version never written to by new writer.
+    5. Lua script for conditional update: SET cache_key value NX EX ttl
+       → only set if key doesn't already exist.
+
+
+Q10: What happens to pending Pub/Sub messages if a Redis primary fails and a replica is promoted?
+───────────────────────────────────────────────────────────────────────────────────────────────────
+  Redis Pub/Sub messages are never stored — they're delivered directly to connected subscribers.
+  On primary failure:
+    Messages published to the old primary (after it became unreachable) are LOST.
+    Messages in flight (published but not delivered before TCP connection dropped): LOST.
+    After failover: subscribers must reconnect to new primary and re-subscribe.
+    Messages published DURING the failover window: NOT delivered.
+
+  This confirms Pub/Sub has no durability guarantee. For HA message delivery:
+  Use Redis Streams — messages are persisted in the stream log and consumer groups
+  track acknowledgments. Messages survive primary failure and are redelivered from
+  the stream after failover.
+
+
+Q11: What is the memory overhead of different Redis data types?
+──────────────────────────────────────────────────────────────
+  String key: ~90 bytes overhead per key (dict entry + robj + SDS)
+  Additional value:
+    Integer ≤ 9999 (shared objects): 0 extra bytes
+    String ≤ 44 chars (embstr): +44 bytes
+    String > 44 chars (raw SDS): +44 bytes + dynamic SDS
+
+  Hash (listpack): compact sequential; overhead ~65 bytes for whole Hash
+  Hash (hashtable): ~200 bytes overhead + ~50 bytes per field
+
+  List (quicklist): ~72 bytes overhead + listpack nodes
+  Set (intset): ~16 bytes overhead + 8 bytes per integer
+  Set (hashtable): ~200 bytes overhead + ~50 bytes per element
+  Sorted Set (listpack): compact; ~32 bytes per element
+  Sorted Set (skiplist+ht): ~200 bytes overhead + ~120 bytes per element
+
+  Optimization rule:
+    Keep structures within encoding thresholds (listpack stays compact).
+    Use HASH with listpack for object storage rather than separate STRING keys:
+    One Hash for 128 fields ≈ same memory as 128 separate String keys but with far less overhead.
+
+
+Q12: How would you design a leaderboard that needs to show rank for 1 million users?
+─────────────────────────────────────────────────────────────────────────────────────
+  Use a Redis Sorted Set:
+    ZADD leaderboard <score> "user:<id>"
+
+  Get top N:
+    ZREVRANGE leaderboard 0 N-1 WITHSCORES   → O(log N + N)
+
+  Get user's rank (0-indexed):
+    ZREVRANK leaderboard "user:42"            → O(log N)
+
+  Get users around rank R (±10):
+    ZREVRANGE leaderboard R-10 R+10 WITHSCORES → O(log N + 20)
+
+  Update score:
+    ZINCRBY leaderboard delta "user:42"       → O(log N)
+
+  Memory: 1M users × ~120 bytes/element = ~120MB. Reasonable for Redis.
+  
+  For truly massive leaderboards:
+    Shard by score range: leaderboard:high (10k–max), leaderboard:mid, leaderboard:low
+    Approximate rank by combining segment count queries.
+    Or use separate leaderboards per region/category to limit cardinality.
+
+================================================================================

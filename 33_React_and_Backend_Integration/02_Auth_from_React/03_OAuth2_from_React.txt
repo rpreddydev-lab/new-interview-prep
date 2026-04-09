@@ -1,0 +1,312 @@
+================================================================
+OAUTH2 FROM REACT — PKCE FLOW & SOCIAL LOGIN
+================================================================
+
+================================================================
+1. WHAT IS OAUTH2?
+================================================================
+
+OAuth2 is an authorization framework that lets users grant a third-party
+application access to their resources without sharing their password.
+
+Common use cases in React:
+  - "Sign in with Google / GitHub / Facebook"
+  - Accessing GitHub API on behalf of the user
+  - Integration with enterprise identity providers (Okta, Azure AD)
+
+KEY ROLES:
+  Resource Owner:     The user
+  Client:             Your React application
+  Authorization Server: Google, GitHub, Okta, Keycloak
+  Resource Server:    API that holds user data (Google APIs, GitHub API)
+
+================================================================
+2. OAUTH2 GRANT TYPES — WHICH ONE FOR SPAs?
+================================================================
+
+The PKCE (Proof Key for Code Exchange) authorization code flow
+is the ONLY recommended grant type for React SPAs.
+
+DO NOT USE implicit flow (deprecated, no longer recommended by OAuth2 RFC 9700).
+DO NOT USE client credentials (for machine-to-machine, not browsers).
+DO NOT USE resource owner password (anti-pattern, defeats OAuth2 purpose).
+
+================================================================
+3. PKCE AUTHORIZATION CODE FLOW — STEP BY STEP
+================================================================
+
+PKCE adds a code_verifier/code_challenge to prevent interception.
+
+  Step 1: Generate PKCE pair
+    code_verifier = random string (43-128 chars, URL-safe)
+    code_challenge = base64url(SHA256(code_verifier))
+
+  Step 2: Redirect user to Authorization Server
+    https://accounts.google.com/o/oauth2/auth?
+      response_type=code
+      &client_id=YOUR_CLIENT_ID
+      &redirect_uri=https://app.example.com/callback
+      &scope=openid email profile
+      &state=random_state_value        ← CSRF protection
+      &code_challenge=xxxxx
+      &code_challenge_method=S256
+
+  Step 3: User authenticates + grants consent
+
+  Step 4: Authorization Server redirects back to your app
+    https://app.example.com/callback?code=AUTH_CODE&state=random_state
+
+  Step 5: React app exchanges code for tokens
+    POST https://oauth2server/token
+    Body: {
+      grant_type: 'authorization_code',
+      code: AUTH_CODE,
+      redirect_uri: 'https://app.example.com/callback',
+      client_id: YOUR_CLIENT_ID,
+      code_verifier: original_code_verifier  ← proves you generated the challenge
+    }
+
+  Step 6: Authorization Server returns tokens
+    {
+      access_token: '...',
+      refresh_token: '...',  (if offline_access scope was requested)
+      id_token: '...',       (OIDC — user info as JWT)
+      token_type: 'Bearer',
+      expires_in: 3600
+    }
+
+================================================================
+4. PKCE IMPLEMENTATION — MANUAL
+================================================================
+
+  // src/utils/pkce.js
+
+  // Generate random code verifier
+  export const generateCodeVerifier = () => {
+    const array = new Uint8Array(32);
+    crypto.getRandomValues(array);
+    return btoa(String.fromCharCode(...array))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=/g, '');
+  };
+
+  // Generate code challenge from verifier
+  export const generateCodeChallenge = async (verifier) => {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(verifier);
+    const digest = await crypto.subtle.digest('SHA-256', data);
+    return btoa(String.fromCharCode(...new Uint8Array(digest)))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=/g, '');
+  };
+
+  // Generate state for CSRF protection
+  export const generateState = () => {
+    const array = new Uint8Array(16);
+    crypto.getRandomValues(array);
+    return Array.from(array, b => b.toString(16).padStart(2, '0')).join('');
+  };
+
+  // src/services/oauthService.js
+  import { generateCodeVerifier, generateCodeChallenge, generateState } from '../utils/pkce';
+
+  const OAUTH_CONFIG = {
+    clientId: import.meta.env.VITE_OAUTH_CLIENT_ID,
+    authorizationEndpoint: 'https://accounts.google.com/o/oauth2/auth',
+    tokenEndpoint: 'https://oauth2.googleapis.com/token',
+    redirectUri: `${window.location.origin}/callback`,
+    scope: 'openid email profile',
+  };
+
+  export const initiateLogin = async () => {
+    const codeVerifier = generateCodeVerifier();
+    const codeChallenge = await generateCodeChallenge(codeVerifier);
+    const state = generateState();
+
+    // Store verifier and state (in sessionStorage for security)
+    sessionStorage.setItem('pkce_code_verifier', codeVerifier);
+    sessionStorage.setItem('oauth_state', state);
+
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: OAUTH_CONFIG.clientId,
+      redirect_uri: OAUTH_CONFIG.redirectUri,
+      scope: OAUTH_CONFIG.scope,
+      state,
+      code_challenge: codeChallenge,
+      code_challenge_method: 'S256',
+    });
+
+    window.location.href = `${OAUTH_CONFIG.authorizationEndpoint}?${params}`;
+  };
+
+  export const handleCallback = async () => {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code');
+    const returnedState = params.get('state');
+
+    // Verify state to prevent CSRF
+    const expectedState = sessionStorage.getItem('oauth_state');
+    if (returnedState !== expectedState) {
+      throw new Error('OAuth state mismatch — potential CSRF attack');
+    }
+
+    const codeVerifier = sessionStorage.getItem('pkce_code_verifier');
+    sessionStorage.removeItem('pkce_code_verifier');
+    sessionStorage.removeItem('oauth_state');
+
+    // Exchange code for tokens
+    const response = await fetch(OAUTH_CONFIG.tokenEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: OAUTH_CONFIG.redirectUri,
+        client_id: OAUTH_CONFIG.clientId,
+        code_verifier: codeVerifier,
+      }),
+    });
+
+    if (!response.ok) throw new Error('Token exchange failed');
+    return response.json();
+  };
+
+================================================================
+5. CALLBACK PAGE COMPONENT
+================================================================
+
+  // src/pages/OAuthCallback.jsx
+  import { useEffect } from 'react';
+  import { useNavigate } from 'react-router-dom';
+  import { handleCallback } from '../services/oauthService';
+  import { useAuth } from '../context/AuthContext';
+
+  function OAuthCallback() {
+    const navigate = useNavigate();
+    const { setTokens } = useAuth();
+
+    useEffect(() => {
+      handleCallback()
+        .then((tokens) => {
+          setTokens(tokens.access_token, tokens.id_token);
+          navigate('/dashboard', { replace: true });
+        })
+        .catch((err) => {
+          console.error('OAuth callback error:', err);
+          navigate('/login?error=auth_failed', { replace: true });
+        });
+    }, []);
+
+    return <div>Completing sign in...</div>;
+  }
+
+  export default OAuthCallback;
+
+================================================================
+6. USING ID TOKEN (OIDC) VS ACCESS TOKEN
+================================================================
+
+ID TOKEN (OpenID Connect):
+  - Identifies WHO the user is
+  - Contains user profile claims (name, email, picture)
+  - Decode with jwtDecode() to get user info
+  - NEVER send to backend APIs as authentication
+  - Example payload: { sub: 'google|abc123', email: 'user@gmail.com', name: 'Alice' }
+
+ACCESS TOKEN:
+  - Authorizes WHAT the user can do
+  - Sent in Authorization: Bearer header to protected APIs
+  - May be opaque (random string) or JWT
+  - Used to call APIs on behalf of the user
+
+  const { jwtDecode } = require('jwt-decode');
+  const idToken = tokens.id_token;
+  const { email, name, picture } = jwtDecode(idToken);
+
+================================================================
+7. BFF PATTERN WITH OAUTH2
+================================================================
+
+For sensitive OAuth flows, handle token exchange on the backend:
+
+  React (public client)
+    │ redirects to OAuth provider, gets auth code
+    │ sends auth code to YOUR backend
+    ▼
+  Your Backend (BFF)
+    │ exchanges code for tokens using client_secret
+    │ stores tokens server-side or in httpOnly cookie
+    │ issues session cookie to React app
+    ▼
+  Protected API calls use session cookie
+
+  This approach:
+  ✅ client_secret never exposed to the browser
+  ✅ Tokens never stored in browser JavaScript
+  ✅ Backend can refresh tokens silently
+
+================================================================
+8. SOCIAL LOGIN PROVIDERS — QUICK REFERENCE
+================================================================
+
+Google:
+  authorizationEndpoint: https://accounts.google.com/o/oauth2/v2/auth
+  tokenEndpoint: https://oauth2.googleapis.com/token
+  scope: openid email profile
+  Register at: https://console.cloud.google.com/
+
+GitHub:
+  authorizationEndpoint: https://github.com/login/oauth/authorize
+  tokenEndpoint: https://github.com/login/oauth/access_token
+  scope: user:email read:user
+  Register at: https://github.com/settings/applications/new
+  NOTE: GitHub token endpoint requires server-side (client_secret needed)
+  → Use BFF pattern
+
+Microsoft:
+  authorizationEndpoint: https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize
+  tokenEndpoint: https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token
+  scope: openid email profile
+  Register at: https://portal.azure.com/
+
+================================================================
+9. INTERVIEW QUESTIONS
+================================================================
+
+Q: Why is PKCE required for React SPAs instead of implicit flow?
+A: Implicit flow returns the access token directly in the URL fragment,
+   which can be leaked via browser history, referrer headers, or log
+   files. PKCE requires exchanging a code for a token (more secure),
+   and the code_verifier proves the requester is who initiated the
+   flow, preventing authorization code interception attacks.
+
+Q: What is the state parameter in OAuth2 and why is it important?
+A: State is a random value generated before the redirect, stored by
+   the client, and returned unchanged by the authorization server.
+   On callback, the client verifies the returned state matches what
+   was stored. This prevents CSRF attacks — without it, an attacker
+   could trick a user into completing an auth flow with the attacker's code.
+
+Q: How does PKCE work? What is code_verifier and code_challenge?
+A: code_verifier is a random string generated before the redirect.
+   code_challenge = base64url(SHA256(code_verifier)) is sent to the
+   authorization server. When exchanging the code for tokens, the
+   code_verifier is sent. The server verifies that SHA256(code_verifier)
+   matches the original challenge. This proves the token requester
+   is the same party that initiated the flow.
+
+Q: What is the difference between id_token and access_token in OIDC?
+A: id_token is a JWT that identifies the user (who they are) — used
+   to extract profile info client-side. access_token authorizes API
+   access (what they can do) — sent in Authorization header to APIs.
+   Never use an id_token to authenticate API requests.
+
+Q: When would you use the BFF pattern for OAuth2?
+A: When the OAuth2 provider requires a client_secret for the token
+   exchange (like GitHub), you can't do it securely in the browser.
+   The BFF backend holds the client_secret, handles the code exchange,
+   and issues a session cookie to the React app. This keeps secrets
+   server-side.

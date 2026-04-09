@@ -1,0 +1,346 @@
+================================================================
+RETRY AND TIMEOUT STRATEGIES IN AXIOS
+================================================================
+
+Network requests fail. Good apps handle failures gracefully —
+either by retrying automatically or by failing fast with a clear error.
+
+================================================================
+1. TIMEOUT CONFIGURATION
+================================================================
+
+A timeout is the maximum time to wait for a response before
+treating the request as failed.
+
+AXIOS TIMEOUT:
+  const apiClient = axios.create({
+    baseURL: '...',
+    timeout: 10_000, // 10 seconds (milliseconds)
+  });
+
+  // Override per request
+  apiClient.get('/slow-endpoint', { timeout: 30_000 }); // 30 seconds
+
+TIMEOUT ERROR DETECTION:
+  try {
+    await apiClient.get('/api/data');
+  } catch (error) {
+    if (axios.isAxiosError(error) && error.code === 'ECONNABORTED') {
+      console.log('Request timed out!');
+    }
+  }
+
+  error.code values:
+    'ECONNABORTED' → timeout exceeded
+    'ERR_CANCELED'  → cancelled via AbortController
+    'ERR_NETWORK'   → network error (no connection)
+
+RECOMMENDED TIMEOUTS BY REQUEST TYPE:
+  GET simple data:        5,000ms
+  GET with computation:   10,000ms
+  POST/PUT data:          10,000ms
+  File upload:            60,000ms+ (or disable, use progress instead)
+  Report generation:      30,000ms
+  Health check:           2,000ms
+
+================================================================
+2. RETRY LOGIC — MANUAL IMPLEMENTATION
+================================================================
+
+  async function retryRequest(requestFn, retries = 3, delay = 1000) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        return await requestFn();
+      } catch (error) {
+        const isLastAttempt = attempt === retries;
+        const shouldRetry = isRetryable(error);
+
+        if (isLastAttempt || !shouldRetry) {
+          throw error;
+        }
+
+        const backoffDelay = delay * Math.pow(2, attempt - 1);
+        console.log(`Attempt ${attempt} failed. Retrying in ${backoffDelay}ms...`);
+        await sleep(backoffDelay);
+      }
+    }
+  }
+
+  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+  const isRetryable = (error) => {
+    if (!axios.isAxiosError(error)) return false;
+    if (!error.response) return true;  // network error
+    const status = error.response.status;
+    return status === 503 || status === 429 || status === 502;
+  };
+
+  // Usage
+  const data = await retryRequest(
+    () => apiClient.get('/api/data').then(r => r.data),
+    3,
+    1000
+  );
+
+================================================================
+3. AXIOS-RETRY LIBRARY (Recommended)
+================================================================
+
+  npm install axios-retry
+
+BASIC SETUP:
+  import axiosRetry from 'axios-retry';
+
+  axiosRetry(apiClient, {
+    retries: 3,
+    retryDelay: axiosRetry.exponentialDelay,
+    retryCondition: axiosRetry.isNetworkOrIdempotentRequestError,
+  });
+
+FULL CONFIGURATION:
+  axiosRetry(apiClient, {
+    // Number of retry attempts
+    retries: 3,
+
+    // Delay between retries
+    // axiosRetry.exponentialDelay: 1s, 2s, 4s (with jitter)
+    // axiosRetry.linearDelay(500): 500ms, 1000ms, 1500ms
+    retryDelay: (retryCount, error) => {
+      const baseDelay = axiosRetry.exponentialDelay(retryCount, error);
+      // Add jitter to prevent thundering herd
+      return baseDelay + Math.random() * 1000;
+    },
+
+    // Which errors to retry
+    retryCondition: (error) => {
+      // Default: retry on network errors + idempotent methods (GET, HEAD, etc.)
+      // Custom: also retry on 503
+      return (
+        axiosRetry.isNetworkOrIdempotentRequestError(error) ||
+        error.response?.status === 503 ||
+        error.response?.status === 429
+      );
+    },
+
+    // Called before each retry
+    onRetry: (retryCount, error, requestConfig) => {
+      console.log(`Retry attempt #${retryCount} for ${requestConfig.url}`);
+    },
+
+    // Whether to reset the timeout on each retry
+    shouldResetTimeout: true,
+  });
+
+================================================================
+4. IDEMPOTENCY AND SAFE RETRIES
+================================================================
+
+KEY RULE: Only retry idempotent requests automatically.
+
+IDEMPOTENT (safe to retry):
+  GET, HEAD, OPTIONS, PUT (with same body), DELETE (same resource)
+  → Same result regardless of how many times called
+
+NOT IDEMPOTENT (dangerous to auto-retry):
+  POST, PATCH
+  → Retrying could create duplicate records, charge a customer twice, etc.
+
+HOW TO SAFELY RETRY NON-IDEMPOTENT REQUESTS:
+  1. Idempotency Keys: include a unique UUID in the request header
+     that the server uses to detect and ignore duplicate requests:
+
+     import { v4 as uuidv4 } from 'uuid';
+     apiClient.post('/api/orders', orderData, {
+       headers: { 'Idempotency-Key': uuidv4() },
+     });
+
+  2. Backend stores the idempotency key and its result for some TTL.
+     If the same key arrives twice, return the first result.
+
+================================================================
+5. RATE LIMITING (429 Too Many Requests)
+================================================================
+
+When hitting a rate limit:
+  1. Read the Retry-After header from the response
+  2. Wait that duration before retrying
+  3. Exponential backoff otherwise
+
+  axiosRetry(apiClient, {
+    retries: 3,
+    retryCondition: (error) => error.response?.status === 429,
+    retryDelay: (retryCount, error) => {
+      // Respect server's Retry-After header
+      const retryAfter = error.response?.headers['retry-after'];
+      if (retryAfter) {
+        return parseInt(retryAfter, 10) * 1000; // convert seconds to ms
+      }
+      return axiosRetry.exponentialDelay(retryCount, error);
+    },
+  });
+
+================================================================
+6. REACT QUERY RETRY CONFIGURATION
+================================================================
+
+React Query has its own retry mechanism:
+
+  const { data } = useQuery({
+    queryKey: ['users'],
+    queryFn: () => apiClient.get('/users').then(r => r.data),
+    retry: 3,               // retry 3 times on failure
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 30_000),
+    // 1s, 2s, 4s, max 30s
+
+    // Custom retry condition
+    retry: (failureCount, error) => {
+      if (error.response?.status === 404) return false; // don't retry 404
+      if (error.response?.status === 403) return false; // don't retry 403
+      return failureCount < 3;
+    },
+  });
+
+  // Disable retries for mutations (usually not idempotent)
+  const mutation = useMutation({
+    mutationFn: createOrder,
+    retry: 0, // no automatic retry for POST
+  });
+
+================================================================
+7. CIRCUIT BREAKER PATTERN
+================================================================
+
+CONCEPT: If a service is consistently failing, stop sending requests
+to it entirely for a period — avoid overwhelming a struggling service.
+
+States: CLOSED (normal) → OPEN (failing) → HALF-OPEN (testing)
+
+Manual implementation:
+  class CircuitBreaker {
+    constructor(threshold = 5, timeout = 30_000) {
+      this.failureCount = 0;
+      this.threshold = threshold;     // failures before opening
+      this.timeout = timeout;         // ms to stay open
+      this.state = 'CLOSED';          // CLOSED, OPEN, HALF_OPEN
+      this.lastFailureTime = null;
+    }
+
+    async call(requestFn) {
+      if (this.state === 'OPEN') {
+        const elapsed = Date.now() - this.lastFailureTime;
+        if (elapsed < this.timeout) {
+          throw new Error('Circuit breaker is OPEN. Rejecting request.');
+        }
+        this.state = 'HALF_OPEN';
+      }
+
+      try {
+        const result = await requestFn();
+        this.onSuccess();
+        return result;
+      } catch (error) {
+        this.onFailure();
+        throw error;
+      }
+    }
+
+    onSuccess() {
+      this.failureCount = 0;
+      this.state = 'CLOSED';
+    }
+
+    onFailure() {
+      this.failureCount++;
+      this.lastFailureTime = Date.now();
+      if (this.failureCount >= this.threshold) {
+        this.state = 'OPEN';
+        console.warn('Circuit breaker OPEN');
+      }
+    }
+  }
+
+  const breaker = new CircuitBreaker(5, 30_000);
+  const data = await breaker.call(() => apiClient.get('/api/data'));
+
+================================================================
+8. TIMEOUT WITH ABORT CONTROLLER
+================================================================
+
+Combine timeout + cancellation with AbortController:
+
+  const fetchWithTimeout = (url, timeout = 5000) => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    return apiClient.get(url, { signal: controller.signal })
+      .finally(() => clearTimeout(timeoutId));
+  };
+
+  // In useEffect:
+  useEffect(() => {
+    const controller = new AbortController();
+
+    apiClient.get('/api/data', {
+      signal: controller.signal,
+      timeout: 5000,
+    }).then(/* ... */).catch(/* ... */);
+
+    return () => controller.abort(); // cancel if unmounted
+  }, []);
+
+================================================================
+9. BEST PRACTICES SUMMARY
+================================================================
+
+DO:
+  ✅ Set a default timeout on the Axios instance
+  ✅ Use axios-retry for idempotent requests
+  ✅ Add jitter to retry delays (prevent thundering herd)
+  ✅ Respect Retry-After headers for 429 responses
+  ✅ Use idempotency keys for retrying non-idempotent POSTs
+  ✅ Let React Query handle retries for queries (useQuery)
+  ✅ Disable retries for mutations by default
+  ✅ Use AbortController to cancel requests on unmount
+
+DON'T:
+  ❌ Auto-retry POST without idempotency keys
+  ❌ Retry 4xx errors (except 429) — they won't succeed
+  ❌ Retry forever — cap at 3-5 attempts
+  ❌ Use fixed delay — use exponential backoff
+  ❌ Ignore Retry-After headers from the server
+
+================================================================
+10. INTERVIEW QUESTIONS
+================================================================
+
+Q: What is exponential backoff and why is it used?
+A: Exponential backoff increases the wait time between retries
+   exponentially (1s, 2s, 4s, 8s...). This prevents overwhelming a
+   struggling server with immediate retries. Adding random jitter (±500ms)
+   prevents multiple clients from retrying simultaneously (thundering herd).
+
+Q: Which HTTP methods are safe to retry automatically? Why?
+A: GET, HEAD, OPTIONS — they are idempotent (calling multiple times
+   produces the same result). POST and PATCH are not idempotent and
+   retrying can create duplicates. PUT is idempotent but still care
+   is needed. Use idempotency keys on the server side to safely retry
+   any method.
+
+Q: How would you implement retry logic in Axios?
+A: Use the axios-retry library: axiosRetry(apiClient, { retries: 3,
+   retryDelay: axiosRetry.exponentialDelay, retryCondition: ... }).
+   Configure retryCondition to only retry network errors and 503/429,
+   not 4xx errors which indicate client mistakes.
+
+Q: What is the difference between a timeout and cancellation?
+A: Timeout: the request is automatically aborted after a time limit.
+   Cancellation: the request is explicitly aborted by code (component
+   unmount, user action, superseded by a newer request). Both produce
+   a CanceledError/AbortError in Axios/fetch.
+
+Q: What is a circuit breaker and when would you use it in a React app?
+A: A circuit breaker stops making requests to a failing service for
+   a period of time, preventing the app from flooding an already
+   overloaded service. In React, it's less common (usually done at the
+   API gateway level), but could be implemented on the client for
+   critical third-party dependencies.

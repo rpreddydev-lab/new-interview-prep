@@ -1,0 +1,220 @@
+================================================================
+Transaction Pitfalls — Common @Transactional Mistakes
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. PITFALL 1: SELF-INVOCATION (The Most Common Mistake)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Problem: Calling a @Transactional method from within the SAME class
+bypasses the AOP proxy — the transaction annotation is IGNORED.
+
+@Service
+public class OrderService {
+
+    public void placeOrder(Order order) {
+        processPayment(order);  // WRONG! Calls this.processPayment(), bypasses proxy
+    }
+
+    @Transactional   // NEVER TRIGGERED — no transaction created!
+    public void processPayment(Order order) {
+        paymentRepo.save(new Payment(order));
+    }
+}
+
+Fix Option A: Move the called method to a SEPARATE @Service bean:
+  @Service
+  public class PaymentService {
+      @Transactional
+      public void processPayment(Order order) { ... }  // now has its own proxy
+  }
+
+Fix Option B: Self-inject the bean through ApplicationContext:
+  @Service
+  public class OrderService {
+      @Autowired
+      private ApplicationContext context;
+
+      public void placeOrder(Order order) {
+          context.getBean(OrderService.class).processPayment(order); // via proxy!
+      }
+
+      @Transactional
+      public void processPayment(Order order) { ... }
+  }
+
+Fix Option C: Inject self-reference (@Autowired on self — Spring Boot 2.x+):
+  @Service
+  public class OrderService {
+      @Autowired
+      @Lazy
+      private OrderService self;   // Spring injects the proxy reference
+
+      public void placeOrder(Order order) {
+          self.processPayment(order);  // goes through proxy
+      }
+
+      @Transactional
+      public void processPayment(Order order) { ... }
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. PITFALL 2: CHECKED EXCEPTION NOT ROLLING BACK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Transactional   // only rolls back on RuntimeException by default
+public void sendOrder(Long id) throws IOException {
+    orderRepo.save(order);
+    emailService.sendConfirmation(order);  // throws IOException
+    // ORDER IS COMMITTED even though IOException was thrown!
+}
+
+Fix:
+  @Transactional(rollbackFor = Exception.class)
+  public void sendOrder(Long id) throws IOException { ... }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. PITFALL 3: SWALLOWED EXCEPTION (NO ROLLBACK)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Transactional
+public void transfer(Long fromId, Long toId, BigDecimal amount) {
+    accountRepo.debit(fromId, amount);
+    try {
+        accountRepo.credit(toId, amount);
+    } catch (Exception e) {
+        log.error("Credit failed");
+        // Exception is swallowed — transaction COMMITS anyway!
+        // Debit happened, credit did not = inconsistent state!
+    }
+}
+
+Fix: Either rethrow, or don't catch inside @Transactional:
+  } catch (Exception e) {
+      log.error("Credit failed");
+      throw e;  // rethrow to trigger rollback
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. PITFALL 4: @TRANSACTIONAL ON PRIVATE METHODS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Service
+public class UserService {
+    @Transactional  // IGNORED — AOP proxy can't intercept private methods
+    private void createUserInternal(String email) {
+        userRepo.save(new User(email));
+    }
+}
+
+Fix: Make the method public, or refactor into a separate @Service.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. PITFALL 5: LONG TRANSACTIONS / HOLDING CONNECTIONS TOO LONG
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Transactional
+public OrderResult processOrder(OrderRequest req) {
+    Order order = createOrder(req);
+    paymentGateway.chargeCard(req.getCard());  // EXTERNAL HTTP CALL inside tx!
+    // Transaction holds DB connection during entire HTTP call to payment gateway
+    // If gateway takes 5s, connection is held for 5s unnecessarily
+    sendConfirmationEmail(req.getEmail());     // another external call
+    return new OrderResult(order);
+}
+
+Problems:
+  - DB connection held for entire external call duration
+  - Increases connection pool pressure
+  - If external call fails after DB write, partial commit risk
+
+Fix: Move external calls OUTSIDE the transaction:
+  public OrderResult processOrder(OrderRequest req) {
+      Order order = createOrderTransactionally(req);  // @Transactional, commits fast
+      paymentGateway.chargeCard(req.getCard());        // outside tx
+      sendConfirmationEmail(req.getEmail());            // outside tx
+      return new OrderResult(order);
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. PITFALL 6: OPEN-IN-VIEW ANTI-PATTERN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+spring.jpa.open-in-view=true (Spring Boot DEFAULT until recently)
+
+This keeps a Hibernate Session (and DB connection) open from the
+start of the HTTP request through the view rendering phase.
+
+Problems:
+  - DB connection held throughout entire HTTP request (view rendering)
+  - Hidden lazy-loading in view templates (N+1 without logging)
+  - Resource leaks at scale
+  - Masking LazyInitializationException issues that surface later
+
+Fix:
+  spring.jpa.open-in-view=false   ← always set this!
+  # Then fix LazyInitializationExceptions with JOIN FETCH / @EntityGraph
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. PITFALL 7: WRONG @TRANSACTIONAL PLACEMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@RestController
+@Transactional   // BAD — transaction open for entire controller method duration
+public class OrderController {
+    public ResponseEntity<Order> createOrder(OrderRequest req) {
+        Order order = orderService.createOrder(req);
+        return ResponseEntity.ok(order);
+        // serialization to JSON happens here — lazy loads triggered outside service!
+    }
+}
+
+Fix: @Transactional belongs in @Service, not @Controller.
+  The service method should complete all DB work and return a non-entity DTO.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. PITFALL 8: REQUIRES_NEW DEADLOCK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Transactional
+public void placeOrder() {
+    Product p = productRepo.findByIdForUpdate(1L);  // outer tx locks product row
+    auditService.logEvent("ORDER");  // REQUIRES_NEW — new tx tries to read product
+    // Deadlock: new tx waits for outer to release the lock, but outer is waiting
+    // for the REQUIRES_NEW tx to complete first!
+}
+
+Fix: Don't lock rows in the outer transaction that the REQUIRES_NEW inner
+transaction also needs to access. Log only after the outer lock is released,
+or use a message queue (Outbox pattern) for deferred audit writes.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. INTERVIEW QUICK HITS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the self-invocation problem with @Transactional?
+A: When a method inside a @Transactional bean calls another @Transactional
+   method in the SAME class using "this", it bypasses the Spring AOP proxy
+   and the inner @Transactional annotation is ignored (no transaction starts).
+   Fix: move the called method to a separate @Service bean.
+
+Q: Does @Transactional on a private method work?
+A: No. Spring AOP intercepts only public method calls made through the proxy.
+   Private methods are not part of the proxy interface and are called directly.
+
+Q: Why might a checked exception not trigger a rollback?
+A: By default, @Transactional only rolls back on RuntimeException and Error.
+   Checked exceptions (any Exception that isn't RuntimeException) commit
+   by default. Use rollbackFor = Exception.class to include checked exceptions.
+
+Q: What is the risk of making external HTTP calls inside a @Transactional method?
+A: The DB connection is held open for the entire duration of the external call.
+   If the call takes 5 seconds, the connection is unavailable to other threads
+   for 5 seconds, exhausting the connection pool under load. Move external
+   calls outside the transaction boundary.
+
+Q: How does open-in-view cause performance issues?
+A: It keeps a DB connection open for the entire HTTP request including
+   view rendering. This ties up pool connections, enables hidden lazy
+   loads in response serialization (N+1 queries invisible in service logs),
+   and reduces throughput. Always disable with spring.jpa.open-in-view=false.

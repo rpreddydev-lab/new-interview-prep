@@ -1,0 +1,287 @@
+================================================================
+  SPRING BEAN SCOPES — IN DEPTH
+================================================================
+
+================================================================
+ALL AVAILABLE SCOPES
+================================================================
+
+  Scope        | Lifecycle                              | Web-only?
+  -------------|----------------------------------------|----------
+  singleton    | One per ApplicationContext             | No
+  prototype    | New instance per injection/getBean()   | No
+  request      | One per HTTP request                   | Yes
+  session      | One per HTTP session                   | Yes
+  application  | One per ServletContext                 | Yes
+  websocket    | One per WebSocket session              | Yes
+
+================================================================
+1. SINGLETON SCOPE (DEFAULT)
+================================================================
+
+  One shared instance for the entire ApplicationContext.
+  Created eagerly at startup (unless @Lazy).
+
+  @Service               // default = singleton
+  public class OrderService { ... }
+
+  @Bean
+  @Scope("singleton")    // explicit (rarely needed)
+  public OrderService orderService() { return new OrderService(); }
+
+  Use for:
+    ✓ Stateless services
+    ✓ DAOs, repositories
+    ✓ Factories, utilities
+    ✓ Everything that is thread-safe and has no per-request state
+
+  Thread safety:
+    Singleton beans are shared between threads.
+    DO NOT store request-specific data in instance fields.
+
+    // BAD — not thread-safe
+    @Service
+    public class CartService {
+        private List<Item> items = new ArrayList<>(); // shared mutable state!
+    }
+
+    // GOOD — use local variables or thread-local storage
+    @Service
+    public class CartService {
+        public List<Item> getCart(String userId) {
+            return cartRepository.findByUserId(userId);
+        }
+    }
+
+================================================================
+2. PROTOTYPE SCOPE
+================================================================
+
+  New instance created EVERY TIME the bean is requested
+  (via @Autowired, getBean(), or ObjectProvider).
+
+  @Service
+  @Scope("prototype")
+  public class ReportBuilder {
+      private final List<ReportSection> sections = new ArrayList<>();
+
+      public void addSection(ReportSection s) { sections.add(s); }
+      public Report build() { return new Report(sections); }
+  }
+
+  // Usage — gets a fresh ReportBuilder each time
+  @Service
+  public class ReportService {
+
+      @Autowired
+      private ObjectProvider<ReportBuilder> builderProvider;
+
+      public Report generateReport(ReportRequest request) {
+          ReportBuilder builder = builderProvider.getObject(); // new instance
+          // ... add sections ...
+          return builder.build();
+      }
+  }
+
+  Key rules for prototype:
+    • @PostConstruct IS called (init callbacks work)
+    • @PreDestroy is NOT called — you own cleanup
+    • BeanPostProcessors apply
+    • Spring does NOT pool/cache prototype instances
+
+================================================================
+3. REQUEST SCOPE (WEB)
+================================================================
+
+  One bean per incoming HTTP request.
+  Created at the start of request, destroyed at end.
+
+  @Component
+  @Scope(value = WebApplicationContext.SCOPE_REQUEST,
+         proxyMode = ScopedProxyMode.TARGET_CLASS)
+  public class RequestContext {
+      private String correlationId = UUID.randomUUID().toString();
+      private Instant startTime    = Instant.now();
+      // getters...
+  }
+
+  @RestController
+  public class OrderController {
+
+      @Autowired
+      private RequestContext requestContext; // fresh per request
+
+      @PostMapping("/orders")
+      public ResponseEntity<?> createOrder(...) {
+          log.info("Request ID: {}", requestContext.getCorrelationId());
+          ...
+      }
+  }
+
+  proxyMode = ScopedProxyMode.TARGET_CLASS:
+    Required when injecting a shorter-lived (request/session) bean
+    into a longer-lived (singleton) bean. Spring creates a CGLIB
+    proxy that looks up the real bean on each invocation.
+
+================================================================
+4. SESSION SCOPE (WEB)
+================================================================
+
+  One bean per HTTP session. Lives as long as the user's session.
+
+  @Component
+  @Scope(value = WebApplicationContext.SCOPE_SESSION,
+         proxyMode = ScopedProxyMode.TARGET_CLASS)
+public class ShoppingCart implements Serializable {
+
+    private final List<CartItem> items = new ArrayList<>();
+
+    public void addItem(CartItem item) { items.add(item); }
+    public List<CartItem> getItems() { return items; }
+    public void clear() { items.clear(); }
+}
+
+@RestController
+public class CartController {
+
+    @Autowired
+    private ShoppingCart cart; // proxy → real bean comes from session
+
+    @PostMapping("/cart/items")
+    public ResponseEntity<?> addToCart(@RequestBody CartItem item) {
+        cart.addItem(item);
+        return ResponseEntity.ok(cart.getItems());
+    }
+}
+
+================================================================
+5. APPLICATION SCOPE (WEB)
+================================================================
+
+  One bean per ServletContext (shared across all sessions/requests).
+  Similar to singleton but tied to the web layer.
+
+  Use for: read-only configuration, static lookup tables.
+
+  @Component
+  @Scope(value = WebApplicationContext.SCOPE_APPLICATION,
+         proxyMode = ScopedProxyMode.TARGET_CLASS)
+  public class CountryList {
+      private final List<String> countries = loadCountries();
+  }
+
+================================================================
+6. WEBSOCKET SCOPE
+================================================================
+
+  One bean per WebSocket session.
+
+  @Component
+  @Scope(value = "websocket",
+         proxyMode = ScopedProxyMode.TARGET_CLASS)
+  public class WebSocketSession {
+      private String userId;
+      private List<String> subscribedTopics = new ArrayList<>();
+  }
+
+================================================================
+SCOPED PROXIES — HOW THEY WORK
+================================================================
+
+  Problem without proxy:
+    @Service               // singleton
+    public class OrderService {
+        @Autowired
+        RequestContext ctx; // request-scoped — injected ONCE at startup
+                            // always references same (null) instance!
+    }
+
+  Fix with ScopedProxyMode.TARGET_CLASS:
+    Spring wraps the request/session bean in a CGLIB proxy.
+    The proxy looks up the real bean from the active request/session
+    on every method call.
+
+    proxyMode options:
+      NO              -- no proxy (only works when both are same scope)
+      INTERFACES      -- JDK dynamic proxy (bean must implement interface)
+      TARGET_CLASS    -- CGLIB proxy (works for any class)
+
+================================================================
+CUSTOM SCOPE
+================================================================
+
+  Implement org.springframework.beans.factory.config.Scope:
+
+  public class ThreadScope implements Scope {
+
+      private final ThreadLocal<Map<String, Object>> threadLocal =
+          ThreadLocal.withInitial(HashMap::new);
+
+      @Override
+      public Object get(String name, ObjectFactory<?> objectFactory) {
+          return threadLocal.get().computeIfAbsent(name,
+              k -> objectFactory.getObject());
+      }
+
+      @Override
+      public Object remove(String name) {
+          return threadLocal.get().remove(name);
+      }
+
+      // ... registerDestructionCallback, resolveContextualObject, getConversationId
+  }
+
+  // Register with context
+  @Bean
+  public static CustomScopeConfigurer threadScopeConfigurer() {
+      CustomScopeConfigurer configurer = new CustomScopeConfigurer();
+      configurer.addScope("thread", new ThreadScope());
+      return configurer;
+  }
+
+  // Use it
+  @Component
+  @Scope("thread")
+  public class ThreadLocalState { ... }
+
+================================================================
+SCOPE SUMMARY TABLE
+================================================================
+
+  Scope       | Created       | Destroyed           | Proxy needed?
+  ------------|---------------|---------------------|---------------
+  singleton   | App startup   | App shutdown        | No
+  prototype   | Each request  | Never (by Spring)   | No
+  request     | HTTP request  | End of HTTP request | Yes (if in singleton)
+  session     | HTTP session  | Session expiry/inv. | Yes (if in singleton)
+  application | App startup   | App shutdown        | Yes (web-specific)
+  websocket   | WS handshake  | WS disconnect       | Yes (if in singleton)
+
+================================================================
+INTERVIEW QUESTIONS — BEAN SCOPES
+================================================================
+
+  Q: What is the default Spring bean scope?
+  A: singleton — one instance per ApplicationContext.
+
+  Q: How does prototype scope differ from singleton?
+  A: A new instance is created for each injection/getBean() call.
+     Spring doesn't manage lifecycle after initialization.
+
+  Q: What is ScopedProxyMode and when is it needed?
+  A: When a shorter-lived bean (request/session) is injected into
+     a longer-lived one (singleton). The proxy delegates calls to
+     the current request/session's instance.
+
+  Q: Why is session scope bean Serializable recommended?
+  A: HTTP sessions can be persisted/replicated (e.g., Redis).
+     If the bean isn't Serializable, session replication fails.
+
+  Q: Can you inject a session-scoped bean into a request-scoped bean?
+  A: Yes, without a proxy — both are request-scope or shorter, so the
+     session bean lives longer and is always available.
+
+  Q: How would you create a custom bean scope?
+  A: Implement the Scope interface and register it via
+     CustomScopeConfigurer or ConfigurableBeanFactory.registerScope().
+

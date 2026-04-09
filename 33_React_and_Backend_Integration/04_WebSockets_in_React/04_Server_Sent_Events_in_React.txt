@@ -1,0 +1,364 @@
+================================================================
+SERVER-SENT EVENTS (SSE) IN REACT
+================================================================
+
+Server-Sent Events (SSE) provide a one-way, server-to-client
+streaming channel over a regular HTTP connection.
+
+================================================================
+1. WHAT IS SSE?
+================================================================
+
+SSE uses the EventSource API to establish a persistent HTTP
+connection where the server can push text events at any time.
+
+Key properties:
+  - One-way: server → client only
+  - Automatic reconnection built in (no extra code needed)
+  - Works over standard HTTP/HTTPS
+  - Text-based (UTF-8) with JSON support
+  - HTTP/2 multiplexes SSE over existing connections efficiently
+  - Simpler than WebSocket when you don't need bidirectional communication
+
+USE CASES:
+  - Live notifications
+  - Progress updates for long-running server jobs
+  - News/feed updates
+  - Real-time analytics dashboards
+  - Audit logs streaming
+
+================================================================
+2. SERVER-SENT EVENT FORMAT
+================================================================
+
+The server sends plain text with a specific format:
+
+  Content-Type: text/event-stream
+  Cache-Control: no-cache
+  Connection: keep-alive
+
+  data: {"message": "Hello"}
+
+  event: userJoined
+  data: {"userId": "abc123", "name": "Alice"}
+  id: 1
+
+  : this is a comment (heartbeat to keep connection alive)
+
+Rules:
+  - Each field is "field: value\n"
+  - Events are separated by a blank line (\n\n)
+  - "data:" is the message body (can span multiple lines)
+  - "event:" names a custom event type
+  - "id:" sets the event ID (client sends Last-Event-ID on reconnect)
+  - "retry:" milliseconds before reconnect attempt
+
+================================================================
+3. EVENTSOURCE API (BROWSER)
+================================================================
+
+  const eventSource = new EventSource('https://api.example.com/events');
+
+  // Default 'message' event (when no 'event:' field is set)
+  eventSource.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    console.log('Received:', data);
+  };
+
+  // Custom named events
+  eventSource.addEventListener('userJoined', (event) => {
+    const user = JSON.parse(event.data);
+    console.log('User joined:', user);
+  });
+
+  eventSource.addEventListener('notification', (event) => {
+    const notif = JSON.parse(event.data);
+    showToast(notif.message);
+  });
+
+  // Connection state
+  eventSource.onopen = () => console.log('SSE connected');
+  eventSource.onerror = (error) => {
+    if (eventSource.readyState === EventSource.CLOSED) {
+      console.log('SSE connection closed');
+    } else {
+      console.error('SSE error, reconnecting...');
+    }
+  };
+
+  // Close the connection
+  eventSource.close();
+
+READY STATES:
+  0 = CONNECTING
+  1 = OPEN
+  2 = CLOSED
+
+================================================================
+4. SSE DOES NOT SUPPORT CUSTOM HEADERS
+================================================================
+
+EventSource does not support setting custom headers (no Authorization).
+Solutions:
+
+A) Cookie-based auth (if using httpOnly session cookies):
+   EventSource will send cookies automatically with the request.
+   This is the simplest approach with cookie-based auth.
+
+B) Query parameter token:
+   const url = `https://api.example.com/events?token=${accessToken}`;
+   const es = new EventSource(url);
+   // Token visible in logs — use short-lived tokens
+
+C) @microsoft/fetch-event-source library (supports custom headers):
+   npm install @microsoft/fetch-event-source
+
+   import { fetchEventSource } from '@microsoft/fetch-event-source';
+
+   fetchEventSource('https://api.example.com/events', {
+     headers: {
+       Authorization: `Bearer ${getToken()}`,
+     },
+     onmessage(event) {
+       const data = JSON.parse(event.data);
+       setUpdates(prev => [...prev, data]);
+     },
+     onerror(err) {
+       throw err; // rethrow to trigger retry
+     },
+   });
+
+================================================================
+5. SSE IN REACT — HOOK
+================================================================
+
+  // src/hooks/useServerSentEvents.js
+  import { useEffect, useRef } from 'react';
+  import { fetchEventSource } from '@microsoft/fetch-event-source';
+
+  export function useServerSentEvents(url, { onMessage, events = {} } = {}) {
+    const abortControllerRef = useRef(null);
+
+    useEffect(() => {
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+
+      fetchEventSource(url, {
+        headers: {
+          Authorization: `Bearer ${getToken()}`,
+          Accept: 'text/event-stream',
+        },
+        signal: controller.signal,
+        onmessage(event) {
+          const data = JSON.parse(event.data);
+          onMessage?.(data, event.type);
+          events[event.type]?.(data);
+        },
+        onerror(err) {
+          console.error('[SSE] Error', err);
+          throw err; // rethrow to trigger reconnect
+        },
+        onclose() {
+          console.log('[SSE] Closed');
+        },
+      });
+
+      return () => {
+        controller.abort();
+      };
+    }, [url]);
+  }
+
+  // Usage
+  function LiveOrderStatus({ orderId }) {
+    const [status, setStatus] = useState('Processing...');
+
+    useServerSentEvents(`/api/orders/${orderId}/status-stream`, {
+      events: {
+        status: (data) => setStatus(data.status),
+        complete: (data) => {
+          setStatus('Complete');
+          // Navigate or show success
+        },
+        error: (data) => setStatus(`Error: ${data.message}`),
+      },
+    });
+
+    return <p>Status: {status}</p>;
+  }
+
+================================================================
+6. SPRING BOOT — SSEEMITTER
+================================================================
+
+  @GetMapping(value = "/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+  public SseEmitter streamEvents(@RequestParam(required = false) String token) {
+      // For query param auth (if not using cookie/Spring Security)
+      // validateToken(token);
+
+      SseEmitter emitter = new SseEmitter(Long.MAX_VALUE); // no timeout
+
+      executorService.execute(() -> {
+          try {
+              for (int i = 0; i < 10; i++) {
+                  emitter.send(SseEmitter.event()
+                      .name("update")
+                      .data(Map.of("index", i, "timestamp", Instant.now()))
+                  );
+                  Thread.sleep(1000);
+              }
+              emitter.complete();
+          } catch (Exception e) {
+              emitter.completeWithError(e);
+          }
+      });
+
+      return emitter;
+  }
+
+  // For Spring Security integration — emitter from service
+  @GetMapping("/notifications/stream")
+  public SseEmitter stream(Authentication authentication) {
+      String userId = authentication.getName();
+      return notificationService.createEmitter(userId);
+  }
+
+================================================================
+7. SPRING BOOT — FLUX (REACTIVE STREAMS)
+================================================================
+
+With Spring WebFlux, SSE is more natural:
+
+  @GetMapping(value = "/events/live", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+  public Flux<ServerSentEvent<Map<String, Object>>> streamLive() {
+      return Flux.interval(Duration.ofSeconds(1))
+          .map(seq -> ServerSentEvent.<Map<String, Object>>builder()
+              .id(String.valueOf(seq))
+              .event("metric")
+              .data(Map.of("cpu", getCpuUsage(), "memory", getMemoryUsage()))
+              .build());
+  }
+
+  // With Spring Security:
+  @GetMapping("/user/events")
+  public Flux<ServerSentEvent<NotificationDto>> userEvents(
+      @AuthenticationPrincipal UserDetails user
+  ) {
+      return notificationFlux
+          .filter(n -> n.getTargetUserId().equals(user.getUsername()))
+          .map(n -> ServerSentEvent.<NotificationDto>builder()
+              .event("notification")
+              .data(n)
+              .build());
+  }
+
+================================================================
+8. SSE FOR LONG-RUNNING JOB PROGRESS
+================================================================
+
+Common pattern: user triggers a long job, progress streams back.
+
+REACT:
+  async function startExportAndStream(params) {
+    // Step 1: Start the job
+    const { data: { jobId } } = await apiClient.post('/exports', params);
+
+    // Step 2: Open SSE stream for this job
+    return new Promise((resolve, reject) => {
+      const es = new EventSource(
+        `/api/exports/${jobId}/progress?token=${getToken()}`
+      );
+
+      es.addEventListener('progress', (event) => {
+        const { percent, message } = JSON.parse(event.data);
+        setProgress(percent);
+        setStatusMessage(message);
+      });
+
+      es.addEventListener('complete', (event) => {
+        const { downloadUrl } = JSON.parse(event.data);
+        es.close();
+        resolve(downloadUrl);
+      });
+
+      es.addEventListener('error', (event) => {
+        es.close();
+        reject(new Error('Export failed'));
+      });
+    });
+  }
+
+SPRING BOOT:
+  @GetMapping("/exports/{jobId}/progress")
+  public SseEmitter exportProgress(@PathVariable String jobId) {
+      SseEmitter emitter = new SseEmitter(300_000L); // 5 min timeout
+      exportService.trackJob(jobId, emitter);
+      return emitter;
+  }
+
+================================================================
+9. SSE VS WEBSOCKET — DECISION GUIDE
+================================================================
+
+  Feature            | SSE                    | WebSocket
+  -------------------|------------------------|-------------------
+  Direction          | Server → Client only   | Full-duplex
+  Protocol           | HTTP                   | ws:// upgrade
+  Browser API        | EventSource            | WebSocket
+  Auto-reconnect     | Built-in               | Manual
+  Custom headers     | Not supported natively | Supported (but complex)
+  Load balancer      | Easy (stateless HTTP)  | Needs sticky sessions
+  Firewall friendly  | Yes                    | Sometimes blocked
+  Binary data        | No (text/UTF-8)        | Yes
+  HTTP/2 multiplexed | Yes (efficient)        | Separate TCP connection
+
+CHOOSE SSE when:
+  - Server pushes only (no client messages via the same channel)
+  - Simple auth (cookies / token in URL)
+  - Need automatic reconnect with resumption (Last-Event-ID)
+  - Working behind proxies/firewalls
+
+CHOOSE WebSocket when:
+  - Bidirectional: user sends messages, game events, collaborative editing
+  - Need binary data
+  - High-frequency bidirectional (chat, multiplayer)
+
+================================================================
+10. INTERVIEW QUESTIONS
+================================================================
+
+Q: What is SSE and how is it different from WebSocket?
+A: SSE is a server-to-client only streaming API over standard HTTP.
+   The browser uses EventSource to connect, and the server sends
+   text events in a specific format. WebSocket is full-duplex (both
+   sides can send). SSE has automatic reconnection, works over HTTP/2,
+   and is simpler to set up. Use SSE for one-way data push; use
+   WebSocket when the client also needs to send data frequently.
+
+Q: How do you handle authentication with EventSource?
+A: EventSource doesn't support custom headers. Options: (1) use
+   cookie-based auth (cookies sent automatically), (2) include the
+   token as a query parameter, (3) use the @microsoft/fetch-event-source
+   library, which is built on Fetch API and supports custom headers.
+
+Q: How does SSE auto-reconnection work?
+A: The browser automatically retries the EventSource connection if
+   it drops. The server can send an "id:" field with each event; the
+   browser sends Last-Event-ID header on reconnect, allowing the
+   server to resume from where it left off. The retry: field sets
+   the reconnection delay in milliseconds.
+
+Q: How do you implement SSE in Spring Boot?
+A: Return SseEmitter from a controller endpoint with
+   produces = MediaType.TEXT_EVENT_STREAM_VALUE. Create the emitter,
+   submit work to an ExecutorService, call emitter.send() with event
+   builder, call emitter.complete() when done. For reactive stacks,
+   return Flux<ServerSentEvent<T>> from a WebFlux controller.
+
+Q: How would you stream long job progress to the React UI?
+A: POST to start the job (returns jobId). Open an EventSource/
+   fetchEventSource to a stream endpoint for that jobId. The server
+   sends progress events (percent, message). On a 'complete' event,
+   close the stream and show the result. On 'error', close and show
+   failure. This pattern works great for exports, data processing,
+   ML inference, etc.

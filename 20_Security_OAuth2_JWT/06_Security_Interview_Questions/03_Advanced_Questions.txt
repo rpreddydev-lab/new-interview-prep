@@ -1,0 +1,606 @@
+========================================================
+ADVANCED SECURITY INTERVIEW QUESTIONS
+========================================================
+
+Scenario-based and architectural Q&A for senior/lead-level interviews.
+Covers system design, trade-offs, security patterns, incident response,
+microservices, Zero Trust, mTLS, and real-world problem-solving.
+
+========================================================
+SECTION 1: SYSTEM DESIGN & ARCHITECTURE
+========================================================
+
+Q1: Design the authentication/authorization architecture for a microservices system
+    with 10 services, 3 types of clients (web SPA, mobile, service-to-service).
+A:
+  Component overview:
+
+  ┌───────────────────────────────────────────────────────────┐
+  │                  Authorization Server                       │
+  │   (Spring Authorization Server / Keycloak)                 │
+  │   - Issues JWTs for users (web + mobile)                   │
+  │   - Issues JWTs for services (client_credentials)          │
+  │   - JWKS endpoint (public key distribution)                │
+  └───────────────────────────────────────────────────────────┘
+              ↓ tokens                          ↑ client registration
+  ┌──────────────────────┐             ┌──────────────────────┐
+  │   API Gateway         │             │ Service Registry      │
+  │   (Spring Cloud GW)   │             │ (Consul/K8s)          │
+  │   - Token validation  │             └──────────────────────┘
+  │   - Rate limiting     │
+  │   - Routing           │
+  └──────────────────────┘
+       ↓ JWT (with propagation)
+  ┌──────────────────────────────────────────────────────────┐
+  │   Microservices (Order, Payment, Inventory, ...)          │
+  │   Each: Spring Boot + spring-security-oauth2-resource-    │
+  │         server + jwt.issuer-uri=...                       │
+  └──────────────────────────────────────────────────────────┘
+
+  Client strategies:
+  Web SPA:               Authorization Code + PKCE → JWT in memory (AT) + httpOnly cookie (RT)
+                         Consider BFF pattern for highest security
+  Mobile:                Authorization Code + PKCE → Keychain/EncryptedSharedPrefs
+  Service-to-service:    Client Credentials → JWT in Authorization header
+
+  Token propagation (S2S):
+  When Order Service calls Payment Service, it either:
+    a) Forwards the user's JWT (acts on behalf of user — audiences must include both)
+    b) Uses its own service JWT (client_credentials) + adds user context as claim
+    c) Token Exchange (RFC 8693): exchanges user JWT for a downscoped JWT targeting Payment Service
+
+  Centralized key management:
+  - All services trust the same JWKS URI
+  - No shared secrets between services
+  - mTLS for service-to-service transport (in addition to JWT authorization)
+
+Q2: How would you implement single sign-on (SSO) across multiple applications?
+A:
+  Central OIDC Provider (Keycloak/SAS/Okta):
+  - Users authenticate once at the IdP
+  - Each app is registered as a separate OIDC client
+  - IdP maintains a session for the user (session cookie on IdP domain)
+  - When user accesses App B after logging into App A:
+    a) App B redirects to IdP's /authorize endpoint
+    b) IdP sees existing session (SSO cookie) → no login prompt
+    c) IdP issues ID Token + Access Token for App B automatically
+    d) User seamlessly lands in App B (appears to never have logged in)
+
+  Session management:
+  - Session durations (idle/absolute timeout) managed centrally at IdP
+  - Front-channel logout: Apps register logout URLs; IdP redirects browser to each on logout
+  - Back-channel logout: IdP POSTs logout_token to each app server → app invalidates local session
+  - Use RP-Initiated Logout (OIDC) for coordinated logout
+
+  Spring OAuth2 Client SSO:
+  spring.security.oauth2.client.registration.keycloak.client-id=myapp
+  spring.security.oauth2.client.registration.keycloak.scope=openid,profile,email
+  // oauth2Login() handles OIDC session, OidcClientInitiatedLogoutSuccessHandler for logout
+
+Q3: What is the BFF (Backend for Frontend) pattern and when should you use it?
+A:
+  Problem: SPAs handling tokens in JavaScript are vulnerable to XSS.
+  Solution: Introduce a server-side BFF that acts as an OAuth2 client.
+
+  Architecture:
+  Browser (SPA) → BFF (Node.js/Spring) → Microservices (JWTs)
+                ↕ httpOnly session cookie
+
+  The BFF:
+  1) Handles the OAuth2 login flow (redirect to IdP, receive code, exchange for tokens)
+  2) Stores tokens SERVER-SIDE (in Redis, database, or in-memory session)
+  3) Issues a session cookie (httpOnly, Secure, SameSite=Strict) to the SPA
+  4) On every SPA API request: validates session cookie, retrieves token, proxies request
+  5) SPA never sees the token — completely XSS-safe
+
+  When to use:
+  - High-security applications (banking, healthcare, government)
+  - When tokens contain sensitive claims
+  - When strict XSS protection is required
+  - When SPA + API are on the same origin (simplifies cookie handling)
+
+  When NOT to use:
+  - Public/low-risk SPAs where complexity outweighs benefit
+  - When you don't control the SPA's backend infrastructure
+  - Mobile apps (use secure storage instead)
+
+Q4: How do you handle token propagation in a microservices call chain?
+A:
+  Scenario: Browser → API Gateway → Order Service → Payment Service → Notification Service
+
+  Option 1: Forward user's access token
+    - Each service forwards the same JWT downstream
+    - All services see the user's identity and scope
+    - Risk: if the scope is overly broad, internal services can misuse it
+    - Risk: token audience must be broad or absent (weakens audience validation)
+
+  Option 2: Service-specific tokens (Token Exchange, RFC 8693)
+    - Order Service exchanges user JWT for a new JWT targeting Payment Service
+    - POST /token: grant_type=urn:ietf:params:oauth:grant-type:token-exchange
+                   subject_token=user_jwt
+                   audience=payment-service
+    - AS issues a downscoped JWT valid only for Payment Service
+    - Audit: clear chain of delegation in token claims (act claim)
+    - More secure but more complex
+
+  Option 3: Client credentials + user context
+    - Each service uses its own client_credentials JWT for auth
+    - Passes user info as a custom header (X-User-ID, X-User-Roles)
+    - Simpler; no user token forwarded
+    - Risk: custom headers must be validated and trusted carefully
+
+  Best practice: Use Option 1 with audience validation or Option 2 for high-security.
+
+========================================================
+SECTION 2: SECURITY INCIDENT SCENARIOS
+========================================================
+
+Q5: Your access tokens are being stolen and used by attackers. How do you detect
+    and respond?
+A:
+  Detection signals:
+  - Same token used from multiple geographic locations simultaneously
+  - Same token used from wildly different IP addresses in short timeframes
+  - Unusual request patterns (rate, timing, endpoint access patterns)
+  - Access from known malicious IPs/ASNs
+  - Failed rate limit checks from token bearer
+  - User reports unusual activity
+
+  Immediate response:
+  1) If refresh token rotation is active, detect already-used refresh token → revoke token family
+  2) Revoke specific access token JTI (blacklist in Redis)
+  3) Revoke ALL tokens for the affected user
+  4) Force re-authentication
+  5) Notify user immediately
+  6) Block originating IP (temporary)
+
+  Investigation:
+  - Audit logs: what endpoints were accessed, what data was read/written
+  - Determine how token was stolen (XSS, MITM, logs, third-party breach)
+  - Scope of impact: what could the attacker do with that token's scope?
+
+  Long-term mitigations:
+  - Shorter token lifetime
+  - DPoP (sender-constrained tokens)
+  - Anomaly detection / UEBA system
+  - Token binding to user IP/device fingerprint (with appropriate UX trade-offs)
+  - Security header review (CSP, HSTS to prevent XSS + MITM)
+
+Q6: A team member accidentally committed a private key to a public GitHub repository.
+    What do you do?
+A:
+  IMMEDIATELY (within minutes):
+  1) Revoke the key — wherever it's used (AS JWK store, mTLS CA, etc.)
+  2) Generate a new key pair, update all services
+  3) Remove the secret from GitHub (though this doesn't fully remove it from history)
+  4) The commit history STILL contains the key — treat it as permanently compromised
+
+  Impact assessment:
+  - What was the key used for? (JWT signing → all outstanding tokens suspect)
+  - If JWT signing key: rotate JWKS, consider revoking all outstanding tokens
+  - If service account password: rotate + audit all actions taken with that account
+  - If API key: rotate + check access logs for unauthorized usage
+
+  GitHub-specific steps:
+  1) git filter-repo or BFG Repo Cleaner to rewrite history (hard push required)
+  2) If others have cloned: history rewrite may be insufficient (old clones still have it)
+  3) Contact GitHub support to purge from caches
+  4) Mark old GitHub issues/PRs where the key appeared
+
+  Process improvements:
+  - Add pre-commit hooks: git-secrets, detect-secrets, gitleaks
+  - Add CI pipeline secret scanning (truffleHog action)
+  - Configure GitHub secret scanning (auto-notifies on push)
+  - Never put secrets in application.properties/yml at rest — use environment variables or Vault
+
+Q7: Your Spring Boot API is getting an unusually high number of 401 errors.
+    What are the possible causes and how do you investigate?
+A:
+  Possible causes:
+  1) Token expiry: AT lifetime too short; clients not refreshing properly
+  2) Clock skew: Server and AS clocks are out of sync (> tolerance)
+  3) JWKS rotation: New key deployed, cached JWKS doesn't have it yet
+  4) Wrong audience: Token issued for a different service; aud validation failing
+  5) Issuer mismatch: Token issuer URL changed (HTTP vs HTTPS, trailing slash)
+  6) Wrong Authorization header format (e.g., missing "Bearer " prefix)
+  7) Token revocation: Tokens are being revoked (introspection returning inactive)
+  8) Algorithm mismatch: AS switched signing algorithm; RS still expects old algorithm
+
+  Investigation steps:
+  a) Sample a failing request: capture the Authorization header
+  b) Decode the JWT payload (jwt.io) — check exp, iss, aud
+  c) Check JWKS endpoint manually — does the kid in the token header exist in JWKS?
+  d) Compare server time with AS time (clock sync)
+  e) Check Spring logs for specific validation error message
+  f) Use OAuth2 token introspection endpoint to test validity directly against AS
+
+========================================================
+SECTION 3: ZERO TRUST AND MODERN SECURITY
+========================================================
+
+Q8: What is Zero Trust and how do you implement it for microservices in Kubernetes?
+A:
+  Zero Trust principle: "Never trust, always verify" — no implicit trust based on
+  network location. Every request is authenticated and authorized explicitly.
+
+  Kubernetes implementation layers:
+
+  Layer 1: Identity (mTLS between services)
+  - Install Istio service mesh
+  - Istio auto-injects Envoy sidecars that handle mTLS
+  - PeerAuthentication policy: STRICT (no plaintext traffic allowed)
+  - SPIFFE SVIDs identify each service: spiffe://cluster.local/ns/default/sa/orders-service
+
+  Layer 2: Authorization (intent-based policy)
+  - Istio AuthorizationPolicy: which service can call which endpoint
+  - OPA for complex policies (checking JWT claims + resource attributes)
+  - Kubernetes NetworkPolicy: default-deny all, explicit allow per service
+
+  Layer 3: Token validation
+  - Each service validates JWT independently (no central session store)
+  - Short-lived tokens (15 min access)
+  - Service-to-service: client_credentials flow or Workload Identity (K8s service accounts)
+
+  Layer 4: Observability and audit
+  - Distributed tracing (OpenTelemetry): trace user requests across services
+  - Audit logging: every authorization decision logged
+  - Anomaly detection: baseline normal traffic, alert on deviations
+
+Q9: Explain how mTLS differs from regular TLS and why it matters for microservices.
+A:
+  Regular TLS (one-way):
+  - Client verifies SERVER's identity via certificate
+  - Server doesn't verify client's identity (clients can be anonymous)
+  - Used for: browser-to-server (HTTPS)
+
+  mTLS (mutual/two-way TLS):
+  - Both sides present X.509 certificates
+  - Client verifies server certificate (same as TLS)
+  - Server ALSO verifies client certificate against a trusted CA
+  - Provides: authentication + encryption at transport layer
+
+  Why it matters for microservices:
+  1) Service identity: "Order Service" can prove it IS Order Service (not a spoofed service)
+  2) No credential sharing: No API keys or passwords shared between services
+  3) Automatic: Service mesh (Istio/Linkerd) handles cert issuance/rotation transparently
+  4) Defense in depth: Even if a service's JWT is compromised, attacker needs the cert too
+  5) Compliance: Required by some standards (PCI-DSS, HIPAA) for internal service auth
+
+  SPIFFE/SPIRE for cloud-native:
+  - SPIFFE defines a standard workload identity format (SVIDs as X.509 or JWT-SVIDs)
+  - SPIRE implements SPIFFE; automatically provisions SVIDs to workloads
+  - No human management of certs; automated short-lived cert rotation
+
+Q10: What is the difference between symmetric and asymmetric encryption in security?
+A:
+  Symmetric encryption (e.g., AES-256):
+  - Same key for encrypt and decrypt
+  - Fast (can encrypt large data efficiently)
+  - Problem: Key distribution — both parties need the same secret key securely
+  - Use cases: Encrypting data at rest, bulk data encryption, TLS record layer
+
+  Asymmetric encryption (e.g., RSA-2048, ECC):
+  - Key pair: public key (share freely) + private key (keep secret)
+  - Encrypt with public key → only private key can decrypt
+  - Sign with private key → verify with public key
+  - Much slower than symmetric (10-100x)
+  - Use cases: Key exchange, digital signatures (JWT RS256), TLS handshake
+
+  In practice — hybrid approach:
+  TLS uses asymmetric for the handshake (key exchange) then switches to symmetric
+  (AES session key) for the bulk data transfer.
+  JWT RS256: Private key signs (fast operation) → Public key verifies.
+
+========================================================
+SECTION 4: API SECURITY DESIGN
+========================================================
+
+Q11: What are the tradeoffs between API Keys and OAuth2 tokens?
+A:
+  API Keys:
+  Pros: Simple to implement/understand; easy for developers to use; good for
+        server-to-server with simple use cases; long-lived (no refresh needed).
+  Cons: Usually coarse-grained (all-or-nothing); no user context; hard to scope
+        to specific operations; rotation requires client coordination; if leaked,
+        no expiry (unless manually rotated); no standard (every API does it differently).
+
+  OAuth2 Tokens:
+  Pros: Industry standard; fine-grained scopes; short-lived (reduced blast radius);
+        user context in token; revocable (refresh tokens); supports delegated auth;
+        rich metadata (claims, audience, etc.).
+  Cons: Complex to implement and understand; requires AS infrastructure; multi-step
+        flow for first use; token management (refresh, storage) client-side complexity.
+
+  Decision guide:
+  Internal service-to-service (same company, controlled): Client Credentials grant
+  Third-party integrations (you control the API): Both API Keys and OAuth2 work;
+    OAuth2 preferred for user-context operations, API Keys for simpler integration
+  Untrusted third-party doing user data access: Must use OAuth2 (user consent, scope, revoke)
+  Simple webhooks / server-to-server callbacks: API Keys can suffice
+
+Q12: How do you rate limit a REST API fairly across different types of clients?
+A:
+  Rate limit keys (what identifies a "bucket"):
+  - IP address: Easy but unfair (shared IPs like NAT, office networks count as one)
+  - API key: Fair for server-to-server; each registered client gets own limit
+  - User ID (from JWT): Fair for per-user limits; extracted from token
+  - Combination: user:endpoint (different limits per endpoint type)
+  - Subscription tier: Free users 100 req/min; Pro 1000 req/min; Enterprise unlimited
+
+  Rate limiting algorithms:
+  - Token Bucket: Burst allowed up to bucket capacity; tokens replenish at fixed rate.
+    Most flexible; good for bursty traffic. Implemented with Bucket4j.
+  - Fixed Window Counter: Count requests in 1-minute window. Simple but burst at boundary.
+  - Sliding Window Log: Track each request timestamp. Accurate but memory-intensive.
+  - Sliding Window Counter: Interpolated from current + previous window. Good compromise.
+
+  Cost-based limiting:
+  Different operations cost different amounts:
+  - Simple GET /users/{id}: 1 token
+  - Complex GET /reports/annual: 10 tokens
+  - Bulk POST /import: 100 tokens
+
+  Response headers (tell clients their limit status):
+  X-RateLimit-Limit: 100          ← max requests
+  X-RateLimit-Remaining: 37       ← remaining in window
+  X-RateLimit-Reset: 1700000000   ← when limit resets (Unix timestamp)
+  Retry-After: 30                 ← seconds until retry (on 429)
+
+Q13: How would you implement fine-grained authorization for a multi-tenant SaaS API?
+A:
+  Design considerations:
+  1) Tenant isolation: Each tenant's data completely separated (DB schema or row-level)
+  2) Authorization hierarchy: Platform Admin → Tenant Admin → Tenant User → Viewer
+  3) Resource ownership: Within a tenant, resource-level permissions
+
+  Architecture:
+  JWT claims:
+  {
+    "sub": "user123",
+    "tenant_id": "tenant-abc",
+    "roles": ["TENANT_ADMIN"],
+    "permissions": ["orders:read", "orders:write", "users:invite"]
+  }
+
+  Service-level: Validate tenant_id in token matches path variable
+  @PreAuthorize("#tenantId == authentication.token.claims['tenant_id']")
+  public List<Order> getOrders(String tenantId) { ... }
+
+  Resource-level: ABAC with PermissionEvaluator
+  @PreAuthorize("hasPermission(#orderId, 'Order', 'read')")
+  public Order getOrder(String tenantId, Long orderId) {
+      // PermissionEvaluator also checks order.tenantId == jwt.tenant_id
+  }
+
+  Database:
+  - All tables have tenant_id column
+  - Hibernate Filter: @Filter(name="tenantFilter", condition="tenant_id = :currentTenant")
+  - Set filter parameter in request interceptor from JWT
+  - Prevents accidental cross-tenant data access even if business logic has bugs
+
+Q14: What is SSRF (Server-Side Request Forgery) and how do you prevent it in Spring Boot?
+A:
+  SSRF: An attacker tricks the server into making HTTP requests to unintended targets —
+  typically internal services the attacker can't reach directly.
+
+  Attack scenario:
+  POST /api/avatar?url=http://169.254.169.254/latest/meta-data/iam/credentials
+  → Spring app fetches AWS metadata endpoint → returns AWS credentials to attacker
+
+  Prevention in Spring Boot:
+  1) Allowlist of permitted URLs/domains — NEVER use user input directly as URL
+  2) Validate URL scheme (only https), domain against allowlist
+  3) Block internal IP ranges (10.x.x.x, 172.16.x.x, 192.168.x.x, 127.x.x.x, 169.254.x.x)
+  4) Use DNS rebinding protection (validate IP after DNS resolution)
+  5) Disable HTTP redirects or validate redirect targets
+
+  @Service
+  public class SafeHttpClient {
+      private static final Set<String> ALLOWED_DOMAINS = Set.of("trusted.com", "partner.com");
+
+      public String fetch(String inputUrl) {
+          URI uri = URI.create(inputUrl);
+          if (!ALLOWED_DOMAINS.contains(uri.getHost())) {
+              throw new SecurityException("URL host not allowed: " + uri.getHost());
+          }
+          // Additional: resolve DNS and check IP isn't internal
+          InetAddress ip = InetAddress.getByName(uri.getHost());
+          if (ip.isSiteLocalAddress() || ip.isLoopbackAddress() || ip.isLinkLocalAddress()) {
+              throw new SecurityException("SSRF: IP address not allowed: " + ip);
+          }
+          return restTemplate.getForObject(inputUrl, String.class);
+      }
+  }
+
+========================================================
+SECTION 5: SECRETS MANAGEMENT & COMPLIANCE
+========================================================
+
+Q15: What are the different approaches to injecting secrets into a Spring Boot app
+     and their security trade-offs?
+A:
+  Option 1: Environment variables
+  Pros: No secrets in code/config files; 12-factor app compliance; easy in K8s
+  Cons: Visible in process env (ps aux --env), accessible to all code in the process,
+        may be logged accidentally
+
+  Option 2: K8s Secrets
+  Pros: Built-in K8s primitive; secrets not in container image; RBAC access control
+  Cons: Base64-encoded (not encrypted at rest by default!); stored in etcd;
+        enable etcd encryption at rest if using K8s secrets for sensitive data
+
+  Option 3: HashiCorp Vault with Spring Cloud Vault
+  Pros: Encrypted at rest; dynamic secrets (DB passwords rotate automatically);
+        fine-grained policies per service; audit log of all secret accesses;
+        AppRole/K8s auth (no hardcoded Vault token); secret versioning
+  Cons: Vault infrastructure to manage; additional operational complexity;
+        single point of failure if not HA
+
+  Option 4: AWS/GCP/Azure managed secrets services
+  Pros: Managed (no infra); tight IAM integration; rotation built-in for some secret types;
+        audit via CloudTrail/Cloud Audit
+  Cons: Cloud provider lock-in; still need to manage IAM policies
+
+  Option 5: Sealed Secrets (K8s)
+  Pros: Encrypted secrets stored in Git (GitOps friendly); encrypted with cluster key
+  Cons: Key rotation is complex; if cluster key compromised, all secrets compromised
+
+  Best practice for production:
+  - Development: .env files (never committed), docker secrets
+  - Production: HashiCorp Vault OR managed secret service with workload identity
+  - CI/CD: GitHub Secrets, GitLab CI Variables, Azure Key Vault actions
+  - Kubernetes: External Secrets Operator syncing from Vault/Cloud to K8s Secrets
+
+Q16: How do you handle database credential rotation without downtime?
+A:
+  Challenge: The DB password changes; all app instances must use the new password
+  without restart or a window where some have old password and some have new.
+
+  HashiCorp Vault Dynamic Secrets (recommended approach):
+  1) Vault generates short-lived DB credentials on demand (e.g., TTL=1 hour)
+  2) Spring Cloud Vault: each app instance requests credentials from Vault
+  3) Vault creates a real DB user with a unique username + auto-generated password
+  4) When lease nears expiry, Vault (or Vault Agent Sidecar) renews it automatically
+  5) If not renewed, credentials are automatically revoked by Vault
+  6) App uses Spring Vault's SecretLeaseContainer to renew/rotate credentials
+     and trigger DataSource refresh without restart
+
+  Application-managed rotation with grace period:
+  1) Store two credentials: primary (current) and secondary (new)
+  2) DB accepts BOTH passwords simultaneously during rotation window
+  3) Deploy new app instances with new credentials
+  4) Wait until all old instances drain (rolling update)
+  5) Remove old credentials from DB
+  6) Update secret store
+
+  Spring Cloud Vault rotation config:
+  spring:
+    cloud:
+      vault:
+        database:
+          enabled: true
+          role: app-role
+          backend: database
+          # Spring Cloud Vault handles lease renewal automatically
+
+========================================================
+SECTION 6: COMPLIANCE & STANDARDS
+========================================================
+
+Q17: What is the OWASP Top 10 and which items are most relevant to API security?
+A:
+  2021 OWASP Top 10:
+
+  A01: Broken Access Control         ← MOST RELEVANT
+    Missing authorization checks; IDOR (direct object references);
+    Privilege escalation
+    Fix: @PreAuthorize, PermissionEvaluator, test negative cases
+
+  A02: Cryptographic Failures        ← HIGHLY RELEVANT
+    Weak algorithms (MD5, SHA1, DES); sensitive data in JWT payload;
+    tokens in URLs; weak TLS config
+    Fix: BCrypt, RS256/ES256, HTTPS-only, tokens in headers
+
+  A03: Injection                     ← HIGHLY RELEVANT
+    SQL injection, LDAP injection, command injection
+    Fix: Parameterized queries, JPA/JPQL, input validation
+
+  A04: Insecure Design
+    Missing rate limiting, no threat modeling, insecure direct references
+    Fix: Rate limiting (Bucket4j), ABAC, threat model during design
+
+  A05: Security Misconfiguration
+    Default creds, debug endpoints exposed, verbose error messages,
+    CORS misconfigured (allow-origin: *)
+    Fix: Secure defaults, actuator secured, proper CORS config
+
+  A06: Vulnerable Components
+    Outdated libraries with known CVEs (Log4Shell, Spring4Shell)
+    Fix: Dependabot/Renovate, OWASP Dependency-Check, regular updates
+
+  A07: Auth Failures
+    Weak passwords, no MFA, session fixation, brute force not blocked
+    Fix: Strong password policy, MFA for sensitive operations, account lockout
+
+  A09: Security Logging & Monitoring
+    No audit trail, failed auth not logged, no alerts
+    Fix: Spring Security events, audit log, centralized logging, alerting
+
+Q18: Walk through a security code review checklist for a Spring Boot REST endpoint.
+A:
+  Authentication:
+  □ Is the endpoint secured (not accidentally .permitAll())?
+  □ Is the correct security filter chain applied?
+  □ Are @PreAuthorize annotations on service layer (not just controller)?
+
+  Authorization:
+  □ Is role/permission check sufficient? (not just isAuthenticated())
+  □ Are OWNERSHIP checks in place (user can only access own data)?
+  □ Are @PostAuthorize checks used where needed?
+  □ Any admin-only endpoints properly restricted?
+
+  Input Validation:
+  □ Are all inputs validated (@Valid, @NotNull, @Size, etc.)?
+  □ Is there parameterized SQL (no string concatenation in queries)?
+  □ Are file uploads restricted by type/size?
+  □ Is user-provided data sanitized before HTML output?
+
+  Output:
+  □ Are sensitive fields excluded from response (@JsonIgnore, DTOs)?
+  □ Is there proper error handling (no stack traces in responses)?
+  □ Are error messages generic (don't reveal implementation details)?
+
+  Secrets:
+  □ No hardcoded secrets, passwords, or API keys in code?
+  □ All sensitive config in environment variables or Vault?
+
+  Logging:
+  □ Authentication events logged (success and failure)?
+  □ No PII or secrets logged?
+  □ Correlation IDs for traceability across services?
+
+  Dependencies:
+  □ No vulnerable library versions (run OWASP Dependency-Check)?
+  □ Libraries pinned to specific versions?
+
+Q19: What is the PKCE code_challenge_method 'plain' and why should you avoid it?
+A:
+  PKCE has two code_challenge_method options:
+  - S256: code_challenge = BASE64URL(SHA256(code_verifier)) — standard, secure
+  - plain: code_challenge = code_verifier — NO hashing
+
+  Why avoid 'plain':
+  If the authorization request is intercepted (HTTPS downgrade, malicious app, logs),
+  the attacker sees the code_challenge. With 'plain', code_challenge IS code_verifier.
+  They can now exchange the authorization code using the intercepted verifier — PKCE
+  provides NO protection with 'plain' against interception.
+
+  With S256: Even if the code_challenge is intercepted, the attacker only has
+  SHA256(code_verifier). They cannot reverse SHA256 to get code_verifier.
+
+  Always use S256. RFC 7636 specifies plain only as a fallback for platforms
+  that cannot compute SHA256. In 2024, all platforms can compute SHA256.
+
+Q20: How do you perform a security audit of JWT implementation in an existing Spring app?
+A:
+  1) Find all JwtDecoder / SecurityFilterChain beans — understand the full validation chain
+  2) Check algorithm restriction:
+     - Is jwsAlgorithm() explicitly set? (reject algorithm confusion)
+     - Is 'none' algorithm rejected?
+  3) Check issuer validation: is JwtValidators.createDefaultWithIssuer() used?
+  4) Check audience validation: is there a custom AudienceValidator?
+  5) Check JWKS source: is it pinned to known URIs? (prevent JKU injection)
+  6) Verify custom validators: are all OAuth2TokenValidator<Jwt> beans wired correctly?
+  7) Check token contents: are there sensitive claims (PII, passwords) that shouldn't be there?
+  8) Check expiry: what is the access token lifetime? (should be ≤ 1 hour; ideally 15 min)
+  9) Check that scope validation is in place (not just role validation)
+  10) Review test coverage:
+      - Are negative tests present (no token, expired, wrong audience, wrong issuer)?
+      - Are authorization negative tests present (wrong role → 403)?
+  11) Check logging: are authentication failures logged without logging the token itself?
+  12) Review dependencies: is Nimbus-JOSE-JWT library up to date?
+      (Check for CVEs: CVE-2021-27568, etc.)
+  13) Check JWKS caching: is NimbusJwtDecoder using default caching (yes by default)
+      or is it re-fetching on every request? (should cache!)
+  14) Check error responses: do they return 401 with WWW-Authenticate header
+      (BearerTokenAuthenticationEntryPoint) or generic 403?

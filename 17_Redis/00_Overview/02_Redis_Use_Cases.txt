@@ -1,0 +1,327 @@
+================================================================================
+REDIS USE CASES — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. SESSION MANAGEMENT
+──────────────────────
+Problem: HTTP is stateless. Session data (user_id, cart, auth tokens) must be
+stored somewhere. DB per-request is too slow. Local memory doesn't work behind
+load balancers.
+
+Redis Solution:
+  - Store session as Hash or JSON string keyed by session_id
+  - Set TTL equal to session expiry (e.g., 30 minutes)
+  - Any server can look up the session → stateless horizontal scaling
+
+  SET session:abc123 "{\"userId\":42,\"role\":\"admin\"}" EX 1800
+  GET session:abc123
+  EXPIRE session:abc123 1800   # sliding expiry on each request
+
+Why Redis fits:
+  ✓ Sub-millisecond reads
+  ✓ Automatic expiry (TTL)
+  ✓ Shared across all app nodes
+  ✓ Can persist (survive restarts)
+
+
+2. CACHING (DATABASE QUERY CACHE)
+───────────────────────────────────
+Problem: Repeated DB queries for popular data (product catalog, user profiles)
+are expensive and slow.
+
+Patterns:
+  a) Cache-Aside (Lazy Loading): app checks Redis → miss → query DB → write Redis
+  b) Read-Through:  cache fetches from DB on miss automatically
+  c) Write-Through: write to DB and Redis simultaneously
+  d) Write-Behind:  write to Redis, async flush to DB
+
+  # Cache-Aside example
+  key = "product:1234"
+  value = redis.get(key)
+  if not value:
+      value = db.query("SELECT * FROM products WHERE id=1234")
+      redis.setex(key, 3600, serialize(value))
+  return deserialize(value)
+
+Consideration: Cache invalidation is one of the hardest problems in CS.
+  - On write: DEL or update the cache key
+  - Or use short TTLs and accept eventual consistency
+
+
+3. RATE LIMITING
+─────────────────
+Problem: Prevent API abuse (brute-force, DDoS, fair-use enforcement).
+
+Approach A — Fixed Window Counter:
+  INCR "rate:user:42:2024-01-01T14:00"
+  EXPIRE "rate:user:42:2024-01-01T14:00" 60
+  # If count > 100, reject
+
+Approach B — Sliding Window with Sorted Set:
+  now = current_timestamp_ms
+  window = 60000  # 1 minute
+  key = "rate:user:42"
+
+  MULTI
+    ZREMRANGEBYSCORE key 0 (now - window)
+    ZADD key now now          # add current request (score = timestamp)
+    ZCARD key                 # count requests in window
+  EXEC
+  # If ZCARD result > 100, reject
+
+Approach C — Token Bucket (Lua script for atomicity):
+  local tokens = tonumber(redis.call('GET', KEYS[1])) or ARGV[2]
+  tokens = math.min(ARGV[2], tokens + ...) -- refill
+  if tokens >= 1 then
+      redis.call('SET', KEYS[1], tokens - 1, 'EX', ARGV[3])
+      return 1
+  else return 0 end
+
+Why Redis fits:
+  ✓ INCR is atomic (no race conditions)
+  ✓ EXPIRE sets automatic window reset
+  ✓ Lua scripts for complex atomic logic
+  ✓ Sorted Sets for sliding window
+
+
+4. LEADERBOARDS & RANKINGS
+────────────────────────────
+Problem: Games, apps need real-time rankings of millions of users by score.
+SQL ORDER BY on a table with 10M rows every request = disaster.
+
+Redis Solution: Sorted Set (ZSET)
+  - ZADD leaderboard <score> <player>  → O(log N)
+  - ZRANK leaderboard <player>          → O(log N) rank (0-based)
+  - ZREVRANK leaderboard <player>       → rank from top
+  - ZRANGE leaderboard 0 9 REV WITHSCORES → top 10 → O(log N + M)
+  - ZINCRBY leaderboard 100 "player1"  → add 100 pts atomically
+
+  Real-time top-10:
+  ZREVRANGE leaderboard 0 9 WITHSCORES
+  → 1) "playerX" "9500"
+     2) "playerY" "9200"
+     ...
+
+Why Redis fits:
+  ✓ O(log N) inserts and rank queries
+  ✓ Atomic score increments
+  ✓ No table scans
+  ✓ Range queries (top 100, page 2, etc.)
+
+
+5. MESSAGE QUEUES
+──────────────────
+Problem: Decouple producers from consumers. Handle async workloads (email,
+image processing, notifications).
+
+Approach A — Simple Queue using List:
+  Producer: LPUSH jobs:email "{\"to\":\"a@b.com\"}"
+  Consumer: BRPOP jobs:email 0   # blocking pop, 0 = wait forever
+
+  BRPOP is blocking and efficient — no polling!
+
+Approach B — Reliable Queue (RPOPLPUSH pattern):
+  BRPOPLPUSH jobs:email jobs:processing 0
+  # After processing: LREM jobs:processing 1 <msg>
+  # On crash: requeue from jobs:processing
+
+Approach C — Redis Streams (Kafka-like, preferred):
+  XADD stream:orders * orderId 42 total 99.99
+  XREADGROUP GROUP workers consumer1 COUNT 10 STREAMS stream:orders >
+  XACK stream:orders workers <id>    # acknowledge processed
+
+Why Redis fits:
+  ✓ Simple, no heavy broker to manage
+  ✓ Atomic operations (no double-processing with Streams + ACK)
+  ✓ Consumer groups (Streams)
+  ✓ Persistence optional
+
+Limitation:
+  ✗ No message routing (use Kafka/RabbitMQ for complex routing)
+  ✗ No guaranteed delivery across cluster without careful design
+
+
+6. PUB/SUB — REAL-TIME NOTIFICATIONS
+──────────────────────────────────────
+Problem: Push real-time events to many subscribers (chat, live feeds, dashboards).
+
+  # Subscriber
+  SUBSCRIBE news:tech
+
+  # Publisher
+  PUBLISH news:tech "Redis 8.0 released!"
+
+  Pattern subscriptions:
+  PSUBSCRIBE news:*    # subscribe to all news channels
+
+  Use cases:
+  - Live chat (messages published to channel per room)
+  - Real-time dashboard updates (metrics published per service)
+  - Push notifications (events published, WebSocket servers subscribed)
+  - Cache invalidation across microservices
+
+Limitations:
+  ✗ Fire-and-forget: if subscriber disconnects, messages are LOST
+  ✗ No persistence, no consumer groups
+  → Use Redis Streams for durable messaging
+
+
+7. DISTRIBUTED LOCKS
+─────────────────────
+Problem: Multiple app nodes must coordinate (only one should process an order,
+run a cron job, etc.).
+
+Simple Lock:
+  SET lock:order:42 "node-1" NX PX 30000
+  # NX = only if not exists, PX = expire in 30000ms
+  # Returns OK if acquired, nil if already locked
+  # Release: check value, then DEL (use Lua for atomicity)
+
+  -- Lua release script:
+  if redis.call('GET', KEYS[1]) == ARGV[1] then
+      return redis.call('DEL', KEYS[1])
+  else return 0 end
+
+Redlock (Multi-node distributed lock):
+  - Try to SET NX PX on N/2+1 nodes in sequence
+  - If majority acquired within validity time → lock held
+  - Release on all nodes regardless
+
+Why Redis fits:
+  ✓ SET NX PX is atomic
+  ✓ Automatic expiry prevents deadlock
+  ✓ Fast (microseconds)
+
+Caveats:
+  ✗ Redlock has theoretical issues under clock drift (Martin Kleppmann critique)
+  ✗ For critical financial locks, prefer ZooKeeper or etcd
+
+
+8. AUTOCOMPLETE / TYPEAHEAD
+────────────────────────────
+Problem: Suggest completions as user types.
+
+Approach using Sorted Set:
+  # Index all prefixes of "redis" with score 0
+  ZADD autocomplete 0 "r"
+  ZADD autocomplete 0 "re"
+  ZADD autocomplete 0 "red"
+  ZADD autocomplete 0 "redi"
+  ZADD autocomplete 0 "redis"
+  ZADD autocomplete 0 "redis*"  # terminator marker
+
+  # Query: get all keys starting with "red"
+  ZRANGEBYLEX autocomplete "[red" "[red\xff"
+
+  # Returns: "red", "redi", "redis", "redis*"
+
+More scalable: Use RediSearch module for full-text autocomplete.
+
+
+9. GEOSPATIAL QUERIES
+──────────────────────
+Problem: Find nearby stores, users, drivers within a radius.
+
+  # Add locations
+  GEOADD stores 13.361389 38.115556 "store:palermo"
+  GEOADD stores 15.087269 37.502669 "store:catania"
+
+  # Find stores within 200km of a point
+  GEOSEARCH stores FROMMEMBER "store:palermo" BYRADIUS 200 km ASC
+
+  # Distance between two
+  GEODIST stores store:palermo store:catania km
+
+Internally: Geospatial data is stored as a Sorted Set with scores being
+geohash-encoded 52-bit integers. This allows range queries via ZRANGE.
+
+
+10. ANALYTICS / UNIQUE COUNTS
+───────────────────────────────
+Problem: Count unique visitors per page without storing all user IDs.
+
+HyperLogLog — probabilistic cardinality estimation:
+  PFADD page:home user1 user2 user3 user4
+  PFCOUNT page:home     # approximate unique count (0.81% std error)
+  PFMERGE all:pages page:home page:about page:contact
+
+  Memory: always 12 KB per HLL key regardless of cardinality!
+  Use case: "10 million unique visitors today" → 12 KB, not 10M * UUID bytes
+
+
+11. COUNTING EVENTS AT SCALE (BITMAPS)
+────────────────────────────────────────
+Problem: Track which users logged in today (daily active users).
+
+  # User 42 logged in today
+  SETBIT dau:2024-01-15 42 1
+
+  # Did user 99 log in?
+  GETBIT dau:2024-01-15 99
+
+  # Count all DAU
+  BITCOUNT dau:2024-01-15
+
+  # Users active BOTH today AND yesterday
+  BITOP AND active:both dau:2024-01-15 dau:2024-01-14
+  BITCOUNT active:both
+
+  Memory: 1 bit per user. 10M users = 1.25 MB. Extremely efficient.
+
+
+12. JOB SCHEDULING / DELAYED QUEUES
+──────────────────────────────────────
+Problem: Schedule a task to run at a future time (send email in 1 hour).
+
+Using Sorted Set with Unix timestamp as score:
+  # Schedule task to run at time T
+  ZADD delayed:jobs <T> "{\"job\":\"sendEmail\",\"to\":\"x@y.com\"}"
+
+  # Worker polls for due jobs
+  now = current_unix_timestamp()
+  jobs = ZRANGEBYSCORE delayed:jobs 0 now LIMIT 0 10
+  # Process jobs, then ZREM
+
+
+13. FEATURE FLAGS
+──────────────────
+  HSET flags:user:42 dark_mode 1 beta_access 1
+  HGET flags:user:42 dark_mode
+
+  Or use a shared feature flag Hash:
+  HSET feature:dark_mode enabled 1 rollout_pct 50
+
+
+14. FULL-TEXT SEARCH (RediSearch)
+───────────────────────────────────
+  # Create index on product data
+  FT.CREATE idx:products ON HASH PREFIX 1 product: SCHEMA name TEXT SORTABLE price NUMERIC
+
+  # Search
+  FT.SEARCH idx:products "redis tutorial" FILTER price 10 50
+
+  # Aggregations
+  FT.AGGREGATE idx:products "*" GROUPBY 1 @category REDUCE SUM 1 @price AS total
+
+Summary of Use Cases (quick reference):
+  ┌──────────────────────────┬────────────────────────────────────────┐
+  │ Use Case                 │ Redis Pattern                          │
+  ├──────────────────────────┼────────────────────────────────────────┤
+  │ Session store            │ String/Hash + TTL                      │
+  │ DB cache                 │ String + TTL + cache-aside             │
+  │ Rate limiting            │ INCR+EXPIRE or ZSet sliding window     │
+  │ Leaderboard              │ Sorted Set (ZADD/ZRANK/ZRANGE)         │
+  │ Simple queue             │ List (LPUSH/BRPOP)                     │
+  │ Durable queue            │ Streams (XADD/XREADGROUP/XACK)         │
+  │ Pub/Sub events           │ PUBLISH/SUBSCRIBE                      │
+  │ Distributed lock         │ SET NX PX + Lua                        │
+  │ Autocomplete             │ Sorted Set ZRANGEBYLEX                 │
+  │ Geolocation              │ GEOADD/GEOSEARCH                       │
+  │ Unique counts            │ HyperLogLog (PFADD/PFCOUNT)            │
+  │ Active user bitmap       │ SETBIT/BITCOUNT/BITOP                  │
+  │ Delayed jobs             │ Sorted Set (score = future timestamp)  │
+  │ Feature flags            │ Hash (HSET/HGET)                       │
+  │ Full-text search         │ RediSearch module                      │
+  └──────────────────────────┴────────────────────────────────────────┘
+
+================================================================================

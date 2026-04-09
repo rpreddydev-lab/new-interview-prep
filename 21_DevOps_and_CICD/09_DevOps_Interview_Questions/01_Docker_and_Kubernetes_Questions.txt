@@ -1,0 +1,569 @@
+================================================================================
+DOCKER & KUBERNETES INTERVIEW QUESTIONS
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+Section A: Docker Internals & Fundamentals
+Section B: Kubernetes Architecture & Components
+Section C: Pod Scheduling & Resource Management
+Section D: Kubernetes Networking
+Section E: Kubernetes Storage
+Section F: Kubernetes Security
+Section G: Troubleshooting Scenarios
+
+================================================================================
+SECTION A: DOCKER INTERNALS & FUNDAMENTALS
+================================================================================
+
+Q1: How do Docker containers work at the OS level?
+
+A: Containers are NOT virtual machines — they are isolated processes using
+   Linux kernel features:
+   
+   Namespaces (isolation — each container sees its own):
+   - pid:    Container has its own process IDs (PID 1 = container init)
+   - net:    Separate network stack (interfaces, IP, iptables)
+   - mnt:    Separate filesystem mounts
+   - uts:    Separate hostname and domain name
+   - ipc:    Separate inter-process communication (shared memory, semaphores)
+   - user:   Separate user IDs (can map container root to host non-root)
+   
+   cgroups (resource limits):
+   - CPU:    Limit CPU shares or cores
+   - Memory: Limit RAM + swap
+   - Block I/O: Throttle disk read/write bandwidth
+   - Network: Limit bandwidth (with tc/netem)
+   
+   Union filesystem (image layers):
+   - OverlayFS (default): stacked layers, copy-on-write
+   - Base layers are read-only, shared between containers
+   - Container layer: writable, deleted when container stops
+   
+   Why this matters in interviews:
+   - Containers share the HOST kernel — no kernel isolation like VMs
+   - A kernel exploit affects ALL containers on that host
+   - Container "root" is the same as host root unless user namespaces are used
+
+---
+
+Q2: Explain Docker image layers and how they affect image size.
+
+A: Docker images are composed of read-only layers stacked using OverlayFS.
+   
+   How layers work:
+   Each Dockerfile instruction that adds/modifies files creates a new layer.
+   Layers are content-addressed (SHA256 hash of layer content).
+   Identical layers are shared between images — download once.
+   
+   Layer caching rules:
+   - Cache is invalidated from the FIRST changed instruction onward
+   - COPY instructions invalidate cache when file content changes
+   - RUN apt-get install cache invalidates if the RUN line changes
+   
+   Optimization example:
+   # BAD — dependencies reinstall on every code change:
+   COPY . /app
+   RUN pip install -r requirements.txt
+   
+   # GOOD — deps cached unless requirements.txt changes:
+   COPY requirements.txt /app/
+   RUN pip install -r requirements.txt
+   COPY . /app    # ← code changes here don't invalidate dep layer
+   
+   Multi-stage builds to reduce final image size:
+   FROM node:20 AS build
+   WORKDIR /app
+   COPY package*.json ./
+   RUN npm ci
+   COPY . .
+   RUN npm run build
+   
+   FROM nginx:alpine          # ← only 23MB base
+   COPY --from=build /app/dist /usr/share/nginx/html
+   # Result: ~30MB image instead of ~900MB with node installed
+
+================================================================================
+SECTION B: KUBERNETES ARCHITECTURE & COMPONENTS
+================================================================================
+
+Q3: Explain the Kubernetes control plane architecture.
+
+A: Control Plane (Master Node) Components:
+   
+   kube-apiserver:
+   - Single entry point for all cluster operations
+   - REST API + kubectl connects here
+   - Validates and processes requests, writes to etcd
+   - Stateless — can run multiple replicas for HA
+   
+   etcd:
+   - Distributed key-value store
+   - Single source of truth for all cluster state
+   - ALL cluster data lives here (pod specs, secrets, service definitions)
+   - Strongly consistent (Raft consensus algorithm)
+   - Requires odd number of nodes for quorum (3 or 5 for HA)
+   
+   kube-scheduler:
+   - Watches for unscheduled pods (no nodeName assigned)
+   - Selects best node based on: resource requests, affinity rules,
+     taints/tolerations, node selector, topology constraints
+   - Does NOT start the pod — writes nodeName to pod spec in etcd
+   
+   kube-controller-manager:
+   - Runs controller loops that reconcile desired vs actual state
+   - Deployment controller: ensures correct replica count
+   - Node controller: detects node failures, evicts pods
+   - Service Account controller: creates default SAs
+   - Endpoint controller: populates Service Endpoints
+   
+   Worker Node Components:
+   
+   kubelet:
+   - Agent running on every node
+   - Reads pod specs from API server
+   - Starts/stops containers via container runtime (containerd)
+   - Reports node/pod status back to API server
+   - Runs liveness/readiness probes
+   
+   kube-proxy:
+   - Runs on every node
+   - Maintains iptables (or ipvs) rules for Service → Pod routing
+   - When you call a Service ClusterIP, kube-proxy routes it to a pod
+   
+   Container runtime:
+   - containerd (default) or CRI-O
+   - Actually starts/stops containers using OCI spec
+
+---
+
+Q4: What happens when you run "kubectl apply -f deployment.yaml"?
+
+A: Full request lifecycle:
+   
+   1. kubectl reads YAML, sends POST/PUT to kube-apiserver REST endpoint
+   
+   2. kube-apiserver:
+      - Authenticates request (certificate, token, OIDC)
+      - Authorizes request (RBAC: can this user create Deployments in this namespace?)
+      - Validates schema (admission webhooks: Kyverno checks image policies)
+      - Writes Deployment object to etcd
+   
+   3. Deployment controller (in kube-controller-manager):
+      - Watches etcd, sees new Deployment
+      - Creates ReplicaSet to match spec.replicas
+   
+   4. ReplicaSet controller:
+      - Watches etcd, sees new ReplicaSet needs 3 pods
+      - Creates 3 Pod objects in etcd (status = Pending, no nodeName)
+   
+   5. kube-scheduler:
+      - Watches for Pending pods with no nodeName
+      - Scores all nodes for each pod
+      - Assigns nodeName to each pod in etcd
+   
+   6. kubelet (on assigned node):
+      - Watches for pods with its nodeName
+      - Calls container runtime (containerd) to pull image, create container
+      - Starts container, sets up volumes, env vars
+      - Reports pod status back to API server
+   
+   7. kube-proxy (on all nodes):
+      - Updates iptables rules for Service endpoints
+   
+   8. kubectl watch shows: Pending → ContainerCreating → Running
+
+================================================================================
+SECTION C: POD SCHEDULING & RESOURCE MANAGEMENT
+================================================================================
+
+Q5: Explain Kubernetes resource requests vs limits and what happens when exceeded.
+
+A: Resource Requests:
+   - Minimum guaranteed resources reserved for the container
+   - Used by scheduler to find a node with enough capacity
+   - Node's capacity = sum of all pod requests on that node
+   
+   Resource Limits:
+   - Maximum resources the container can use
+   - Enforced by cgroups at runtime
+   
+   What happens when exceeded:
+   
+   CPU exceeded:
+   - Container is THROTTLED (slowed down)
+   - CPU is compressible — container continues running, just slower
+   - No OOM kill for CPU over-use
+   
+   Memory exceeded:
+   - Container is OOMKilled (killed immediately)
+   - Memory is NOT compressible — system can't just "slow it down"
+   - Pod restarts (if RestartPolicy = Always, which is default)
+   
+   QoS Classes (affects eviction order during node pressure):
+   
+   Guaranteed: requests == limits for ALL containers
+   Best for: critical system services
+   
+   Burstable:  requests < limits for at least one container
+   Best for:   most workloads (can burst, but won't exhaust node)
+   
+   BestEffort: no requests or limits specified
+   Evicted FIRST when node is under pressure. Avoid for production.
+   
+   Best practice:
+   - Always set requests (accurate estimates based on load testing)
+   - Set limits to 2-3x requests (allow bursting)
+   - Never leave limits unset in production (noisy neighbor risk)
+
+---
+
+Q6: How do you control which nodes a pod is scheduled on?
+
+A: Four mechanisms:
+   
+   1. nodeSelector (simplest):
+      spec:
+        nodeSelector:
+          disk: ssd        # Only schedule on nodes with this label
+   
+   2. Node Affinity (more expressive):
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:  # Hard rule
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: topology.kubernetes.io/zone
+                  operator: In
+                  values: [us-east-1a, us-east-1b]
+            preferredDuringSchedulingIgnoredDuringExecution:  # Soft rule
+            - weight: 100
+              preference:
+                matchExpressions:
+                - key: instance-type
+                  operator: In
+                  values: [m5.2xlarge]
+   
+   3. Taints and Tolerations:
+      # Taint a node (repels pods that don't tolerate it):
+      kubectl taint nodes gpu-node-1 gpu=true:NoSchedule
+      
+      # Pod must tolerate the taint to be scheduled:
+      spec:
+        tolerations:
+        - key: "gpu"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+      
+      Use cases: Dedicate nodes for GPU workloads, spot instances, maintenance
+   
+   4. Pod Topology Spread Constraints:
+      # Spread pods evenly across zones (prevent all pods in same zone):
+      spec:
+        topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: myapp
+
+================================================================================
+SECTION D: KUBERNETES NETWORKING
+================================================================================
+
+Q7: Explain how Kubernetes networking works — from pod to pod across nodes.
+
+A: Kubernetes Networking Model requirements:
+   - Every pod has its own IP address
+   - Pods can communicate with any other pod without NAT
+   - Nodes can communicate with all pods without NAT
+   
+   CNI (Container Network Interface):
+   Plugin that implements the networking model.
+   Popular choices: Calico, Flannel, Cilium, Weave.
+   
+   Pod-to-Pod communication (same node):
+   - Both pods connect to a virtual Ethernet bridge (cbr0)
+   - Traffic goes directly through the bridge
+   - No performance overhead
+   
+   Pod-to-Pod communication (different nodes):
+   - Depends on CNI implementation:
+   
+   Flannel VXLAN:
+   - Encapsulates pod traffic in UDP packets (VXLAN overlay)
+   - Pod IP → VXLAN encapsulation → node IP → destination node
+   - Slightly higher overhead (encapsulation)
+   
+   Calico BGP:
+   - Uses BGP routing protocol (no encapsulation)
+   - Pod routes advertised to other nodes
+   - More efficient than overlay networks
+   - Works well in cloud VPCs that support BGP
+   
+   Cilium (eBPF-based):
+   - Uses eBPF kernel programs instead of iptables
+   - Most performant (no iptables traversal)
+   - Network policies with L7 (HTTP path, DNS)
+   - Growing adoption for large clusters
+   
+   Services and kube-proxy:
+   - Service ClusterIP is a virtual IP (not a real network interface)
+   - kube-proxy programs iptables DNAT rules
+   - Packet to ClusterIP:port → iptables → rewritten to pod IP:port
+   - Load balancing = random selection among healthy endpoints
+
+---
+
+Q8: What is a Kubernetes Network Policy and when do you need one?
+
+A: By default, Kubernetes has ZERO network segmentation.
+   Any pod can talk to any other pod in any namespace.
+   
+   NetworkPolicy objects define:
+   - Which pods can SEND traffic to the selected pods (ingress)
+   - Which pods the selected pods can CONNECT TO (egress)
+   
+   Example — Default deny all + allow only frontend → backend:
+   
+   # Step 1: Deny all ingress in namespace:
+   apiVersion: networking.k8s.io/v1
+   kind: NetworkPolicy
+   metadata:
+     name: default-deny-ingress
+     namespace: production
+   spec:
+     podSelector: {}   # Matches ALL pods
+     policyTypes: [Ingress]
+   
+   # Step 2: Allow frontend pods to reach backend pods:
+   apiVersion: networking.k8s.io/v1
+   kind: NetworkPolicy
+   metadata:
+     name: allow-frontend-to-backend
+     namespace: production
+   spec:
+     podSelector:
+       matchLabels:
+         app: backend
+     policyTypes: [Ingress]
+     ingress:
+     - from:
+       - podSelector:
+           matchLabels:
+             app: frontend
+       ports:
+       - port: 8080
+         protocol: TCP
+   
+   Requires a CNI that enforces NetworkPolicy (Calico, Cilium, Weave).
+   Flannel alone does NOT enforce NetworkPolicy — you need Calico or Cilium with it.
+
+================================================================================
+SECTION E: KUBERNETES STORAGE
+================================================================================
+
+Q9: Explain PersistentVolumes, PersistentVolumeClaims, and StorageClasses.
+
+A: The storage abstraction layer:
+   
+   PersistentVolume (PV):
+   - Cluster-level resource representing actual storage
+   - Created by admin (static) or dynamically by StorageClass
+   - Lifecycle independent of pods
+   
+   PersistentVolumeClaim (PVC):
+   - Namespace-level resource — pod's request for storage
+   - Specifies: size, access mode, storageClassName
+   - K8s binds PVC to a matching PV
+   
+   StorageClass:
+   - Template for dynamic PV provisioning
+   - Different classes for different performance tiers
+   
+   Access Modes:
+   ReadWriteOnce (RWO):   Mounted by one node at a time (most disks)
+   ReadOnlyMany (ROX):    Mounted read-only by many nodes
+   ReadWriteMany (RWX):   Mounted read-write by many nodes (NFS, EFS)
+   
+   Example:
+   # StorageClass (gp3 on EKS):
+   apiVersion: storage.k8s.io/v1
+   kind: StorageClass
+   metadata:
+     name: gp3
+   provisioner: ebs.csi.aws.com
+   parameters:
+     type: gp3
+     iops: "3000"
+   reclaimPolicy: Delete
+   volumeBindingMode: WaitForFirstConsumer
+   
+   # PVC — pod requests storage:
+   apiVersion: v1
+   kind: PersistentVolumeClaim
+   metadata:
+     name: myapp-data
+   spec:
+     accessModes: [ReadWriteOnce]
+     storageClassName: gp3
+     resources:
+       requests:
+         storage: 20Gi
+
+================================================================================
+SECTION F: KUBERNETES SECURITY
+================================================================================
+
+Q10: How does Kubernetes RBAC work?
+
+A: Four RBAC objects:
+   
+   Role / ClusterRole:
+   - Defines a set of allowed API operations (rules)
+   - Role: namespace-scoped
+   - ClusterRole: cluster-scoped (or for non-namespaced resources)
+   
+   RoleBinding / ClusterRoleBinding:
+   - Grants a Role to a Subject (user, group, ServiceAccount)
+   
+   # Role: allow reading pods in production:
+   apiVersion: rbac.authorization.k8s.io/v1
+   kind: Role
+   metadata:
+     name: pod-reader
+     namespace: production
+   rules:
+   - apiGroups: [""]
+     resources: ["pods", "pods/log"]
+     verbs: ["get", "list", "watch"]
+   
+   # RoleBinding: grant to the monitoring-sa ServiceAccount:
+   apiVersion: rbac.authorization.k8s.io/v1
+   kind: RoleBinding
+   metadata:
+     name: pod-reader-binding
+     namespace: production
+   subjects:
+   - kind: ServiceAccount
+     name: monitoring-sa
+     namespace: monitoring
+   roleRef:
+     kind: Role
+     name: pod-reader
+     apiGroup: rbac.authorization.k8s.io
+   
+   # Test: can service account do this?
+   kubectl auth can-i list pods \
+     --as=system:serviceaccount:monitoring:monitoring-sa \
+     -n production
+   
+   Principle of Least Privilege:
+   - No ClusterAdmin for application workloads
+   - Each service gets its own ServiceAccount
+   - Bind only the verbs/resources actually needed
+
+================================================================================
+SECTION G: TROUBLESHOOTING SCENARIOS
+================================================================================
+
+Q11: A pod is stuck in CrashLoopBackOff. How do you debug it?
+
+A: Systematic approach:
+   
+   1. Get pod status:
+      kubectl describe pod myapp-xxx -n production
+      Look for: Events section, Last State, Restart count, Exit code
+   
+   2. Read container logs:
+      kubectl logs myapp-xxx -n production
+      kubectl logs myapp-xxx -n production --previous   # ← crashed container logs
+   
+   3. Common exit codes:
+      Exit 0:    Clean exit (app bug — process exited intentionally)
+      Exit 1:    Generic error (check logs for exception)
+      Exit 137:  OOMKilled (memory limit exceeded — increase limits)
+      Exit 139:  Segfault (memory corruption bug in app)
+      Exit 143:  SIGTERM not handled (graceful shutdown issue)
+   
+   4. OOMKilled investigation:
+      kubectl describe pod myapp-xxx | grep -A5 "OOMKilled"
+      # Increase memory limit or find memory leak
+      # Check Grafana: memory usage graph over time
+   
+   5. App startup failure:
+      - Missing environment variable → add to deployment env section
+      - Can't connect to DB → check network policy, secret values
+      - File not found → check ConfigMap/volume mount paths
+   
+   6. Temporary debugging:
+      # If you need to exec in (before crash):
+      kubectl exec -it myapp-xxx -n production -- /bin/sh
+      # If distroless (no shell):
+      kubectl debug -it myapp-xxx --image=busybox --target=app
+
+---
+
+Q12: Pods are Pending. What do you check?
+
+A: Pending means scheduler can't find a node.
+   
+   kubectl describe pod myapp-xxx
+   # Look at Events section for reason
+   
+   Common reasons and fixes:
+   
+   "Insufficient cpu/memory":
+   - Not enough resources on any node
+   - Fix: scale node group up, or reduce resource requests
+   - Check: kubectl describe nodes | grep -A5 "Allocated resources"
+   
+   "0/3 nodes are available: 3 node(s) didn't match node affinity":
+   - nodeSelector or affinity rules don't match any node labels
+   - Fix: check node labels, fix affinity spec
+   - Check: kubectl get nodes --show-labels
+   
+   "0/3 nodes are available: 3 node(s) had taint {dedicated:gpu}, pod didn't tolerate":
+   - Node has a taint the pod doesn't tolerate
+   - Fix: add toleration to pod spec, or use different nodes
+   
+   "PVC is not bound":
+   - Pod waiting for PVC to bind to a PV
+   - Fix: check storageclass, PV availability, CSI driver running
+   - kubectl describe pvc myapp-data
+
+================================================================================
+QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+DOCKER DEBUGGING:
+  docker inspect <container>          Full config, network, mounts
+  docker exec -it <container> sh      Shell in running container
+  docker logs <container> --tail=100  Last 100 log lines
+  docker history <image>              Layer sizes
+
+KUBECTL ESSENTIALS:
+  kubectl get pods -n <ns> -o wide         With node assignment
+  kubectl describe pod <pod> -n <ns>       Events and config
+  kubectl logs <pod> --previous            Previous crash logs
+  kubectl exec -it <pod> -- /bin/sh        Shell in pod
+  kubectl top pods -n <ns>                 CPU/memory usage
+  kubectl rollout status deploy/<name>     Deployment progress
+  kubectl get events --sort-by=.lastTimestamp -n <ns>
+
+POD STATUS TROUBLESHOOTING:
+  CrashLoopBackOff:  Check --previous logs, exit code, OOMKilled
+  Pending:           Check node affinity, taints, resource requests, PVC
+  ImagePullBackOff:  Check image name, tag, registry credentials
+  Terminating:       Check finalizers (kubectl get pod -o yaml | grep finalizer)
+  OOMKilled:         Increase memory limit or fix memory leak
+
+RBAC CHECK:
+  kubectl auth can-i <verb> <resource> --as=<user> -n <namespace>
+
+================================================================================
+END OF FILE
+================================================================================

@@ -1,0 +1,800 @@
+================================================================================
+ELK STACK — ELASTICSEARCH, LOGSTASH, KIBANA (AND LOKI)
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. ELK Stack Overview
+2. Elasticsearch
+3. Logstash
+4. Beats (Lightweight Shippers)
+5. Kibana
+6. ELK Architecture Patterns
+7. Loki — Log Aggregation for Kubernetes
+8. Structured Logging Best Practices
+9. Log Rotation and Retention
+10. Common Interview Questions & Answers
+11. Quick Reference Cheat Sheet
+
+================================================================================
+1. ELK STACK OVERVIEW
+================================================================================
+
+The ELK Stack:
+  E — Elasticsearch   Distributed search and analytics engine (storage)
+  L — Logstash        Log ingestion, transformation, enrichment pipeline
+  K — Kibana          Visualization and exploration UI
+  
+  Modern name: Elastic Stack (added Beats, APM, etc.)
+
+Typical Data Flow:
+  
+  Application / System
+       │
+       │ logs (stdout, files, syslog)
+       ▼
+  ┌──────────────────────────────────┐
+  │    Beats (lightweight shippers)  │
+  │    Filebeat, Metricbeat, etc.    │
+  └──────────┬───────────────────────┘
+             │
+             ▼ (directly OR via)
+  ┌──────────────────────────────────┐
+  │    Logstash (processing)         │
+  │    Filter, parse, enrich         │
+  └──────────┬───────────────────────┘
+             │
+             ▼
+  ┌──────────────────────────────────┐
+  │    Elasticsearch                 │
+  │    Index + Store + Search        │
+  └──────────┬───────────────────────┘
+             │
+             ▼
+  ┌──────────────────────────────────┐
+  │    Kibana                        │
+  │    Search, Dashboard, Alerts     │
+  └──────────────────────────────────┘
+
+When to use ELK:
+  - Full-text search across logs
+  - Complex log parsing and enrichment
+  - Security/SIEM use cases
+  - Large-scale log analytics
+  - Non-Kubernetes or heterogeneous environments
+
+When Loki is better:
+  - Kubernetes-native environment
+  - Cost-sensitive (Loki is much cheaper — indexes only labels, not full text)
+  - Already using Grafana for metrics
+  - Simple log viewing without complex search
+
+================================================================================
+2. ELASTICSEARCH
+================================================================================
+
+What is Elasticsearch?
+  Distributed, RESTful search and analytics engine.
+  Built on Apache Lucene. JSON documents stored in INDICES.
+  
+  Use cases: Log storage, full-text search, time-series data, APM.
+
+Core Concepts:
+  
+  Cluster:     Group of nodes working together.
+  Node:        Single Elasticsearch instance.
+  Index:       Collection of documents (like a database table).
+               Log indices typically named: logs-app-2024.01.15
+  Document:    Single JSON object stored in an index.
+  Shard:       Subdivision of an index (for parallelism and scalability).
+               Primary shards: set at index creation, cannot change.
+               Replica shards: copies of primary (redundancy + read performance).
+  
+  Shard sizing rule of thumb:
+  Target shard size: 20-40 GB
+  Nodes in cluster should have few, large shards (not many small shards).
+
+Index Templates:
+  Define settings and mappings for new indices automatically.
+  
+  # Create index template:
+  PUT _index_template/logs-template
+  {
+    "index_patterns": ["logs-*-*"],
+    "template": {
+      "settings": {
+        "number_of_shards": 1,
+        "number_of_replicas": 1,
+        "index.lifecycle.name": "logs-ilm-policy",
+        "index.lifecycle.rollover_alias": "logs"
+      },
+      "mappings": {
+        "properties": {
+          "@timestamp": { "type": "date" },
+          "level": { "type": "keyword" },
+          "service": { "type": "keyword" },
+          "message": { "type": "text" },
+          "trace_id": { "type": "keyword" },
+          "user_id": { "type": "keyword" },
+          "response_time_ms": { "type": "float" }
+        }
+      }
+    }
+  }
+
+Index Lifecycle Management (ILM):
+  Automate index aging: hot → warm → cold → delete.
+  
+  PUT _ilm/policy/logs-ilm-policy
+  {
+    "policy": {
+      "phases": {
+        "hot": {
+          "actions": {
+            "rollover": {
+              "max_age": "1d",
+              "max_size": "50GB"
+            }
+          }
+        },
+        "warm": {
+          "min_age": "7d",
+          "actions": {
+            "shrink": { "number_of_shards": 1 },
+            "forcemerge": { "max_num_segments": 1 },
+            "allocate": { "number_of_replicas": 0 }
+          }
+        },
+        "cold": {
+          "min_age": "30d",
+          "actions": {
+            "searchable_snapshot": {
+              "snapshot_repository": "s3-backup"
+            }
+          }
+        },
+        "delete": {
+          "min_age": "90d",
+          "actions": {
+            "delete": {}
+          }
+        }
+      }
+    }
+  }
+
+Elasticsearch Query DSL:
+  
+  # Full-text search:
+  GET /logs-*/_search
+  {
+    "query": {
+      "bool": {
+        "must": [
+          { "match": { "message": "payment failed" } }
+        ],
+        "filter": [
+          { "term": { "service": "payment-service" } },
+          { "term": { "level": "ERROR" } },
+          {
+            "range": {
+              "@timestamp": {
+                "gte": "now-1h",
+                "lt": "now"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "sort": [{ "@timestamp": { "order": "desc" } }],
+    "size": 100
+  }
+  
+  # Aggregation (count errors by service):
+  GET /logs-*/_search
+  {
+    "size": 0,
+    "aggs": {
+      "by_service": {
+        "terms": { "field": "service" },
+        "aggs": {
+          "error_count": {
+            "filter": { "term": { "level": "ERROR" } }
+          }
+        }
+      }
+    }
+  }
+
+================================================================================
+3. LOGSTASH
+================================================================================
+
+What is Logstash?
+  Server-side data processing pipeline.
+  Ingests data from multiple sources, transforms it, sends to destinations.
+  
+  Pipeline: INPUT → FILTER → OUTPUT
+
+Example Logstash Configuration:
+  
+  # /etc/logstash/conf.d/app-logs.conf:
+  
+  input {
+    beats {
+      port => 5044               # Receive from Filebeat
+    }
+    
+    kafka {
+      bootstrap_servers => "kafka:9092"
+      topics => ["app-logs"]
+      group_id => "logstash-consumer"
+      codec => json
+    }
+  }
+  
+  filter {
+    # Parse JSON logs:
+    json {
+      source => "message"
+      target => "parsed"
+    }
+    
+    # Grok (regex parsing for unstructured logs):
+    grok {
+      match => {
+        "message" => "%{TIMESTAMP_ISO8601:timestamp} %{LOGLEVEL:level} %{GREEDYDATA:log_message}"
+      }
+    }
+    
+    # Mutate (modify fields):
+    mutate {
+      rename => { "[parsed][trace_id]" => "trace_id" }
+      rename => { "[parsed][service]" => "service" }
+      remove_field => ["message", "parsed"]
+    }
+    
+    # Add GeoIP from IP address:
+    geoip {
+      source => "client_ip"
+      target => "geoip"
+    }
+    
+    # Add tags based on conditions:
+    if [level] == "ERROR" {
+      mutate {
+        add_tag => ["error", "alert"]
+      }
+    }
+    
+    # Date parsing:
+    date {
+      match => ["timestamp", "ISO8601"]
+      target => "@timestamp"
+      remove_field => ["timestamp"]
+    }
+  }
+  
+  output {
+    elasticsearch {
+      hosts => ["https://elasticsearch:9200"]
+      index => "logs-%{service}-%{+YYYY.MM.dd}"
+      user => "logstash_writer"
+      password => "${LOGSTASH_ES_PASSWORD}"
+      ssl_certificate_verification => true
+    }
+    
+    # Also send errors to Slack (example):
+    if "error" in [tags] {
+      http {
+        url => "https://hooks.slack.com/services/..."
+        http_method => "post"
+        format => "json"
+        mapping => {
+          "text" => "ERROR in %{service}: %{message}"
+        }
+      }
+    }
+  }
+
+Logstash Performance:
+  - Multiple pipelines for separation of concerns
+  - PersistentQueue: buffer data during Elasticsearch downtime
+  - Increase workers for CPU-intensive filters (-w flag)
+
+================================================================================
+4. BEATS (LIGHTWEIGHT SHIPPERS)
+================================================================================
+
+Beats are lightweight agents installed on servers/containers.
+  Send data to Logstash or Elasticsearch directly.
+
+Common Beats:
+  Filebeat       Reads log files, forwards to Logstash/Elasticsearch
+  Metricbeat     Collects system/service metrics (CPU, Docker, MySQL, etc.)
+  Packetbeat     Network packet analyzer
+  Auditbeat      Linux audit framework — file changes, syscalls
+  Heartbeat      Uptime monitoring (HTTP/TCP/ICMP pings)
+  Winlogbeat     Windows event logs
+
+Filebeat Configuration:
+  
+  # /etc/filebeat/filebeat.yaml:
+  filebeat.inputs:
+  - type: container
+    paths:
+    - /var/log/containers/*.log
+    
+    # Kubernetes metadata:
+    processors:
+    - add_kubernetes_metadata:
+        host: ${NODE_NAME}
+        matchers:
+        - logs_path:
+            logs_path: "/var/log/containers/"
+  
+  output.logstash:
+    hosts: ["logstash:5044"]
+  
+  # OR direct to Elasticsearch:
+  # output.elasticsearch:
+  #   hosts: ["https://elasticsearch:9200"]
+  #   index: "filebeat-%{+yyyy.MM.dd}"
+
+Filebeat as DaemonSet (Kubernetes):
+  # Deploy Filebeat to collect logs from all nodes:
+  # Official Helm chart:
+  helm repo add elastic https://helm.elastic.co
+  helm install filebeat elastic/filebeat \
+    --namespace logging \
+    --set daemonset.extraEnvs[0].name=ELASTICSEARCH_HOST \
+    --set daemonset.extraEnvs[0].value=elasticsearch-master
+
+================================================================================
+5. KIBANA
+================================================================================
+
+Kibana Features:
+  Discover:          Search and filter logs in real-time
+  Visualize:         Create charts, histograms, pie charts from data
+  Dashboard:         Combine visualizations
+  Canvas:            Pixel-perfect reports
+  Maps:              Geospatial visualization
+  Lens:              Drag-and-drop analytics
+  Alerts:            Set up alerts on queries
+  APM:               Application Performance Monitoring
+  SIEM:              Security analytics and threat detection
+  Dev Tools:         Query Elasticsearch directly (Kibana Console)
+
+Kibana Query Language (KQL):
+  # Simple field search:
+  level: ERROR
+  
+  # Wildcard:
+  message: "payment*"
+  
+  # Multiple conditions (AND):
+  level: ERROR AND service: "payment-service"
+  
+  # Multiple conditions (OR):
+  level: ERROR OR level: WARN
+  
+  # Range:
+  response_time_ms >= 500
+  
+  # Negation:
+  NOT level: DEBUG
+  
+  # Phrase search:
+  message: "connection refused"
+
+================================================================================
+6. ELK ARCHITECTURE PATTERNS
+================================================================================
+
+Production Architecture:
+  
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                    Production Cluster                            │
+  │                                                                   │
+  │  ┌──────────────────────────────────────────────────────────┐   │
+  │  │  Kafka (message buffer)                                   │   │
+  │  │  Decouples log producers from Elasticsearch              │   │
+  │  │  Handles bursts, prevents Elasticsearch overload         │   │
+  │  └──────────────────────────────────────────────────────────┘   │
+  │       ▲                              │                            │
+  │       │ push                         │ consume                   │
+  │  ┌────┴────────────────┐    ┌────────▼──────────────────────┐   │
+  │  │  Filebeat/Fluentbit │    │  Logstash Consumers           │   │
+  │  │  (DaemonSet K8s)    │    │  Parse, enrich, route         │   │
+  │  └────────────────────┘    └────────────┬──────────────────┘   │
+  │                                          │                        │
+  │                             ┌────────────▼──────────────────┐   │
+  │                             │  Elasticsearch Cluster         │   │
+  │                             │  3+ Master nodes               │   │
+  │                             │  6+ Data nodes (hot/warm/cold) │   │
+  │                             └────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────────────────┘
+
+Hot-Warm-Cold Architecture:
+  Hot nodes:   High CPU, SSD storage — recent data, frequent queries
+  Warm nodes:  Medium CPU, large HDDs — 7-30 day data
+  Cold nodes:  Low CPU, S3-backed — 30-90 days, infrequent queries
+  
+  Automated by ILM (Index Lifecycle Management).
+
+Scaling Elasticsearch:
+  Horizontal scaling: Add more data nodes.
+  Read scaling: Add replica shards (each replica can serve queries).
+  Ingest scaling: Add ingest nodes or scale Logstash.
+
+Security:
+  X-Pack Security (now free in basic license):
+  - TLS for inter-node communication and client connections
+  - Authentication (built-in, LDAP, SAML, OIDC)
+  - RBAC (index-level, field-level, document-level permissions)
+  - Audit logging
+
+================================================================================
+7. LOKI — LOG AGGREGATION FOR KUBERNETES
+================================================================================
+
+What is Loki?
+  "Prometheus, but for logs" — from Grafana Labs.
+  Horizontally scalable log aggregation.
+  
+  Key difference from Elasticsearch:
+  - Only indexes LABELS (not full log content)
+  - Much cheaper storage (logs stored as compressed chunks)
+  - Query via LogQL (similar to PromQL)
+  - Designed for Grafana (unified metrics + logs)
+
+Architecture:
+  
+  Application Pods → Promtail (DaemonSet) → Loki → Grafana
+  
+  Promtail:  Agent that ships logs from K8s pods to Loki.
+             Adds Kubernetes labels (pod, namespace, container, node).
+  Loki:      Stores and indexes log streams.
+  Grafana:   Query and visualize (Explore view with LogQL).
+
+Loki Stack Installation (K8s):
+  helm repo add grafana https://grafana.github.io/helm-charts
+  helm install loki grafana/loki-stack \
+    --namespace monitoring \
+    --set grafana.enabled=true \
+    --set promtail.enabled=true
+
+LogQL — Loki Query Language:
+  
+  # Log stream selector (required):
+  {namespace="my-app", pod=~"payment-.*"}
+  
+  # Filter by content:
+  {namespace="my-app"} |= "ERROR"          # Contains "ERROR"
+  {namespace="my-app"} != "DEBUG"          # Does not contain
+  {namespace="my-app"} |~ "payment.*fail"  # Regex match
+  
+  # Parse JSON logs and filter by field:
+  {namespace="my-app"}
+  | json
+  | level = "ERROR"
+  | service = "payment-service"
+  
+  # Metric queries (count lines per minute):
+  sum(rate({namespace="my-app"} |= "ERROR" [5m])) by (pod)
+  
+  # Count errors by service:
+  sum by (service) (
+    rate({namespace="my-app"}
+    | json
+    | level="ERROR"
+    [5m])
+  )
+  
+  # P99 latency from JSON logs:
+  quantile_over_time(0.99,
+    {namespace="my-app"}
+    | json
+    | unwrap response_time_ms [5m]
+  ) by (service)
+
+Loki vs Elasticsearch:
+  
+  ┌────────────────────┬──────────────────────┬─────────────────────────┐
+  │ Feature            │ Elasticsearch         │ Loki                    │
+  ├────────────────────┼──────────────────────┼─────────────────────────┤
+  │ Full-text search   │ ✅ Excellent          │ ❌ No (grep-style only) │
+  │ Storage cost       │ ❌ High               │ ✅ Low (label-indexed)  │
+  │ Query speed        │ ✅ Fast for any field │ ⚠️  Slower without index│
+  │ K8s integration    │ ⚠️  More setup        │ ✅ Native (Promtail)    │
+  │ Grafana integration│ ⚠️  Possible          │ ✅ Native               │
+  │ SIEM use cases     │ ✅ Excellent          │ ❌ Not designed for it  │
+  │ Scaling            │ ⚠️  Complex           │ ✅ Simpler              │
+  └────────────────────┴──────────────────────┴─────────────────────────┘
+
+================================================================================
+8. STRUCTURED LOGGING BEST PRACTICES
+================================================================================
+
+Why Structured Logging?
+  Unstructured: "2024-01-15 10:23:45 ERROR payment failed for user 456 after 3 retries"
+  → Hard to search, hard to parse, can't query specific fields
+  
+  Structured (JSON): 
+  {
+    "timestamp": "2024-01-15T10:23:45Z",
+    "level": "ERROR",
+    "service": "payment-service",
+    "trace_id": "abc123-def456",
+    "span_id": "gh789",
+    "user_id": "user_456",
+    "message": "Payment processing failed",
+    "error": "Card declined",
+    "retry_count": 3,
+    "duration_ms": 234
+  }
+  
+  Benefits:
+  - Machine-parseable (ELK, Loki can extract fields)
+  - Consistent across services
+  - trace_id enables cross-service correlation
+  - Duration as number → aggregatable in Kibana/Grafana
+
+Key Fields to Always Include:
+  timestamp      ISO 8601 (UTC) — required for time-based search
+  level          ERROR, WARN, INFO, DEBUG — standardize across services
+  service        Service/application name
+  trace_id       Distributed trace identifier
+  request_id     Per-request unique identifier
+  message        Human-readable description of the event
+  error          Error message or exception details (only on errors)
+
+What NOT to log:
+  ❌ Passwords, API keys, tokens (even in DEBUG level)
+  ❌ Full credit card numbers, SSNs, PII (GDPR, PCI-DSS)
+  ❌ Extremely verbose debug data in production (cost + noise)
+  
+  Mask sensitive data: "card_last4": "1234" (not full card)
+
+Log Levels Usage:
+  TRACE/DEBUG   Detailed flow, variable values — production should filter these out
+  INFO          Normal operations, key business events (user logged in, order placed)
+  WARN          Unexpected but recoverable (retry succeeded, deprecated API called)
+  ERROR         Unrecoverable failure, action required
+  FATAL/CRITICAL Application cannot continue, requires immediate attention
+
+================================================================================
+9. LOG ROTATION AND RETENTION
+================================================================================
+
+Container/K8s Log Rotation:
+  Kubernetes automatically rotates container logs.
+  Default: 10MB per file, 5 files per container.
+  
+  Configure in kubelet:
+  --container-log-max-size=10Mi
+  --container-log-max-files=5
+
+Logrotate (Linux):
+  # /etc/logrotate.d/my-app:
+  /var/log/my-app/*.log {
+    daily                    # Rotate daily
+    rotate 7                 # Keep 7 rotated files
+    compress                 # Compress rotated files
+    delaycompress            # Don't compress most recent rotation
+    missingok                # Don't error if log missing
+    notifempty               # Don't rotate empty files
+    postrotate               # Run after rotation:
+      systemctl reload my-app
+    endscript
+  }
+
+Elasticsearch Retention:
+  Use ILM (Index Lifecycle Management) — see section 2.
+  
+  Typical retention by environment:
+  Production:   90 days (compliance requirements often 1-7 years)
+  Staging:      30 days
+  Development:  7 days
+  
+  Cold storage (S3 snapshots) for compliance beyond hot/warm retention.
+
+Loki Retention:
+  # loki-config.yaml:
+  limits_config:
+    retention_period: 744h    # 31 days
+
+================================================================================
+10. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: Explain the ELK stack and how each component works.
+A: The ELK stack is a log aggregation and analysis platform:
+   
+   Elasticsearch: The storage and search layer.
+   Distributed search engine built on Apache Lucene.
+   Stores logs as JSON documents in time-based indices.
+   Full-text search with Kibana Query Language (KQL).
+   Handles petabytes of log data across a distributed cluster.
+   
+   Logstash: The processing pipeline.
+   Ingests logs from multiple sources (files, Kafka, Beats, syslog).
+   Parses unstructured text with Grok patterns (regex templates).
+   Enriches logs (add GeoIP, parse fields, add tags).
+   Routes to one or multiple outputs (Elasticsearch, S3, Kafka).
+   
+   Kibana: The visualization layer.
+   Web UI for searching, visualizing, and alerting on log data.
+   Discover view for raw log browsing.
+   Visualize + Dashboard for analytics.
+   
+   Modern patterns:
+   - Logstash replaced by Fluent Bit or Filebeat for K8s (lighter weight)
+   - Kafka added between Beats and Logstash (buffer for traffic spikes)
+   - "EFK" (Elasticsearch, Fluentd, Kibana) common K8s pattern
+
+Q2: How does Loki differ from Elasticsearch and when would you choose each?
+A: Core architectural difference:
+   
+   Elasticsearch: Full-text indexes EVERY field in every log message.
+   Fast to search any field → expensive to store (large index size).
+   
+   Loki: Only indexes LABELS (metadata like namespace, pod, service).
+   Log content stored as compressed chunks (not indexed).
+   Much cheaper storage (10-50x less than Elasticsearch).
+   Search requires grep through logs (slower for arbitrary field searches).
+   
+   Choose Elasticsearch when:
+   - You need fast full-text search across all log fields
+   - SIEM/security use case (correlation, threat hunting)
+   - Complex analytics with Kibana
+   - Non-Kubernetes, heterogeneous environment (VMs, multiple clouds)
+   - Compliance requirements (Elasticsearch has mature audit + access control)
+   
+   Choose Loki when:
+   - Kubernetes-native environment (Promtail auto-discovers pods)
+   - Already using Grafana for metrics (unified observability)
+   - Cost is a concern (logs are expensive at scale)
+   - Your queries are primarily label-based (by service, namespace, level)
+   - Simpler operational overhead (Loki is lighter than an ES cluster)
+   
+   Real-world: Many teams use both. Loki for day-to-day K8s log viewing.
+   Elasticsearch for security events, compliance, complex analytics.
+
+Q3: How would you set up centralized logging for a Kubernetes cluster?
+A: Two common approaches:
+   
+   Option A: Loki Stack (simpler, Grafana-native):
+   1. Install loki-stack Helm chart (includes Loki + Promtail):
+      helm install loki grafana/loki-stack -n monitoring
+   
+   2. Promtail DaemonSet automatically:
+      - Tails /var/log/containers/*.log on each node
+      - Adds Kubernetes labels (pod, namespace, container, node)
+      - Sends to Loki
+   
+   3. Add Loki as Grafana data source:
+      URL: http://loki:3100
+   
+   4. Query with LogQL in Grafana Explore:
+      {namespace="my-app"} | json | level="ERROR"
+   
+   Option B: EFK Stack (richer search):
+   1. Deploy Elasticsearch cluster (ECK Operator or Helm)
+   2. Deploy Kibana (connected to Elasticsearch)
+   3. Deploy Filebeat DaemonSet:
+      helm install filebeat elastic/filebeat -n logging
+      Filebeat reads container logs, adds K8s metadata, ships to Elasticsearch
+   4. Create index patterns and dashboards in Kibana
+   
+   Both approaches:
+   - Ensure structured (JSON) logging in applications
+   - Add trace_id to correlate with distributed traces
+   - Define retention policy (ILM for ES, retention_period for Loki)
+   - Set up alerts on error rate from logs
+
+Q4: What is the difference between metrics and logs and when do you use each?
+A: Metrics and logs serve complementary purposes:
+   
+   Metrics: Aggregated numerical data over time.
+   - "There were 450 errors in the last 5 minutes across the payment service"
+   - Efficient storage (one number per time interval)
+   - Fast to query and alert on
+   - Cannot tell you WHICH requests failed or WHY
+   
+   Logs: Individual events with full context.
+   - "User 456's payment failed at 10:23:45 due to card declined, trace_id: abc123"
+   - High storage cost at scale
+   - Can answer arbitrary questions
+   - Necessary for debugging specific incidents
+   
+   Workflow:
+   1. Alert fires on metric (error rate > 1%)
+   2. Go to Grafana dashboard (metrics) to understand scale and pattern
+   3. Switch to logs (Explore view) to find specific error messages
+   4. Use trace_id from logs to open trace (distributed trace view)
+   
+   Rule of thumb:
+   - Use metrics for ALERTING and DASHBOARDS (continuous monitoring)
+   - Use logs for DEBUGGING and ROOT CAUSE ANALYSIS (post-incident)
+   - Use traces for understanding WHICH service is slow in microservices
+
+Q5: How do you handle log volume at scale? What are strategies to reduce costs?
+A: Log volume is expensive — at scale, logs can be 10-100x the cost of metrics.
+   
+   Strategies:
+   
+   1. Log level filtering at collection point:
+      Don't ship DEBUG/TRACE logs in production.
+      Configure Fluentbit/Filebeat to drop debug logs before shipping.
+      Result: 50-80% volume reduction with no loss of useful data.
+   
+   2. Structured + sampling for high-volume events:
+      Log every 10th successful request (sample 10%).
+      Log 100% of errors, warnings.
+      
+   3. Aggregation in the pipeline:
+      Count similar log lines instead of storing each one.
+      "Connection pool exhausted" occurred 1000 times → log once per minute with count.
+   
+   4. Retention policies (ILM/Loki retention):
+      Hot (0-7 days): Fast SSD, all logs
+      Warm (7-30 days): Slower storage, less replicas
+      Cold (30-90 days): Object storage (S3), compressed, searchable
+      Delete after 90 days (or archive to S3 Glacier for compliance)
+   
+   5. Choose right storage:
+      Loki: 10-50x cheaper than Elasticsearch for same log volume
+      S3 + Athena: For compliance archival (very cheap, slow to query)
+   
+   6. Alert on log volume spikes:
+      Log volume spike often means something is wrong (error flood).
+      Alert before costs explode.
+
+================================================================================
+11. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+ELK COMPONENTS:
+  Elasticsearch   Distributed search engine (storage + search)
+  Logstash        Ingest pipeline (parse, transform, route)
+  Kibana          Visualization (dashboards, discover, alerts)
+  Filebeat        Lightweight log shipper (DaemonSet in K8s)
+
+LOKI COMPONENTS:
+  Loki            Log storage (label-indexed, compressed chunks)
+  Promtail        Agent that ships K8s pod logs to Loki
+  Grafana         UI for LogQL queries and dashboards
+
+LOGQL ESSENTIALS:
+  {namespace="app"}                   Select log stream by label
+  |= "ERROR"                          Filter lines containing string
+  | json                              Parse JSON log fields
+  | level = "ERROR"                   Filter by parsed field
+  rate({...}[5m])                    Rate of matching lines
+
+KIBANA QUERY (KQL):
+  level: ERROR                        Field match
+  message: "payment*"                 Wildcard
+  level: ERROR AND service: payment   AND condition
+  response_time_ms >= 500             Range
+  NOT level: DEBUG                    Negation
+
+STRUCTURED LOG FIELDS (must-have):
+  @timestamp, level, service, trace_id, message, error
+
+ILM PHASES:
+  hot    Active indexing (SSD)
+  warm   7-30 days, fewer replicas
+  cold   S3-backed, read-only
+  delete Auto-delete after retention period
+
+LOKI vs ELASTICSEARCH:
+  Loki       Label-indexed, cheap, K8s-native, Grafana-integrated
+  ES         Full-text search, expensive, SIEM/compliance, Kibana
+
+================================================================================
+END OF FILE
+================================================================================

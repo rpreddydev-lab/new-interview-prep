@@ -1,0 +1,366 @@
+================================================================================
+PAGINATION AND FILTERING — IN DEPTH
+================================================================================
+
+WHY PAGINATION?
+----------------
+Collections can contain millions of records. Returning everything is:
+  - Memory-intensive for client and server
+  - Slow (large serialization + network transfer)
+  - Wasteful (clients typically display only a small subset)
+  
+Pagination limits responses to manageable chunks.
+
+================================================================================
+1. PAGINATION STRATEGIES
+================================================================================
+
+STRATEGY 1: OFFSET-BASED PAGINATION (Page-Based)
+  ─────────────────────────────────────────────────
+  Parameters: page (0-indexed or 1-indexed) + size
+  
+  GET /orders?page=2&size=20
+  GET /orders?offset=40&limit=20
+  
+  SQL Equivalent: SELECT * FROM orders LIMIT 20 OFFSET 40
+  
+  RESPONSE:
+  {
+    "data": [...],
+    "pagination": {
+      "page": 2,
+      "size": 20,
+      "totalElements": 450,
+      "totalPages": 23,
+      "hasNext": true,
+      "hasPrevious": true
+    }
+  }
+  
+  PROS:
+  ✅ Simple to implement and understand
+  ✅ Random access (jump to page 5 directly)
+  ✅ Total count available (show "450 results")
+  ✅ Easy with SQL LIMIT/OFFSET
+  
+  CONS:
+  ❌ UNSTABLE: If records are inserted/deleted while paginating,
+               pages shift → duplicates or skips
+  ❌ SLOW on large offsets: OFFSET 10000 means DB reads 10000 rows and throws away first 10000
+  ❌ COUNT(*) query is expensive on large tables
+  
+  STABILITY PROBLEM EXAMPLE:
+    Page 1: Records 1-10. User views page 1.
+    Record 3 deleted. User goes to page 2.
+    Records 11-20 now includes what was record 21.
+    Record 11 appears on both pages! (or a record is skipped)
+  
+  BEST FOR: Admin panels, dashboards with stable datasets, small to medium tables
+
+STRATEGY 2: CURSOR-BASED PAGINATION (Keyset Pagination)
+  ────────────────────────────────────────────────────────
+  Use an opaque cursor (encoded pointer to last seen record) instead of page number.
+  
+  GET /orders?limit=20                          ← First page
+  GET /orders?cursor=eyJpZCI6NDB9&limit=20      ← Next page (cursor from previous response)
+  
+  Internal cursor: Base64-encoded { "id": 40, "createdAt": "2026-04-08T10:00:00Z" }
+  
+  SQL Equivalent: 
+    SELECT * FROM orders WHERE id > 40 ORDER BY id ASC LIMIT 20
+    (or: WHERE (created_at, id) > ('2026-04-08', 40) for multi-column sort)
+  
+  RESPONSE:
+  {
+    "data": [...],
+    "pagination": {
+      "limit": 20,
+      "hasNext": true,
+      "nextCursor": "eyJpZCI6NjB9",
+      "hasPrevious": true,
+      "previousCursor": "eyJpZCI6MjF9"
+    }
+  }
+  
+  PROS:
+  ✅ STABLE: insertions/deletions don't cause duplicates or skips
+  ✅ FAST: No OFFSET; keyset navigation uses index efficiently (O(log n))
+  ✅ Works well for infinite scroll / real-time feeds
+  ✅ Scales to billions of records
+  
+  CONS:
+  ❌ No random access (can't jump to page 500)
+  ❌ No total count (hard to say "450 results")
+  ❌ Cursor becomes invalid if sort column changes
+  ❌ Slightly complex to implement
+
+  BEST FOR: Activity feeds, audit logs, large + fast-changing collections,
+            infinite scroll, time-series data, real-time APIs (Twitter, Instagram)
+
+STRATEGY 3: SEEK-BASED PAGINATION
+  ─────────────────────────────────
+  Client sends last seen record's values to identify starting point.
+  Similar to cursor but client uses actual field values instead of encoded cursor.
+  
+  GET /orders?afterId=40&limit=20
+  GET /orders?afterDate=2026-04-08T10:00:00Z&limit=20
+  
+  More transparent than opaque cursor; same keyset performance.
+
+STRATEGY 4: TIME-BASED PAGINATION
+  ──────────────────────────────────
+  Paginate by time window (common for event logs, audit trails).
+  
+  GET /events?from=2026-01-01T00:00:00Z&to=2026-01-31T23:59:59Z&limit=100
+
+================================================================================
+2. PAGINATION PARAMETERS NAMING CONVENTIONS
+================================================================================
+
+STYLE 1: page + size (Spring Data)
+  GET /users?page=0&size=20
+  Spring Pageable: controller accepts Pageable directly.
+
+STYLE 2: offset + limit (SQL-like)
+  GET /users?offset=0&limit=20
+
+STYLE 3: cursor + limit
+  GET /users?cursor=<encoded>&limit=20
+
+STYLE 4: before + after + limit (GitHub style)
+  GET /repos?before=<cursor>&after=<cursor>&limit=20
+
+DEFAULTS:
+  - Default page size: 20
+  - Maximum page size: 100 or 500 (cap it to prevent abuse)
+  - If size > max: return 400 or clamp to max + add warning header
+
+================================================================================
+3. FILTERING STRATEGIES
+================================================================================
+
+BASIC FILTERING (Query Parameters):
+  GET /users?role=admin&active=true&country=US
+  
+  Multiple values for same field:
+  GET /users?role=admin&role=moderator
+  GET /users?role=admin,moderator
+
+RANGE FILTERING:
+  GET /orders?minAmount=100&maxAmount=500
+  GET /orders?createdAfter=2026-01-01&createdBefore=2026-12-31
+  GET /orders?amount[gte]=100&amount[lte]=500   (bracket notation)
+
+SEARCH / FREE TEXT:
+  GET /users?q=alice
+  GET /users?search=alice+smith
+
+FIELD SELECTION (Partial Response):
+  GET /users?fields=id,name,email
+  GET /users?include=name,address(city,zip)   (nested fields)
+
+SORTING:
+  GET /users?sort=lastName&order=asc
+  GET /users?sort=lastName,asc
+  GET /users?sort=lastName:asc,firstName:desc  (multi-sort)
+  Spring Data: ?sort=lastName,asc&sort=firstName,desc
+
+================================================================================
+4. ADVANCED FILTERING — RSQL / FIQL
+================================================================================
+
+RSQL (Resource Query Language):
+  Feed==(2-*);updatedAt=gt=2026-04-01
+  
+  GET /users?filter=age=ge=18;country==US
+  Operators: ==, !=, <, >, <=, >=, =in=, =out=, =q= (like)
+  
+  Spring RSQL library: io.github.perplexhub:rsql-jpa-spring-boot-starter
+
+FIQL (Feed Item Query Language):
+  GET /orders?q=status==PENDING,status==PROCESSING    (comma = OR)
+  GET /orders?q=total=gt=100;status==PENDING          (semicolon = AND)
+
+GRAPHQL-STYLE FLEXIBILITY:
+  For complex filtering needs, consider GraphQL.
+  REST + RSQL is a good middle ground.
+
+================================================================================
+5. SPRING BOOT IMPLEMENTATION
+================================================================================
+
+PAGE-BASED PAGINATION WITH SPRING DATA:
+  @GetMapping("/users")
+  public Page<UserDto> getUsers(
+          @RequestParam(defaultValue = "0") int page,
+          @RequestParam(defaultValue = "20") int size,
+          @RequestParam(defaultValue = "id") String sortBy,
+          @RequestParam(defaultValue = "asc") String order) {
+      
+      if (size > 100) size = 100;  // Cap max page size
+      
+      Sort sort = order.equalsIgnoreCase("desc") 
+          ? Sort.by(sortBy).descending() 
+          : Sort.by(sortBy).ascending();
+      
+      Pageable pageable = PageRequest.of(page, size, sort);
+      return userRepository.findAll(pageable).map(userMapper::toDto);
+  }
+
+SPRING PAGEABLE FROM REQUEST:
+  @GetMapping("/users")
+  public Page<UserDto> getUsers(Pageable pageable) {
+      // Spring auto-binds: ?page=0&size=20&sort=name,asc
+      return userRepository.findAll(pageable).map(userMapper::toDto);
+  }
+
+  // Configure max page size
+  @Configuration
+  public class PaginationConfig implements WebMvcConfigurer {
+      @Override
+      public void addArgumentResolvers(List<HandlerMethodArgumentResolver> resolvers) {
+          PageableHandlerMethodArgumentResolver resolver = new PageableHandlerMethodArgumentResolver();
+          resolver.setMaxPageSize(100);
+          resolver.setFallbackPageable(PageRequest.of(0, 20));
+          resolvers.add(resolver);
+      }
+  }
+
+CURSOR-BASED PAGINATION IMPLEMENTATION:
+  @GetMapping("/feed")
+  public CursorPage<Event> getFeed(
+          @RequestParam(required = false) String cursor,
+          @RequestParam(defaultValue = "20") int limit) {
+      
+      Long lastId = cursor != null ? decodeCursor(cursor) : null;
+      
+      List<Event> events = eventRepository.findByCursor(lastId, limit + 1);
+      boolean hasNext = events.size() > limit;
+      
+      if (hasNext) events = events.subList(0, limit);
+      
+      String nextCursor = hasNext 
+          ? encodeCursor(events.get(events.size() - 1).getId()) 
+          : null;
+      
+      return new CursorPage<>(events, nextCursor, hasNext);
+  }
+  
+  private String encodeCursor(Long id) {
+      return Base64.getEncoder().encodeToString(("{\"id\":" + id + "}").getBytes());
+  }
+  
+  private Long decodeCursor(String cursor) {
+      String json = new String(Base64.getDecoder().decode(cursor));
+      return JsonPath.read(json, "$.id");  // Or Jackson
+  }
+
+JPA QUERY FOR CURSOR:
+  @Query("SELECT e FROM Event e WHERE (:lastId IS NULL OR e.id > :lastId) ORDER BY e.id ASC")
+  List<Event> findByCursor(@Param("lastId") Long lastId, Pageable pageable);
+
+FILTERING WITH SPECIFICATION PATTERN:
+  @GetMapping("/users")
+  public Page<UserDto> getUsers(
+          @RequestParam(required = false) String role,
+          @RequestParam(required = false) Boolean active,
+          Pageable pageable) {
+      
+      Specification<User> spec = Specification.where(null);
+      
+      if (role != null) {
+          spec = spec.and((root, query, cb) -> cb.equal(root.get("role"), role));
+      }
+      if (active != null) {
+          spec = spec.and((root, query, cb) -> cb.equal(root.get("active"), active));
+      }
+      
+      return userRepository.findAll(spec, pageable).map(userMapper::toDto);
+  }
+
+================================================================================
+6. PAGINATION RESPONSE HEADERS
+================================================================================
+
+LINK HEADER (RFC 5988):
+  HTTP/1.1 200 OK
+  Link: <https://api.example.com/users?page=0&size=20>; rel="first",
+        <https://api.example.com/users?page=1&size=20>; rel="prev",
+        <https://api.example.com/users?page=3&size=20>; rel="next",
+        <https://api.example.com/users?page=22&size=20>; rel="last"
+  X-Total-Count: 450
+  X-Page: 2
+  X-Page-Size: 20
+
+GitHub uses this approach (Link header for pagination navigation).
+
+OR include pagination in response body (more common for JSON APIs):
+  {
+    "data": [...],
+    "pagination": { "page": 2, "size": 20, "total": 450 },
+    "_links": { "next": ..., "prev": ... }
+  }
+
+================================================================================
+7. PERFORMANCE CONSIDERATIONS
+================================================================================
+
+COUNT(*) IS EXPENSIVE:
+  totalPages requires COUNT(*) which is expensive on large tables.
+  
+  Options:
+  1. Async count (return immediately, count in background)
+  2. Approximate count (pg_class stats in PostgreSQL)
+  3. Skip total count for cursor pagination
+  4. Cached count with TTL
+
+OFFSET PERFORMANCE ON LARGE TABLES:
+  SELECT * FROM orders LIMIT 20 OFFSET 100000
+  → DB reads 100020 rows, throws away 100000 → SLOW
+  
+  Solution: Keyset pagination (cursor-based)
+  SELECT * FROM orders WHERE id > 100000 ORDER BY id LIMIT 20
+  → Uses index; reads only 20 rows → FAST
+
+INDEX FOR SORTING:
+  Ensure sorted columns are indexed.
+  Composite index if sorting by multiple columns.
+  CREATE INDEX idx_orders_created_at ON orders(created_at DESC, id DESC);
+
+================================================================================
+8. INTERVIEW QUESTIONS — PAGINATION AND FILTERING
+================================================================================
+
+Q1: What is the difference between offset and cursor pagination?
+    Offset (page/limit) uses numeric position in results; simple but unstable
+    (inserts/deletes cause skips or duplicates) and slow for large offsets.
+    Cursor uses an opaque pointer to the last seen item; stable (insertions
+    don't affect pages), fast (keyset query uses index), but no random access
+    and no total count. Use cursor for real-time feeds; offset for admin panels.
+
+Q2: How would you implement cursor pagination in a REST API?
+    Return an opaque cursor (Base64-encoded last item's ID and sort key) in
+    pagination metadata. Next request sends cursor as parameter. Server decodes
+    cursor and generates: WHERE id > :lastId ORDER BY id LIMIT :pageSize.
+    Cursor is opaque to client — implementation detail can change without
+    API contract change.
+
+Q3: What is the Specification pattern and when would you use it for filtering?
+    Spring Data JPA Specification wraps JPA Criteria API predicates.
+    Each filter criterion is a Specification. Combine with and()/or() for
+    complex queries. Useful for dynamic filtering where filter combinations
+    vary per request. Avoids large number of @Query method variants.
+
+Q4: How do you prevent a client from requesting 1 million records at once?
+    Cap maximum page size server-side (e.g., 100). If size > max, clamp to max
+    or return 400 with descriptive error. Set default page size (e.g., 20).
+    Use query timeouts (spring.datasource.hikari.connection-timeout).
+    Document the max size in API spec.
+
+Q5: How would you design filtering for a product search with multiple criteria?
+    Simple: query parameters per field (?category=electronics&minPrice=100).
+    Advanced: structured filter parameter (?filter=category==electronics;price=ge=100)
+    using RSQL syntax. For full-text search: dedicated search parameter (?q=laptop).
+    Consider Elasticsearch/OpenSearch for complex product search requirements.
+
+================================================================================

@@ -1,0 +1,264 @@
+================================================================
+WEBSOCKET CLEANUP IN REACT
+================================================================
+
+Improper cleanup causes memory leaks, stale closures, duplicate
+subscriptions, and React "state update on unmounted component"
+warnings. This file covers all aspects of cleanup.
+
+================================================================
+1. THE PROBLEM: MISSING CLEANUP
+================================================================
+
+What happens without cleanup:
+
+  // BAD — no cleanup
+  useEffect(() => {
+    const ws = new WebSocket('wss://...');
+    ws.onmessage = (event) => {
+      setMessages(prev => [...prev, JSON.parse(event.data)]);
+    };
+    // No return / no ws.close()
+  }, []);
+
+  Consequences:
+  - Every remount (StrictMode double-invoking, route changes)
+    creates a new WebSocket but never closes the old one
+  - Multiple simultaneous connections
+  - setMessages called on an unmounted component → React warning
+  - Memory leak — Blob/listener references held indefinitely
+
+================================================================
+2. BASIC CLEANUP PATTERN
+================================================================
+
+  useEffect(() => {
+    const ws = new WebSocket('wss://api.example.com/ws');
+
+    ws.onmessage = (event) => {
+      setMessages(prev => [...prev, JSON.parse(event.data)]);
+    };
+
+    // Return cleanup function — runs on unmount OR before next effect
+    return () => {
+      ws.close(1000, 'Component unmounted');
+    };
+  }, []); // empty deps = mount/unmount only
+
+IMPORTANT: Returning from useEffect is not optional for side effects.
+React calls the cleanup function:
+  1. Before the component unmounts
+  2. Before the effect re-runs (when dependencies change)
+
+================================================================
+3. STOMP CLIENT CLEANUP
+================================================================
+
+  useEffect(() => {
+    const client = new Client({
+      webSocketFactory: () => new SockJS(url),
+      reconnectDelay: 5000,
+      onConnect: () => {
+        client.subscribe('/topic/updates', (msg) => {
+          handleMessage(JSON.parse(msg.body));
+        });
+      },
+    });
+
+    client.activate();
+
+    return () => {
+      // deactivate sends STOMP DISCONNECT, then closes WS
+      client.deactivate().catch(console.error);
+    };
+  }, [url]);
+
+================================================================
+4. PREVENTING STALE CLOSURES
+================================================================
+
+A stale closure is when an effect captures an old value of a
+variable (e.g., state or prop) and never updates.
+
+  // PROBLEM: message handler captures stale userId
+  useEffect(() => {
+    const ws = new WebSocket('wss://...');
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      // userId is captured at mount time, never updates
+      if (data.targetUser === userId) {
+        setMessages(prev => [...prev, data]);
+      }
+    };
+    return () => ws.close();
+  }, []); // userId not in deps!
+
+  // FIX 1: Add userId to deps (reconnects when userId changes)
+  useEffect(() => {
+    // ... same code
+  }, [userId]);
+
+  // FIX 2: Use a ref to track current userId without reconnecting
+  const userIdRef = useRef(userId);
+  useEffect(() => {
+    userIdRef.current = userId;
+  }, [userId]);
+
+  useEffect(() => {
+    const ws = new WebSocket('wss://...');
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.targetUser === userIdRef.current) { // always current
+        setMessages(prev => [...prev, data]);
+      }
+    };
+    return () => ws.close();
+  }, []);
+
+================================================================
+5. PREVENTING UPDATES ON UNMOUNTED COMPONENTS
+================================================================
+
+After React 18, calling setState on an unmounted component no longer
+throws a warning, but it's still bad practice and wastes work.
+
+  useEffect(() => {
+    let mounted = true; // ← track mount state
+
+    const ws = new WebSocket('wss://...');
+    ws.onmessage = (event) => {
+      if (!mounted) return; // ← guard
+      setMessages(prev => [...prev, JSON.parse(event.data)]);
+    };
+
+    return () => {
+      mounted = false; // ← set false before closing
+      ws.close(1000);
+    };
+  }, []);
+
+================================================================
+6. CLEANUP FOR RECONNECTION LOGIC
+================================================================
+
+When reconnecting with timers, clean up pending timers too:
+
+  useEffect(() => {
+    let ws;
+    let reconnectTimer;
+    let shouldReconnect = true;
+
+    function connect() {
+      ws = new WebSocket(url);
+
+      ws.onmessage = (e) => setMessages(prev => [...prev, JSON.parse(e.data)]);
+
+      ws.onclose = (event) => {
+        if (!shouldReconnect || event.code === 1000) return;
+        const delay = Math.min(1000 * 2 ** reconnectCount++, 30000);
+        reconnectTimer = setTimeout(connect, delay);
+      };
+    }
+
+    let reconnectCount = 0;
+    connect();
+
+    return () => {
+      shouldReconnect = false;           // stop reconnection attempts
+      clearTimeout(reconnectTimer);       // cancel pending reconnect
+      ws?.close(1000, 'Unmounted');      // close current connection
+    };
+  }, [url]);
+
+================================================================
+7. REACT STRICT MODE AND DOUBLE-INVOCATION
+================================================================
+
+React 18 StrictMode in development intentionally double-invokes
+effects (mount → cleanup → mount) to detect cleanup issues.
+
+This means your WebSocket will:
+  1. Connect (first mount)
+  2. Be closed (cleanup)
+  3. Connect again (second mount)
+
+This is EXPECTED behavior and is how Strict Mode tests your cleanup.
+If your cleanup is correct, the double-invoke should be harmless.
+
+  // If double-invocation causes issues in dev, you can verify:
+  console.log('[WS] Connecting...');
+  // You'll see this twice in Strict Mode — that's fine
+
+================================================================
+8. CLEANUP FOR SUBSCRIPTIONS
+================================================================
+
+STOMP's subscribe() returns a subscription object with an unsubscribe()
+method. Always call it in cleanup:
+
+  useEffect(() => {
+    let subscription;
+
+    const client = new Client({ ... });
+    client.onConnect = () => {
+      subscription = client.subscribe('/topic/updates', (msg) => {
+        handleMessage(JSON.parse(msg.body));
+      });
+    };
+
+    client.activate();
+
+    return () => {
+      subscription?.unsubscribe(); // clean up subscription
+      client.deactivate();
+    };
+  }, []);
+
+================================================================
+9. CLEANUP CHECKLIST
+================================================================
+
+✅ Close WebSocket (ws.close(1000)) in useEffect return
+✅ Deactivate STOMP client (client.deactivate()) in cleanup
+✅ Clear timers (clearTimeout, clearInterval) for reconnection logic
+✅ Set shouldReconnect = false before close to prevent reconnect loop
+✅ Unsubscribe STOMP subscriptions
+✅ Set mounted = false flag if you need to guard setState calls
+✅ Use functional state updates (prev => [...prev, item]) to avoid
+   stale closures in message handlers
+✅ Use refs for values needed in handlers without triggering reconnect
+
+================================================================
+10. INTERVIEW QUESTIONS
+================================================================
+
+Q: Why is cleanup important for WebSocket useEffect?
+A: Without cleanup, each remount (StrictMode, route change) creates a
+   new WebSocket connection without closing the old one. This causes
+   multiple simultaneous connections, duplicate messages, memory leaks,
+   and potentially state updates on unmounted components.
+
+Q: What is a stale closure in the context of WebSocket handlers?
+A: A stale closure occurs when the onmessage handler captures a
+   variable value from when the effect ran, and that value is no
+   longer current. Solution: either include the variable in the
+   dependency array (triggering reconnect on change) or store it
+   in a ref so the handler always reads the latest value.
+
+Q: How does React StrictMode affect WebSocket effects?
+A: In development, StrictMode double-invokes effects: mount →
+   cleanup → mount. This tests that your cleanup correctly closes
+   the connection. The result is you'll see two connections in dev,
+   but only one in production. If double-invoke breaks your app,
+   your cleanup is incomplete.
+
+Q: How do you prevent reconnecting after intentional unmount?
+A: Use a flag variable (shouldReconnect = false) that is set to
+   false in the cleanup function. Check this flag in the onclose
+   handler before scheduling a reconnection timeout.
+
+Q: What is the correct close code for intentional disconnection?
+A: 1000 (Normal Closure). Using 1000 signals to the server and to
+   your own onclose handler that this was expected. Don't reconnect
+   on close code 1000. Reserve other codes (1001-1011) for specific
+   error conditions.

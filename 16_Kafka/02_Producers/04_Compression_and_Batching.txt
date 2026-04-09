@@ -1,0 +1,234 @@
+================================================================================
+  KAFKA COMPRESSION AND BATCHING
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHY BATCHING AND COMPRESSION MATTER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Sending one message at a time is inefficient:
+  - Each message requires a network round-trip overhead (TCP headers, Kafka headers)
+  - Many small writes to disk are slower than fewer large writes
+  - Compression works better on larger data (more patterns to exploit)
+
+Batching solves this by grouping multiple messages:
+  - One network request carries hundreds or thousands of messages
+  - One disk write for the entire batch
+  - Compression ratio dramatically improves with larger batches
+
+Effect on throughput:
+  - No batching (linger.ms=0, batch.size=1): ~50K msg/sec per producer
+  - With batching (linger.ms=5ms, batch.size=32KB) + compression: ~500K-1M+ msg/sec
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. HOW BATCHING WORKS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RecordAccumulator:
+  - In-memory buffer per producer (buffer.memory total, default 32 MB)
+  - Per-partition deque of ProducerBatch objects
+  - New messages are appended to the current batch for their partition
+  - Batch is "ready" when:
+    a) batch.size bytes accumulated (default 16 KB)
+    b) linger.ms milliseconds elapsed since first message added (default 0 ms)
+    c) buffer is full
+    d) producer.flush() called
+    e) producer.close() called
+
+Sender thread:
+  - Background thread (one per producer)
+  - Continuously drains ready batches from RecordAccumulator
+  - Groups batches by broker leader (sends all batches to same broker in one request)
+  - Sends ProduceRequest to broker
+
+key configs:
+  batch.size = 16384 (16 KB, default)
+    - Max bytes per batch per partition
+    - Batch is sent when it fills OR linger.ms expires
+    - Increasing: 32KB, 64KB → better throughput, higher memory, more latency
+
+  linger.ms = 0 (default — send immediately)
+    - How long to wait for more messages before sending an incomplete batch
+    - 0: send immediately when a message arrives (low latency, poor batching)
+    - 5-20: wait up to N ms for more messages (better batching, small latency trade-off)
+    - Use cases: 
+      - linger.ms=0: real-time alerting, user-facing apps (latency sensitive)
+      - linger.ms=5-20: analytics, logs, CDC (throughput > latency)
+
+  buffer.memory = 33554432 (32 MB, default)
+    - Total memory for all batches across all partitions
+    - If full: producer blocks for max.block.ms, then throws BufferExhaustedException
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. COMPRESSION ALGORITHMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Kafka compresses at the BATCH level (whole batch, not individual messages).
+This is why larger batches = better compression.
+
+Supported algorithms:
+
+  compression.type = none (default)
+    - No compression
+    - Highest throughput for CPU
+    - Most network and disk usage
+
+  compression.type = gzip
+    - Good compression ratio (high)
+    - Slow (CPU intensive) — especially bad on producer side
+    - Good for: archival, cold storage, low-CPU-demand scenarios
+    - Compression ratio: ~5-10x for JSON text
+
+  compression.type = snappy
+    - Moderate compression ratio (medium)
+    - Very fast (designed for speed over ratio)
+    - Low CPU overhead
+    - Compression ratio: ~2-4x for JSON text
+    - Good for: most production streaming use cases
+
+  compression.type = lz4
+    - Very fast compression and decompression
+    - Better ratio than snappy
+    - Recommended for most production workloads
+    - Compression ratio: ~3-5x for JSON text
+    - Good for: high-throughput streaming, latency-sensitive workloads
+
+  compression.type = zstd (Kafka 2.1+)
+    - Best compression ratio (similar to or better than gzip)
+    - Faster than gzip, comparable speed to lz4
+    - Excellent choice for data with repetitive patterns
+    - Good for: high-volume topics where disk/network is the bottleneck
+
+  compression.type = producer (broker config)
+    - Broker accepts whatever compression type the producer uses
+    - Broker does NOT recompress (preserves producer compression)
+    - Best for performance: no re-compression overhead on broker
+
+Comparison table:
+  Algorithm   Ratio    Speed   CPU Usage   Recommended For
+  ──────────────────────────────────────────────────────────────────────
+  none        1x       N/A     Lowest      CPU-limited brokers
+  snappy      2-4x     Fast    Low         General purpose
+  lz4         3-5x     Fastest Low         High-throughput, latency sensitive
+  zstd        4-8x     Fast    Medium      Best overall (Kafka 2.1+)
+  gzip        5-10x    Slow    High        Archival, cold data
+
+Where is decompression performed?
+  - Broker: decompresses to validate checksum, then stores compressed form
+  - Consumer: decompresses batch before delivering individual records
+  - Compression is transparent to the consumer (it just receives values)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. COMPRESSION AND OFFSET INTERACTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A compressed batch is stored as a single unit in the log:
+  - The outer batch has one base offset and one last offset
+  - Individual records inside have relative offsets (offsetDelta from base)
+  - Consumer receives the decompressed individual records with absolute offsets
+
+Inner offsets:
+  - In old Kafka (v1 message format): inner offset was relative (0, 1, 2, ...)
+  - In new Kafka (v2 message format): offsetDelta is used, absolute offsets computed
+  - Consumers always see absolute offsets regardless of compression
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. TUNING FOR THROUGHPUT vs LATENCY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+High-throughput config (batch-intensive):
+  batch.size = 65536          # 64 KB
+  linger.ms = 20              # wait 20ms for more messages
+  compression.type = lz4      # fast + good ratio
+  buffer.memory = 67108864    # 64 MB buffer
+
+Low-latency config:
+  batch.size = 16384          # 16 KB (default)
+  linger.ms = 0               # send immediately
+  compression.type = none     # no compression overhead
+  acks = 1                    # faster ack
+
+Balanced production config:
+  batch.size = 32768          # 32 KB
+  linger.ms = 5               # 5ms batching
+  compression.type = lz4      # fast compression
+  buffer.memory = 33554432    # 32 MB (default)
+  acks = all
+  enable.idempotence = true
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. ESTIMATING BATCH EFFICIENCY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Monitor the batch-size-avg JMX metric:
+  kafka.producer:type=producer-metrics,client-id=<id>,name=batch-size-avg
+
+  If batch-size-avg << batch.size:
+    → Batches are not filling up → increase linger.ms or accept this as optimal
+    → Or: message rate is too low to fill batches quickly
+
+  If batch-size-avg ≈ batch.size:
+    → Batches are consistently full → can try increasing batch.size
+    → Or: message rate is high enough to always fill batches
+
+Monitor compression-rate-avg:
+  kafka.producer:type=producer-metrics,client-id=<id>,name=compression-rate-avg
+  
+  compression-rate-avg = 0.3 means: batches compressed to 30% of original size (70% saved)
+  If close to 1.0: minimal compression (maybe already binary data, or too-small batches)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. BROKER-SIDE COMPRESSION CONFIG
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Broker's compression.type (topic config):
+  - "producer" (default): Broker stores batches in whatever compression the producer used
+  - "none": Broker decompresses incoming batches and stores uncompressed
+  - "gzip"/"snappy"/"lz4"/"zstd": Broker RE-COMPRESSES incoming batches with this algorithm
+
+When would you force broker-side compression?
+  - Producers use different compression types → standardize on one at broker
+  - Older producers not supporting newer algorithms (zstd) → broker upgrades
+  - Security: broker decompresses to validate, then recompresses for storage
+
+Performance note:
+  - Re-compression on broker is CPU expensive
+  - Best practice: use compression.type=producer on broker (accept producer's compression)
+  - If standardization needed: configure all producers to same algorithm
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: How does Kafka producer batching work?
+A: The producer accumulates messages in an in-memory RecordAccumulator buffer,
+   one batch per partition. A batch is sent when either batch.size bytes are
+   accumulated OR linger.ms milliseconds elapse. The background Sender thread
+   drains ready batches, groups them by broker, and sends in bulk. This reduces
+   network round-trips and enables effective compression.
+
+Q: What is the difference between batch.size and linger.ms?
+A: batch.size is a size limit (bytes) — send when the batch is full.
+   linger.ms is a time limit — send after waiting this long, even if batch isn't full.
+   Messages are sent when EITHER limit is hit first. Increasing linger.ms (e.g., 5-20ms)
+   allows more messages to accumulate, improving batch efficiency at the cost of latency.
+
+Q: Which compression algorithm should you use in Kafka?
+A: lz4 is the recommended default for most production workloads: very fast
+   compression/decompression with good ratio. zstd (Kafka 2.1+) is excellent
+   if you need the best ratio and your brokers/clients are modern enough.
+   snappy is a safe fallback. gzip is too CPU-intensive for real-time streaming.
+   none is fine if CPU savings are more important than network/disk bandwidth.
+
+Q: Does compression affect consumers?
+A: Compression is transparent to consumers. The broker stores compressed batches.
+   Consumers receive compressed data, and the Kafka client library automatically
+   decompresses it before delivering individual records to your application code.
+   The consumer doesn't need to know what compression was used.
+
+Q: What happens when the producer's buffer.memory is exhausted?
+A: The producer blocks the calling thread for up to max.block.ms (default 60 seconds).
+   If the buffer isn't freed within that time (because brokers are slow or down),
+   a BufferExhaustedException is thrown. This signals back-pressure: the application
+   should slow down or alert on producer throughput issues.

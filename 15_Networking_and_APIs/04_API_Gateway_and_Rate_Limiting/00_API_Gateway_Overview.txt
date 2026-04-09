@@ -1,0 +1,332 @@
+================================================================================
+API GATEWAY — OVERVIEW & IN DEPTH
+================================================================================
+
+WHAT IS AN API GATEWAY?
+------------------------
+An API Gateway is a server that acts as a single entry point for all client
+requests to a microservices backend. It sits between clients and services,
+handling cross-cutting concerns centrally so individual services don't have to.
+
+Single entry point = Single Responsibility for:
+  - Authentication / Authorization
+  - Rate Limiting / Throttling
+  - SSL Termination
+  - Request Routing
+  - Load Balancing
+  - Request/Response Transformation
+  - Caching
+  - Request Aggregation / Composition
+  - Logging / Metrics / Tracing
+  - Circuit Breaking
+  - CORS
+
+Without API Gateway:
+  Client → UserService   (auth, rate limit, logging per service)
+  Client → OrderService  (auth, rate limit, logging per service)
+  Client → PaymentService(auth, rate limit, logging per service)
+
+With API Gateway:
+  Client → API Gateway → UserService    (auth once, at gateway)
+              ↓      → OrderService
+                     → PaymentService
+
+================================================================================
+1. API GATEWAY PATTERNS
+================================================================================
+
+PATTERN 1 — BACKEND FOR FRONTEND (BFF):
+  Separate gateway per client type, optimized for each.
+
+  Mobile BFF     → UserService, OrderService (mobile-optimized payloads)
+  Web BFF        → UserService, OrderService (full payloads + SSR data)
+  Partner BFF    → limited endpoints, specific auth
+
+  Benefits: each BFF evolves independently; no one-size-fits-all compromise.
+
+PATTERN 2 — GATEWAY AGGREGATION:
+  Single client request → gateway fans out to multiple services → aggregates.
+  Client receives one response instead of making N parallel calls.
+
+  GET /dashboard → gateway calls (in parallel):
+    UserService.getProfile(userId)
+    OrderService.getRecentOrders(userId)
+    NotificationService.getUnread(userId)
+  ← Merges responses → { user: {...}, orders: [...], notifications: [...] }
+
+PATTERN 3 — GATEWAY OFFLOADING:
+  Move repetitive cross-cutting logic from services to gateway:
+  - SSL termination (services only need HTTP internally)
+  - Request/response compression
+  - IP allowlisting
+  - Header injection (X-User-Id from JWT so services don't parse JWT)
+
+================================================================================
+2. GATEWAY RESPONSIBILITIES IN DETAIL
+================================================================================
+
+AUTHENTICATION:
+  Gateway validates JWT / API key before forwarding requests.
+  Services receive a trusted X-User-Id / X-Roles header injected by gateway.
+  Services never need to validate tokens themselves.
+
+ROUTING:
+  Map API paths to backend service endpoints:
+    /api/users/**   → user-service:8081
+    /api/orders/**  → order-service:8082
+    /api/payments/**→ payment-service:8083
+  Supports path rewriting (strip prefix, add prefix)
+
+LOAD BALANCING:
+  Gateway distributes requests across service instances.
+  Integrates with service discovery (Eureka, Consul, K8s DNS).
+
+RATE LIMITING:
+  Limit requests per API key / user / IP per time window.
+  Enforce usage quotas for API monetization.
+  Protect backend from abuse.
+
+CIRCUIT BREAKING:
+  If backend fails, gateway opens circuit and fails fast.
+  Prevents cascading failures in microservices.
+
+REQUEST TRANSFORMATION:
+  - Add/remove/rename headers
+  - Path rewriting
+  - Query parameter manipulation
+  - Body transformation (request enrichment)
+  - Protocol translation (HTTP → gRPC)
+
+CACHING:
+  Cache idempotent GET responses at gateway level.
+  Reduces load on downstream services.
+  Per-route TTL configuration.
+
+================================================================================
+3. SPRING CLOUD GATEWAY
+================================================================================
+
+DEPENDENCY:
+  <dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-gateway</artifactId>
+  </dependency>
+
+  Note: Spring Cloud Gateway is built on Spring WebFlux (reactive). Do NOT mix
+  with spring-webmvc.
+
+BASIC CONFIGURATION (application.yml):
+  spring:
+    cloud:
+      gateway:
+        routes:
+          - id: user-service
+            uri: lb://USER-SERVICE      # lb:// = load balanced via Eureka
+            predicates:
+              - Path=/api/users/**
+            filters:
+              - StripPrefix=1           # strips /api prefix before forwarding
+              - AddRequestHeader=X-Gateway-Version, 1.0
+              - RemoveRequestHeader=Cookie
+
+          - id: order-service
+            uri: lb://ORDER-SERVICE
+            predicates:
+              - Path=/api/orders/**
+              - Method=GET,POST         # only GET and POST
+              - Header=Authorization, Bearer .* # only if header matches regex
+            filters:
+              - StripPrefix=1
+              - name: CircuitBreaker
+                args:
+                  name: orderServiceCB
+                  fallbackUri: forward:/fallback/orders
+              - name: RequestRateLimiter
+                args:
+                  redis-rate-limiter.replenishRate: 10
+                  redis-rate-limiter.burstCapacity: 20
+                  key-resolver: "#{@ipKeyResolver}"
+
+          # Rewrite path
+          - id: legacy-api
+            uri: http://legacy-service:8090
+            predicates:
+              - Path=/legacy/v1/**
+            filters:
+              - RewritePath=/legacy/v1/(?<segment>.*), /api/v2/$\{segment}
+
+JAVA-BASED ROUTE CONFIGURATION:
+  @Configuration
+  public class GatewayRouteConfig {
+
+      @Bean
+      public RouteLocator customRouteLocator(RouteLocatorBuilder builder) {
+          return builder.routes()
+              .route("user-service", r -> r
+                  .path("/api/users/**")
+                  .filters(f -> f
+                      .stripPrefix(1)
+                      .addRequestHeader("X-User-Service-Version", "2")
+                      .retry(config -> config
+                          .setRetries(3)
+                          .setStatuses(HttpStatus.SERVICE_UNAVAILABLE)
+                          .setMethods(HttpMethod.GET)
+                          .setBackoff(Duration.ofMillis(100), Duration.ofSeconds(2), 2, true)))
+                  .uri("lb://USER-SERVICE"))
+              
+              .route("order-service", r -> r
+                  .path("/api/orders/**")
+                  .and()
+                  .header("Authorization")
+                  .filters(f -> f
+                      .stripPrefix(1)
+                      .circuitBreaker(config -> config
+                          .setName("orderCB")
+                          .setFallbackUri("forward:/fallback/orders")))
+                  .uri("lb://ORDER-SERVICE"))
+              
+              .build();
+      }
+  }
+
+GLOBAL FILTERS:
+  // Applied to ALL routes
+  @Component
+  public class JwtGlobalFilter implements GlobalFilter, Ordered {
+
+      @Override
+      public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+          String auth = exchange.getRequest().getHeaders().getFirst("Authorization");
+          
+          if (auth == null || !auth.startsWith("Bearer ")) {
+              exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+              return exchange.getResponse().setComplete();
+          }
+          
+          return jwtService.validateToken(auth.substring(7))
+              .flatMap(claims -> {
+                  // Inject user info as headers for downstream services
+                  ServerHttpRequest mutated = exchange.getRequest().mutate()
+                      .header("X-User-Id", claims.getSubject())
+                      .header("X-User-Roles", String.join(",", claims.getRoles()))
+                      .build();
+                  return chain.filter(exchange.mutate().request(mutated).build());
+              })
+              .onErrorResume(e -> {
+                  exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+                  return exchange.getResponse().setComplete();
+              });
+      }
+
+      @Override
+      public int getOrder() { return -1; } // run before routing
+  }
+
+PREDICATES (Route matching conditions):
+  Path          : Path=/api/users/**
+  Method        : Method=GET,POST
+  Header        : Header=X-Request-Id, \d+
+  Query         : Query=color, green
+  Host          : Host=**.example.com
+  Before        : Before=2026-01-01T00:00:00+00:00[UTC]
+  After         : After=2024-01-01T00:00:00+00:00[UTC]
+  Between       : Between=2024-01-01T..., 2025-01-01T...
+  Weight        : Weight=group1, 8  (80% of traffic, for blue-green)
+  RemoteAddr    : RemoteAddr=192.168.1.1/24
+
+BUILT-IN FILTERS:
+  AddRequestHeader, AddResponseHeader, RemoveRequestHeader
+  StripPrefix, PrefixPath
+  RewritePath, RewriteResponseHeader
+  SetPath, SetStatus
+  Retry, CircuitBreaker, RequestRateLimiter
+  RequestSize, SetRequestHeader
+  DedupeResponseHeader, SecureHeaders
+
+================================================================================
+4. GATEWAY FALLBACKS
+================================================================================
+
+@RestController
+@RequestMapping("/fallback")
+public class FallbackController {
+
+    @GetMapping("/orders")
+    public ResponseEntity<Map<String, Object>> ordersFallback() {
+        return ResponseEntity
+            .status(HttpStatus.SERVICE_UNAVAILABLE)
+            .body(Map.of(
+                "error", "ORDER_SERVICE_UNAVAILABLE",
+                "message", "Order service is temporarily unavailable. Please try again.",
+                "retryAfter", 30
+            ));
+    }
+}
+
+================================================================================
+5. COMMERCIAL AND OPEN-SOURCE GATEWAYS
+================================================================================
+
+OPEN SOURCE:
+  Kong         : Nginx-based; Lua plugins; highly extensible; popular
+  Traefik      : Cloud-native; auto-discovers K8s services; zero-config
+  NGINX        : Reverse proxy; can be configured as basic gateway
+  Envoy        : CNCF; used as sidecar in Istio service mesh
+  Tyk          : Full API management with developer portal
+
+CLOUD-MANAGED:
+  AWS API Gateway  : Pay per request; Lambda integration; HTTP/REST/WebSocket
+  Azure API Management (APIM) : Full lifecycle; policies; developer portal
+  GCP Apigee      : Enterprise; analytics; monetization
+  Kong Konnect    : SaaS Kong
+
+SPRING CLOUD GATEWAY:
+  Built on Spring WebFlux + Reactor Netty
+  Integrated with Spring ecosystem (Eureka, Circuit Breaker, Zipkin)
+  Programmatic and YAML configuration
+  Custom filter development in Java
+
+================================================================================
+6. INTERVIEW QUESTIONS — API GATEWAY
+================================================================================
+
+Q1: What is the difference between an API Gateway and a reverse proxy?
+    A reverse proxy (Nginx, HAProxy) forwards client requests to backend servers
+    and handles SSL termination, load balancing, caching. An API Gateway does all
+    that plus: authentication/authorization, rate limiting, API key management,
+    request/response transformation, circuit breaking, analytics, developer portals,
+    and version management. An API Gateway is purpose-built for managing APIs
+    rather than general-purpose proxying.
+
+Q2: What is the Backend For Frontend (BFF) pattern?
+    Instead of a single API Gateway serving all clients, create separate gateway
+    layers (BFFs) optimized for each client type. Mobile BFF returns compact
+    payloads; Web BFF returns full data with extra context. Each BFF can evolve
+    independently. Reduces the need for clients to make multiple API calls — BFF
+    aggregates and shapes responses for its specific client. Popularized by Sam Newman.
+
+Q3: What is the downside of an API Gateway?
+    1) Single point of failure — must be highly available (run multiple instances)
+    2) Additional network hop — adds latency (usually < 10ms with proper setup)
+    3) Complexity — misconfiguration can take down all APIs simultaneously
+    4) Bottleneck — all traffic flows through it; must be scaled carefully
+    5) Vendor lock-in with commercial gateways. Mitigate: HA deployment,
+    timeout/fallback configuration, performance testing.
+
+Q4: How does Spring Cloud Gateway differ from Zuul?
+    Both are Spring-ecosystem API gateways. Zuul (Netflix, Spring Cloud Netflix)
+    is built on blocking Servlet API — one thread per request.
+    Spring Cloud Gateway is built on Spring WebFlux (reactive, non-blocking) with
+    Reactor Netty event loop. Gateway handles more concurrent connections with fewer
+    threads, making it better for high-throughput environments. Zuul is in maintenance
+    mode; Spring Cloud Gateway is the actively maintained replacement.
+
+Q5: How would you implement zero-downtime deployment using an API Gateway?
+    Use weighted routing (canary deployment):
+    Weight=group-stable,90  → existing version (90% traffic)
+    Weight=group-canary,10  → new version (10% traffic)
+    Gradually shift weight from old to new after validating metrics.
+    Or use blue-green: two environments, switch gateway routing instantly.
+    Spring Cloud Gateway supports Weight predicates natively.
+
+================================================================================

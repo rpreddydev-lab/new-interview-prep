@@ -1,0 +1,246 @@
+================================================================================
+REDIS STRINGS — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. OVERVIEW
+────────────
+Redis Strings are the most basic and versatile Redis data type. They are:
+  - Binary-safe: can store any byte sequence (text, JSON, serialized objects,
+    images, compressed data)
+  - Max size: 512 MB per value
+  - Backed by SDS (Simple Dynamic Strings) internally
+
+"Strings" is a misnomer — they're generic byte arrays. You can store:
+  - Plain text:    "Hello, World!"
+  - Integers:      "42"
+  - Floats:        "3.14"
+  - JSON:          "{\"name\":\"Alice\"}"
+  - Binary:        any bytes (serialized Protobuf, JPEG, etc.)
+
+
+2. INTERNAL ENCODINGS
+──────────────────────
+Redis uses three internal encodings for strings, chosen automatically:
+
+  int:     When the string value can be represented as a 64-bit signed integer
+           Value range: [-9223372036854775808, 9223372036854775807]
+           Memory-efficient (stores as actual integer, not char array)
+           OBJECT ENCODING key → "int"
+
+  embstr:  Short strings ≤ 44 bytes (Redis 3.2+)
+           A single memory allocation for both robj header and SDS
+           Immutable once set (a single-allocation optimization)
+           OBJECT ENCODING key → "embstr"
+
+  raw:     Strings > 44 bytes
+           Two separate memory allocations: robj header + SDS buffer
+           OBJECT ENCODING key → "raw"
+
+  Important: APPEND to an embstr string automatically converts it to raw,
+  because embstr is immutable.
+
+
+3. BASIC COMMANDS
+──────────────────
+  SET key value [EX seconds] [PX milliseconds] [EXAT timestamp] [PXAT ts_ms]
+       [NX | XX] [GET] [KEEPTTL]
+    EX / PX    → set TTL in seconds or milliseconds
+    EXAT/PXAT  → set TTL as Unix timestamp
+    NX         → Only set if key does NOT exist (create if absent)
+    XX         → Only set if key EXISTS (update if present)
+    GET        → Return old value before setting (atomic swap)
+    KEEPTTL    → Preserve existing TTL
+
+  GET key                    → returns nil if not exists
+  MSET key1 v1 key2 v2 …    → set multiple atomically
+  MGET key1 key2 …          → get multiple (returns array, nil for missing)
+  GETSET key value           → (deprecated) set new, return old
+  GETDEL key                 → get and delete atomically
+  GETEX key [EX n | PERSIST] → get and update TTL atomically
+
+  SETNX key value            → set only if not exists (returns 1 or 0)
+                               Prefer: SET key value NX
+  SETEX key seconds value    → set with TTL
+                               Prefer: SET key value EX seconds
+
+  Examples:
+    SET user:42:name "Alice" EX 3600
+    SET counter 0
+    SET lock:order:1 "node-1" NX PX 30000    # distributed lock
+    GET user:42:name
+    MGET user:42:name user:43:name
+
+
+4. NUMERIC OPERATIONS (ATOMIC COUNTERS)
+─────────────────────────────────────────
+  INCR key              → increment by 1, return new value
+  INCRBY key delta      → increment by delta
+  INCRBYFLOAT key delta → increment float (stores as string, IEEE 754)
+  DECR key              → decrement by 1
+  DECRBY key delta      → decrement by delta
+
+  Key MUST have an integer (or float for INCRBYFLOAT) value.
+  Returns error if value is not numeric.
+  INCR creates the key with value 0 if it doesn't exist, then increments → 1.
+
+  Why atomic? Redis is single-threaded. INCR is one operation — no read-modify-
+  write race condition possible. This is WHY you'd use Redis for counters
+  instead of doing counter++ in application code.
+
+  Examples:
+    SET page:home:hits 0
+    INCR page:home:hits        → 1
+    INCRBY page:home:hits 5    → 6
+    INCRBYFLOAT price 1.50     → "7.50" (stored as string)
+
+  Rate limiting example:
+    INCR rate:user:42:2024-01-15T14:00
+    EXPIRE rate:user:42:2024-01-15T14:00 60
+    # If > 100, reject request
+
+
+5. STRING MANIPULATION
+───────────────────────
+  APPEND key value      → append to existing value, return new length
+                          Creates key if not exists (empty string start)
+  STRLEN key            → O(1) — length stored in SDS struct
+  GETRANGE key start end → substring (inclusive, supports negative indices)
+                           -1 = last char, -2 = second to last
+  SETRANGE key offset value → overwrite substring at offset
+                              Pads with \x00 if offset > current length
+
+  Examples:
+    SET greeting "Hello"
+    APPEND greeting ", World!"   → 13
+    STRLEN greeting              → 13
+    GETRANGE greeting 0 4        → "Hello"
+    GETRANGE greeting -6 -1      → "World!"
+    SETRANGE greeting 7 "Redis"  → overwrites "World" with "Redis"
+
+
+6. BINARY USAGE — STORING SERIALIZED OBJECTS
+─────────────────────────────────────────────
+  Strings are binary-safe → can store any serialized format:
+
+  # Java / Spring pattern
+  SET user:42 <protobuf_bytes>
+  SET user:42 <json_string>
+  SET user:42 <msgpack_bytes>
+
+  Tradeoffs:
+    JSON:     Human-readable, larger, parsing overhead
+    Protobuf: Binary, compact, requires schema
+    MessagePack: Binary, compact, no schema required
+    Java native serialization: Easy but slow and fragile
+
+  Redis String vs Hash for objects:
+    String (serialized JSON): ONE network round trip to get all fields
+    Hash:                     Can get individual fields (HGET), save bandwidth
+                              But: cannot atomically update multiple fields
+                              easily without a transaction
+
+
+7. TTL AND EXPIRY PATTERNS
+────────────────────────────
+  # Set TTL at creation
+  SET session:abc123 "data" EX 1800
+
+  # Add TTL after the fact
+  EXPIRE session:abc123 1800
+
+  # Sliding expiry (refresh TTL on each access)
+  GET session:abc123
+  EXPIRE session:abc123 1800   # reset timer
+
+  # Atomic get + refresh TTL
+  GETEX session:abc123 EX 1800
+
+  # Check TTL
+  TTL session:abc123    → seconds remaining, -1=no TTL, -2=doesn't exist
+  PTTL session:abc123   → milliseconds remaining
+
+
+8. DISTRIBUTED LOCK WITH STRINGS
+──────────────────────────────────
+  # Acquire lock (atomic: set only if not exists + set expiry atomically)
+  SET lock:resource:123 "owner-uuid-abc" NX PX 30000
+  → OK (acquired) or nil (lock held by someone else)
+
+  # Release lock (must verify ownership to avoid releasing someone else's lock)
+  # Use Lua for atomic check-and-delete:
+  local current = redis.call('GET', KEYS[1])
+  if current == ARGV[1] then
+      return redis.call('DEL', KEYS[1])
+  else
+      return 0
+  end
+
+  This is the foundation of Redlock (distributed lock algorithm).
+
+
+9. SCAN FOR STRING KEYS
+────────────────────────
+  SCAN 0 MATCH "user:*" COUNT 100 TYPE string
+  → Returns cursor + matching keys
+  → Cursor 0 at end means scan complete
+  → Non-blocking: use instead of KEYS * in production
+
+  NEVER use KEYS * in production — it blocks the server for the full scan!
+
+
+10. PERFORMANCE CONSIDERATIONS
+────────────────────────────────
+  - GET/SET: O(1) — fastest possible operation
+  - MGET/MSET: O(N) but one round-trip → better than N individual calls
+  - Large strings (>1MB): network bandwidth becomes bottleneck
+  - APPEND: can cause embstr→raw conversion (single realloc, not expensive)
+  - INCR/INCRBY: O(1), atomic, ideal for counters
+
+  Common interview gotcha: "Is INCR truly atomic?"
+  Answer: Yes, because Redis command execution is single-threaded.
+  Even without locks or transactions, no two clients can interleave their INCR.
+
+
+11. USE CASES SUMMARY
+──────────────────────
+  ┌───────────────────────────────────────────────────────────────────┐
+  │ Use Case                  │ Redis Pattern                         │
+  ├───────────────────────────┼───────────────────────────────────────┤
+  │ Page view counter         │ INCR page:home:hits                   │
+  │ Session data              │ SET session:id data EX 1800           │
+  │ API response cache        │ SET cache:key json EX 300             │
+  │ Feature flag              │ SET feature:dark_mode 1               │
+  │ Distributed lock          │ SET lock:res uuid NX PX 30000         │
+  │ Rate limiting (simple)    │ INCR rate:user:42 + EXPIRE            │
+  │ Idempotency key           │ SET idem:req-id "" NX EX 86400        │
+  │ Unique token storage      │ SET reset:token:abc userId EX 3600    │
+  │ JSON document cache       │ SET user:42 {json} EX 600             │
+  └───────────────────────────┴───────────────────────────────────────┘
+
+
+12. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: How is a Redis String stored internally?
+  A: As SDS (Simple Dynamic String). For integers ≤ 64-bit, the int encoding
+     stores the actual integer. For strings ≤ 44 bytes: embstr (single alloc).
+     For larger strings: raw SDS with separate header and buffer.
+
+  Q: What's the difference between SET NX and SETNX?
+  A: Functionally equivalent. But SET key value NX is atomic and also supports
+     EX/PX in the same command. SETNX is a legacy command that doesn't support
+     setting TTL atomically. Always prefer SET ... NX EX.
+
+  Q: Why use INCR for counters instead of GET → increment in app → SET?
+  A: GET + increment + SET is three operations and NOT atomic. Two concurrent
+     clients could both GET the same value, increment, and SET the same result
+     (lost update). INCR is a single atomic command — no race condition.
+
+  Q: What happens if you call INCR on a key that doesn't exist?
+  A: Redis initializes the key to 0, then increments it to 1. Returns 1.
+
+  Q: Can Redis strings store binary data like images?
+  A: Yes. Redis strings are binary-safe (backed by SDS, not null-terminated).
+     However, storing large binary blobs (>1MB) is inefficient — use object
+     storage (S3/Azure Blob) and only store the URL in Redis.
+
+================================================================================

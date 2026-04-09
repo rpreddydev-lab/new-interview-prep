@@ -1,0 +1,625 @@
+========================================================
+SPRING SECURITY INTERVIEW QUESTIONS
+========================================================
+
+Comprehensive Q&A covering Spring Security architecture, filter chains,
+resource server config, CORS/CSRF, method security, testing, and more.
+
+========================================================
+SECTION 1: SPRING SECURITY ARCHITECTURE
+========================================================
+
+Q1: How does Spring Security integrate with a Spring Boot application?
+A: Spring Security integrates through the Servlet filter mechanism.
+   Spring registers a DelegatingFilterProxy (a standard Servlet Filter) that
+   delegates to a FilterChainProxy bean. FilterChainProxy holds a list of
+   SecurityFilterChain beans, each matching a specific request pattern.
+
+   Flow:
+   HTTP Request
+     → Servlet Container
+     → DelegatingFilterProxy (regular servlet filter)
+       → FilterChainProxy (Spring-managed bean)
+         → Matches first SecurityFilterChain (by RequestMatcher)
+           → Executes 10-15 security filters in order
+             → DispatcherServlet (your controllers)
+
+   Spring Boot auto-configures the entire chain when spring-boot-starter-security
+   is on the classpath. You customize by declaring @Bean SecurityFilterChain.
+
+Q2: What is the purpose of the SecurityFilterChain?
+A: SecurityFilterChain combines a RequestMatcher (which requests to intercept) with
+   an ordered list of security filters to apply. You can have MULTIPLE chains:
+
+   @Bean
+   @Order(1)
+   SecurityFilterChain apiChain(HttpSecurity http) throws Exception {
+       http.securityMatcher("/api/**")
+           .authorizeHttpRequests(a -> a.anyRequest().authenticated())
+           .oauth2ResourceServer(rs -> rs.jwt(Customizer.withDefaults()));
+       return http.build();
+   }
+
+   @Bean
+   @Order(2)
+   SecurityFilterChain webChain(HttpSecurity http) throws Exception {
+       http.securityMatcher("/**")  // catches everything else
+           .authorizeHttpRequests(a -> a.anyRequest().authenticated())
+           .formLogin(Customizer.withDefaults());
+       return http.build();
+   }
+
+   Only the FIRST matching chain processes the request. Lower @Order = higher priority.
+
+Q3: What are the most important Security Filters in order?
+A: Key filters (order numbers are Spring Security defaults):
+
+  Order  Filter
+  -----  ------------------------------------
+  100    DisableEncodeUrlFilter          — prevents jsessionid in URLs
+  300    WebAsyncManagerIntegrationFilter — propagates SecurityContext to async
+  400    SecurityContextHolderFilter     — loads/saves SecurityContext (replaces PersistenceFilter in SS6)
+  500    HeaderWriterFilter              — writes X-Frame-Options, HSTS, etc.
+  600    CorsFilter                      — handles CORS preflight/actual requests
+  700    CsrfFilter                      — validates CSRF token on mutating requests
+  800    LogoutFilter                    — handles /logout
+  900    UsernamePasswordAuthenticationFilter — form login
+  1100   BearerTokenAuthenticationFilter — OAuth2 JWT/opaque token (resource server)
+  1200   BasicAuthenticationFilter       — HTTP Basic
+  1400   AnonymousAuthenticationFilter   — sets AnonymousAuthentication if no auth yet
+  1500   ExceptionTranslationFilter      — maps exceptions to HTTP responses
+  1600   AuthorizationFilter             — final authorization check (replaces FilterSecurityInterceptor)
+
+Q4: What is the SecurityContextHolder and how does it work?
+A: SecurityContextHolder is a thread-local storage for the current user's
+   authentication information. The default strategy is MODE_THREADLOCAL:
+   each thread has its own SecurityContext.
+
+   How it works:
+   - SecurityContextHolderFilter loads SecurityContext from session (web) or
+     sets new context (stateless API)
+   - Filters populate it: BearerTokenAuthenticationFilter → JwtAuthenticationToken
+   - @Controller methods can access via @AuthenticationPrincipal or
+     SecurityContextHolder.getContext().getAuthentication()
+   - After the response, SecurityContextHolderFilter clears the context to prevent leaks
+
+   For async code (@Async, CompletableFuture):
+   - SecurityContext doesn't propagate automatically to new threads!
+   - Solution: SecurityContextHolder.setStrategyName(MODE_INHERITABLETHREADLOCAL)
+   - Or: DelegatingSecurityContextExecutor wrapping your executor
+   - Or: Use @Async with Spring's AsyncConfigurer that propagates SecurityContext
+
+Q5: Explain the Authentication hierarchy in Spring Security.
+A:
+  Authentication (interface):
+    - Represents a security principal (user's identity + their auth status)
+    - Key methods: getPrincipal(), getCredentials(), getAuthorities(), isAuthenticated()
+    - Major implementations:
+      - UsernamePasswordAuthenticationToken (form login)
+      - JwtAuthenticationToken (OAuth2 resource server)
+      - AnonymousAuthenticationToken (not authenticated)
+      - OAuth2AuthenticationToken (OAuth2 login/social)
+
+  AuthenticationManager:
+    - Single method: authenticate(Authentication) → Authentication
+    - Primary implementation: ProviderManager
+
+  ProviderManager:
+    - Iterates through AuthenticationProviders to find one that supports the token type
+    - Delegates to parent ProviderManager if none found
+
+  AuthenticationProvider:
+    - supports(Class<?> authentication): tells ProviderManager if it can handle this type
+    - authenticate(Authentication): does the actual authentication work
+
+  Chain: ProviderManager → [DaoAuthenticationProvider → UserDetailsService → DB]
+                          → [JwtAuthenticationProvider → JwtDecoder → JWKS]
+                          → [CustomApiKeyAuthenticationProvider → ApiKeyRepository → DB]
+
+Q6: What is UserDetailsService and how does it work?
+A: UserDetailsService is an interface with one method:
+   UserDetails loadUserByUsername(String username) throws UsernameNotFoundException
+
+   It's called by DaoAuthenticationProvider during form login or HTTP Basic auth
+   to load the user from your data store. You implement it to fetch from DB/LDAP/cache.
+
+   @Service
+   public class CustomUserDetailsService implements UserDetailsService {
+       private final UserRepository userRepo;
+
+       @Override
+       public UserDetails loadUserByUsername(String username) {
+           User user = userRepo.findByUsername(username)
+               .orElseThrow(() -> new UsernameNotFoundException("User not found: " + username));
+           return org.springframework.security.core.userdetails.User
+               .withUsername(user.getUsername())
+               .password(user.getPasswordHash())
+               .roles(user.getRoles().toArray(new String[0]))
+               .accountExpired(!user.isActive())
+               .build();
+       }
+   }
+
+   DaoAuthenticationProvider then compares the submitted password against the
+   stored hash using PasswordEncoder.
+
+Q7: What PasswordEncoder should you use and why?
+A: BCryptPasswordEncoder (or Argon2PasswordEncoder for new systems).
+
+   BCrypt characteristics:
+   - Adaptive cost factor (work factor): default 10, higher = slower = more brute-force resistant
+   - Automatically generates and embeds salt (no separate salt storage needed)
+   - Same password hashes to different values each time (salt prevents rainbow tables)
+   - The salt is stored inside the BCrypt hash string itself
+
+   Never use: MD5, SHA-1, SHA-256 (fast, no salt, rainbow table vulnerable)
+   Avoid:     SHA-512 (still fast despite being "strong" hash)
+   Prefer:    BCrypt (strength 10-12), Argon2id (recommended by OWASP for new systems),
+              SCrypt, PBKDF2
+
+   Use PasswordEncoderFactories.createDelegatingPasswordEncoder() for
+   migration scenarios — it supports multiple encoders based on a {bcrypt} prefix.
+
+========================================================
+SECTION 2: RESOURCE SERVER CONFIGURATION
+========================================================
+
+Q8: What auto-configuration does Spring Boot provide for OAuth2 Resource Server?
+A: With spring-boot-starter-oauth2-resource-server and one of these in application.yml:
+
+   Option A — JWKS URI:
+   spring.security.oauth2.resourceserver.jwt.jwks-uri=https://as.example.com/jwks
+
+   Option B — Issuer URI (recommended):
+   spring.security.oauth2.resourceserver.jwt.issuer-uri=https://as.example.com
+
+   Auto-configured beans:
+   - JwtDecoder (NimbusJwtDecoder): parses and validates JWTs
+   - BearerTokenAuthenticationFilter: extracts Bearer token from Authorization header
+   - SecurityFilterChain: applies .oauth2ResourceServer(jwt -> ...)
+   - JwtAuthenticationConverter: converts JWT claims to GrantedAuthority
+
+   You can override any of these by declaring your own @Bean.
+
+Q9: What is the difference between issuer-uri vs jwks-uri configuration?
+A:
+  issuer-uri: Spring fetches the OIDC Discovery document from
+    {issuer-uri}/.well-known/openid-configuration
+    Extracts: jwks_uri, issuer, token_endpoint, etc.
+    Also automatically validates the 'iss' claim in JWTs.
+    Preferred — single configuration point.
+
+  jwks-uri: Directly specifies where to fetch public keys.
+    Does NOT automatically configure issuer validation.
+    You must add an issuer validator manually.
+    Use when the AS doesn't publish an OIDC Discovery document.
+
+Q10: How would you configure an opaque token Resource Server?
+A:
+  application.yml:
+  spring:
+    security:
+      oauth2:
+        resourceserver:
+          opaquetoken:
+            introspection-uri: https://as.example.com/introspect
+            client-id: resource-server-1
+            client-secret: ${RS_CLIENT_SECRET}
+
+  Or programmatically with caching:
+  @Bean
+  public OpaqueTokenIntrospector introspector() {
+      NimbusOpaqueTokenIntrospector base = new NimbusOpaqueTokenIntrospector(
+          introspectionUri, clientId, clientSecret);
+      return new CachingOpaqueTokenIntrospector(base); // cache results
+  }
+
+  Use opaque tokens when:
+  - Token revocation is required immediately
+  - You don't want claims visible in the token
+  - Phantom Token pattern (clients get opaque, API Gateway exchanges for JWT)
+
+Q11: How do you handle Bearer token extraction from a non-standard location?
+A: By default, BearerTokenExtractor reads from Authorization: Bearer header.
+   To also support cookies or custom headers:
+
+   @Bean
+   public BearerTokenResolver bearerTokenResolver() {
+       return request -> {
+           // First try Authorization header (standard)
+           DefaultBearerTokenResolver defaultResolver = new DefaultBearerTokenResolver();
+           String token = defaultResolver.resolve(request);
+           if (token != null) return token;
+           // Fallback: try cookie (SPA pattern)
+           if (request.getCookies() != null) {
+               for (Cookie c : request.getCookies()) {
+                   if ("access_token".equals(c.getName())) return c.getValue();
+               }
+           }
+           return null;
+       };
+   }
+
+========================================================
+SECTION 3: CORS AND CSRF
+========================================================
+
+Q12: Why do you need to configure CORS in Spring Security and not just @CrossOrigin?
+A: @CrossOrigin adds CORS headers to regular responses but CORS preflight requests
+   (OPTIONS method) are blocked by Spring Security BEFORE they reach your controllers.
+   Spring Security intercepts them, sees no authorization, and rejects them.
+
+   Correct approach: Configure CORS at the Spring Security level:
+   @Bean
+   CorsConfigurationSource corsConfigurationSource() {
+       CorsConfiguration config = new CorsConfiguration();
+       config.setAllowedOriginPatterns(List.of("https://*.example.com"));
+       config.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
+       config.setAllowedHeaders(List.of("Authorization", "Content-Type"));
+       config.setAllowCredentials(true);
+
+       UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+       source.registerCorsConfiguration("/api/**", config);
+       return source;
+   }
+
+   Then in SecurityFilterChain: .cors(cors -> cors.configurationSource(corsConfigurationSource()))
+
+Q13: What is a CSRF attack and how does Spring Security prevent it?
+A:
+  CSRF (Cross-Site Request Forgery): An attacker tricks an authenticated user's
+  browser into making a request to the victim's application without the user's
+  knowledge. The browser automatically sends session cookies, so the request appears
+  legitimate to the server.
+
+  Example:
+  Victim is logged into bank.com (session cookie set).
+  Attacker's page: <img src="https://bank.com/transfer?to=attacker&amount=1000">
+  Browser sends request with bank.com session cookie → transfer happens!
+
+  Spring Security prevention:
+  CsrfFilter generates a unique CSRF token and stores it in the session/cookie.
+  Every state-changing request (POST, PUT, DELETE) must include this token
+  as a header (X-CSRF-TOKEN) or form parameter (_csrf).
+  An attacker's page cannot read the CSRF token (same-origin policy on cookies/JS),
+  so it can't include the correct token.
+
+Q14: When is it safe to disable CSRF protection?
+A: It's safe to disable CSRF when ALL of these conditions are true:
+  1) The application is stateless (no session cookies)
+  2) Clients authenticate with tokens in the Authorization header
+  3) Tokens are stored in JS memory or non-HttpOnly cookies
+  4) No cookies carrying authentication information
+
+  Rationale: CSRF exploits the fact that browsers automatically attach cookies.
+  If authentication is via Authorization header (Bearer token), the attacker's
+  cross-origin page can't add that header (SOP prevents it), so CSRF is impossible.
+
+  Typical REST API (JWT in Authorization header):
+  .csrf(csrf -> csrf.disable())  // Safe for stateless token auth
+
+  NEVER disable CSRF for:
+  - Traditional form-based logins (session cookie auth)
+  - Applications using httpOnly cookies for JWTs
+  - Mixed auth applications
+
+Q15: What is CookieCsrfTokenRepository and when do you use it?
+A: Used with Angular/React SPAs that send CSRF tokens via the X-XSRF-TOKEN header.
+   Spring Security stores the CSRF token in a readable cookie (not httpOnly), so
+   the JavaScript can read it and include it in requests.
+
+   Angular's HttpClientModule automatically reads the XSRF-TOKEN cookie and
+   sends it as X-XSRF-TOKEN header on every non-GET request.
+
+   Configuration:
+   .csrf(csrf -> csrf
+       .csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())
+       .csrfTokenRequestHandler(new XorCsrfTokenRequestAttributeHandler())
+   )
+
+   Security: Even though the cookie is readable by JS, an attacker's cross-origin
+   page cannot read cookies from a different origin (same-origin policy).
+
+========================================================
+SECTION 4: METHOD SECURITY
+========================================================
+
+Q16: What's the difference between @EnableMethodSecurity and @EnableGlobalMethodSecurity?
+A:
+  @EnableGlobalMethodSecurity(prePostEnabled=true, securedEnabled=true):
+    - Spring Security 5.x and earlier
+    - Uses a less flexible configuration mechanism
+    - Deprecated in Spring Security 6
+
+  @EnableMethodSecurity:
+    - Spring Security 5.6+ (recommended for Spring Boot 3)
+    - prePostEnabled=true by default
+    - Uses AuthorizationManager (more extensible)
+    - Supports custom AuthorizationManagers
+    - Better error messages
+    - Must explicitly enable @Secured with securedEnabled=true
+    - Must explicitly enable @RolesAllowed with jsr250Enabled=true
+
+Q17: Explain the SpEL expressions available in @PreAuthorize.
+A:
+  Built-in expressions:
+    hasRole('ADMIN')               — true if user has ROLE_ADMIN authority
+    hasAnyRole('ADMIN', 'USER')    — true if user has any of the listed roles
+    hasAuthority('SCOPE_read')     — exact match on authority string (no ROLE_ prefix)
+    hasAnyAuthority(...)           — exact match on any of the listed strings
+    isAuthenticated()              — user is not anonymous
+    isFullyAuthenticated()         — authenticated and not via remember-me
+    isAnonymous()                  — user is anonymous
+    permitAll                      — always true
+    denyAll                        — always false
+    principal                      — the Authentication.getPrincipal() object
+    authentication                 — the Authentication object itself
+    #variableName                  — method parameter by name
+
+  Method parameter examples:
+    @PreAuthorize("#userId == authentication.name")        — user accessing own resource
+    @PreAuthorize("hasRole('ADMIN') or #id == principal.userId")  — admin or owner
+    @PostAuthorize("returnObject.ownerId == authentication.name") — post-filter result
+    @PreFilter("filterObject.department == authentication.name")  — filter input collection
+
+Q18: What is the self-invocation problem with @PreAuthorize?
+A: Spring Security method security is implemented via AOP proxies. When a class
+   calls its own method internally (this.someMethod()), it bypasses the proxy
+   and therefore bypasses the security check.
+
+   @Service
+   public class OrderService {
+       @PreAuthorize("hasRole('ADMIN')")
+       public void deleteOrder(Long id) { ... }
+
+       public void doSomeWork() {
+           deleteOrder(123L);  // ← BYPASSES security! Called on 'this', not proxy
+       }
+   }
+
+   Solution 1: Inject the bean itself:
+   @Service
+   public class OrderService {
+       @Autowired
+       private OrderService self;  // Spring injects the proxy
+
+       public void doSomeWork() {
+           self.deleteOrder(123L);  // ← Goes through proxy → security enforced
+       }
+   }
+
+   Solution 2: Extract the annotated method to a separate @Service bean.
+
+Q19: When should you use @PostAuthorize?
+A: @PostAuthorize is evaluated AFTER the method runs, on the return value.
+   Use it when you need to authorize based on the returned object's properties.
+
+   @PostAuthorize("returnObject.ownerId == authentication.name or hasRole('ADMIN')")
+   public Order getOrder(Long orderId) {
+       return orderRepository.findById(orderId).orElseThrow();  // loads from DB first
+   }
+
+   The method always executes and fetches from DB. The security check happens after.
+   Useful for "can this user see this specific record?" scenarios where you must
+   load the record to check authorization.
+
+   Caveat: If the method has side effects, they occur even if authorization fails.
+   Prefer @PreAuthorize with parameter-based checks for write operations.
+
+========================================================
+SECTION 5: SPRING AUTHORIZATION SERVER
+========================================================
+
+Q20: What is Spring Authorization Server and when would you use it?
+A: Spring Authorization Server (SAS) is Spring's official OAuth2/OIDC Authorization
+   Server implementation. Use it when you want to run your own Authorization Server
+   (rather than using a managed service like Auth0, Okta, or Keycloak).
+
+   Key features:
+   - Full OAuth2 AS: authorization_code, client_credentials, refresh_token flows
+   - OIDC support: ID Token, UserInfo endpoint, OIDC Discovery
+   - All grant types including Device Authorization and Token Exchange
+   - JWT and opaque token support
+   - JWKS endpoint
+   - Token introspection + revocation endpoints
+   - Extensible: customize token claims, consent pages, user mapping
+   - JDBC persistence for clients, authorizations, JWKS keys
+
+   Use it for: internal SSO, microservices token issuance, white-labeling,
+   full control over authorization logic without vendor lock-in.
+
+Q21: What is RegisteredClient and what are its key fields?
+A: RegisteredClient represents an OAuth2 client registered with the Authorization
+   Server. Key fields:
+
+   RegisteredClient.withId(UUID.randomUUID().toString())
+     .clientId("orders-service")           // identifies the client
+     .clientSecret("{bcrypt}$2a$...")       // hashed secret
+     .clientAuthenticationMethod(CLIENT_SECRET_BASIC)  // how client authenticates
+     .authorizationGrantType(AUTHORIZATION_CODE)
+     .authorizationGrantType(REFRESH_TOKEN)
+     .authorizationGrantType(CLIENT_CREDENTIALS)
+     .redirectUri("https://app.example.com/callback")  // allowed redirect URIs
+     .scope(OidcScopes.OPENID)              // scopes the client may request
+     .scope("orders:read")
+     .clientSettings(ClientSettings.builder()
+         .requireProofKey(true)             // enforce PKCE
+         .requireAuthorizationConsent(true) // show consent screen
+         .build())
+     .tokenSettings(TokenSettings.builder()
+         .accessTokenTimeToLive(Duration.ofMinutes(15))
+         .refreshTokenTimeToLive(Duration.ofDays(30))
+         .reuseRefreshTokens(false)         // enable rotation
+         .build())
+     .build()
+
+Q22: How do you add custom claims to JWT access tokens?
+A: Use OAuth2TokenCustomizer<JwtEncodingContext>:
+
+   @Bean
+   public OAuth2TokenCustomizer<JwtEncodingContext> tokenCustomizer() {
+       return context -> {
+           if (OAuth2TokenType.ACCESS_TOKEN.equals(context.getTokenType())) {
+               Authentication principal = context.getPrincipal();
+               // Add custom claims:
+               context.getClaims()
+                   .claim("roles", getUserRoles(principal))
+                   .claim("department", getUserDepartment(principal))
+                   .claim("tenant", getTenant(context));
+           }
+           if (OidcParameterNames.ID_TOKEN.equals(context.getTokenType().getValue())) {
+               // Customize ID Token claims
+               context.getClaims().claim("email_verified", true);
+           }
+       };
+   }
+
+========================================================
+SECTION 6: SPRING SECURITY TESTING
+========================================================
+
+Q23: How do you test secured endpoints in Spring MVC tests?
+A:
+  // JWT-based authentication:
+  mockMvc.perform(get("/api/orders")
+      .with(jwt()
+          .jwt(j -> j.subject("user1").claim("scope", "orders:read"))
+          .authorities(new SimpleGrantedAuthority("SCOPE_orders:read"))))
+      .andExpect(status().isOk());
+
+  // Form-based (mock user):
+  mockMvc.perform(get("/dashboard")
+      .with(user("admin").roles("ADMIN")))
+      .andExpect(status().isOk());
+
+  // CSRF token for POST:
+  mockMvc.perform(post("/api/orders")
+      .with(csrf())
+      .contentType(MediaType.APPLICATION_JSON)
+      .content("{\"item\": \"book\"}")
+      .with(jwt()))
+      .andExpect(status().isCreated());
+
+Q24: What is the difference between @WithMockUser and SecurityMockMvcRequestPostProcessors.jwt()?
+A:
+  @WithMockUser:
+    - Class/method annotation — affects the entire test
+    - Creates a UsernamePasswordAuthenticationToken (simulates form login)
+    - Does NOT simulate JWT/OAuth2 authentication
+    - Cannot set custom JWT claims
+    - Use for testing endpoints secured by basic/form login
+
+  jwt() PostProcessor:
+    - Applied per request in MockMvc's .with(jwt())
+    - Creates a JwtAuthenticationToken (simulates OAuth2 resource server)
+    - Can set arbitrary JWT claims, subject, authorities
+    - Doesn't call real JwtDecoder (bypasses token validation)
+    - Use for testing JWT-secured REST endpoints
+
+Q25: How do you test @PreAuthorize on Service layer methods?
+A: Use @WithMockUser on the test method or @WithUserDetails to load from service.
+   Then call the service method directly (not via MockMvc).
+
+   @Test
+   @WithMockUser(roles = "USER")
+   void deleteOrder_asUser_throwsAccessDeniedException() {
+       assertThrows(AccessDeniedException.class,
+           () -> orderService.deleteOrder(1L));
+   }
+
+   @Test
+   @WithMockUser(roles = "ADMIN")
+   void deleteOrder_asAdmin_succeeds() {
+       assertDoesNotThrow(() -> orderService.deleteOrder(1L));
+   }
+
+   // With custom JWT claims:
+   @Test
+   void approveOrder_asManager_succeeds() {
+       JwtAuthenticationToken auth = createJwtAuth("manager1", List.of("ROLE_MANAGER"));
+       SecurityContextHolder.getContext().setAuthentication(auth);
+       try {
+           assertDoesNotThrow(() -> orderService.approveOrder(1L));
+       } finally {
+           SecurityContextHolder.clearContext();
+       }
+   }
+
+Q26: What security scenarios must you always test?
+A:
+  Authentication tests:
+  □ Valid credentials → 200 OK
+  □ No credentials → 401 Unauthorized
+  □ Invalid credentials → 401 Unauthorized
+  □ Expired token → 401 Unauthorized
+
+  Authorization tests:
+  □ Correct role → 200 OK
+  □ Missing required role → 403 Forbidden
+  □ Lower privilege role trying higher privilege endpoint → 403
+
+  Scope tests:
+  □ Required scope present → 200 OK
+  □ Required scope missing → 403
+
+  Ownership tests:
+  □ User accessing own resource → 200 OK
+  □ User accessing another user's resource → 403 Forbidden
+  □ Admin accessing any resource → 200 OK
+
+  CSRF tests:
+  □ POST with CSRF token → 200 OK
+  □ POST without CSRF token → 403 Forbidden
+
+  Input validation:
+  □ SQL injection in parameters → 400 Bad Request (not 500)
+  □ XSS payload in body → sanitized/rejected
+
+========================================================
+SECTION 7: EXCEPTION HANDLING
+========================================================
+
+Q27: What is the difference between AuthenticationEntryPoint and AccessDeniedHandler?
+A:
+  AuthenticationEntryPoint:
+    - Called when an UNAUTHENTICATED user tries to access a protected resource
+    - Corresponds to 401 Unauthorized
+    - Default: Http403ForbiddenEntryPoint (confusingly named!)
+    - For resource servers: BearerTokenAuthenticationEntryPoint
+    - Action: Return 401 or redirect to login page
+
+  AccessDeniedHandler:
+    - Called when an AUTHENTICATED user lacks required permissions
+    - Corresponds to 403 Forbidden
+    - Default: AccessDeniedHandlerImpl (sends 403 page)
+    - For resource servers: BearerTokenAccessDeniedHandler
+    - Action: Return 403 or redirect to "access denied" page
+
+  Configuration:
+  .exceptionHandling(ex -> ex
+      .authenticationEntryPoint(new BearerTokenAuthenticationEntryPoint())
+      .accessDeniedHandler(new BearerTokenAccessDeniedHandler())
+  )
+
+Q28: How do you handle authentication errors globally in a Spring REST API?
+A: For OAuth2 Resource Servers:
+   - AuthenticationException → BearerTokenAuthenticationEntryPoint → 401
+   - AccessDeniedException → BearerTokenAccessDeniedHandler → 403
+
+   These automatically set the WWW-Authenticate response header with error details.
+
+   For custom authentication (API Key, custom tokens):
+   @Component
+   public class ApiAuthenticationEntryPoint implements AuthenticationEntryPoint {
+       @Override
+       public void commence(HttpServletRequest req, HttpServletResponse res,
+                            AuthenticationException ex) throws IOException {
+           res.setContentType(MediaType.APPLICATION_JSON_VALUE);
+           res.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+           res.getWriter().write("{\"error\":\"Unauthorized\",\"message\":\""
+               + ex.getMessage() + "\"}");
+       }
+   }
+
+   Note: Do NOT use @ExceptionHandler or @ControllerAdvice for security exceptions —
+   they occur in filters, before reaching the DispatcherServlet.

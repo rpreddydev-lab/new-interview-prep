@@ -1,0 +1,552 @@
+================================================================================
+RESILIENCE AND SECURITY INTERVIEW QUESTIONS
+================================================================================
+
+TOP 15 QUESTIONS — covering Circuit Breaker, Bulkhead, JWT, mTLS, Vault.
+
+================================================================================
+Q1. What is the Circuit Breaker pattern?
+================================================================================
+
+ANSWER:
+The Circuit Breaker prevents an application from repeatedly trying to call a
+service that is likely to fail, allowing it to fail fast.
+
+Named after electrical circuit breakers that open to prevent damage.
+
+States:
+  CLOSED — Normal operation. Calls pass through. Monitors failure rate.
+  OPEN — Failure threshold exceeded. All calls FAIL IMMEDIATELY (no network call).
+         Fallback method invoked.
+  HALF-OPEN — After wait duration, allows limited test calls through.
+             If successful → CLOSED. If failed → OPEN again.
+
+Implementation with Resilience4j:
+  @CircuitBreaker(name = "inventory", fallbackMethod = "inventoryFallback")
+  public InventoryDTO getInventory(Long productId) {
+    return inventoryClient.getInventory(productId);
+  }
+
+  public InventoryDTO inventoryFallback(Long productId, Throwable t) {
+    log.warn("Inventory service unavailable, returning cached/default");
+    return InventoryDTO.defaultAvailable(productId);
+  }
+
+  # application.yml
+  resilience4j.circuitbreaker.instances.inventory:
+    sliding-window-size: 10
+    failure-rate-threshold: 50       # Open when 5/10 calls fail
+    wait-duration-in-open-state: 10s
+    permitted-number-of-calls-in-half-open-state: 3
+
+BENEFIT: Prevents cascading failures. Fast failure is better than slow failure.
+Without circuit breaker: slow service fills up thread pool → cascading failure.
+
+================================================================================
+Q2. What is the Bulkhead pattern?
+================================================================================
+
+ANSWER:
+Bulkhead isolates failures to a portion of the system, named after the
+watertight compartments in a ship's hull.
+
+In microservices: separate thread pools per dependency.
+
+Problem without Bulkhead:
+  Order service calls Inventory (slow) and Payment (fast).
+  All calls share one thread pool (200 threads).
+  Inventory becomes slow → fills all 200 threads → Payment calls also blocked.
+
+Bulkhead solution:
+  Inventory gets 50 threads max. Payment gets 50 threads max.
+  Even if Inventory is completely saturated → Payment still has 50 threads.
+
+Resilience4j implementation:
+  @Bulkhead(name = "inventory", type = Bulkhead.Type.THREADPOOL)
+  @CompletableFuture
+  public CompletableFuture<InventoryDTO> getInventoryAsync(Long productId) {
+    return CompletableFuture.supplyAsync(() -> inventoryClient.getInventory(productId));
+  }
+
+  resilience4j.bulkhead.instances.inventory:
+    maxConcurrentCalls: 25         # Semaphore-based concurrent calls
+
+  resilience4j.thread-pool-bulkhead.instances.inventory:
+    maxThreadPoolSize: 10          # Dedicated thread pool
+    coreThreadPoolSize: 5
+
+TYPES:
+  Semaphore Bulkhead: Limits concurrent calls (lightweight, same thread).
+  Thread Pool Bulkhead: Dedicated threads per dependency (full isolation).
+
+================================================================================
+Q3. What is the difference between Retry with backoff and Circuit Breaker?
+================================================================================
+
+ANSWER:
+Retry and Circuit Breaker are complementary, not alternatives.
+
+Retry:
+  Handles transient failures (network blip, brief overload).
+  Should use: exponential backoff + jitter to avoid thundering herd.
+  Limited retries (3 attempts max).
+  NOT suitable for: service is down (circuit breaker more appropriate).
+
+  resilience4j.retry.instances.inventory:
+    max-attempts: 3
+    wait-duration: 500ms
+    enable-exponential-backoff: true
+    exponential-backoff-multiplier: 2
+    retry-exceptions:
+      - java.net.ConnectException
+      - java.util.concurrent.TimeoutException
+
+Circuit Breaker:
+  Handles persistent failures (service is down).
+  Prevents hammering a failing service with retries.
+  Fail fast → return fallback immediately.
+
+COMBINED USE:
+  1. Request fails
+  2. Retry (3 attempts with backoff)
+  3. If all retries fail → Circuit Breaker records failure
+  4. When failure rate exceeds threshold → Circuit OPENS
+  5. All subsequent calls: FAIL FAST → fallback (no retry needed)
+
+@Retry applied first, @CircuitBreaker outside:
+  @CircuitBreaker(name = "inventory", fallbackMethod = "fallback")
+  @Retry(name = "inventory")
+  public InventoryDTO getInventory(Long id) { ... }
+
+================================================================================
+Q4. What is JWT and how is it used in microservices?
+================================================================================
+
+ANSWER:
+JWT (JSON Web Token) is a compact, self-contained token for securely transmitting
+information between parties as a signed JSON object.
+
+Structure: header.payload.signature (base64url encoded, dot-separated)
+  Header: {"alg": "RS256", "typ": "JWT"}
+  Payload: {"sub": "user123", "roles": ["USER"], "exp": 1735689600, "iat": 1735603200}
+  Signature: RSA-SHA256(base64(header) + "." + base64(payload), privateKey)
+
+Why JWT for microservices:
+  ✓ Stateless — no DB lookup needed to validate. Service verifies signature locally.
+  ✓ Self-contained — user ID, roles, permissions in token
+  ✓ Scales — no shared session state between services
+  ✓ Propagatable — forward Authorization header to downstream services
+
+Spring Boot resource server:
+  @Bean
+  SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+    return http
+      .oauth2ResourceServer(oauth2 -> oauth2.jwt(jwt ->
+        jwt.jwtAuthenticationConverter(jwtAuthenticationConverter())
+      ))
+      .authorizeHttpRequests(auth -> auth
+        .requestMatchers("/api/orders/**").hasRole("USER")
+        .anyRequest().authenticated()
+      ).build();
+  }
+
+Service-to-service: Forward Authorization header or use client_credentials flow.
+
+SECURITY CONCERNS:
+  ✗ Token revocation (tokens are valid until expiry — use short TTLs + refresh tokens)
+  ✗ Signature verification overhead (use RS256 for distributed verify)
+  ✗ Token theft (use HTTPS always, set Secure + HttpOnly on cookies)
+
+================================================================================
+Q5. What is OAuth2 and what are the different grant types?
+================================================================================
+
+ANSWER:
+OAuth2 is an authorization framework. It delegates authorization (not authentication).
+OpenID Connect (OIDC) adds identity (authentication) on top of OAuth2.
+
+Key roles:
+  Resource Owner: User who owns the data
+  Client: Application requesting access
+  Authorization Server: Issues tokens (Keycloak, Auth0, Okta)
+  Resource Server: API being accessed
+
+Grant types:
+  1. Authorization Code + PKCE (for web/SPA/mobile user-facing apps):
+     Most secure. User logs in at Auth Server. Code exchanged for token.
+     PKCE (Proof Key for Code Exchange) prevents code interception attacks.
+
+  2. Client Credentials (for service-to-service, no user involved):
+     Service authenticates with client_id + client_secret.
+     Gets access token to call other services.
+     Use for: microservice-to-microservice automated communication.
+
+  3. Implicit (DEPRECATED): Token returned directly. PKCE replaced it.
+
+  4. Device Code: For devices with no browser (IoT, TV apps).
+
+  5. Refresh Token: Exchange refresh token for new access token without login.
+
+Spring Boot client_credentials:
+  spring.security.oauth2.client.registration.inventory-service:
+    client-id: order-service
+    client-secret: ${OAUTH_SECRET}
+    authorization-grant-type: client_credentials
+    scope: inventory:read
+
+================================================================================
+Q6. What is mTLS and how does it differ from regular TLS?
+================================================================================
+
+ANSWER:
+TLS (one-way): Server proves identity to client via certificate.
+  Client: Is this really example.com? Check server certificate.
+  Server: Trusts all clients (doesn't verify who the client is).
+
+mTLS (mutual TLS): BOTH server AND client verify each other's certificates.
+  Client: Is this really inventory-service? Check server cert.
+  Server: Is this really order-service? Check client cert.
+
+Why mTLS for microservices:
+  ✓ Prevents impersonation — a compromised service can't masquerade as another
+  ✓ Encryption in transit — even on internal network (east-west traffic)
+  ✓ Zero-trust network — each service proves its identity
+  ✓ No shared secrets — certificate-based, not password-based
+
+How to implement:
+  Option 1: Service Mesh (Istio) — automatic mTLS for all pods.
+    PeerAuthentication → STRICT mTLS enforced. No app code changes.
+    Certificates managed by Istio (rotated automatically).
+
+  Option 2: cert-manager + SPIFFE/SPIRE:
+    cert-manager issues certificates from Vault CA.
+    SPIFFE provides workload identity (SVID).
+
+  Option 3: Manual (Spring Boot):
+    Configure SSL client keystore in RestClient/WebClient.
+
+"I prefer service mesh for mTLS. It's transparent to application code,
+certificates are automatically rotated, and policy is declarative."
+
+================================================================================
+Q7. How do you manage secrets in microservices?
+================================================================================
+
+ANSWER:
+Secrets: database passwords, API keys, TLS private keys, OAuth client secrets.
+
+NEVER:
+  ✗ Hardcode in source code
+  ✗ Commit to Git
+  ✗ Store in environment variables in Dockerfile
+  ✗ Log secrets
+
+Options (in order of security):
+
+1. HashiCorp Vault (gold standard):
+   Central secrets management. Dynamic secrets (DB credentials rotated automatically).
+   Spring Cloud Vault: inject secrets as Spring properties at startup.
+   
+   spring.cloud.vault.token: ${VAULT_TOKEN}
+   spring.cloud.vault.generic.backend: secret
+   spring.config.import: vault://
+
+   Dynamic DB credentials: Vault creates a unique DB user per service instance.
+   Credentials expire. Vault auto-renews. Breach exposure is limited.
+
+2. Kubernetes Secrets + RBAC:
+   kubectl create secret generic db-creds --from-literal=password=xyz
+   Mounted as environment variables or files in pod.
+   LIMITATION: Secrets are only base64 encoded (not encrypted by default).
+   Encrypt etcd at rest. Use RBAC to limit which pods can access which secrets.
+
+3. Sealed Secrets (Bitnami):
+   Encrypt secrets to a SealedSecret resource safe to commit to Git.
+   Controller decrypts using private key in cluster.
+
+4. AWS Secrets Manager / Azure Key Vault:
+   Managed secrets service. Spring Cloud AWS auto-imports.
+
+LIFECYCLE: Rotate secrets regularly. Short TTL for dynamic credentials.
+Detect and alert on unexpected secret access.
+
+================================================================================
+Q8. What is Zero Trust Security?
+================================================================================
+
+ANSWER:
+Zero Trust: "Never trust, always verify." Opposite of perimeter security.
+
+Traditional perimeter model: Trust everything inside the network.
+  Attacker breaches perimeter → has free access to all internal services.
+
+Zero Trust: Every request must be authenticated and authorized, regardless
+of network location (inside or outside).
+
+Principles:
+  1. Verify explicitly: Always authenticate using all available data points
+     (identity, location, device health, service identity).
+  2. Least privilege access: Limit access to exactly what's needed.
+  3. Assume breach: Segment the network. Minimize blast radius.
+     Use end-to-end encryption even on internal network.
+
+Microservices Zero Trust implementation:
+  - mTLS for all service-to-service communication (service identity)
+  - JWT for user identity propagation
+  - RBAC at each service level (don't just rely on gateway auth)
+  - Service Mesh policies (Istio AuthorizationPolicy per service)
+  - Network policies (K8s NetworkPolicy: restrict which pods can talk to which)
+
+  # K8s NetworkPolicy: order-service can only accept traffic from api-gateway
+  podSelector:
+    matchLabels:
+      app: order-service
+  ingress:
+    - from:
+      - podSelector:
+          matchLabels:
+            app: api-gateway
+
+================================================================================
+Q9. How do you handle authentication between microservices?
+================================================================================
+
+ANSWER — Three patterns:
+
+1. JWT Propagation (most common):
+   User authenticates → gets JWT → calls API Gateway → Gateway validates JWT →
+   Forwards token in Authorization header to downstream services.
+   Downstream services validate JWT signature locally (no DB call).
+
+2. Service Account / Client Credentials:
+   Internal service calls use separate service-to-service JWT.
+   Each service has its own OAuth2 client (client_credentials grant).
+   OrderService → Keycloak: "I am order-service, give me a token for inventory-service"
+   OrderService → InventoryService: presents service token.
+
+3. mTLS (Service Mesh):
+   Certificate-based identity. No tokens needed.
+   Istio manages certificates. Services proved by cert, not token.
+   Often combined with #1 for user identity propagation.
+
+WHICH TO USE:
+  External → Service: JWT (OAuth2 Bearer token)
+  Service → Service (automated): Client credentials OR mTLS
+  Service → Service (on behalf of user): JWT propagation
+
+  "I use mTLS for transport-level identity and JWT for user-level authorization.
+  Each is enforced at different layers."
+
+================================================================================
+Q10. What is API Gateway security?
+================================================================================
+
+ANSWER:
+API Gateway is the security boundary between internet and services.
+
+Responsibilities:
+  1. Authentication: Validate JWT tokens (introspection or public key verification)
+  2. Authorization: Basic role checks before routing
+  3. Rate limiting: Prevent DoS attacks (per IP, per user, per API key)
+  4. Input validation: Block malformed requests before they reach services
+  5. TLS termination: Decrypt HTTPS, encrypt again for internal (optional)
+  6. CORS: Control which origins can call your APIs
+  7. WAF integration: SQL injection, XSS detection
+
+JWT validation in Spring Cloud Gateway:
+  @Bean
+  SecurityWebFilterChain securityWebFilterChain(ServerHttpSecurity http) {
+    return http
+      .oauth2ResourceServer(oauth2 -> oauth2.jwt(withDefaults()))
+      .authorizeExchange(exchange -> exchange
+        .pathMatchers("/api/public/**").permitAll()
+        .pathMatchers("/api/**").authenticated()
+        .anyExchange().denyAll()
+      )
+      .csrf(CsrfSpec::disable)
+      .build();
+  }
+
+Defense in depth:
+  Services should ALSO validate JWT (not rely only on gateway auth).
+  If attacker bypasses gateway (internal network), services still protected.
+
+================================================================================
+Q11. What is the difference between authentication and authorization?
+================================================================================
+
+ANSWER:
+Authentication (AuthN): Who are you? Verify identity.
+  → JWT validation, OAuth2, mTLS certificate
+  → "This request is from user ID 42"
+
+Authorization (AuthZ): What are you allowed to do?
+  → RBAC (role-based), ABAC (attribute-based), ACL
+  → "User 42 has role USER. USER can read orders but not admin."
+
+In microservices:
+  API Gateway: Handles authentication (validate JWT, extract identity).
+  Individual services: Handle fine-grained authorization.
+
+Spring Security:
+  @PreAuthorize("hasRole('ADMIN') or #userId == authentication.principal.id")
+  public OrderDTO getOrder(Long userId, Long orderId) { ... }
+
+  // Role hierarchy
+  @Bean
+  RoleHierarchy roleHierarchy() {
+    return RoleHierarchyImpl.fromHierarchy(
+      "ROLE_ADMIN > ROLE_STAFF > ROLE_USER"
+    );
+  }
+
+ABAC example: "Users in EU region can only access EU-stored data."
+  More complex than RBAC. Use when roles alone aren't granular enough.
+
+================================================================================
+Q12. What is the Principle of Least Privilege in microservices?
+================================================================================
+
+ANSWER:
+Each service should have only the minimum permissions required to function.
+
+DB level: Service DB user has only SELECT/INSERT/UPDATE on its own schema.
+  NOT: superuser, CREATE, DROP, access to other schemas.
+
+K8s RBAC: Service account with only necessary verbs on necessary resources.
+  NOT: cluster-admin or wildcard permissions.
+
+Secret access: Service can only read secrets it owns.
+  NOT: access to all secrets in the namespace.
+
+Service-to-service: Each service can only call the services it needs.
+  Enforced via: Istio AuthorizationPolicy, K8s NetworkPolicy.
+
+  # Inventory service can only be called by order-service
+  apiVersion: security.istio.io/v1beta1
+  kind: AuthorizationPolicy
+  spec:
+    selector:
+      matchLabels:
+        app: inventory-service
+    rules:
+      - from:
+        - source:
+            principals: ["cluster.local/ns/default/sa/order-service"]
+
+"I apply least privilege at every layer: DB, K8s, Istio policies, and OAuth2
+scopes. Blast radius of a breach is limited to what that specific service can access."
+
+================================================================================
+Q13. How do you handle token expiry and refresh in microservices?
+================================================================================
+
+ANSWER:
+Access Token: Short-lived (15 min - 1 hour). Used for every API call.
+Refresh Token: Long-lived (hours to days). Used ONLY to get new access tokens.
+
+Flow:
+  1. User authenticates → gets access_token (15min) + refresh_token (7 days)
+  2. User calls API with access_token
+  3. access_token expires → 401 response
+  4. Client calls /oauth2/token with refresh_token → new access_token
+  5. If refresh_token expired → user must re-authenticate
+
+Service-to-service token management:
+  @Bean
+  public OAuth2AuthorizedClientManager authorizedClientManager(
+    ClientRegistrationRepository clients,
+    OAuth2AuthorizedClientService clientService
+  ) {
+    // Auto-refreshes token before it expires
+    return new AuthorizedClientServiceOAuth2AuthorizedClientManager(
+      clients, clientService
+    );
+  }
+
+  // WebClient auto-includes fresh token
+  @Bean
+  public WebClient inventoryClient(OAuth2AuthorizedClientManager clientManager) {
+    var oauth2 = new ServletOAuth2AuthorizedClientExchangeFilterFunction(clientManager);
+    oauth2.setDefaultClientRegistrationId("inventory-service");
+    return WebClient.builder().apply(oauth2.oauth2Configuration()).build();
+  }
+
+Token introspection vs local validation:
+  Local: Verify signature with public key. No network call. Fast.
+  Introspection: Call auth server to validate. Allows revocation. Slow.
+  Recommendation: Local validation for access tokens (short-lived). Introspection
+  for sensitive operations or when revocation is critical.
+
+================================================================================
+Q14. What is a penetration test and security audit for microservices?
+================================================================================
+
+ANSWER:
+Security testing strategies for microservices:
+
+1. Dependency vulnerability scanning:
+   OWASP Dependency-Check, Snyk, GitHub Dependabot.
+   Scan Maven/Gradle dependencies for known CVEs.
+   Add to CI pipeline: build fails if critical CVE found.
+
+2. Container image scanning:
+   Trivy, Grype scan Docker images for OS + package vulnerabilities.
+   Scan in CI before pushing to registry.
+
+3. Static Application Security Testing (SAST):
+   SonarQube, Checkmarx, Semgrep.
+   Analyze source code for security patterns (SQL injection, hardcoded secrets).
+
+4. Dynamic Application Security Testing (DAST):
+   OWASP ZAP, Burp Suite.
+   Automated penetration testing against running service.
+
+5. Secret scanning:
+   GitHub Secret Scanning, Gitleaks.
+   Detect accidentally committed secrets.
+   Run pre-commit hooks.
+
+6. Chaos engineering for security:
+   Simulate: network segmentation failure, certificate expiry, mTLS policy bypass.
+
+"Security is continuous, not a one-time audit. I embed SAST + dependency scanning
+in CI, image scanning before deploy, and run quarterly penetration tests."
+
+================================================================================
+Q15. What is Secrets Rotation and why is it important?
+================================================================================
+
+ANSWER:
+Secrets rotation: Periodically replace secrets (passwords, certificates, tokens)
+with new values. Old secret is invalidated.
+
+WHY:
+  - Limits damage from undetected credential theft
+  - Regulatory compliance (PCI-DSS, SOC2 require rotation)
+  - Reduces window of exposure
+
+TYPES:
+  Static rotation: Manual or scheduled replacement.
+    Risk: downtime if not handled carefully. Services must pick up new secret.
+
+  Dynamic secrets (HashiCorp Vault):
+    Vault generates a UNIQUE database credential per service instance.
+    Credential has TTL (e.g., 1 hour). Vault auto-renews.
+    If service is compromised, only that instance's credential works.
+    Expires automatically when instance dies.
+
+  Certificate rotation:
+    cert-manager auto-renews TLS certificates before expiry.
+    Istio rotates workload certificates automatically (default: 24 hours).
+
+  K8s rotation challenge:
+    Secrets must be updated in K8s, pods must restart or pick up new value.
+    Spring Cloud Config + @RefreshScope can reload config without restart.
+    Reloader (Stakater) watches secrets → triggers rolling restart on change.
+
+"I use Vault dynamic secrets for databases — each pod gets unique credentials
+that expire in 1 hour. For TLS, Istio handles rotation automatically.
+For static secrets, I use cert-manager and Vault with TTLs."
+
+================================================================================

@@ -1,0 +1,318 @@
+================================================================
+  R2DBC — REACTIVE RELATIONAL DATABASE CONNECTIVITY
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. WHY R2DBC?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+JDBC is fundamentally blocking:
+  - Connection.query() blocks the calling thread until results arrive
+  - In Spring WebFlux, using JDBC blocks the Netty event-loop thread
+  - This defeats the entire purpose of reactive programming
+
+R2DBC:
+  - A non-blocking, reactive API spec for SQL databases
+  - Drivers return Mono/Flux rather than blocking JDBC ResultSet
+  - Fully integrates with Spring Data and Project Reactor
+
+Supported databases:
+  - PostgreSQL: io.r2dbc:r2dbc-postgresql
+  - MySQL/MariaDB: io.asyncer:r2dbc-mysql
+  - H2 (dev/testing): io.r2dbc:r2dbc-h2
+  - MSSQL: io.r2dbc:r2dbc-mssql
+  - Oracle: com.oracle.database.r2dbc:oracle-r2dbc
+
+NOTE: R2DBC does NOT support JPA. Use Spring Data R2DBC (simpler,
+      entity-based) or DatabaseClient (low-level, SQL-based).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. SETUP AND CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-r2dbc</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.postgresql</groupId>
+    <artifactId>r2dbc-postgresql</artifactId>
+    <scope>runtime</scope>
+</dependency>
+
+# application.yml
+spring:
+  r2dbc:
+    url: r2dbc:postgresql://localhost:5432/shopdb
+    username: user
+    password: secret
+    pool:
+      max-size: 20
+      initial-size: 5
+      max-idle-time: 30m
+  sql:
+    init:
+      mode: always        # run schema.sql on startup (dev only)
+      schema-locations: classpath:schema.sql
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. ENTITY AND REPOSITORY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Entity (no JPA annotations — use Spring Data R2DBC annotations)
+@Table("orders")
+public class Order {
+
+    @Id
+    private Long id;
+
+    private String status;
+
+    private BigDecimal total;
+
+    @Column("customer_id")
+    private Long customerId;
+
+    @CreatedDate
+    private LocalDateTime createdAt;
+
+    @LastModifiedDate
+    private LocalDateTime updatedAt;
+
+    // constructors, getters, setters / @Data
+}
+
+// Enable auditing
+@Configuration
+@EnableR2dbcAuditing
+public class R2dbcConfig extends AbstractR2dbcConfiguration {
+    // custom config if needed
+}
+
+// Reactive repository
+public interface OrderRepository extends ReactiveCrudRepository<Order, Long> {
+
+    Flux<Order> findByStatus(String status);
+
+    Flux<Order> findByCustomerId(Long customerId);
+
+    Mono<Long> countByStatus(String status);
+
+    @Query("SELECT * FROM orders WHERE total > :minTotal ORDER BY total DESC LIMIT :limit")
+    Flux<Order> findTopOrders(@Param("minTotal") BigDecimal minTotal, @Param("limit") int limit);
+
+    Mono<Void> deleteByCustomerId(Long customerId);
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. SERVICE LAYER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Service
+@Transactional
+public class OrderService {
+
+    private final OrderRepository orderRepository;
+    private final ProductRepository productRepository;
+
+    public Mono<Order> placeOrder(CreateOrderRequest request) {
+        return productRepository.findById(request.getProductId())
+            .switchIfEmpty(Mono.error(new ProductNotFoundException(request.getProductId())))
+            .flatMap(product -> {
+                Order order = Order.builder()
+                    .customerId(request.getCustomerId())
+                    .total(product.getPrice().multiply(BigDecimal.valueOf(request.getQuantity())))
+                    .status("PENDING")
+                    .build();
+                return orderRepository.save(order);
+            });
+    }
+
+    @Transactional(readOnly = true)
+    public Flux<Order> findByCustomer(Long customerId) {
+        return orderRepository.findByCustomerId(customerId);
+    }
+
+    public Mono<Order> updateStatus(Long orderId, String status) {
+        return orderRepository.findById(orderId)
+            .switchIfEmpty(Mono.error(new OrderNotFoundException(orderId)))
+            .flatMap(order -> {
+                order.setStatus(status);
+                return orderRepository.save(order);
+            });
+    }
+
+    public Mono<Void> cancelOrder(Long orderId) {
+        return orderRepository.findById(orderId)
+            .switchIfEmpty(Mono.error(new OrderNotFoundException(orderId)))
+            .flatMap(order -> {
+                if ("SHIPPED".equals(order.getStatus())) {
+                    return Mono.error(new IllegalStateException("Cannot cancel shipped order"));
+                }
+                return orderRepository.deleteById(orderId);
+            });
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. DatabaseClient — LOW-LEVEL SQL QUERIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For complex queries not supported by derived methods:
+
+@Repository
+public class OrderAnalyticsRepository {
+
+    private final DatabaseClient db;
+
+    // Complex aggregation query
+    public Flux<OrderSummary> findMonthlySummary(int year) {
+        return db.sql("""
+                SELECT DATE_TRUNC('month', created_at) AS month,
+                       COUNT(*) AS order_count,
+                       SUM(total) AS revenue
+                FROM orders
+                WHERE EXTRACT(YEAR FROM created_at) = :year
+                GROUP BY DATE_TRUNC('month', created_at)
+                ORDER BY month
+                """)
+            .bind("year", year)
+            .map((row, meta) -> OrderSummary.builder()
+                .month(row.get("month", LocalDateTime.class))
+                .orderCount(row.get("order_count", Long.class))
+                .revenue(row.get("revenue", BigDecimal.class))
+                .build())
+            .all();
+    }
+
+    // Upsert
+    public Mono<Void> upsertCustomerStats(Long customerId, BigDecimal total) {
+        return db.sql("""
+                INSERT INTO customer_stats (customer_id, total_spent)
+                VALUES (:customerId, :total)
+                ON CONFLICT (customer_id)
+                DO UPDATE SET total_spent = customer_stats.total_spent + :total
+                """)
+            .bind("customerId", customerId)
+            .bind("total", total)
+            .fetch().rowsUpdated().then();
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. TRANSACTIONS IN R2DBC
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Transactional works with R2DBC via R2dbcTransactionManager.
+
+@Service
+public class TransferService {
+
+    private final AccountRepository accountRepo;
+
+    @Transactional  // both operations in same transaction
+    public Mono<Void> transfer(Long fromId, Long toId, BigDecimal amount) {
+        return accountRepo.findById(fromId)
+            .flatMap(from -> {
+                from.setBalance(from.getBalance().subtract(amount));
+                return accountRepo.save(from);
+            })
+            .then(accountRepo.findById(toId))
+            .flatMap(to -> {
+                to.setBalance(to.getBalance().add(amount));
+                return accountRepo.save(to);
+            })
+            .then();
+        // If any step throws → transaction rolls back
+    }
+}
+
+// For programmatic transaction control:
+@Autowired
+private TransactionalOperator txOperator;
+
+public Mono<Void> doWithTransaction(Mono<Void> operation) {
+    return txOperator.transactional(operation);
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. TESTING R2DBC WITH @DataR2dbcTest
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@DataR2dbcTest — loads R2DBC auto-configuration + repositories, no services/controllers
+
+@DataR2dbcTest
+@Testcontainers
+class OrderRepositoryTest {
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+
+    @Autowired
+    private OrderRepository orderRepository;
+
+    @Test
+    void shouldSaveAndFindOrder() {
+        Order order = new Order(null, "PENDING", new BigDecimal("49.99"), 1L, null, null);
+
+        StepVerifier.create(
+            orderRepository.save(order)
+                .flatMap(saved -> orderRepository.findById(saved.getId())))
+            .assertNext(found -> {
+                assertThat(found.getStatus()).isEqualTo("PENDING");
+                assertThat(found.getTotal()).isEqualByComparingTo("49.99");
+            })
+            .verifyComplete();
+    }
+
+    @Test
+    void shouldFindByStatus() {
+        // Persist test data then query
+        StepVerifier.create(
+            orderRepository.save(new Order(null, "PENDING", BigDecimal.TEN, 1L, null, null))
+                .thenMany(orderRepository.findByStatus("PENDING")))
+            .expectNextCount(1)
+            .verifyComplete();
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is R2DBC and why can't you use JPA with WebFlux?
+A: R2DBC (Reactive Relational Database Connectivity) is a non-blocking API
+   for relational databases. JPA/Hibernate is built on top of JDBC, which is
+   fundamentally blocking — it occupies a thread until the query completes.
+   In WebFlux, blocking threads kills the event-loop concurrency model.
+   R2DBC returns Mono/Flux, allowing the thread to be released while the DB
+   responds. Spring Data R2DBC provides repository support for R2DBC.
+
+Q: Does Spring Data R2DBC support the same features as Spring Data JPA?
+A: No. R2DBC has a simpler feature set than JPA. It does NOT support: lazy
+   loading, first-level cache, JPQL, criteria API, entity relationships
+   (no @OneToMany), @Embeddable. You manually handle joins using @Query + SQL
+   or DatabaseClient. The tradeoff is simplicity and non-blocking behavior
+   vs. the rich ORM features of JPA.
+
+Q: How does @Transactional work in R2DBC?
+A: Spring provides R2dbcTransactionManager for reactive transaction management.
+   @Transactional wraps the reactive pipeline in a transaction context
+   propagated via Reactor Context (not ThreadLocal). If the Mono/Flux terminates
+   with an error, the transaction rolls back. It requires the method to return
+   Mono or Flux (not void).
+
+Q: What is StepVerifier and when is it used?
+A: StepVerifier is the Project Reactor test utility for verifying reactive
+   pipelines. It subscribes to a Mono/Flux and lets you assert what values
+   are emitted, the order, errors, and completion. Methods: create(), assertNext(),
+   expectNext(), expectNextCount(), expectError(), verifyComplete(). It's the
+   standard way to unit-test reactive code.
+
+Q: What is the connection pool configuration for R2DBC?
+A: Spring Boot auto-configures r2dbc-pool (connection pool) using
+   spring.r2dbc.pool.* properties. Key settings: max-size (max connections,
+   default 10), initial-size (initial connections), max-idle-time (how long
+   a connection can be idle before being closed). Unlike HikariCP for JDBC,
+   R2DBC pool is non-blocking — acquiring a connection returns a Mono<Connection>.

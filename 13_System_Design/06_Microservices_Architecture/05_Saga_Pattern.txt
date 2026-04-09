@@ -1,0 +1,198 @@
+================================================================
+SAGA PATTERN
+================================================================
+
+(See also: Distributed Transactions in 04_Distributed_Systems)
+
+WHAT IS THE SAGA PATTERN?
+---------------------------
+The Saga pattern manages distributed transactions across multiple
+microservices without using a distributed lock (2PC).
+
+A Saga is a sequence of local transactions, each within one service.
+If a step fails, compensating transactions undo the work of previous steps.
+
+EXAMPLE: E-commerce Order Flow
+  Step 1: Order Service — create order (status: PENDING)
+  Step 2: Inventory Service — reserve items
+  Step 3: Payment Service — charge credit card
+  Step 4: Shipping Service — schedule shipment
+  Step 5: Order Service — update order (status: CONFIRMED)
+
+If Step 3 (payment) fails:
+  Compensation 3: (nothing to undo in Payment)
+  Compensation 2: Inventory Service — release reserved items
+  Compensation 1: Order Service — update order (status: CANCELLED)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SAGA TYPES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. CHOREOGRAPHY SAGA:
+   No central coordinator. Services react to events autonomously.
+   
+   Flow:
+   OrderService → publishes: OrderCreated
+     ↓ (Kafka / RabbitMQ)
+   InventoryService listens → reserves inventory → publishes: InventoryReserved
+     ↓
+   PaymentService listens → charges payment → publishes: PaymentCharged
+     ↓
+   ShippingService listens → schedules shipment → publishes: ShipmentScheduled
+     ↓
+   OrderService listens → marks CONFIRMED
+   
+   On failure:
+   PaymentService fails → publishes: PaymentFailed
+   InventoryService listens to PaymentFailed → releases inventory → publishes: InventoryReleased
+   OrderService listens to InventoryReleased → marks CANCELLED
+   
+   PROS:
+   ✓ No central bottleneck
+   ✓ Simple to add new participants (subscribe to events)
+   ✓ Fully decoupled
+   
+   CONS:
+   ✗ Hard to understand the overall flow (events scattered)
+   ✗ Hard to track saga state (where is this saga in progress?)
+   ✗ Complex compensation chain (who compensates whom?)
+   ✗ Testing is difficult
+
+2. ORCHESTRATION SAGA:
+   A central Saga Orchestrator directs each step.
+   Tracks overall state. Calls each service and handles failures.
+   
+   SagaOrchestrator:
+     state = PENDING
+     
+     call InventoryService.reserve(orderId, items)
+     → success: state = INVENTORY_RESERVED
+     → failure: state = CANCELLED; return error
+     
+     call PaymentService.charge(orderId, amount)
+     → success: state = PAYMENT_CHARGED
+     → failure: call InventoryService.release(orderId); state = CANCELLED
+     
+     call ShippingService.schedule(orderId)
+     → success: state = COMPLETED
+     → failure: call PaymentService.refund(orderId)
+                call InventoryService.release(orderId)
+                state = CANCELLED
+   
+   PROS:
+   ✓ Clear, centralized flow (easy to understand and debug)
+   ✓ State tracked in one place
+   ✓ Easier to add compensations
+   ✓ Better observability
+   
+   CONS:
+   ✗ Orchestrator is a central bottleneck (must be HA)
+   ✗ Coupling: orchestrator knows all participants
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMPENSATING TRANSACTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Each step in a saga must have a compensating action.
+
+┌──────────────────────────────┬──────────────────────────────┐
+│ Forward Action               │ Compensating Action          │
+├──────────────────────────────┼──────────────────────────────┤
+│ Create order (PENDING)       │ Cancel order                 │
+│ Reserve inventory            │ Release reservation          │
+│ Charge payment               │ Refund payment               │
+│ Schedule shipment            │ Cancel shipment              │
+│ Send confirmation email      │ Send cancellation email      │
+│ Deduct loyalty points        │ Refund loyalty points        │
+└──────────────────────────────┴──────────────────────────────┘
+
+IMPORTANT: Not all actions can be compensated perfectly.
+  "Send email" — you can send a cancellation email, but the original
+  email was already sent. This is a "semantic undo."
+  Some sagas accept these limitations and communicate them to the user.
+
+IDEMPOTENT STEPS:
+  Every step AND compensation must be idempotent.
+  The saga may retry on transient failures → must be safe to retry.
+  Use idempotency keys: track which steps have already been executed.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SAGA STATE PERSISTENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Orchestration saga: persist saga state after each step.
+  If orchestrator crashes mid-saga, it can resume from where it left off.
+  
+  Saga state table:
+  CREATE TABLE saga_state (
+    saga_id     UUID PRIMARY KEY,
+    saga_type   VARCHAR(100),
+    current_step VARCHAR(100),
+    state       JSONB,        -- context for the saga (orderId, amounts, etc.)
+    status      VARCHAR(50),  -- STARTED, COMPLETED, FAILED, COMPENSATING
+    created_at  TIMESTAMP,
+    updated_at  TIMESTAMP
+  );
+  
+  On restart: load all STARTED sagas and resume from current_step.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ISOLATION PROBLEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Unlike ACID transactions, Sagas have NO isolation.
+During execution, intermediate states are visible to other transactions.
+
+Example problem:
+  User places Order A (saga running: inventory reserved, payment pending).
+  User places Order B simultaneously.
+  Order B's saga checks inventory → sees it as reserved but not committed.
+  
+  Mitigation: Use "semantic locks" — mark records as processing.
+  InventoryService: when reserving, set status = RESERVED_PENDING_PAYMENT.
+  Other sagas: reject if status is RESERVED_PENDING_PAYMENT.
+  On saga completion: set status = RESERVED (confirmed).
+  On compensation: set status = AVAILABLE.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTBOX PATTERN + SAGA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Each saga step should:
+  1. Update local DB state.
+  2. Write event to outbox table.
+  Both in the SAME local DB transaction.
+  
+  Outbox publisher then publishes the event to Kafka.
+  
+  This ensures: if local DB write succeeds → event will eventually publish.
+  No lost events even if process crashes between step and publish.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TOOLS FOR SAGA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Axon Framework (Java): Saga support, event sourcing, CQRS all in one.
+MassTransit (.NET): Saga state machines, message bus integration.
+Temporal.io: Workflow orchestration with built-in saga support, retries, timeouts.
+Conductor (Netflix): Microservice orchestration engine.
+AWS Step Functions: Serverless saga orchestration.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"The Saga pattern handles distributed transactions across microservices
+ without distributed locking. Each step executes a local transaction
+ and publishes an event. If a step fails, compensating transactions
+ undo previous steps.
+ 
+ I prefer orchestration sagas for complex flows: a central orchestrator
+ tracks state and directs each step. State is persisted after each step
+ so the saga can resume after a crash. I combine this with the Outbox
+ Pattern to ensure events are published reliably.
+ 
+ The main trade-off vs 2PC: no isolation. I mitigate this with semantic
+ locks (marking records as 'processing') and designing compensations
+ to be idempotent. For very high-throughput sagas, Temporal.io provides
+ a production-grade saga engine with built-in retries and timeouts."

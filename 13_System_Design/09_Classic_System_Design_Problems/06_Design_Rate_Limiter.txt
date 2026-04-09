@@ -1,0 +1,290 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DESIGN: RATE LIMITER (SERVICE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FUNCTIONAL:
+  - Limit number of requests per user/IP/API key within a time window
+  - Return 429 Too Many Requests with Retry-After header when limit exceeded
+  - Support multiple rule types:
+      - Per user: 100 requests/minute
+      - Per IP: 1000 requests/minute  
+      - Per endpoint: POST /payments limited to 10/minute
+      - Per API key (B2B): customizable per customer
+  - Rules must be configurable without code deployment (hot reload)
+  - Work across multiple API Gateway instances (distributed)
+
+NON-FUNCTIONAL:
+  - Latency overhead: < 5ms per request check (rate limiting is in the hot path)
+  - High availability: rate limiter failure must not block legitimate traffic
+    (fail open: if rate limiter unavailable, allow request)
+  - Throughput: handle 100K+ RPS across the fleet
+  - Accuracy: > 99.9% accurate (small error tolerance for sliding window)
+
+WHERE TO PLACE THE RATE LIMITER:
+  Option 1: Client-side — trivially bypassable, unreliable
+  Option 2: Middleware in each service — code duplication, inconsistent limits
+  Option 3: API Gateway / Reverse Proxy ← RECOMMENDED
+  Option 4: Dedicated rate limiting service called by gateway
+
+
+2. RATE LIMITING ALGORITHMS — COMPARISON
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ALGORITHM 1: TOKEN BUCKET ← RECOMMENDED FOR MOST CASES
+  Concept:
+    - Bucket holds max N tokens
+    - Tokens added at rate R per second
+    - Each request consumes 1 token
+    - If bucket empty: reject request (429)
+  
+  Properties:
+    - ALLOWS BURSTING: can burst up to N requests instantly
+    - Smooth rate limiting after burst is consumed
+    - Simple to implement
+  
+  Parameters: bucket_capacity=100, refill_rate=10/sec
+    User can burst 100 requests instantly, then 10/sec sustained
+  
+  Implementation:
+    last_refill_time = current_time
+    tokens = bucket_capacity
+    
+    def allow_request(user_id):
+        now = time.now()
+        elapsed = now - last_refill_time[user_id]
+        # Refill tokens based on elapsed time
+        tokens[user_id] = min(capacity, tokens[user_id] + elapsed * refill_rate)
+        last_refill_time[user_id] = now
+        
+        if tokens[user_id] >= 1:
+            tokens[user_id] -= 1
+            return True   # Allow
+        return False      # Reject
+
+ALGORITHM 2: LEAKY BUCKET
+  Concept:
+    - Queue with max size N
+    - Requests process at constant rate R/sec (leak out the bottom)
+    - Burst requests queue up, then process in order
+  
+  Properties:
+    - FIXED RATE output (smooth, no burst)
+    - Queue fills up under sustained overload → still rejects
+    - Good for protecting downstream services with fixed capacity
+  
+  Use case: Payment processing (protect payment gateway from bursts)
+
+ALGORITHM 3: FIXED WINDOW COUNTER
+  Concept:
+    - Divide time into 1-minute windows
+    - Count requests per window per user
+    - Reset counter at window boundary
+  
+  Redis: INCR counter:{user_id}:{window_key}  (key = "user:123:2024-01-15-14:30")
+         EXPIRE counter ... 60
+  
+  CRITICAL FLAW — BOUNDARY EXPLOIT:
+    Limit: 100 req/minute
+    At 14:30:59.9: 100 requests (window not reset yet, all allowed)
+    At 14:31:00.1: 100 requests (new window, counter reset, all allowed)
+    Result: 200 requests in ~0.2 seconds!
+  
+  Only use for coarse limits where boundary abuse doesn't matter much.
+
+ALGORITHM 4: SLIDING WINDOW LOG
+  Concept:
+    - Store timestamp of every request in a sorted set
+    - On new request: remove entries older than window
+    - Count remaining entries = request count in window
+    
+  Redis:
+    ZADD log:{user_id} timestamp timestamp
+    ZREMRANGEBYSCORE log:{user_id} 0 (now - window_ms)
+    count = ZCARD log:{user_id}
+    if count >= limit: reject
+  
+  Pros: Precise (no boundary exploit)
+  Cons: Memory-heavy (stores all request timestamps)
+        At 100K RPS × 60s window: 6M timestamps per user!
+
+ALGORITHM 5: SLIDING WINDOW COUNTER ← USED BY CLOUDFLARE
+  Concept:
+    - Combine previous_window_count × overlap + current_window_count
+    - Approximation but highly accurate (< 0.003% error in Cloudflare tests)
+  
+  Two Redis keys: counter:{user_id}:prev, counter:{user_id}:curr
+  
+  def allow_request(user_id, limit, window=60):
+    now = time.now()
+    window_start = floor(now / window) * window
+    elapsed_in_window = (now % window) / window  # 0.0 to 1.0
+    
+    prev_count = GET counter:{user_id}:{window_start - window}
+    curr_count = GET counter:{user_id}:{window_start}
+    
+    # Weighted count: more recent = less weight on previous window
+    estimate = prev_count * (1 - elapsed_in_window) + curr_count
+    
+    if estimate >= limit:
+        return False  # Reject
+    
+    INCR counter:{user_id}:{window_start}
+    EXPIRE counter:{user_id}:{window_start} (window * 2)
+    return True
+  
+  Memory: Only 2 integers per user per window (vs 6M for log approach)
+  Accuracy: ~99.997%
+
+
+3. DISTRIBUTED RATE LIMITING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROBLEM: 10 API gateway instances, each maintaining local counter
+  User sends 100 requests, distributed across 10 instances
+  Each instance sees only 10 requests → all allowed
+  Reality: 100 requests served, limit was 100 but 100 allowed (works by accident)
+  
+  But: If user sends all 100 to 1 instance, then next minute all 100 to another,
+  it looks like 0 requests to the second instance (not shared state).
+
+SOLUTION: CENTRALIZED COUNTER WITH REDIS
+  All gateway instances share Redis for counter state
+  
+  ATOMIC LUA SCRIPT (prevents race conditions):
+  local key = KEYS[1]
+  local limit = tonumber(ARGV[1])
+  local window = tonumber(ARGV[2])
+
+  local count = redis.call('INCR', key)
+  if count == 1 then
+      redis.call('EXPIRE', key, window)
+  end
+
+  if count > limit then
+      return 0  -- rejected
+  end
+  return 1  -- allowed
+
+  Call: redis.eval(lua_script, 1, "ratelimit:user:123:1700000", 100, 60)
+  
+  WHY ATOMIC SCRIPT?
+    Without atomicity: INCR and EXPIRE as two separate commands can fail
+    between them, leaving a key with no expiry (permanent leak).
+
+REDIS CLUSTER SHARDING:
+  With Redis Cluster, keys are distributed across shards by hash slot
+  To ensure user's requests always hit same shard:
+    Key: "ratelimit:{user_id}:window"  (curly braces = hash tag)
+    Redis Cluster routes all keys with same hash tag to same slot
+  Result: user's counter always on same shard → consistency guaranteed
+
+
+4. RULES ENGINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RULE STRUCTURE:
+  {
+    "ruleId": "user-default",
+    "dimensions": ["user_id"],
+    "endpoint": null,         // null = applies to all endpoints
+    "limit": 100,
+    "window": 60,
+    "action": "reject"        // reject or throttle (slow down)
+  },
+  {
+    "ruleId": "payment-endpoint",
+    "dimensions": ["user_id"],
+    "endpoint": "POST /api/v1/payments",
+    "limit": 10,
+    "window": 60,
+    "action": "reject"
+  }
+
+RULE RESOLUTION:
+  Most specific rule wins:
+    endpoint-specific + user_id >> endpoint-specific + ip >> global
+  
+  Multiple rules applied (checked in order of specificity):
+    If any rule rejects → reject request
+
+RULE STORAGE AND HOT RELOAD:
+  Rules stored in database (PostgreSQL)
+  Cached in all gateway instances (in-process cache, 60s TTL)
+  Push update: rule change → event bus → all instances invalidate cache
+  
+  Zero-deployment rule change: update DB → rule propagates within 60 seconds
+
+
+5. RESPONSE FORMAT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+HTTP 429 Too Many Requests:
+  Headers:
+    X-RateLimit-Limit: 100          (max requests in window)
+    X-RateLimit-Remaining: 0        (requests remaining)
+    X-RateLimit-Reset: 1700000060   (UTC epoch when limit resets)
+    Retry-After: 45                 (seconds to wait)
+  
+  Body:
+    {
+      "error": "rate_limit_exceeded",
+      "message": "Too many requests. Please retry after 45 seconds.",
+      "retryAfter": 45,
+      "limit": 100,
+      "window": "60s"
+    }
+
+SUCCESS response headers (always include):
+  X-RateLimit-Limit: 100
+  X-RateLimit-Remaining: 73
+  X-RateLimit-Reset: 1700000060
+
+
+6. FAIL-OPEN STRATEGY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+If Redis is unreachable (rate limiter down):
+  Option 1: FAIL-OPEN: Allow all requests
+            Risk: Abuse during outage
+            Benefit: Service stays up (availability > security during failure)
+  
+  Option 2: FAIL-CLOSED: Reject all requests
+            Risk: Total service outage if Redis fails
+            Unacceptable for most use cases
+  
+  RECOMMENDED: Fail open with circuit breaker
+    If Redis latency > 5ms: serve from local in-process cache (stale but fast)
+    If Redis unavailable: fail open (allow), log extensively, alert on-call
+
+LOCAL FALLBACK:
+  Each gateway node maintains in-process Sliding Window Counter (no Redis)
+  With 10 nodes and 100 req/min limit → each node allows 10 req/min locally
+  Not perfectly accurate but provides some protection during Redis outage
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWER — "Design a distributed rate limiter"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"I'd place the rate limiter in the API Gateway layer, before requests reach
+services. The algorithm choice: Token Bucket for most endpoints (allows
+bursting, smooth rate limiting) and Leaky Bucket for payment endpoints
+(strict constant-rate output to protect the payment processor).
+
+For distributed accuracy, all gateway instances share Redis as the counter
+store. The increment + check is done atomically with a Lua script — a
+single round-trip to Redis with guaranteed atomicity.
+
+The key Redis data structure: hash-tagged keys for Redis Cluster sharding
+ensure all counter increments for a user land on the same Redis shard.
+
+I implement Sliding Window Counter for precision without the memory
+overhead of the log approach. It's accurate to 99.997%, which Cloudflare
+has validated in production.
+
+Failure mode: Rate limiter must fail open. A Redis outage should not
+take down the entire API. Each gateway maintains a local fallback counter;
+it won't be accurate across nodes, but provides some protection while Redis
+recovers — and legitimate traffic continues flowing."

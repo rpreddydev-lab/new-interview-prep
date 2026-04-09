@@ -1,0 +1,179 @@
+================================================================
+Read-Only Queries and Projections
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHY READ-ONLY MATTERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When you load an entity for display only (no modification):
+- Hibernate still tracks it in the 1LC (persistence context)
+- Hibernate performs dirty checking on flush
+- All fields are loaded even if only 2 are needed for the API response
+- Proxy objects and lazy collection placeholders are allocated
+
+For read-heavy REST APIs, this is unnecessary overhead.
+Read-only patterns eliminate tracking, reduce memory, and speed up queries.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. INTERFACE PROJECTIONS (Spring Data JPA)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Define an interface with getter methods matching entity field names.
+Spring Data generates a proxy implementation automatically.
+
+// Projection interface:
+public interface UserSummary {
+    Long getId();
+    String getEmail();
+    String getFirstName();
+}
+
+// Repository:
+List<UserSummary> findByStatus(String status);
+// SQL: SELECT id, email, first_name FROM users WHERE status = ?
+// Only selected columns — not SELECT *
+
+// Nested projections:
+public interface OrderSummary {
+    Long getId();
+    BigDecimal getTotal();
+    UserInfo getUser();             // nested projection
+
+    interface UserInfo {
+        String getEmail();
+    }
+}
+
+List<OrderSummary> findByStatus(String status);
+// SQL: SELECT o.id, o.total, u.email FROM orders o JOIN users u ...
+
+// Computed properties (SpEL):
+public interface UserSummary {
+    String getFirstName();
+    String getLastName();
+
+    @Value("#{target.firstName + ' ' + target.lastName}")
+    String getFullName();          // computed from entity fields
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. CLASS-BASED (DTO) PROJECTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Define a record or class with a constructor matching the @Query.
+
+// DTO record (Java 16+):
+public record UserDto(Long id, String email, int orderCount) {}
+
+// JPQL constructor expression:
+@Query("SELECT new com.example.UserDto(u.id, u.email, SIZE(u.orders)) FROM User u")
+List<UserDto> findUserDtos();
+
+// Or with Spring Data JPA (constructor inference — works if field names match):
+List<UserDto> findByStatus(String status);
+// Spring Data uses record constructor automatically if field names match
+
+Benefits over interface projections:
+  - Fully typed (no proxy)
+  - Can be passed across layers without issues
+  - Immutable (use records)
+  - No SpEL overhead
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. @TRANSACTIONAL(READONLY=TRUE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Transactional(readOnly = true)
+public List<UserSummary> getUsers() {
+    return userRepo.findAllProjectedBy();
+}
+
+Benefits:
+1. Hibernate skips dirty checking on flush (no change detection)
+2. Hibernate can optimize 1LC (marks loaded objects as read-only)
+3. Spring passes hint to DataSource for read replica routing
+4. JDBC driver may optimize connection (disable auto-commit hints)
+
+Does NOT mean:
+  - No writes are physically possible (DB may still allow writes)
+  - It's equivalent to SERIALIZABLE isolation
+
+Best practice: mark all read-only service methods with @Transactional(readOnly=true)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. @IMMUTABLE (Hibernate)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Entity
+@Immutable         // Hibernate-specific: never generates UPDATE statements
+@Table(name = "audit_log")
+public class AuditLog {
+    @Id private Long id;
+    private String action;
+    private LocalDateTime occurredAt;
+    // Hibernate ignores all changes to fields; no dirty checking
+}
+
+Use cases: audit logs, event sourcing tables, reference data
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. NATIVE SQL WITH PROJECTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Query(
+    value = "SELECT u.id, u.email, COUNT(o.id) AS orderCount " +
+            "FROM users u LEFT JOIN orders o ON o.user_id = u.id " +
+            "GROUP BY u.id, u.email",
+    nativeQuery = true
+)
+List<UserSummary> findUserOrderCounts();  // interface projection on native query
+
+// Interface getters must match column ALIASES in native SQL:
+// getId() → id, getEmail() → email, getOrderCount() → orderCount
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. COMPARISON: ALL READ-ONLY APPROACHES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Approach                | SQL columns | 1LC tracked | Type-safe | Best for
+────────────────────────|─────────────|─────────────|───────────|──────────────────
+Full entity             | SELECT *    | YES         | YES       | Reads that might need writes
+@Transactional(readOnly)| SELECT *    | Partial opt | YES       | Read-only full entity
+Interface projection    | Specific    | NO          | Partial   | Quick read with derived queries
+DTO/record projection   | Specific    | NO          | YES       | API response shaping
+Native SQL + projection | Specific    | NO          | Partial   | Complex SQL/DB-specific queries
+@Immutable entity       | SELECT *    | YES (no upd)| YES       | Append-only tables
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. INTERVIEW QUICK HITS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is a Spring Data JPA projection?
+A: A projection is a view of a subset of entity data. Interface projections
+   define getter methods matching field names — Spring generates a proxy.
+   DTO projections use a constructor expression in JPQL or inferred from
+   a record/class. Both avoid loading the full entity and reduce SELECT columns.
+
+Q: What are the benefits of @Transactional(readOnly=true)?
+A: Hibernate skips dirty checking (no change detection on flush), marks
+   entities as read-only in 1LC, and passes the read-only hint to the
+   JDBC driver. Spring can route the call to a read replica.
+   It doesn't prevent writes, but signals intent and enables optimizations.
+
+Q: What is the difference between interface and class (DTO) projections?
+A: Interface projections generate a JDK dynamic proxy at runtime that
+   delegates to the entity — they have access to SpEL computed values
+   but carry some proxy overhead. DTO projections (records/classes with
+   constructor) are fully typed, no proxy, no runtime overhead, and
+   immutable. Use DTO records for API response DTOs.
+
+Q: Can you use projections with native SQL queries?
+A: Yes. Use an interface projection and ensure the getter names match
+   the column ALIASES in the native SQL. E.g., SELECT u.id AS id,
+   COUNT(*) AS orderCount maps to getId() and getOrderCount().
+
+Q: When would you use @Immutable on a Hibernate entity?
+A: On entities that should never be updated — like audit logs, historical
+   records, or reference data tables. Hibernate will skip generating any
+   UPDATE statements, reducing overhead and preventing accidental writes.

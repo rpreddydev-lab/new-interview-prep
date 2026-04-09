@@ -1,0 +1,202 @@
+================================================================
+Multitenancy in JPA/Hibernate
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHAT IS MULTITENANCY?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Multitenancy = one application instance serves multiple customers (tenants)
+while keeping their data isolated.
+
+Examples:
+  SaaS CRM — each company is a tenant
+  Cloud POS — each store is a tenant
+
+JPA/Hibernate supports three multitenancy strategies:
+
+Strategy              | Isolation | Complexity | Cost
+──────────────────────|───────────|────────────|───────────────────
+Discriminator Column  | LOW       | Low        | Cheapest (one DB)
+Separate Schema       | MEDIUM    | Medium     | One DB, N schemas
+Separate Database     | HIGH      | High       | One DB per tenant
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. STRATEGY 1: DISCRIMINATOR COLUMN (Schema sharing)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+All tenants share the SAME tables. A tenant_id column differentiates rows.
+
+Schema: orders(id, amount, status, tenant_id)
+
+Implementation Options:
+
+Option A: Application-level filter (manual — error-prone)
+  @ManyToOne(fetch = FetchType.LAZY)
+  @JoinColumn(name = "tenant_id")
+  private Tenant tenant;
+
+  // Service must always add WHERE tenant_id = ? — easy to forget!
+
+Option B: Hibernate @Filter (recommended for discriminator)
+  // Step 1: Define filter on entity
+  @Entity
+  @FilterDef(
+      name = "tenantFilter",
+      parameters = @ParamDef(name = "tenantId", type = Long.class)
+  )
+  @Filter(name = "tenantFilter", condition = "tenant_id = :tenantId")
+  public class Order {
+      @Column(name = "tenant_id", nullable = false, updatable = false)
+      private Long tenantId;
+      // other fields...
+  }
+
+  // Step 2: Enable filter per session in a Spring interceptor/filter
+  @Component
+  public class TenantFilter implements Filter {
+      @Autowired
+      private EntityManager em;
+
+      public void doFilter(ServletRequest req, ...) {
+          Long tenantId = resolveTenantId(req);
+          Session session = em.unwrap(Session.class);
+          session.enableFilter("tenantFilter").setParameter("tenantId", tenantId);
+          chain.doFilter(req, res);
+      }
+  }
+
+  // Now all queries automatically include WHERE tenant_id = ?
+
+  Option C: Spring Data Specification + ThreadLocal
+  // Store tenant in ThreadLocal, apply in Specification — common pattern
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. STRATEGY 2: SEPARATE SCHEMA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Each tenant has its own DB schema. Same tables, different schema prefix.
+  public_schema.orders, tenant_a.orders, tenant_b.orders
+
+Hibernate built-in support via MultiTenancyStrategy.SCHEMA.
+
+// Step 1: Configure Hibernate multitenancy
+spring.jpa.properties.hibernate.multiTenancy=SCHEMA
+spring.jpa.properties.hibernate.tenant_identifier_resolver=com.example.TenantContext
+spring.jpa.properties.hibernate.multi_tenant_connection_provider=com.example.SchemaMultiTenantProvider
+
+// Step 2: TenantIdentifierResolver — tells Hibernate the current tenant
+@Component
+public class TenantContext implements CurrentTenantIdentifierResolver {
+    private static final ThreadLocal<String> TENANT = new ThreadLocal<>();
+
+    public static void setTenant(String tenantId) { TENANT.set(tenantId); }
+    public static void clear() { TENANT.remove(); }
+
+    @Override
+    public String resolveCurrentTenantIdentifier() {
+        String tenant = TENANT.get();
+        return tenant != null ? tenant : "public";
+    }
+
+    @Override
+    public boolean validateExistingCurrentSessions() { return true; }
+}
+
+// Step 3: MultiTenantConnectionProvider — sets schema on connection
+@Component
+public class SchemaMultiTenantProvider implements MultiTenantConnectionProvider {
+    @Autowired
+    private DataSource dataSource;
+
+    @Override
+    public Connection getConnection(String tenantId) throws SQLException {
+        Connection connection = dataSource.getConnection();
+        connection.setSchema(tenantId);   // SET search_path = tenant_id
+        return connection;
+    }
+    // release, supportsAggressiveRelease, etc.
+}
+
+// Step 4: Set tenant on each request (Spring interceptor)
+public boolean preHandle(HttpServletRequest request, ...) {
+    String tenant = request.getHeader("X-Tenant-Id");
+    TenantContext.setTenant(tenant);
+    return true;
+}
+public void afterCompletion(...) {
+    TenantContext.clear();  // prevent leaks
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. STRATEGY 3: SEPARATE DATABASE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Each tenant has a completely separate database (and DataSource).
+
+// Step 1: Hibernate multitenancy mode
+spring.jpa.properties.hibernate.multiTenancy=DATABASE
+
+// Step 2: MultiTenantConnectionProvider provides a per-tenant DataSource
+@Component
+public class DatabaseMultiTenantProvider implements MultiTenantConnectionProvider {
+    private final Map<String, DataSource> dataSources = new ConcurrentHashMap<>();
+
+    @Override
+    public Connection getConnection(String tenantId) throws SQLException {
+        DataSource ds = dataSources.computeIfAbsent(tenantId, this::createDataSource);
+        return ds.getConnection();
+    }
+
+    private DataSource createDataSource(String tenantId) {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl("jdbc:postgresql://localhost:5432/" + tenantId);
+        config.setUsername("app_user");
+        config.setPassword("...");
+        return new HikariDataSource(config);
+    }
+}
+
+// Benefits: complete data isolation, independent backup/restore per tenant
+// Cost: connection pool per tenant, operational complexity
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. TENANT RESOLUTION APPROACHES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Common ways to identify the current tenant:
+- HTTP header: X-Tenant-Id: acme
+- JWT claim: { "tenantId": "acme" }
+- Subdomain: acme.myapp.com (parsed from Host header)
+- Database user: different DB user per tenant
+- URL path: /api/acme/orders
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. INTERVIEW QUICK HITS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What are the three multitenancy strategies in Hibernate?
+A: DISCRIMINATOR (tenant_id column in shared tables), SCHEMA (one schema
+   per tenant, one database), and DATABASE (one database per tenant).
+   Each offers increasing isolation at increasing infrastructure cost.
+
+Q: What is CurrentTenantIdentifierResolver used for?
+A: It's a Hibernate interface that resolves the current tenant's ID.
+   Hibernate calls it on each operation to know which schema or database
+   to use. Typically backed by a ThreadLocal set during request processing.
+
+Q: What is the risk of discriminator-column multitenancy?
+A: Application code must always filter by tenant_id. Missing a WHERE
+   clause leaks another tenant's data (IDOR vulnerability). Use Hibernate's
+   @Filter or a persistent query interceptor to enforce this automatically.
+
+Q: What is MultiTenantConnectionProvider used for?
+A: It tells Hibernate how to obtain a database connection for a specific
+   tenant. For SCHEMA strategy, it typically calls connection.setSchema().
+   For DATABASE strategy, it selects a tenant-specific DataSource.
+
+Q: How do you prevent tenant data leaks in a shared-schema multitenant app?
+A: Use Hibernate @Filter enabled via a request interceptor so every
+   query automatically includes WHERE tenant_id = :currentTenant.
+   Add a @Column(insertable=false, updatable=false) tenant_id field
+   and enforce at the Spring Security layer too (verify JWT tenant claim).

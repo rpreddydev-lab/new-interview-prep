@@ -1,0 +1,231 @@
+================================================================================
+CONTAINERIZATION WITH DOCKER
+================================================================================
+
+DOCKER BASICS
+--------------
+Docker packages an application + its dependencies + runtime environment into
+a portable, immutable image that runs consistently in any environment.
+
+Key concepts:
+  - Image: read-only blueprint (layers: OS + JRE + app)
+  - Container: running instance of an image (isolated process)
+  - Registry: image repository (Docker Hub, ECR, GCR, ACR)
+  - Dockerfile: recipe to build an image
+
+────────────────────────────────────────────────────────────────────────────────
+
+OPTIMIZED DOCKERFILE FOR SPRING BOOT
+=======================================
+
+# BAD: naive Dockerfile (slow, large, insecure)
+FROM openjdk:21-jre
+COPY target/order-service.jar /app/app.jar
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
+
+Problems:
+  - Single layer: any change rebuilds entire image
+  - Runs as root (security risk)
+  - Full JDK instead of JRE
+  - No health check
+  - No JVM tuning for containers
+
+# GOOD: Optimized multi-stage Dockerfile
+# Stage 1: Extract layers (Spring Boot layered jars)
+FROM eclipse-temurin:21-jre-alpine AS builder
+WORKDIR /app
+COPY target/order-service.jar app.jar
+# Extract Spring Boot layers for better caching
+RUN java -Djarmode=layertools -jar app.jar extract
+
+# Stage 2: Production image
+FROM eclipse-temurin:21-jre-alpine
+
+# Security: create non-root user
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+USER appuser
+
+WORKDIR /app
+
+# Copy Spring Boot layers (most stable layers first for cache efficiency)
+COPY --from=builder --chown=appuser:appgroup /app/dependencies/ ./
+COPY --from=builder --chown=appuser:appgroup /app/spring-boot-loader/ ./
+COPY --from=builder --chown=appuser:appgroup /app/snapshot-dependencies/ ./
+COPY --from=builder --chown=appuser:appgroup /app/application/ ./
+
+# JVM tuning for containers
+ENV JAVA_OPTS="-XX:+UseContainerSupport \
+               -XX:MaxRAMPercentage=75.0 \
+               -XX:InitialRAMPercentage=50.0 \
+               -Djava.security.egd=file:/dev/./urandom"
+
+EXPOSE 8080
+
+# Health check (Docker-level)
+HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:8080/actuator/health || exit 1
+
+ENTRYPOINT ["java", "-XX:+UseContainerSupport", "-XX:MaxRAMPercentage=75.0", \
+            "org.springframework.boot.loader.launch.JarLauncher"]
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING BOOT 3 BUILDPACKS (NO DOCKERFILE NEEDED)
+=================================================
+
+Spring Boot 3 supports Cloud Native Buildpacks — no Dockerfile required.
+
+pom.xml:
+  <plugin>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-maven-plugin</artifactId>
+    <configuration>
+      <image>
+        <name>myregistry.io/order-service:${project.version}</name>
+        <buildpacks>
+          <!-- Paketobuildpacks provide optimized Java support -->
+          <buildpack>paketobuildpacks/java</buildpack>
+        </buildpacks>
+        <env>
+          <BP_JVM_VERSION>21</BP_JVM_VERSION>
+          <BPL_JVM_THREAD_COUNT>50</BPL_JVM_THREAD_COUNT>
+        </env>
+      </image>
+    </configuration>
+  </plugin>
+
+Build command:
+  mvn spring-boot:build-image -DskipTests
+
+Benefits of Buildpacks:
+  ✓ No Dockerfile to maintain
+  ✓ Automatically layered images (better caching)
+  ✓ Security patches applied automatically (base image rebasing)
+  ✓ OCI-compliant images
+  ✓ Memory calculator included
+
+────────────────────────────────────────────────────────────────────────────────
+
+DOCKER IMAGE BEST PRACTICES
+==============================
+
+1. USE SPECIFIC TAGS, NOT "latest"
+   ✗ FROM eclipse-temurin:latest
+   ✓ FROM eclipse-temurin:21.0.2_13-jre-alpine
+
+2. MINIMAL BASE IMAGE
+   Use Alpine or Distroless images:
+   - eclipse-temurin:21-jre-alpine (smallest JRE)
+   - gcr.io/distroless/java21-debian12 (no shell, most secure)
+
+3. RUN AS NON-ROOT
+   RUN adduser -S appuser
+   USER appuser
+
+4. LAYERED JARS FOR CACHING
+   Dependencies (stable) → separate layer from application code (frequent changes)
+   Only rebuild changed layers
+
+5. .dockerignore
+   target/
+   .git/
+   *.md
+   src/test/
+
+6. SCAN FOR VULNERABILITIES
+   docker scout cves order-service:latest
+   trivy image order-service:latest
+
+────────────────────────────────────────────────────────────────────────────────
+
+CONTAINER RESOURCE MANAGEMENT
+================================
+
+# docker-compose.yml (for local dev)
+services:
+  order-service:
+    image: order-service:latest
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/orders
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d orders"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+────────────────────────────────────────────────────────────────────────────────
+
+JLINK — CUSTOM JRE (SMALLEST POSSIBLE IMAGE)
+=============================================
+
+Create a minimal JRE with only needed modules:
+  FROM eclipse-temurin:21-jdk-alpine AS jre-builder
+  RUN $JAVA_HOME/bin/jlink \
+    --no-header-files \
+    --no-man-pages \
+    --compress=2 \
+    --strip-debug \
+    --add-modules java.base,java.net.http,java.sql,java.desktop,jdk.crypto.ec \
+    --output /custom-jre
+
+  FROM alpine:3.19
+  COPY --from=jre-builder /custom-jre /opt/jre
+  ENV PATH="/opt/jre/bin:$PATH"
+  COPY target/order-service.jar /app/app.jar
+  ENTRYPOINT ["java", "-jar", "/app/app.jar"]
+
+Result: ~40MB image vs ~200MB with full JRE
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is a layered Docker image and why is it important?
+A: Docker images consist of layers. Each instruction adds a layer. Layers are
+   cached — unchanged layers are reused. Spring Boot layered jars separate
+   dependencies (stable) from application code (frequently changing) into
+   separate layers. Only the changed layer is rebuilt and pushed, drastically
+   reducing build time and bandwidth.
+
+Q: What are the security best practices for Docker images?
+A: Run as non-root user, use minimal base images (Alpine/Distroless), use
+   specific tags not "latest", scan with Trivy/Snyk, never embed secrets in
+   images (use env vars or secrets mounts), use multi-stage builds to exclude
+   build tools from final image, set read-only root filesystem.
+
+Q: Why use -XX:UseContainerSupport for JVM in Docker?
+A: Java traditionally read host machine memory/CPU for ergonomics settings.
+   In a container with memory limits, the JVM might see 128GB host RAM and
+   allocate a huge heap, crashing the container. UseContainerSupport makes the
+   JVM respect container cgroup limits. Use MaxRAMPercentage instead of -Xmx
+   to set a relative heap size.
+
+================================================================================

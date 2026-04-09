@@ -1,0 +1,191 @@
+================================================================
+  REACTIVE vs SERVLET (SPRING MVC vs SPRING WEBFLUX)
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. THREADING MODEL DEEP DIVE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SPRING MVC (Servlet stack):
+  - One OS thread per HTTP request (from Tomcat's thread pool; default 200 threads)
+  - Thread is blocked during I/O (DB call, HTTP call, file read)
+  - Blocking is fine — the thread just waits
+  - Under high load with slow I/O: threads queue → latency spike → potential OOM
+
+  Request  → [Thread 1] → DB query (blocks 50ms) → response
+  Request  → [Thread 2] → DB query (blocks 50ms) → response
+  ...200 concurrent requests max before queuing
+
+SPRING WEBFLUX (Reactive stack):
+  - Small event-loop thread pool (cpu * 2 threads on Netty)
+  - Threads are never blocked; tasks are suspended while waiting for I/O
+  - Continuation is registered as a callback, run when I/O completes
+  - Same threads handle thousands of concurrent requests
+
+  Request  → [Thread 1] → send DB query → suspend → free for next request
+                           (DB responds) → [Thread 1 or 2] → continue
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. FULL COMPARISON TABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Feature                   | Spring MVC                    | Spring WebFlux
+--------------------------|-------------------------------|-------------------------------
+Web server                | Tomcat (default), Jetty       | Netty (default), Undertow
+Threading model           | Thread-per-request            | Event-loop (few threads)
+Programming style         | Synchronous, imperative       | Asynchronous, declarative
+Return types              | T, ResponseEntity<T>          | Mono<T>, Flux<T>
+I/O during request        | Blocking OK                   | Must be non-blocking
+Database driver           | JDBC / JPA                    | R2DBC / MongoDB Reactive
+HTTP client               | RestTemplate, RestClient      | WebClient
+Context propagation       | ThreadLocal-based             | Reactor Context (no ThreadLocal)
+Error handling            | try/catch, @ControllerAdvice  | onErrorReturn/Resume/Map + advice
+Debugging                 | Stack trace is straightforward | Async stack traces are harder
+Learning curve            | Lower                         | Higher
+Best for                  | Standard CRUD apps            | High-concurrency I/O-bound
+Bad for                   | Blocking + thousands of conn. | CPU-intensive, blocking libs
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. CONTEXT PROPAGATION — MDC / SECURITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Spring MVC uses ThreadLocal for SecurityContext (Spring Security) and MDC
+(logging trace IDs). In WebFlux, threads switch constantly, so ThreadLocal
+doesn't work.
+
+Solution: Reactor Context (per-subscription key-value store)
+
+// Writing to Reactor Context
+Mono.deferContextual(ctx -> {
+    String userId = ctx.get("userId");
+    return service.findByUser(userId);
+})
+.contextWrite(Context.of("userId", "u-001"));
+
+// Spring Security Reactive uses Reactor Context automatically
+// @Secured, @PreAuthorize work with ReactiveSecurityContextHolder
+
+// Accessing current user in WebFlux
+@GetMapping("/me")
+public Mono<User> me() {
+    return ReactiveSecurityContextHolder.getContext()
+        .map(ctx -> (UserDetails) ctx.getAuthentication().getPrincipal())
+        .flatMap(userDetails -> userService.findByUsername(userDetails.getUsername()));
+}
+
+// MDC context propagation for tracing (manual setup)
+service.processRequest()
+    .contextWrite(Context.of("traceId", MDC.get("traceId")))
+    .doOnEach(signal -> {
+        if (signal.getContextView().hasKey("traceId")) {
+            MDC.put("traceId", signal.getContextView().get("traceId"));
+        }
+    });
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. COMMON MIGRATION PITFALLS (MVC → WebFlux)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Pitfall 1: Calling .block() inside a handler
+  Bad:  Mono.fromCallable(this::blocking).block()  // blocks event-loop thread
+  Fix:  .subscribeOn(Schedulers.boundedElastic())
+
+Pitfall 2: Using JDBC (blocking) with WebFlux
+  Bad:  orderRepository.save(order)  // JPA is blocking
+  Fix:  Use R2DBC + Spring Data R2DBC
+  Or:   Wrap in Mono.fromCallable().subscribeOn(Schedulers.boundedElastic())
+
+Pitfall 3: ThreadLocal usage (logging, security)
+  Bad:  MDC.get("traceId")  // loses value when thread switches
+  Fix:  Use Reactor Context + Micrometer Observation
+
+Pitfall 4: Not subscribing to Mono/Flux
+  Bad:  service.sendEmail(user);  // lazy — nothing happens!
+  Fix:  return service.sendEmail(user); (return Mono to let framework subscribe)
+
+Pitfall 5: Mixing hot/cold publishers incorrectly
+  Bad:  Flux.create(sink -> ...)  declared globally (shared mutable state)
+  Fix:  Use Sinks.many() for multicast scenarios
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. WHEN TO CHOOSE WHICH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Choose Spring MVC when:
+  ✓ Standard CRUD with low-medium concurrency
+  ✓ Team is familiar with blocking/synchronous code
+  ✓ Using JDBC/JPA and migration to R2DBC isn't justified
+  ✓ Third-party blocking libraries (no reactive alternative)
+  ✓ Simpler debugging and stack traces needed
+
+Choose Spring WebFlux when:
+  ✓ High-concurrency I/O-bound workloads (thousands of simultaneous connections)
+  ✓ Real-time streaming (SSE, WebSocket, long-polling)
+  ✓ API gateway / aggregation layer calling many downstream services in parallel
+  ✓ Full reactive stack available (R2DBC, reactive Mongo, Kafka reactor)
+  ✓ Using Micronaut/Quarkus approach to microservices
+
+Both can coexist in a microservices system — individual services choose based
+on their use case.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. SPRING SECURITY REACTIVE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+</dependency>
+
+@Configuration
+@EnableWebFluxSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityWebFilterChain securityChain(ServerHttpSecurity http) {
+        return http
+            .csrf(ServerHttpSecurity.CsrfSpec::disable)
+            .authorizeExchange(ex -> ex
+                .pathMatchers("/api/public/**").permitAll()
+                .pathMatchers(HttpMethod.POST, "/api/orders").hasRole("USER")
+                .anyExchange().authenticated())
+            .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()))
+            .build();
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: Does Spring WebFlux always perform better than Spring MVC?
+A: No. WebFlux shines under high concurrency with I/O-bound work (thousands of
+   simultaneous requests waiting on DB/HTTP). For CPU-bound tasks, WebFlux adds
+   overhead without benefit — MVC can be faster. For simple CRUD at low concurrency,
+   MVC is simpler. Performance gains from WebFlux are only visible when I/O wait
+   is the bottleneck.
+
+Q: Can Spring MVC and WebFlux coexist in the same application?
+A: Not in the same module — they use different web server abstractions (Servlet
+   vs Reactive). However, in a microservices architecture, different services can
+   use different stacks. A single Spring Boot app can use WebClient (reactive)
+   from within an MVC application for outbound HTTP calls.
+
+Q: How does Spring Security integrate with WebFlux?
+A: Spring Security provides a reactive variant using ServerHttpSecurity instead of
+   HttpSecurity, @EnableWebFluxSecurity instead of @EnableWebSecurity, and
+   ReactiveSecurityContextHolder instead of SecurityContextHolder. The security
+   context is stored in Reactor Context, not ThreadLocal.
+
+Q: How do you propagate request-scoped data (user ID, trace ID) in WebFlux?
+A: Use Reactor Context — a per-subscription key-value store that travels through
+   the reactive pipeline. Write values with contextWrite(Context.of(...)) and read
+   with Mono.deferContextual(ctx -> ...). Micrometer Tracing + Reactor instruments
+   this automatically for trace/span IDs.
+
+Q: What is a cold vs hot publisher in Project Reactor?
+A: Cold publisher: creates a new data source per subscriber (each subscriber sees
+   all data from the start). Example: HTTP request, database query. Mono.just(),
+   repository calls are cold. Hot publisher: emits data regardless of subscribers;
+   late subscribers miss past items. Example: Kafka topic, WebSocket stream,
+   Sinks.many().multicast(). Hot sources share data across subscribers.

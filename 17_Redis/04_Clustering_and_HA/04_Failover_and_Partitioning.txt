@@ -1,0 +1,224 @@
+================================================================================
+REDIS FAILOVER AND PARTITIONING — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. FAILOVER CONCEPTS
+──────────────────────
+  Failover: the process of switching from a failed primary to a replica.
+
+  Types:
+    Manual failover:  operator manually runs REPLICAOF NO ONE on chosen replica.
+    Automatic failover: Sentinel or Cluster detects failure and promotes replica.
+
+  Key metrics:
+    RTO (Recovery Time Objective): how long the system is down during failover.
+      Redis Sentinel: ~10–30 seconds
+      Redis Cluster: ~1–10 seconds
+    RPO (Recovery Point Objective): how much data can be lost.
+      Async replication: last few seconds of writes may be lost.
+      WAIT 1 1000 + min-replicas: reduces RPO significantly.
+
+
+2. SENTINEL FAILOVER (RECAP)
+──────────────────────────────
+  See 01_Redis_Sentinel.txt for full detail.
+
+  Key points:
+    - Primary → SDOWN → ODOWN (quorum) → Sentinel election → replica promoted
+    - Total time: ~10–30s (configurable via down-after-milliseconds)
+    - Data loss: async replication lag since last replication
+
+
+3. CLUSTER FAILOVER (RECAP)
+─────────────────────────────
+  See 02_Redis_Cluster.txt for full detail.
+
+  Key points:
+    - Primary failure → gossip → PFAIL → FAIL (majority) → replica election
+    - Replica sends FAILOVER_AUTH_REQUEST, earns votes, promotes itself
+    - Total time: ~1–10s
+    - Slots unserved during failover window
+
+
+4. MANUAL CLUSTER FAILOVER (ZERO DOWNTIME)
+────────────────────────────────────────────
+  Perform maintenance without downtime:
+
+  Step 1: On the replica you want to promote:
+    CLUSTER FAILOVER
+
+  What happens:
+    1. Replica asks primary to stop accepting writes
+    2. Primary sends remaining replication data to replica
+    3. Replica confirms offset matches primary
+    4. Replica promotes itself
+    5. Primary demotes itself to replica
+
+  Variations:
+    CLUSTER FAILOVER FORCE:     promotes without waiting for replication sync
+                                Use when primary is alive but you must fail over fast
+    CLUSTER FAILOVER TAKEOVER:  no election, no primary involvement
+                                DANGEROUS: can cause split-brain if primary alive
+
+
+5. NETWORK PARTITIONS AND SPLIT-BRAIN
+───────────────────────────────────────
+  Split-brain scenario:
+    Network partition separates Redis nodes into two groups.
+    Each group believes the other is down.
+    Both groups may elect a primary → two primaries accepting writes.
+    When partition heals: diverged data, one side loses its writes.
+
+  Example:
+    ┌──────────────────┐   ╳ network ╳   ┌──────────────────┐
+    │ Primary (A)      │                  │ Sentinel 1, 2, 3 │
+    │ Clients writing  │                  │ elect Replica    │
+    └──────────────────┘                  │ as new primary   │
+                                          └──────────────────┘
+
+  Prevention:
+    min-replicas-to-write 1       → Primary stops writes if isolated
+    min-replicas-max-lag 10       → Primary stops writes if replica too stale
+    Odd number of Sentinels       → Quorum always resolvable
+
+  Sentinel split-brain:
+    If Sentinels are partitioned: may not reach quorum → NO failover (safer)
+    If 2 of 3 Sentinels see primary down → quorum met → failover happens
+
+  Recovery from split-brain:
+    When partition heals: old primary (with extra writes) becomes replica.
+    It drops its extra writes and syncs from new primary.
+    Those extra writes are permanently LOST.
+
+
+6. DATA PARTITIONING STRATEGIES
+─────────────────────────────────
+  Three approaches to partition data across Redis nodes:
+
+  6a. Range Partitioning:
+    Assign key ranges to nodes:
+      Keys 0–999: Node A
+      Keys 1000–1999: Node B
+      Keys 2000+: Node C
+
+    Pros: Simple, predictable, easy range queries.
+    Cons: Uneven distribution (hot keys), hard to rebalance.
+
+  6b. Hash Partitioning:
+    node = CRC16(key) % num_nodes
+    Pros: Even distribution.
+    Cons: Adding/removing a node changes formula → all keys remap → expensive.
+
+  6c. Consistent Hashing:
+    Keys and nodes placed on a virtual ring.
+    Key → closest node clockwise on ring.
+    Adding node: only keys in the new node's arc need to move.
+    Removing node: only that node's keys need to move.
+    Pros: Minimal remapping on topology change.
+    Cons: Uneven distribution without virtual nodes.
+    With virtual nodes: each physical node gets K points on ring → smoother distribution.
+
+  Redis Cluster uses:
+    Fixed 16,384 slots (not consistent hashing).
+    Slot-to-node mapping is explicit and flexible.
+    Resharding = moving slots between nodes (explicit, controlled).
+
+
+7. PARTITIONING ERRORS IN CLUSTER
+────────────────────────────────────
+  CROSSSLOT error:
+    Command touches keys in different slots:
+    > MSET {a}:key1 v1 {b}:key2 v2
+    (error) CROSSSLOT Keys in request don't hash to the same slot
+    Fix: use hash tags to co-locate: MSET {user:42}:key1 v1 {user:42}:key2 v2
+
+  CLUSTERDOWN error:
+    A slot is uncovered (primary down + no replica):
+    (error) CLUSTERDOWN Hash slot not served
+    Fix: recover failed node, or manually reassign slot.
+
+  MOVED redirect:
+    Key requested on wrong node → client auto-redirected to correct node.
+    Non-cluster-aware clients will fail.
+
+  Lua scripts in cluster:
+    All KEYS[] must be in the same slot.
+    Script fails at EVAL time with CROSSSLOT if keys span slots.
+
+
+8. SENTINEL + CLUSTER COMPARISON (FAILOVER)
+──────────────────────────────────────────────
+  Aspect                    │ Sentinel                │ Cluster
+  ──────────────────────────┼─────────────────────────┼──────────────────────────
+  Failover trigger          │ Sentinels (quorum vote) │ Cluster nodes (gossip)
+  Typical failover time     │ 10–30s                  │ 1–10s
+  External monitoring proc  │ Yes (Sentinel processes)│ No (built into nodes)
+  Manual failover           │ SENTINEL failover       │ CLUSTER FAILOVER
+  Partial availability      │ Full down during failover│ Only affected shard down
+  Data loss risk            │ async lag               │ async lag (per shard)
+
+
+9. BEST PRACTICES FOR FAILOVER AND PARTITIONING
+─────────────────────────────────────────────────
+  Deployment:
+    - Use 3+ Sentinels in different availability zones
+    - Use 6+ Cluster nodes (3P + 3R) across AZs
+    - Place replicas in different AZs from their primaries
+
+  Data safety:
+    - Set min-replicas-to-write 1, min-replicas-max-lag 10
+    - Use WAIT for critical writes
+    - Enable AOF on replicas too (not just primary)
+
+  Client configuration:
+    - Use Sentinel-aware clients (JedisSentinelPool, Lettuce with Sentinel)
+    - Use Cluster-aware clients (JedisCluster, ClusterTopologyRefreshOptions in Lettuce)
+    - Configure retry on MOVED/ASK/CLUSTERDOWN
+    - Set reasonable connection timeouts and retry logic
+
+  Monitoring:
+    - Alert on: connected_slaves < expected, master_link_status:down
+    - Alert on: evicted_keys > 0, keyspace_hits/(hits+misses) < 0.9
+    - Alert on: CLUSTER INFO cluster_state:fail
+
+  Testing:
+    - Run chaos engineering: kill a primary, verify failover time
+    - Test client behavior during failover (verify no stuck connections)
+    - Verify WAIT behavior under load
+
+
+10. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: What is split-brain in Redis and how do you prevent it?
+  A: Split-brain occurs when a network partition causes multiple Redis nodes
+     to independently believe they are the primary, accepting writes. When the
+     partition heals, one side's writes are lost. Prevention strategies:
+     (1) min-replicas-to-write + min-replicas-max-lag: primary stops writes
+     when isolated. (2) Sentinel quorum: need majority of Sentinels to agree,
+     impossible in a minority partition. (3) Deploy Sentinels across AZs.
+
+  Q: What is the difference between manual and automatic failover in Redis Cluster?
+  A: Automatic failover: triggered by the cluster detecting primary failure via
+     gossip protocol. Replica election happens without operator intervention,
+     typically in 1–10 seconds.
+     Manual failover (CLUSTER FAILOVER): initiated by an operator on a specific
+     replica. Graceful — waits for replication to sync before promoting. Used
+     for maintenance or rolling upgrades. FORCE/TAKEOVER variants allow
+     immediate promotion without waiting for the primary.
+
+  Q: What's the difference between hash partitioning and consistent hashing?
+  A: Hash partitioning: node = hash(key) % N. Adding/removing nodes requires
+     remapping (N-1)/N of all keys — very disruptive.
+     Consistent hashing: keys and nodes on a ring; only move keys in the
+     new/removed node's arc (~1/N of keys). Much less disruption on topology
+     changes. Redis Cluster uses a fixed 16,384 slot approach, which is similar
+     in spirit to consistent hashing but uses explicit slot-to-node mapping.
+
+  Q: How does Redis Cluster handle a key request sent to the wrong node?
+  A: The node computes the correct slot for the key and responds with a MOVED
+     error containing the correct node's address (e.g., -MOVED 7638 127.0.0.1:6380).
+     Smart clients update their slot map and retry on the correct node.
+     During slot migration, ASK redirects are used temporarily — clients
+     must send ASKING before the actual command but should not update their map.
+
+================================================================================

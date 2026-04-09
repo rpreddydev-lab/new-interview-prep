@@ -1,0 +1,269 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DESIGN: NOTIFICATION SYSTEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FUNCTIONAL:
+  - Send notifications via 4 channels:
+      1. Push notification (iOS via APNs, Android via FCM)
+      2. Email (via SendGrid / AWS SES)
+      3. SMS (via Twilio)
+      4. In-app / WebSocket (while user is online)
+  - Support multiple notification types:
+      - Transactional: payment confirmation, order shipped (critical)
+      - Social: someone liked your photo, new follower
+      - Promotional: discount offers, weekly digest
+      - System: security alerts, password changed
+  - User preferences: Opt-out per channel per notification type
+  - Priority queues: Critical notifications delivered within seconds
+  - Delivery tracking: sent → delivered → read
+  - Template support: Personalized messages with user variables
+  - Scheduled notifications: Send at specific future time
+
+NON-FUNCTIONAL:
+  - Volume: 10M notifications/day → 115/second average, peak 500/second
+  - Transactional latency: < 10 seconds end-to-end
+  - Promotional: eventual delivery acceptable (within 1 hour)
+  - Delivery rate: > 99.9% (retry failed deliveries)
+  - No duplicate notifications (idempotency)
+  - Deduplication window: 24 hours (same notification to same user)
+
+
+2. ESTIMATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+VOLUME:
+  10M notifications/day total
+  Split: 60% push, 25% email, 10% SMS, 5% in-app
+  Peak (promo blast): 1M notifications in 1 hour = 280/second
+
+THROUGHPUT PER CHANNEL:
+  Push: 6M/day × payload 1KB = 6GB/day
+  Email: 2.5M/day × avg 50KB = 125GB/day (email content)
+  SMS: 1M/day × 160 bytes = 160MB/day
+
+TEMPLATE STORAGE:
+  100 templates × 10KB each = 1MB (trivial)
+
+
+3. HIGH-LEVEL ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+                     ┌─────────────────────┐
+    Trigger Sources: │  Upstream Services  │
+                     │  (payment, order,   │
+                     │   social, marketing)│
+                     └──────────┬──────────┘
+                                │ POST /api/v1/notifications
+                     ┌──────────▼──────────┐
+                     │  Notification API   │
+                     │  - Auth, validate   │
+                     │  - Idempotency check│
+                     │  - User preference  │
+                     │    lookup           │
+                     └──┬───────────────┬──┘
+                        │               │
+               ┌────────▼──┐       ┌────▼───────────┐
+               │ Priority  │       │ Preference      │
+               │ Queue     │       │ Service         │
+               │ (Kafka)   │       │ (user opt-outs) │
+               └────┬──────┘       └─────────────────┘
+                    │
+          ┌─────────┼──────────────────────────────────┐
+          │         │                                   │
+   ┌──────▼──┐ ┌────▼─────┐  ┌──────────┐  ┌──────────┐
+   │  Push   │ │  Email   │  │   SMS    │  │ In-App   │
+   │ Worker  │ │  Worker  │  │  Worker  │  │  Worker  │
+   └────┬────┘ └────┬─────┘  └────┬─────┘  └────┬─────┘
+        │           │             │              │
+   ┌────▼────┐ ┌────▼──────┐ ┌───▼──────┐  ┌───▼──────┐
+   │APNs/FCM │ │SendGrid/  │ │  Twilio  │  │WebSocket │
+   │         │ │ AWS SES   │ │          │  │ Server   │
+   └─────────┘ └───────────┘ └──────────┘  └──────────┘
+          │           │             │              │
+          └───────────┴─────────────┴──────────────┘
+                                │
+                     ┌──────────▼──────────┐
+                     │  Delivery Tracker   │
+                     │  (Cassandra)        │
+                     │  - Status updates   │
+                     │  - Retry logic      │
+                     └─────────────────────┘
+
+
+4. KAFKA TOPICS AND PRIORITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SEPARATE TOPICS BY PRIORITY:
+  notifications-critical    (payment confirmations, security alerts)
+  notifications-transactional (order shipped, account changes)
+  notifications-social      (likes, follows, comments)
+  notifications-promotional (marketing, offers)
+
+WHY SEPARATE TOPICS?
+  - Different consumer groups with different SLAs
+  - Critical workers process first, promotional can lag
+  - Promotional volume burst doesn't delay critical notifications
+  - Different retention: critical = 7 days, promotional = 1 day
+
+CONSUMER GROUPS:
+  push-consumer-critical       (20 workers, high priority)
+  push-consumer-normal         (10 workers)
+  email-consumer               (5 workers, SendGrid rate limited)
+  sms-consumer                 (3 workers, Twilio rate limited)
+
+
+5. USER PREFERENCE MANAGEMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PREFERENCES TABLE:
+  user_id | notification_type | channel  | enabled
+  --------|-------------------|----------|--------
+  123     | social            | push     | false    (opted out push for social)
+  123     | promotional       | email    | false    (unsubscribed from promo emails)
+  123     | promotional       | sms      | false
+  123     | transactional     | *        | true     (can't opt out of transactional)
+
+PREFERENCE CHECK:
+  Before routing to channel workers:
+    1. Load user's preferences (cached in Redis with 5-min TTL)
+    2. If user opted out of channel × notification_type → skip that channel
+    3. Transactional notifications: skip preference check (cannot opt out legally in some countries)
+  
+  GDPR: Must honor opt-out for marketing within reasonable time
+  CAN-SPAM: Must include unsubscribe link in all commercial emails
+
+
+6. DEVICE TOKEN MANAGEMENT (PUSH)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Push tokens:
+  iOS: APNs device token (64 hex characters)
+  Android: FCM registration token (variable length)
+
+STORAGE:
+  user_devices table:
+    user_id | device_token | platform | created_at | last_active
+  
+  One user → multiple devices (phone + tablet, iOS + Android)
+  Send to ALL active devices for a user
+
+TOKEN REFRESH:
+  Tokens change when: user reinstalls app, factory reset, new device
+  APNs/FCM return error for invalid token
+  Notification Service: on delivery error → mark token as invalid → delete from DB
+
+TOKEN VALIDATION CYCLE:
+  APNs error: BadDeviceToken → remove immediately
+  FCM error: NotRegistered → remove immediately
+  These cleanup calls reduce wasted API calls on future notifications
+
+
+7. RETRY AND FAILURE HANDLING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RETRY STRATEGY:
+  Transient error (rate limit, 5xx from APNs/FCM): Retry with exponential backoff
+    Attempt 1: immediate
+    Attempt 2: 10 seconds
+    Attempt 3: 100 seconds
+    Attempt 4: 1000 seconds
+    Attempt 5: Dead Letter Queue
+  
+  Permanent error (invalid token, user doesn't exist): No retry, mark failed
+
+IDEMPOTENCY:
+  Each notification has a notification_id (UUID, assigned by API)
+  Before processing: check Redis "processed:{notification_id}" (24-hour key)
+  If exists: skip (already processed)
+  If not: process and set the key
+  
+  This prevents duplicate sends if the same event triggers twice
+  (e.g., upstream service retries its publish to the Notification API)
+
+DEAD LETTER QUEUE (DLQ):
+  After max retries: move to DLQ Kafka topic
+  Monitoring: alert if DLQ grows → investigate systemic issues
+  Manual review: determine if bulk retry needed or issue resolved
+
+
+8. TEMPLATE ENGINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TEMPLATE DEFINITION:
+  {
+    "templateId": "order-shipped",
+    "channels": {
+      "push": {
+        "title": "Your order is on its way! 🚚",
+        "body": "Hi {{user.firstName}}, order #{{order.id}} shipped via {{shipment.carrier}}"
+      },
+      "email": {
+        "subject": "Order #{{order.id}} Shipped",
+        "htmlBody": "<p>Hi {{user.firstName}},...</p>",
+        "textBody": "Hi {{user.firstName}}, your order..."
+      },
+      "sms": {
+        "body": "Order {{order.id}} shipped. Track: {{shipment.trackingUrl}}"
+      }
+    }
+  }
+
+RENDER PIPELINE:
+  1. Load template from cache (Redis) or DB
+  2. Merge context variables (user, order, product objects)
+  3. Render using Mustache/Handlebars template engine
+  4. Send rendered content to channel workers
+
+I18N (INTERNATIONALIZATION):
+  Template has variants per locale: "en", "es", "fr", "ja"
+  Lookup user's preferred language from profile
+  Fallback to "en" if locale not found
+
+
+9. DELIVERY TRACKING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+NOTIFICATION EVENTS TABLE (Cassandra, event-sourced):
+  notification_id | user_id | event_type | channel | timestamp | metadata
+  
+  Events: CREATED → QUEUED → SENT_TO_PROVIDER → DELIVERED → OPENED/READ
+  
+  Delivery events from providers:
+    APNs: delivery receipts (optional, best-effort)
+    FCM: delivery receipts available
+    Email: webhook from SendGrid (opened, clicked, bounced, spam)
+    SMS: delivery receipt from Twilio webhook
+  
+  Analytics dashboard:
+    Delivery rate, open rate, click rate per template/campaign
+    Failed notification analysis (by channel, by error type)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWER — "Design a notification system for 10M users"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"I'd design the notification system as an event-driven pipeline with
+separate Kafka topics per priority level. Critical notifications (payment,
+security) flow through a high-priority topic with dedicated workers;
+promotional notifications use a separate topic that can tolerate queuing.
+
+The key insight is separating the notification API (intake + validation)
+from the channel workers (delivery). The API checks user preferences,
+applies deduplication (Redis 24-hr idempotency key per notification_id),
+and publishes to the appropriate Kafka topic. Channel workers are
+independently scaled — email workers don't compete with SMS workers.
+
+For push notifications: users may have multiple devices. I store all
+device tokens per user. On APNs/FCM delivery failure with 'BadDeviceToken',
+I immediately prune the invalid token to avoid wasting calls.
+
+For reliability: exponential backoff retries with 5 attempts, then DLQ.
+Transient provider failures (rate limits, 5xx) are retried; permanent
+failures (invalid token) are not. This gives > 99.9% delivery rates.
+
+Template rendering is decoupled: a template engine merges variables into
+channel-specific templates, supporting i18n and personalization without
+hardcoded strings in notification events."

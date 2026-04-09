@@ -1,0 +1,245 @@
+================================================================================
+REDIS REPLICATION — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. WHAT IS REDIS REPLICATION?
+───────────────────────────────
+  Redis replication is a mechanism where one Redis server (primary / master)
+  automatically copies its data to one or more Redis servers (replicas / slaves).
+
+  Purpose:
+    - Read scaling: replicas serve read traffic
+    - High availability: replica can be promoted on primary failure
+    - Data backup: replica as live read-only copy
+    - Analytics: run expensive queries on replicas without impacting primary
+
+  Key characteristics:
+    - Asynchronous by default (primary doesn't wait for replica ACK)
+    - Non-blocking on the primary side (BGSAVE runs in forked child)
+    - Replicas are read-only by default (replica-read-only yes)
+    - Replicas always connect TO the primary (not vice versa)
+    - Replication is persistent: replicas auto-reconnect on disconnect
+
+
+2. REPLICATION SETUP
+──────────────────────
+  Method 1 — redis.conf on replica:
+    replicaof 127.0.0.1 6379
+
+  Method 2 — runtime command:
+    REPLICAOF 127.0.0.1 6379     # start replication
+    REPLICAOF NO ONE             # stop replication (become standalone/primary)
+
+  Verify replication status:
+    On primary: INFO replication
+      role:master
+      connected_slaves:1
+      slave0:ip=127.0.0.1,port=6380,state=online,offset=1234567,lag=0
+
+    On replica: INFO replication
+      role:slave
+      master_host:127.0.0.1
+      master_port:6379
+      master_link_status:up
+      master_last_io_seconds_ago:0
+      master_sync_in_progress:0
+      slave_repl_offset:1234567
+      slave_priority:100
+      slave_read_only:1
+
+
+3. FULL RESYNC (INITIAL SYNC)
+───────────────────────────────
+  When a replica connects to a primary for the first time (or after long disconnect):
+
+  Handshake:
+    1. Replica sends PING to primary → verify connectivity
+    2. Authentication (if requirepass set)
+    3. Replica sends REPLCONF listening-port <port>
+    4. Replica sends REPLCONF capa psync2 (announce PSYNC2 capability)
+    5. Replica sends PSYNC <replication-id> <offset>
+       - First time: PSYNC ? -1 (full resync requested)
+
+  Primary response (full resync):
+    1. Primary forks a child process → BGSAVE (RDB snapshot)
+    2. Primary buffers ALL new write commands to replication buffer
+    3. Primary sends RDB file to replica
+    4. Replica loads RDB (flushes its own data first)
+    5. Primary sends all buffered commands (catch-up)
+    6. Normal incremental replication begins
+
+  Memory impact:
+    Primary needs memory for:
+      - RDB file creation (fork + CoW overhead)
+      - repl-backlog-buffer (default 1MB) to buffer commands during sync
+
+
+4. PARTIAL RESYNC (PSYNC2)
+────────────────────────────
+  On temporary disconnection + reconnect, avoid full RDB resync.
+
+  Key concepts:
+    Replication ID: unique ID for a primary's replication stream
+    Replication Offset: byte offset in the replication stream
+
+  Primary maintains a circular replication backlog buffer:
+    Default: repl-backlog-size 1mb
+    Stores last N bytes of replication stream.
+
+  On reconnect, replica sends:
+    PSYNC <replication-id> <last-known-offset>
+
+  Primary responds:
+    CONTINUE → partial resync (sends only missed bytes from backlog)
+    FULLRESYNC → full resync (offset too far behind, not in backlog)
+
+  Configure larger backlog for high-traffic or slow replicas:
+    repl-backlog-size 100mb
+
+  Redis 4.0+ PSYNC2 improvements:
+    Replica promoted to primary retains the secondary replication ID.
+    Other replicas can PSYNC against the new primary using old ID.
+    (Avoids full resync cascade after failover)
+
+
+5. REPLICATION BUFFER vs BACKLOG BUFFER
+─────────────────────────────────────────
+  Replication buffer (per replica, live):
+    Stores commands to send to a currently-connected replica.
+    If replica is slow or backlogged: buffer grows.
+    client-output-buffer-limit slave 256mb 64mb 60
+    → Hard limit: 256MB immediately disconnects replica
+    → Soft limit: 64MB for 60 seconds disconnects replica
+
+  Replication backlog (global, circular):
+    Ring buffer storing last N bytes of replication stream.
+    Used for partial resync on reconnect.
+    repl-backlog-size 1mb (default, usually too small)
+
+
+6. SYNCHRONOUS REPLICATION — WAIT COMMAND
+───────────────────────────────────────────
+  By default: replication is ASYNC.
+  Primary sends write to client immediately, replica receives asynchronously.
+
+  WAIT numreplicas timeout
+    → Blocks until numreplicas replicas have acknowledged the write,
+      OR timeout milliseconds have passed.
+    → Returns: number of replicas that have caught up.
+
+  Example:
+    SET critical:order:42 "confirmed"
+    WAIT 1 1000   → wait for at least 1 replica to confirm, max 1 second
+    -- Returns (integer) 1 if 1 replica confirmed
+    -- Returns (integer) 0 if timeout (no replica confirmed in time)
+
+  Use case:
+    Financial transactions, inventory decrement, anything requiring
+    durability guarantee before acknowledging to user.
+
+  Caveat:
+    WAIT doesn't fully guarantee no data loss on primary failure.
+    If primary crashes immediately after WAIT returns, replica may still
+    not have applied the command (replication offset ≠ flush to disk).
+
+
+7. REPLICATION CASCADING (CHAIN REPLICATION)
+──────────────────────────────────────────────
+  Replicas can themselves have replicas:
+    Primary → Replica A → Replica B
+
+  Useful for:
+    - Reducing replication fan-out on primary (primary sends to one, A fans out)
+    - Geographic distribution (Primary in US, Replica A in EU, Replica B in EU)
+
+  Configure:
+    On Replica B: REPLICAOF <Replica-A-host> <Replica-A-port>
+
+  Caveat:
+    Increased replication lag at each hop.
+    B is always at least as stale as A.
+
+
+8. DATA CONSISTENCY GUARANTEES
+──────────────────────────────────
+  Replication guarantee: eventual consistency.
+    Primary acknowledges write → replication happens asynchronously.
+    Replica may be behind by milliseconds (or seconds under load).
+
+  Stale reads:
+    Reading from a replica may return old data.
+    For strict consistency: always read from primary.
+
+  Replica catch-up on reconnect:
+    If backlog is large enough: partial resync catches up.
+    If backlog overflow: full resync (expensive).
+
+
+9. MIN REPLICAS — PROTECTING AGAINST SPLIT-BRAIN
+──────────────────────────────────────────────────
+  Prevent primary accepting writes if no healthy replicas:
+    min-replicas-to-write 1
+    min-replicas-max-lag 10
+
+  Effect:
+    Primary refuses writes if fewer than 1 replica is connected
+    AND within 10 seconds of lag.
+
+  Protects against:
+    Split-brain scenario where primary is isolated but still serving writes.
+    If isolated primary accepts writes and a new primary is elected:
+    → Data divergence + possible loss on primary recovery.
+
+
+10. INFO REPLICATION KEY METRICS
+───────────────────────────────────
+  On primary:
+    repl_backlog_size              → backlog buffer configured size
+    repl_backlog_first_byte_offset → starting offset of backlog
+    repl_backlog_histlen           → actual data in backlog (bytes)
+    slave0:…,lag=0                 → 0 = real-time, >0 = replication lag (seconds)
+
+  On replica:
+    master_link_status:up|down     → connectivity to primary
+    master_last_io_seconds_ago     → last communication (seconds)
+    master_sync_in_progress:1|0    → full resync in progress?
+    slave_repl_offset              → replica's current offset
+    slave_priority:100             → failover priority (lower = preferred)
+
+
+11. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: How does Redis replication work at a high level?
+  A: A replica connects to the primary and requests PSYNC. On first connect,
+     the primary forks a child to create an RDB snapshot while buffering new
+     writes in the replication backlog. The RDB is sent to the replica, which
+     loads it. Then the buffered commands are replayed. After that, all write
+     commands are streamed asynchronously to the replica in real time.
+
+  Q: What is the difference between full resync and partial resync?
+  A: Full resync (FULLRESYNC) sends a complete RDB snapshot followed by
+     buffered commands — expensive in time and memory. Partial resync
+     (CONTINUE via PSYNC2) reuses the circular backlog buffer to send only
+     the commands missed during the disconnect, much cheaper. Partial resync
+     only works if the replica's last offset is still within the backlog window.
+
+  Q: How would you guarantee that a write has been replicated before responding to a user?
+  A: Use the WAIT command: WAIT 1 1000 blocks until at least 1 replica
+     confirms the write, with a 1-second timeout. This provides a stronger
+     durability guarantee. Note it's not 100% guaranteed persistence unless
+     the replica also has AOF with appendfsync always.
+
+  Q: What happens to replication when a Redis primary fails and a replica is promoted?
+  A: In PSYNC2 (Redis 4.0+), the promoted replica retains the secondary
+     replication ID of the old primary. Other replicas can do partial resyncs
+     against the new primary using the old replication ID and their last offset.
+     Without PSYNC2, all replicas would need full resyncs after failover.
+
+  Q: What is min-replicas-to-write and when would you use it?
+  A: It prevents the primary from accepting writes unless a minimum number
+     of replicas are connected within a maximum replication lag. Used to
+     prevent data loss in split-brain scenarios where the primary is network-
+     partitioned but still serving writes that diverge from the replica-turned-
+     primary. Commonly set to 1 replica, max 10s lag for critical data.
+
+================================================================================

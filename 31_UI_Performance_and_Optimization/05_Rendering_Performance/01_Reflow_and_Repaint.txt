@@ -1,0 +1,332 @@
+================================================================
+REFLOW AND REPAINT
+================================================================
+
+DEFINITIONS
+─────────────
+REFLOW (LAYOUT): The browser recalculates the geometry (position and size)
+of ALL elements affected by a change. A reflow in one element can cause
+reflows across the entire page — a very expensive operation.
+
+REPAINT: The browser re-fills pixels for elements whose visual appearance
+changed (color, background, shadow) but whose geometry didn't change.
+Cheaper than reflow but still significant.
+
+COMPOSITE ONLY: Transform and opacity changes happen on the compositor thread
+(GPU) without triggering layout or paint. Cheapest operation, enables 60fps.
+
+ORDER OF COST (slowest → fastest):
+  Reflow → Repaint → Composite Only
+
+================================================================
+WHAT TRIGGERS REFLOW
+================================================================
+
+CHANGES TO GEOMETRY-RELATED PROPERTIES:
+  CSS Properties (any modification triggers reflow):
+  - width, height, min-width, max-width
+  - margin, padding, border, border-width
+  - top, bottom, left, right (for positioned elements)
+  - position (changing from static to relative, etc.)
+  - float, clear
+  - display (none ↔ block, flex, grid)
+  - font-size, font-weight, line-height, letter-spacing
+  - text-align, vertical-align, white-space, word-wrap
+  - overflow, overflow-x, overflow-y
+  - flex, flex-direction, flex-wrap, grid-*
+
+DOM CHANGES:
+  - Adding/removing elements
+  - Changing element content (innerHTML, textContent)
+  - Showing/hiding elements (display: none/block)
+  - Resizing window (reflows entire page)
+  - Scrolling (sometimes — depends on positioned elements)
+
+JAVASCRIPT THAT FORCES REFLOW (READING LAYOUT PROPERTIES):
+  Accessing any of these FORCES the browser to flush pending changes
+  and recalculate layout synchronously:
+  
+  // Offsetting:
+  element.offsetTop, element.offsetLeft, element.offsetWidth, element.offsetHeight
+  element.offsetParent
+  
+  // Scrolling:
+  element.scrollTop, element.scrollLeft, element.scrollWidth, element.scrollHeight
+  
+  // Client:
+  element.clientTop, element.clientLeft, element.clientWidth, element.clientHeight
+  
+  // Bounding rect:
+  element.getBoundingClientRect()
+  
+  // Computed styles:
+  window.getComputedStyle(element)
+  
+  // Window:
+  window.innerWidth, window.innerHeight
+  
+  // Focus/selection:
+  element.focus()  // Can trigger layout
+
+================================================================
+WHAT TRIGGERS REPAINT ONLY (NOT REFLOW)
+================================================================
+
+Visual changes that don't affect layout:
+  - color
+  - background-color, background-image, background-position
+  - border-color (but NOT border-width — that changes layout)
+  - text-decoration
+  - box-shadow, outline
+  - visibility (visible ↔ hidden — DIFFERENT from display: none!)
+  - cursor
+  - border-radius (doesn't affect layout in most cases)
+
+================================================================
+COMPOSITED ONLY (NO LAYOUT OR PAINT)
+================================================================
+
+These trigger ONLY the compositor — GPU handled, off main thread:
+  - transform: translate, scale, rotate, skew, matrix
+  - opacity
+  - filter (on promoted layers)
+  - will-change: transform (the property itself, not a visual property)
+  
+  // WHY: These don't change layout (no reflowing other elements)
+  // and the compositor can apply them to texture already on GPU
+
+================================================================
+LAYOUT THRASHING - DEEP DIVE
+================================================================
+
+Layout thrashing = repeated forced synchronous layouts in a loop.
+The single most common performance anti-pattern in JavaScript.
+
+THE MECHANISM:
+  Normally, the browser batches style mutations and recalculates layout
+  once per frame. But if you READ a layout property after a WRITE, the
+  browser MUST flush the queue and recalculate immediately (synchronously)
+  to give you the correct value.
+
+// ❌ CLASSIC LAYOUT THRASHING:
+const boxes = document.querySelectorAll('.box');
+
+for (const box of boxes) {
+  const width = box.offsetWidth;     // FORCE REFLOW: browser must calculate now
+  box.style.width = width * 2 + 'px'; // WRITE: invalidates layout
+}
+// Result: 1 forced reflow per iteration = O(n) reflows
+
+// What the browser does:
+// Frame 1 start: pending mutations from previous loop iteration
+// Read offsetWidth: "I need to flush, recalculate, then read" → REFLOW
+// Write style: "layout invalidated"
+// Next loop iteration: same thing...
+
+// ✅ CORRECT: Batch reads, then batch writes:
+const boxes = document.querySelectorAll('.box');
+
+// Phase 1: Read ALL values (no mutations yet, no forced reflow)
+const widths = Array.from(boxes).map(box => box.offsetWidth);
+
+// Phase 2: Write ALL values (browser batches, ONE reflow)
+boxes.forEach((box, i) => {
+  box.style.width = widths[i] * 2 + 'px';
+});
+
+// ✅ USING FASTDOM (library for safe read/write batching):
+import FastDOM from 'fastdom';
+
+for (const box of boxes) {
+  FastDOM.measure(() => {
+    const width = box.offsetWidth;  // All measures run first
+    FastDOM.mutate(() => {
+      box.style.width = width * 2 + 'px';  // All mutations run after
+    });
+  });
+}
+
+================================================================
+AVOID REFLOW WITH BETTER PATTERNS
+================================================================
+
+1. CHANGE CLASSES INSTEAD OF INDIVIDUAL STYLES
+───────────────────────────────────────────────
+  // ❌ Multiple reflows (one per style change)
+  element.style.width = '100px';
+  element.style.height = '100px';
+  element.style.left = '50px';
+  
+  // ✅ One reflow (browser batches class changes)
+  element.classList.add('expanded');  // CSS class handles all 3 properties
+
+2. REMOVE FROM FLOW BEFORE BATCH CHANGES
+──────────────────────────────────────────
+  // ❌ Every innerHTML causes reflow (element is in DOM)
+  list.innerHTML = '';
+  for (const item of items) {
+    list.innerHTML += `<li>${item.name}</li>`; // Reflow per concatenation!
+  }
+  
+  // ✅ DocumentFragment: build off-DOM, add once
+  const fragment = document.createDocumentFragment();
+  for (const item of items) {
+    const li = document.createElement('li');
+    li.textContent = item.name;
+    fragment.appendChild(li);  // No reflow (not in DOM)
+  }
+  list.appendChild(fragment);  // ONE reflow (one DOM insertion)
+  
+  // ✅ Or: display:none while mutating
+  list.style.display = 'none';   // Remove from rendering flow
+  // ... many DOM mutations ...
+  list.style.display = 'block';  // Re-add: ONE reflow
+
+3. USE POSITION ABSOLUTE FOR ANIMATED ELEMENTS
+────────────────────────────────────────────────
+  // Elements with position: absolute don't affect sibling layout
+  // Moving them causes reflow only in their stacking context, not siblings
+  
+  // BETTER: Use transform (no reflow at all!)
+  // position: absolute + left/top → reflow
+  // position: absolute + transform → composite only!
+
+4. CACHE LAYOUT PROPERTIES
+────────────────────────────
+  // ❌ Reading in a loop (each read may force reflow)
+  for (let i = 0; i < 1000; i++) {
+    if (element.offsetHeight > threshold) { /* ... */ }
+  }
+  
+  // ✅ Read once, cache
+  const height = element.offsetHeight; // Read ONCE
+  for (let i = 0; i < 1000; i++) {
+    if (height > threshold) { /* ... */ }
+  }
+
+5. AVOID TABLE LAYOUT FOR DYNAMIC CONTENT
+───────────────────────────────────────────
+  // Tables recalculate ALL cells when ONE cell changes
+  // For dynamic data, use CSS Grid or Flexbox instead
+  // Grid/Flexbox: only affected row/column reflowed
+
+================================================================
+CONTAIN PROPERTY FOR REFLOW ISOLATION
+================================================================
+
+CSS contain tells the browser to limit the scope of rendering calculations.
+
+  .widget {
+    contain: layout;
+    /* Reflows INSIDE .widget don't trigger parent/sibling reflows */
+  }
+  
+  .card {
+    contain: paint;
+    /* Painting is clipped to .card — overflow hidden equivalent for painting */
+  }
+  
+  .isolated {
+    contain: content; /* = layout + paint + style */
+    /* Changes inside don't affect outside at all */
+  }
+
+REAL EXAMPLE - CHAT MESSAGE RENDERING:
+  /* Without contain: adding one message reflowed entire chat history */
+  /* With contain: content: each message is isolated, adding one message
+     only reflowed the message list, not the entire page */
+  .chat-message {
+    contain: content;
+  }
+
+================================================================
+COMMON ANTI-PATTERNS AND FIXES
+================================================================
+
+ANTI-PATTERN 1: Reading geometry in scroll/resize handlers
+  // ❌
+  window.addEventListener('scroll', () => {
+    const rect = element.getBoundingClientRect(); // Forces reflow on EVERY scroll!
+    if (rect.top < 0) element.classList.add('sticky');
+  });
+  
+  // ✅ Use IntersectionObserver (no forced layout)
+  const observer = new IntersectionObserver(
+    ([entry]) => entry.target.classList.toggle('sticky', !entry.isIntersecting),
+    { threshold: 0 }
+  );
+  observer.observe(element);
+
+ANTI-PATTERN 2: Animating left/top instead of transform
+  // ❌ left/top animation → reflow every frame
+  element.style.left = `${x}px`;
+  
+  // ✅ transform animation → composite only (GPU)
+  element.style.transform = `translateX(${x}px)`;
+
+ANTI-PATTERN 3: window.getComputedStyle() in a loop
+  // ❌ Forces reflow each call
+  for (const el of elements) {
+    const style = window.getComputedStyle(el);
+    if (style.color === 'red') { /* ... */ }
+  }
+  
+  // ✅ Avoid if possible; use data attributes or class checks instead
+  if (el.classList.contains('warning')) { /* ... */ }
+
+================================================================
+USING DEVTOOLS TO FIND REFLOW PROBLEMS
+================================================================
+
+PERFORMANCE PANEL:
+  1. Record interaction (click, scroll, etc.)
+  2. In main thread timeline, look for:
+     - PURPLE "Layout" events (reflow)
+     - Frequent small layouts = layout thrashing
+     - One large layout = expensive single reflow
+  3. Click a layout event → "Call Stack" shows what triggered it
+
+PERFORMANCE MONITOR:
+  DevTools > More Tools > Performance Monitor
+  Shows live:
+  - Layout/sec (number of reflows per second)
+  - Style recalc/sec
+  - DOM nodes
+  
+  Ideal: Layout/sec should be 0 when not animating
+
+TIMELINE WATERFALL:
+  Look for "Recalculate Style" (style calc) preceding "Layout" events.
+  Purple cascades of Layout events = thrashing.
+
+================================================================
+INTERVIEW ANSWERS
+================================================================
+
+Q: What's the difference between reflow and repaint?
+A: Reflow (layout) recalculates the geometry of elements — size, position.
+   When any element's geometry changes, the browser may need to recalculate
+   all elements that depend on it. Repaint re-fills pixels for visual changes
+   (color, background) without recalculating geometry. Compositing (transform,
+   opacity) runs on the GPU compositor thread with neither reflow nor repaint.
+   Performance order: reflow > repaint > composite. Aim for the composite-only
+   path for animations.
+
+Q: What is layout thrashing and how do you fix it?
+A: Layout thrashing is alternately reading layout properties (offsetWidth,
+   getBoundingClientRect) and modifying styles in a loop. Each read after a
+   write forces the browser to flush its pending mutation queue and calculate
+   layout immediately. Fix: separate reads and writes — read all values first
+   in one pass (stores them), then write all values. FastDOM library enforces
+   this pattern. requestAnimationFrame can help by batching writes to the
+   next frame boundary. IntersectionObserver eliminates the most common
+   thrashing pattern (scroll-based visibility checks).
+
+Q: How do you animate at 60fps without causing reflow?
+A: Animate only transform and opacity properties, not width/height/left/top.
+   Use will-change: transform on animated elements to promote them to their
+   own compositor layer before animation starts (removing will-change after).
+   Use requestAnimationFrame to sync animation updates with browser paint cycles.
+   For JS animations: use the Web Animations API (WAAPI) which runs on compositor
+   thread. For CSS animations: use @keyframes with transform/opacity only.
+   CSS transitions on transform/opacity are automatically GPU-composited.

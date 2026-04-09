@@ -1,0 +1,282 @@
+================================================================================
+REQUEST AGGREGATION — IN DEPTH
+================================================================================
+
+WHAT IS REQUEST AGGREGATION?
+------------------------------
+Request aggregation (also called API composition or fan-out) is when an API
+Gateway or BFF layer makes multiple downstream service calls in response to
+a single client request, then merges the results into one response.
+
+Without aggregation:
+  Client makes 4 requests:
+    GET /users/42          → UserService
+    GET /orders?userId=42  → OrderService
+    GET /notifications/42  → NotificationService
+    GET /preferences/42    → PreferenceService
+  
+  Each with: network RTT + TLS + HTTP overhead × 4 = high mobile latency
+
+With aggregation:
+  Client makes 1 request:
+    GET /dashboard/42      → API Gateway
+  Gateway fans out to 4 services (in parallel) → merges → returns one response
+
+Benefits:
+  - Fewer round trips (critical for mobile apps)
+  - Reduced client complexity
+  - Gateway can optimize/parallel-call downstream services
+  - Can transform and reshape responses for each client type
+
+================================================================================
+1. PARALLEL AGGREGATION PATTERN
+================================================================================
+
+Gateway calls multiple services concurrently and waits for all responses:
+
+  GET /api/dashboard/{userId}
+  ┌─────────────┐   parallel   ┌──────────────┐
+  │ API Gateway │─────────────→│ UserService  │
+  │             │─────────────→│ OrderService │
+  │             │─────────────→│ NotifService │
+  │             │←─────────────│ (all respond)│
+  │             │  aggregate   └──────────────┘
+  └─────────────┘
+
+MAX LATENCY = max(latency_each_service) NOT sum
+  UserService: 50ms
+  OrderService: 80ms
+  NotifService: 30ms
+  Sequential: 160ms  |  Parallel: 80ms
+
+SPRING CLOUD GATEWAY (Java aggregation filter):
+  @Component
+  public class DashboardAggregationFilter implements GatewayFilter {
+
+      private final WebClient userClient;
+      private final WebClient orderClient;
+      private final WebClient notifClient;
+
+      @Override
+      public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+          String userId = exchange.getRequest().getPath().variable("userId");
+          String authHeader = exchange.getRequest().getHeaders().getFirst("Authorization");
+          
+          // Fan out in parallel
+          Mono<UserProfile>       userMono  = userClient.get()
+              .uri("/users/{id}", userId)
+              .header("Authorization", authHeader)
+              .retrieve()
+              .bodyToMono(UserProfile.class)
+              .timeout(Duration.ofMillis(500))
+              .onErrorReturn(UserProfile.empty());
+          
+          Mono<List<Order>>       orderMono = orderClient.get()
+              .uri("/orders?userId={id}&limit=5", userId)
+              .header("Authorization", authHeader)
+              .retrieve()
+              .bodyToFlux(Order.class)
+              .collectList()
+              .timeout(Duration.ofMillis(500))
+              .onErrorReturn(Collections.emptyList());
+          
+          Mono<List<Notification>> notifMono = notifClient.get()
+              .uri("/notifications/{id}/unread", userId)
+              .header("Authorization", authHeader)
+              .retrieve()
+              .bodyToFlux(Notification.class)
+              .collectList()
+              .timeout(Duration.ofMillis(500))
+              .onErrorReturn(Collections.emptyList());
+          
+          // Zip all results
+          return Mono.zip(userMono, orderMono, notifMono)
+              .flatMap(tuple -> {
+                  DashboardResponse dashboard = DashboardResponse.builder()
+                      .user(tuple.getT1())
+                      .recentOrders(tuple.getT2())
+                      .notifications(tuple.getT3())
+                      .build();
+                  
+                  byte[] bytes = objectMapper.writeValueAsBytes(dashboard);
+                  exchange.getResponse().setStatusCode(HttpStatus.OK);
+                  exchange.getResponse().getHeaders()
+                      .setContentType(MediaType.APPLICATION_JSON);
+                  
+                  DataBuffer buffer = exchange.getResponse()
+                      .bufferFactory().wrap(bytes);
+                  return exchange.getResponse().writeWith(Mono.just(buffer));
+              });
+      }
+  }
+
+================================================================================
+2. SEQUENTIAL AGGREGATION (PIPELINE)
+================================================================================
+
+When later calls depend on results from earlier calls:
+
+  GET /order/{orderId}/full
+  Step 1: Get order → order.userId
+  Step 2: Get user(order.userId) → parallel with
+  Step 3: Get payment(orderId)
+  Step 4: Merge into one response
+
+  @GetMapping("/orders/{orderId}/full")
+  public Mono<FullOrderResponse> getFullOrder(@PathVariable String orderId) {
+      return orderClient.getOrder(orderId)
+          .flatMap(order -> {
+              // Steps 2 and 3 can run in parallel
+              Mono<UserProfile> userMono =
+                  userClient.getUser(order.getUserId());
+              Mono<PaymentStatus> paymentMono =
+                  paymentClient.getStatus(orderId);
+              
+              return Mono.zip(userMono, paymentMono)
+                  .map(tuple -> FullOrderResponse.builder()
+                      .order(order)
+                      .user(tuple.getT1())
+                      .payment(tuple.getT2())
+                      .build());
+          });
+  }
+
+================================================================================
+3. PARTIAL AGGREGATION (RESILIENT DEFAULTS)
+================================================================================
+
+Not all aggregation calls are required. If a non-critical service fails,
+return partial data rather than failing the entire request:
+
+  @GetMapping("/dashboard/{userId}")
+  public Mono<DashboardResponse> getDashboard(@PathVariable Long userId) {
+      return Mono.zip(
+          userService.getProfile(userId)
+              .onErrorReturn(UserProfile.anonymous()),     // required
+          orderService.getRecentOrders(userId)
+              .onErrorReturn(Collections.emptyList()),     // nice-to-have
+          notifService.getUnread(userId)
+              .onErrorReturn(Collections.emptyList()),     // nice-to-have
+          recoService.getRecommendations(userId)
+              .onErrorReturn(Collections.emptyList())      // optional
+      ).map(tuple -> DashboardResponse.of(
+          tuple.getT1(), tuple.getT2(), tuple.getT3(), tuple.getT4()));
+  }
+
+Response includes which parts are partial:
+  {
+    "user": { "id": 42, "name": "Alice" },
+    "orders": [],
+    "notifications": [],
+    "recommendations": [],
+    "partial": true,
+    "unavailableServices": ["NotificationService"]
+  }
+
+================================================================================
+4. GRAPHQL AS AN ALTERNATIVE TO AGGREGATION
+================================================================================
+
+GraphQL solves the aggregation problem from the client side:
+  - Client declares exactly which fields it needs
+  - Server resolves them (potentially from multiple services)
+  - One round trip regardless of data complexity
+
+  query DashboardQuery($userId: ID!) {
+    user(id: $userId) {
+      name email
+      recentOrders(limit: 5) { id status total }
+      unreadNotifications { id message }
+    }
+  }
+
+GraphQL Federation:
+  Multiple services contribute their schemas to a single gateway schema.
+  Apollo Federation or GraphQL Yoga Federation.
+
+When aggregation gateway is better than GraphQL:
+  - Existing REST services; don't want to add GraphQL resolvers
+  - Simple composition (fixed dashboard shapes)
+  - When full GraphQL flexibility is overkill
+
+When GraphQL is better:
+  - Many different clients need different data shapes
+  - Client-driven queries; avoid over-fetching
+  - Complex graph-like data relationships
+
+================================================================================
+5. TIMEOUT AND FALLBACK STRATEGIES
+================================================================================
+
+GLOBAL TIMEOUT (gateway level):
+  spring.cloud.gateway.httpclient.connect-timeout=5000   # 5s connect
+  spring.cloud.gateway.httpclient.response-timeout=PT10S  # 10s response
+
+PER-ROUTE TIMEOUT:
+  - id: slow-service
+    uri: lb://SLOW-SERVICE
+    filters:
+      - name: CircuitBreaker
+        args:
+          name: slowServiceCB
+      - name: SetRequestHeader
+        args:
+          name: X-Timeout
+          value: 3000
+
+REACTIVE TIMEOUT CHAIN:
+  userService.getProfile(userId)
+      .timeout(Duration.ofMillis(300))
+      .onErrorResume(TimeoutException.class, e ->
+          cacheService.getCachedProfile(userId)
+              .switchIfEmpty(Mono.just(UserProfile.anonymous())));
+
+CIRCUIT BREAKER FALLBACK:
+  If aggregation target circuit is open, immediately return cached/default:
+
+  .circuitBreaker(config -> config
+      .setName("userServiceCB")
+      .setFallbackUri("forward:/fallback/user"))
+
+================================================================================
+6. INTERVIEW QUESTIONS — REQUEST AGGREGATION
+================================================================================
+
+Q1: What is the difference between request aggregation and the BFF pattern?
+    Request aggregation is the technique of calling multiple downstream services
+    and merging results into one response. The Backend For Frontend (BFF) pattern
+    is an architectural pattern where a dedicated backend (gateway) is created
+    per client type (mobile, web, partner). A BFF typically uses aggregation
+    as one of its tools, but BFF is broader — it also handles response shaping,
+    authentication optimization, and client-specific business logic.
+
+Q2: Why is parallel fan-out important for aggregation?
+    If you call N services sequentially, total latency = sum of all service
+    latencies. If you call them in parallel (Mono.zip, CompletableFuture.allOf),
+    total latency = max of all service latencies. For a dashboard with 4 services
+    each taking 50-100ms, sequential takes 300ms+, parallel takes ~100ms.
+    Parallel aggregation is essential for mobile-responsive APIs.
+
+Q3: How do you handle a partial failure in aggregation?
+    Use fallback/default values for non-critical services. With Reactor:
+    .onErrorReturn(defaultValue) or .onErrorResume(fallbackMono). The response
+    should indicate partial data with a flag like "partial": true and list
+    which services were unavailable. Critical services (user profile) can throw
+    errors up; non-critical (recommendations) should degrade gracefully.
+
+Q4: What is the N+1 problem in aggregation and how do you avoid it?
+    N+1 occurs when fetching a list of N items and then making 1 additional
+    call per item. Example: get 10 orders, then call UserService for each
+    order's user = 11 calls. Solution: batch calls — GET /users?ids=1,2,3...10
+    (one call for all users), then join in memory. In GraphQL, the DataLoader
+    pattern solves N+1 by batching and caching resolver calls.
+
+Q5: How do you set timeouts for aggregated calls?
+    Set a timeout on each downstream call individually (not just a global
+    timeout). Individual timeouts allow partial success — if one service is slow,
+    others can still succeed. Use .timeout(Duration) in reactive code or
+    WebClient timeout configuration. Fail fast on timeout and use cached/default
+    data. Set global gateway timeout as a last-resort safety net. The sum of
+    individual timeouts should never exceed the overall request timeout.
+
+================================================================================

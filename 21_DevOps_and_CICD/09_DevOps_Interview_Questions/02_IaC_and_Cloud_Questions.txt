@@ -1,0 +1,479 @@
+================================================================================
+INFRASTRUCTURE AS CODE & CLOUD INTERVIEW QUESTIONS
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+Section A: Terraform
+Section B: Ansible vs Terraform
+Section C: GitOps (ArgoCD & FluxCD)
+Section D: Cloud Architecture & Cost
+Section E: IaC Testing & Security
+
+================================================================================
+SECTION A: TERRAFORM
+================================================================================
+
+Q1: How does Terraform state work and what are the risks if it's mismanaged?
+
+A: Terraform State (terraform.tfstate):
+   - JSON file that maps Terraform resource definitions to real cloud resources
+   - Without it, Terraform can't know what it already created
+   - Contains: resource IDs, attributes, dependency graph, outputs
+   
+   State file risks:
+   1. Contains secrets in plaintext (RDS passwords, IAM keys)
+   2. If lost → Terraform thinks nothing exists → tries to create everything again
+      (creates duplicate resources or fails with conflicts)
+   3. If corrupted → resources exist in cloud but Terraform doesn't know
+   4. Concurrent runs without locking → state corruption
+   
+   Remote state (required for teams):
+   # backend.tf — store state in S3 with DynamoDB locking:
+   terraform {
+     backend "s3" {
+       bucket         = "my-terraform-state-prod"
+       key            = "services/myapp/terraform.tfstate"
+       region         = "us-east-1"
+       encrypt        = true             # KMS encryption at rest
+       dynamodb_table = "terraform-state-lock"  # Prevents concurrent runs
+     }
+   }
+   
+   State management commands:
+   terraform state list              # Show all resources in state
+   terraform state show aws_instance.web    # Show specific resource details
+   terraform state mv <old> <new>    # Rename resource in state (avoid destroy)
+   terraform import <resource> <id>  # Import existing resource into state
+   terraform state rm <resource>     # Remove from state without destroying
+   
+   Drift detection:
+   terraform plan -refresh-only      # Shows what changed outside of Terraform
+
+---
+
+Q2: What is Terraform workspace vs separate state files — when to use each?
+
+A: Terraform Workspaces:
+   Multiple state files in the same configuration directory.
+   Same code, different state, parameterized by workspace name.
+   
+   # Usage:
+   terraform workspace new staging
+   terraform workspace new production
+   terraform workspace select production
+   terraform apply    # Applies to production state
+   
+   # In code:
+   resource "aws_instance" "web" {
+     instance_type = terraform.workspace == "production" ? "m5.xlarge" : "t3.micro"
+   }
+   
+   Problems with workspaces:
+   - All workspaces share the same code repo → production & dev tied together
+   - Easy to accidentally apply to wrong workspace
+   - Doesn't work well with complex per-environment differences
+   - HCP Terraform workspaces are different from CLI workspaces (confusing naming)
+   
+   Separate directories (Recommended for teams):
+   Directory structure per environment:
+   
+   terraform/
+   ├── modules/
+   │   ├── networking/
+   │   └── compute/
+   ├── environments/
+   │   ├── dev/
+   │   │   └── main.tf    # Uses modules, dev-specific values
+   │   ├── staging/
+   │   │   └── main.tf
+   │   └── production/
+   │       └── main.tf
+   
+   Benefits:
+   - Production change requires explicit edit to production directory
+   - Can have wildly different configs per environment
+   - Separate state files per environment automatically
+
+---
+
+Q3: How do you manage Terraform modules effectively?
+
+A: Modules = reusable Terraform code packages.
+   
+   Good module design:
+   - Single responsibility (a "vpc" module, not a "everything" module)
+   - Well-documented input/output variables
+   - Sensible defaults for optional variables
+   - No hardcoded environment-specific values
+   
+   Module versioning:
+   # Pin module to specific version (NEVER use latest in production):
+   module "vpc" {
+     source  = "terraform-aws-modules/vpc/aws"
+     version = "~> 5.0"     # ← allows patch updates, blocks major
+     
+     cidr = "10.0.0.0/16"
+     azs  = ["us-east-1a", "us-east-1b", "us-east-1c"]
+     private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+     public_subnets  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
+   }
+   
+   # Internal module (in same repo):
+   module "myapp_ec2" {
+     source = "../../modules/ec2-cluster"
+     
+     environment    = "production"
+     instance_count = 3
+     instance_type  = "m5.xlarge"
+   }
+   
+   Module outputs — expose what callers need:
+   # modules/vpc/outputs.tf:
+   output "vpc_id" {
+     value       = aws_vpc.main.id
+     description = "VPC ID to use in security groups and subnets"
+   }
+   
+   output "private_subnet_ids" {
+     value = aws_subnet.private[*].id
+   }
+
+---
+
+Q4: What is the Terraform lifecycle meta-argument? When do you use it?
+
+A: lifecycle block controls how Terraform manages resource changes.
+   
+   create_before_destroy:
+   resource "aws_autoscaling_group" "app" {
+     lifecycle {
+       create_before_destroy = true
+       # ↑ Create new ASG before destroying old one (zero-downtime replacement)
+     }
+   }
+   
+   prevent_destroy:
+   resource "aws_rds_instance" "prod_db" {
+     lifecycle {
+       prevent_destroy = true
+       # ↑ terraform destroy or plan requiring delete will ERROR
+       # Protection against accidental DB deletion
+     }
+   }
+   
+   ignore_changes:
+   resource "aws_instance" "web" {
+     ami           = "ami-12345678"
+     instance_type = "t3.micro"
+     
+     lifecycle {
+       ignore_changes = [ami]
+       # ↑ Don't update instance if AMI changes (managed outside Terraform)
+       # Common for: auto-scaling groups that update AMI via launch template
+     }
+   }
+   
+   replace_triggered_by:
+   resource "aws_instance" "web" {
+     lifecycle {
+       replace_triggered_by = [aws_launch_template.app.latest_version]
+       # ↑ Force replace this instance when launch template version changes
+     }
+   }
+
+================================================================================
+SECTION B: ANSIBLE VS TERRAFORM
+================================================================================
+
+Q5: When should you use Ansible vs Terraform?
+
+A: Different tools, different purposes — often used together.
+   
+   Terraform:
+   - Infrastructure provisioning (create/destroy cloud resources)
+   - Declarative: define desired state, Terraform calculates changes
+   - Idempotent by design (run 10 times = same result)
+   - State-aware: knows what it created
+   - Best for: creating VPCs, EC2, RDS, S3, IAM, EKS
+   
+   Ansible:
+   - Configuration management (install software, manage files, run commands)
+   - Procedural: executes tasks in order you define
+   - Agentless: uses SSH (no agent to install on managed nodes)
+   - No state file: checks current state before each task (when module supports it)
+   - Best for: installing packages, configuring Nginx, deploying app code,
+              managing system users, running one-off admin tasks
+   
+   Key differences:
+   
+   Aspect           Terraform                 Ansible
+   ─────────────────────────────────────────────────────────────
+   Purpose          Provision infra           Configure software
+   Approach         Declarative               Procedural (mostly)
+   State            tfstate file              Check before act (no central state)
+   Cloud resources  Excellent                 Can do it but limited
+   OS-level config  No                        Excellent
+   Learning curve   Medium                    Low
+   Idempotency      Built-in                  Module-dependent (mostly idempotent)
+   
+   Typical combined workflow:
+   1. Terraform creates: VPC, EC2 instances, RDS, security groups
+   2. Terraform outputs: instance IPs written to inventory file
+   3. Ansible runs against the new instances:
+      - Install application dependencies
+      - Configure Nginx reverse proxy
+      - Deploy application code
+      - Configure monitoring agent
+
+================================================================================
+SECTION C: GITOPS (ARGOCD & FLUXCD)
+================================================================================
+
+Q6: What is GitOps and why is it better than traditional push-based deployments?
+
+A: GitOps: Git is the single source of truth for infrastructure and application state.
+   The cluster PULLS its desired state from Git, rather than CI/CD PUSHING to it.
+   
+   Traditional (Push-based):
+   CI/CD pipeline → kubectl apply → Kubernetes cluster
+   Problems:
+   - CI/CD needs cluster credentials (security risk)
+   - Actual cluster state might diverge from what's in Git (no enforcement)
+   - Hard to know what's deployed in each cluster (check the cluster, not Git)
+   - Rollback = re-run old pipeline (requires finding correct artifact)
+   
+   GitOps (Pull-based):
+   Git (Kubernetes manifests) → ArgoCD/FluxCD → Kubernetes cluster (continuously syncing)
+   
+   Benefits:
+   - Cluster credentials never leave the cluster (pull model)
+   - Automatic drift correction: ArgoCD syncs if someone manually kubectl applies
+   - Audit trail: every deployment change = Git commit (who, when, what)
+   - Rollback = git revert (automatically re-deploys previous state)
+   - Multi-cluster management: one Git repo → all clusters
+   
+   ArgoCD vs FluxCD:
+   
+   Feature                ArgoCD                   FluxCD
+   ──────────────────────────────────────────────────────────
+   UI                     Rich web UI              Minimal (CLI focused)
+   Multi-tenancy          Projects + RBAC          Multiple controllers
+   Helm support           Excellent                Excellent
+   Kustomize support      Excellent                Excellent
+   OCI artifacts          Yes                      Yes
+   SOPS/secret decrypt    Via plugin               Native
+   Notification system    ArgoCD Notifications     Flux Notifications
+   GitOps model           App-centric              Controller-centric
+   
+   Choose ArgoCD: when team needs visibility via UI, multi-tenancy controls
+   Choose FluxCD: when you prefer declarative configuration, tight GitOps adherence
+
+---
+
+Q7: How does ArgoCD sync strategy work? What are the sync options?
+
+A: ArgoCD Application:
+   - Defines: Git repo URL + path, target cluster + namespace
+   - Continuously watches both Git and cluster state
+   - "Synced" = cluster state matches Git state
+   - "OutOfSync" = drift detected (either Git changed or someone manually applied)
+   
+   Sync Policies:
+   
+   Manual sync:
+   spec:
+     syncPolicy: {}    # No automatic sync — team must click sync or run argocd app sync
+   
+   Automated sync:
+   spec:
+     syncPolicy:
+       automated:
+         prune: true         # Delete resources removed from Git
+         selfHeal: true      # Auto-sync if someone manually changes cluster state
+         allowEmpty: false   # Don't allow empty (safety: won't delete everything)
+   
+   Sync options:
+   spec:
+     syncPolicy:
+       syncOptions:
+       - CreateNamespace=true      # Create target namespace if missing
+       - PruneLast=true            # Delete removed resources last (after creating new)
+       - Replace=true              # Use replace instead of apply (for non-mergeable changes)
+       - ApplyOutOfSyncOnly=true   # Only sync resources that are actually out of sync
+   
+   Sync Waves (ordering within a sync):
+   Use annotations to control order of resource application:
+   
+   # Apply this ConfigMap first (wave -1), before Deployment (wave 0):
+   metadata:
+     annotations:
+       argocd.argoproj.io/sync-wave: "-1"
+
+================================================================================
+SECTION D: CLOUD ARCHITECTURE & COST
+================================================================================
+
+Q8: How do you optimize cloud costs in a DevOps context?
+
+A: Cost optimization is an ongoing practice, not a one-time task.
+   
+   Right-sizing:
+   - Use actual utilization data (CloudWatch, Datadog) not estimates
+   - If average CPU < 20%, downsize the instance type
+   - Kubernetes: set requests based on actual usage (VPA recommendations)
+   
+   Reserved capacity:
+   - Reserved Instances (1-3 year): 40-60% cheaper for steady-state workloads
+   - Savings Plans: flexible RI (applies to any instance type)
+   - Use for: baseline capacity (always-on workloads)
+   
+   Spot/Preemptible instances:
+   - 70-90% cheaper than on-demand
+   - Can be terminated with 2-minute warning
+   - Use for: stateless, fault-tolerant workloads; batch processing; CI/CD runners
+   - K8s: spot node group for worker nodes (with Pod Disruption Budgets)
+   
+   Auto-scaling:
+   - Don't keep idle capacity
+   - Scale down to minimum at night/weekends (dev/staging)
+   - KEDA: event-driven autoscaling (scale to zero when no queue messages)
+   
+   Storage optimization:
+   - Use S3 Intelligent-Tiering for objects with unknown access patterns
+   - EBS: gp3 is cheaper and better than gp2 (migrate old gp2 volumes)
+   - ECR/S3: lifecycle policies to delete old artifacts
+   
+   Cost visibility:
+   - AWS Cost Explorer: per-service, per-tag breakdown
+   - Tag ALL resources with: Team, Environment, Service, CostCenter
+   - Budget alerts: alert before hitting cost threshold
+   - Kubecost/OpenCost: per-namespace K8s cost visibility
+
+---
+
+Q9: How do you design for high availability and disaster recovery?
+
+A: HA and DR are different concerns:
+   
+   High Availability (continuous operation despite failures):
+   - Multi-AZ deployment: spread resources across 3+ availability zones
+   - No single point of failure: LB → multiple app instances → multi-AZ RDS
+   - Auto-scaling: replace failed instances automatically
+   - Health checks: load balancer routes only to healthy instances
+   - Zero-downtime deploys: rolling or blue/green
+   
+   RTO and RPO:
+   - RTO (Recovery Time Objective): How long until service is restored?
+   - RPO (Recovery Point Objective): How much data can we lose?
+   
+   Disaster Recovery tiers:
+   
+   Tier       Strategy           RTO         RPO        Cost
+   ──────────────────────────────────────────────────────────
+   Tier 4     Backup & Restore   Hours-days  Hours      $
+   Tier 3     Pilot Light        Hours       Minutes    $$
+   Tier 2     Warm Standby       Minutes     Seconds    $$$
+   Tier 1     Multi-site Active  < 1 min     ~0         $$$$
+   
+   Pilot Light (common for most services):
+   - Minimal standby in DR region (just RDS replica + AMIs)
+   - On disaster: launch app servers in DR region, point to replica
+   - RTO: ~1 hour. RPO: < 5 minutes (RDS replication lag)
+   
+   Database DR:
+   - RDS Multi-AZ: synchronous standby in same region (failover < 1 min, no data loss)
+   - RDS Read Replica: async replica in another region (RPO = replication lag ~seconds)
+   - On DR: promote read replica to primary
+
+================================================================================
+SECTION E: IAC TESTING & SECURITY
+================================================================================
+
+Q10: How do you test Infrastructure as Code?
+
+A: Testing pyramid for IaC:
+   
+   Unit tests (fast, no cloud):
+   - Validate Terraform syntax: terraform validate
+   - Check for common misconfigs: tfsec, checkov
+   - Policy tests: Conftest + OPA policies
+   
+   # checkov — IaC SAST:
+   checkov -d ./terraform --framework terraform
+   # Checks: S3 versioning, encryption, public access, security groups, etc.
+   
+   # Conftest — policy as code:
+   # policy/s3.rego:
+   deny[msg] {
+     resource := input.resource.aws_s3_bucket[_]
+     not resource.server_side_encryption_configuration
+     msg = sprintf("S3 bucket %v must have encryption enabled", [resource])
+   }
+   conftest test ./terraform/main.tf
+   
+   Integration tests (create real infrastructure):
+   - Terratest (Go library): create real resources, test they work, destroy
+   
+   // terratest example:
+   func TestVpcModule(t *testing.T) {
+     opts := &terraform.Options{
+       TerraformDir: "../modules/vpc",
+       Vars: map[string]interface{}{
+         "environment": "test",
+         "cidr": "10.99.0.0/16",
+       },
+     }
+     defer terraform.Destroy(t, opts)
+     terraform.InitAndApply(t, opts)
+     
+     vpcId := terraform.Output(t, opts, "vpc_id")
+     assert.NotEmpty(t, vpcId)
+     // Verify VPC exists in AWS:
+     vpc := aws.GetVpcById(t, vpcId, "us-east-1")
+     assert.Equal(t, "10.99.0.0/16", aws.GetTagsForVpc(t, vpcId, "us-east-1")["CIDR"])
+   }
+   
+   Cost: Integration tests create real resources.
+   - Use t3.micro, delete immediately after test
+   - Run in dedicated test AWS account
+
+================================================================================
+QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+TERRAFORM COMMANDS:
+  terraform init           Download providers/modules
+  terraform plan           Preview changes (dry run)
+  terraform apply -auto-approve  Apply (CI/CD use)
+  terraform destroy        Destroy all resources (dangerous!)
+  terraform state list     List managed resources
+  terraform import         Import existing resource
+
+TERRAFORM BEST PRACTICES:
+  Remote state (S3 + DynamoDB locking)
+  Pin provider versions in required_providers
+  Pin module versions (never "latest")
+  prevent_destroy on databases and critical infra
+  Separate state per environment
+  Tag all resources (team, env, service)
+
+ARGOCD COMMANDS:
+  argocd app list              List all apps
+  argocd app sync myapp        Sync app to Git state
+  argocd app diff myapp        Show diff vs Git
+  argocd app rollback myapp 3  Roll back to revision 3
+
+IaC SCANNING:
+  tfsec ./terraform            Security issues
+  checkov -d ./terraform       Misconfigurations
+  terraform validate           Syntax check
+  conftest test                OPA policies
+
+GITOPS TOOLS:
+  ArgoCD:   Web UI, multi-tenancy, app-centric
+  FluxCD:   CLI-focused, native SOPS, tight GitOps
+
+================================================================================
+END OF FILE
+================================================================================

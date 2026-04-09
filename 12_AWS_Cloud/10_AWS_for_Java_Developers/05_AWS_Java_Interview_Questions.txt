@@ -1,0 +1,920 @@
+================================================================
+AWS FOR JAVA DEVELOPERS — JAVA + AWS INTERVIEW Q&A MASTER GUIDE
+Complete Interview Preparation Guide — 20 Critical Questions
+================================================================
+
+This file covers the most frequently asked AWS + Java interview questions.
+Each answer is structured for interview delivery: direct answer → explanation → example.
+
+================================================================
+SECTION 1: AWS SDK v2 FOR JAVA
+================================================================
+
+Q1: How does AWS SDK v2 differ from SDK v1? What are the key improvements?
+
+A: SDK v2 is a ground-up rewrite with major improvements:
+
+   1. MODULAR DEPENDENCIES (biggest change):
+      SDK v1: com.amazonaws:aws-java-sdk (all services, 70+ MB)
+      SDK v2: software.amazon.awssdk:s3 (only what you need, ~2 MB for S3)
+      Impact: Smaller Lambda JARs, faster cold starts, no dependency conflicts
+   
+   2. ASYNC CLIENTS:
+      SDK v1: Synchronous only (AmazonS3Client), blocking calls
+      SDK v2: S3AsyncClient — returns CompletableFuture, non-blocking I/O
+      Impact: Better Lambda throughput, reactive applications
+   
+   3. IMMUTABLE BUILDERS:
+      SDK v1: Mutable request objects (setters)
+      SDK v2: Builder pattern (PutObjectRequest.builder().bucket("...").key("...").build())
+      Impact: Thread-safe request objects, cleaner code
+   
+   4. HTTP CLIENT ABSTRACTION:
+      SDK v2: Pluggable HTTP clients (Apache HTTP, Netty async, CRT-based)
+      Allows tuning connection pools for Lambda or long-running services
+   
+   5. ENHANCED CLIENT FOR DYNAMODB:
+      SDK v2 DynamoDB Enhanced Client: Annotated POJOs with @DynamoDbBean
+      SDK v1: DynamoDBMapper (similar concept, but redesigned)
+   
+   For interviews: Lead with modular dependencies (most impactful for Lambda) 
+   and async clients.
+
+---
+
+Q2: Explain the AWS credentials provider chain and how it works in different environments.
+
+A: The DefaultCredentialsProvider checks credentials sources in order:
+   
+   1. Java system properties (aws.accessKeyId + aws.secretAccessKey)
+   2. Environment variables (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY)
+   3. Web Identity Token (for EKS pod IAM roles via IRSA)
+   4. AWS credentials file (~/.aws/credentials)
+   5. AWS config file (~/.aws/config)
+   6. Container credentials (ECS task role — http://169.254.170.2/...)
+   7. Instance metadata (EC2 instance role — http://169.254.169.254/...)
+   
+   In practice:
+   - LOCAL DEV: ~/.aws/credentials (from aws configure) or environment variables
+   - LAMBDA: Lambda execution role injected as environment variables
+     (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
+   - ECS/Fargate: Task role via container metadata endpoint
+   - EC2: Instance profile via IMDS
+   - EKS: IRSA (IAM Roles for Service Accounts) via web identity token
+   
+   NEVER hardcode credentials. DefaultCredentialsProvider works across all environments:
+   S3Client s3 = S3Client.builder()
+       .credentialsProvider(DefaultCredentialsProvider.create())
+       .build();
+
+---
+
+Q3: What is envelope encryption and how do you implement it with AWS SDK v2 + KMS?
+
+A: Envelope encryption: Use KMS to generate a data key, encrypt data locally with 
+   that key, then encrypt the data key with KMS CMK. Store encrypted data + encrypted key.
+   
+   WHY: KMS has a 4KB limit per encrypt call. For large payloads, encrypt locally.
+   Also: fewer KMS API calls = lower cost + better performance.
+   
+   FLOW:
+   1. GenerateDataKey → get plaintext key + encrypted key (ciphertext)
+   2. Encrypt your data locally using plaintext key (AES-256-GCM)
+   3. DISCARD plaintext key from memory
+   4. Store: encrypted data + encrypted data key (ciphertext blob)
+   
+   DECRYPT FLOW:
+   1. Call KMS Decrypt with encrypted data key → get plaintext key
+   2. Decrypt your data locally using plaintext key
+   3. DISCARD plaintext key
+   
+   Java SDK v2 example:
+   KmsClient kms = KmsClient.builder().build();
+   
+   // Encrypt
+   GenerateDataKeyResponse dataKeyResponse = kms.generateDataKey(
+       GenerateDataKeyRequest.builder()
+           .keyId("arn:aws:kms:us-east-1:123456789:key/key-id")
+           .keySpec(DataKeySpec.AES_256)
+           .build()
+   );
+   SdkBytes plaintextKey = dataKeyResponse.plaintext();      // Encrypt data with this
+   SdkBytes encryptedKey = dataKeyResponse.ciphertextBlob(); // Store this
+   
+   // Decrypt
+   DecryptResponse decryptResponse = kms.decrypt(
+       DecryptRequest.builder().ciphertextBlob(encryptedKey).build()
+   );
+   SdkBytes recoveredKey = decryptResponse.plaintext(); // Use to decrypt data
+   
+   Use encryption context (Map<String,String>) for additional security: 
+   it's included in CloudTrail logs and must match on decrypt.
+
+================================================================
+SECTION 2: DYNAMODB + JAVA
+================================================================
+
+Q4: How do you model a one-to-many relationship in DynamoDB using the 
+    single-table design pattern?
+
+A: Single-table design: Store all entity types in one table using composite keys 
+   (PK + SK) where the SK discriminates entity type and relationship.
+   
+   Example: Users and their Orders
+   
+   PK            | SK              | Attributes
+   ──────────────┼─────────────────┼──────────────────────────────────
+   USER#user-123 | PROFILE         | name, email, createdAt
+   USER#user-123 | ORDER#2024-01   | status, total, items
+   USER#user-123 | ORDER#2024-02   | status, total, items
+   ORDER#ord-456 | METADATA        | userId, warehouse, carrier
+   ──────────────────────────────────────────────────────────────────
+   
+   Queries:
+   - Get user profile: PK=USER#user-123, SK=PROFILE
+   - Get all orders for user: PK=USER#user-123, SK begins_with ORDER#
+   - Get single order: PK=USER#user-123, SK=ORDER#2024-01
+   
+   Java with Enhanced Client:
+   @DynamoDbBean
+   public class UserRecord {
+       @DynamoDbPartitionKey
+       public String getPk() { return pk; }   // USER#user-123
+       @DynamoDbSortKey
+       public String getSk() { return sk; }   // ORDER#2024-01
+   }
+   
+   // Query all orders for a user:
+   QueryEnhancedRequest query = QueryEnhancedRequest.builder()
+       .queryConditional(QueryConditional.sortBeginsWith(
+           Key.builder()
+               .partitionValue("USER#user-123")
+               .sortValue("ORDER#")
+               .build()))
+       .build();
+   
+   Benefits: 1 table = 1 round trip for related entities, no joins needed, 
+   highly scalable.
+
+---
+
+Q5: How do you handle DynamoDB conditional writes and what exceptions do they throw?
+
+A: Conditional writes: Only write if a condition is true. Used for optimistic locking 
+   and ensuring uniqueness.
+   
+   // Create only if item doesn't exist (prevent duplicates)
+   try {
+       orderTable.putItem(PutItemEnhancedRequest.builder(Order.class)
+           .item(order)
+           .conditionExpression(Expression.builder()
+               .expression("attribute_not_exists(orderId)")
+               .build())
+           .build());
+   } catch (ConditionalCheckFailedException e) {
+       throw new DuplicateOrderException("Order already exists: " + order.getOrderId());
+   }
+   
+   // Optimistic locking: update only if version matches
+   @DynamoDbBean
+   public class Order {
+       @DynamoDbVersionAttribute  // Enhanced Client manages this automatically!
+       public Long getVersion() { return version; }
+   }
+   // Enhanced Client automatically adds condition: version = expectedVersion
+   // Throws ConditionalCheckFailedException if another process updated it first
+   
+   // Transaction with condition check
+   try {
+       enhancedClient.transactWriteItems(
+           TransactWriteItemsEnhancedRequest.builder()
+               .addPutItem(orderTable, newOrder)
+               .addUpdateItem(inventoryTable, inventoryItem)
+               .build());
+   } catch (TransactionCanceledException e) {
+       // Check cancellation reasons
+       e.cancellationReasons().forEach(reason -> {
+           if ("ConditionalCheckFailed".equals(reason.code())) {
+               // Which item failed and why
+           }
+       });
+   }
+
+================================================================
+SECTION 3: LAMBDA + JAVA
+================================================================
+
+Q6: Explain how Lambda SnapStart works and what you need to change in your Java code.
+
+A: SnapStart uses Amazon CRaC (Coordinated Restore at Checkpoint) technology.
+   
+   Normal Lambda flow:
+   Request → [JVM start + class load + init code] → handleRequest()
+               (500ms-3s cold start)
+   
+   SnapStart flow:
+   First deploy → Lambda runs init once → Takes JVM snapshot
+   Request      → [Restore snapshot] → handleRequest()
+                   (~100ms restore)
+   
+   What you MUST fix for SnapStart to work correctly:
+   
+   1. NETWORK CONNECTIONS must be re-established after restore:
+      SDK clients (S3, DynamoDB) automatically re-create HTTP connections — fine.
+      Direct DB connections (JDBC) must be re-created in afterRestore().
+   
+   2. RANDOMNESS: SecureRandom seeds from /dev/random — snapshot captures the seed.
+      Fix: Use SecureRandom.getInstanceStrong() after restore, or:
+      // Re-seed in afterRestore hook
+   
+   3. CACHED TIMESTAMPS: Instant.now() in static init → captured as snapshot time.
+      Fix: Don't cache timestamps; compute them in handleRequest() instead.
+   
+   4. SHORT-LIVED TOKENS: IAM credentials, JWT tokens expire.
+      Fix: Don't cache tokens in static init; let SDK handle credentials refresh.
+   
+   Implementation:
+   public class Handler implements RequestHandler<Input, Output>, Resource {
+       
+       static { Core.getGlobalContext().register(/* this instance */); }
+       
+       @Override
+       public void beforeCheckpoint(Context<? extends Resource> ctx) {
+           // Close resources that can't be serialized/restored
+       }
+       
+       @Override
+       public void afterRestore(Context<? extends Resource> ctx) {
+           // Re-initialize connections, refresh tokens, re-seed randomness
+       }
+   }
+
+---
+
+Q7: How do you optimize Lambda Java performance for high-throughput applications?
+
+A: Layered optimization strategy:
+   
+   COLD START REDUCTION:
+   1. SnapStart (Java 21): Eliminates JVM startup → ~100ms cold start
+   2. Static client initialization: private static final S3Client S3 = S3Client.create()
+   3. Reduce JAR size: SDK v2 modular deps, maven-shade-plugin minimizeJar
+   4. Increase memory (128→1024MB): More CPU, faster class loading
+   5. JVM flags: -XX:+TieredCompilation -XX:TieredStopAtLevel=1 
+      (disables C2 JIT, not needed for short-lived Lambda)
+   
+   WARM EXECUTION IMPROVEMENT:
+   1. Connection reuse: Static SDK clients maintain HTTP connection pool
+   2. Object reuse: Static ObjectMapper, validators — expensive to construct
+   3. DynamoDB batch operations: BatchGetItem (up to 100 items, 1 RCU per item)
+      vs GetItem × 100 (100 RCUs, 100 round trips)
+   4. S3 multipart for large uploads (parallel parts)
+   5. SQS batch send (10 messages per API call)
+   
+   CONCURRENCY MANAGEMENT:
+   1. Provisioned Concurrency for predictable traffic peaks
+   2. Reserved Concurrency to limit max instances (prevent downstream overload)
+   3. SQS batch size tuning: larger batch = fewer Lambda invocations
+   
+   MEMORY TUNING:
+   - Lambda bills: (duration × memory)
+   - 512MB at 200ms = same cost as 1024MB at 100ms (but faster response!)
+   - Use AWS Lambda Power Tuning tool (open-source) to find optimal memory
+
+---
+
+Q8: What are the different Lambda invocation types and when would you use each?
+
+A: Three invocation types:
+   
+   1. SYNCHRONOUS (RequestResponse) — default for API calls:
+      - Caller waits for Lambda to complete and return result
+      - API Gateway always synchronous
+      - SDK: invokeResult = lambdaClient.invoke(request) — blocks until done
+      - Max timeout: 29s for API GW (hard limit), 15min for direct Lambda invocation
+      - Error handling: Exception propagates back to caller
+   
+   2. ASYNCHRONOUS (Event) — fire and forget:
+      - Lambda queues the event internally; caller gets 202 Accepted immediately
+      - Lambda retries on failure (2 automatic retries)
+      - Configure DLQ (SQS/SNS) for failed events after retries exhausted
+      - Use when: S3 event notifications, SNS notifications, EventBridge rules
+      - SDK: InvocationType.EVENT
+      - No response goes back to caller
+   
+   3. EVENT SOURCE MAPPING (polling) — AWS polls on your behalf:
+      - Supported sources: SQS, Kinesis, DynamoDB Streams, MSK, Kafka
+      - Lambda service polls the source queue/stream
+      - Batches records and invokes Lambda synchronously
+      - DLQ support via event source mapping config
+      - Use when: SQS consumer, Kinesis stream processor, DynamoDB CDC
+   
+   Summary:
+   API Gateway → Synchronous (wait for HTTP response)
+   S3 events → Asynchronous (S3 triggers event, caller doesn't wait)
+   SQS queue → Event Source Mapping (Lambda polls SQS)
+
+================================================================
+SECTION 4: S3 ADVANCED
+================================================================
+
+Q9: How do you securely provide S3 access to frontend clients without exposing 
+    your S3 bucket or API credentials?
+
+A: Use presigned URLs as the standard pattern:
+   
+   FLOW:
+   1. User authenticates to your backend API
+   2. Backend generates a presigned URL for the specific object
+   3. Backend returns the presigned URL (JSON response)
+   4. Frontend/mobile app uses the URL directly (HTTP GET/PUT to S3)
+   5. S3 validates the embedded signature and expiry
+   
+   For DOWNLOADS (presigned GET):
+   // User requests their report
+   GET /api/my-reports/2024-01
+   Authorization: Bearer jwt-token
+   
+   // Backend generates:
+   PresignedGetObjectRequest presignedGet = presigner.presignGetObject(
+       GetObjectPresignRequest.builder()
+           .signatureDuration(Duration.ofMinutes(15))
+           .getObjectRequest(GetObjectRequest.builder()
+               .bucket("private-reports-bucket")
+               .key("users/user-123/reports/2024-01.pdf")
+               .build())
+           .build()
+   );
+   return presignedGet.url().toString();
+   
+   For UPLOADS (presigned PUT):
+   // User wants to upload profile picture
+   // Backend generates upload URL, frontend PUTs directly to S3
+   // Advantages: No bandwidth through your server, S3 handles large files
+   
+   ADDITIONAL CONTROLS:
+   - Set short expiry (5-15 minutes) — presigned URLs are credentials
+   - Use different KMS keys per user for sensitive data
+   - Set Content-Type in presigned request to prevent content-type spoofing
+   - Use S3 event notifications to process uploads after completion
+
+---
+
+Q10: Explain S3 consistency model and how it affects your application design.
+
+A: As of December 2020, S3 provides STRONG CONSISTENCY for all operations:
+   
+   - PUT → immediately visible to subsequent GET (read-after-write consistent)
+   - DELETE → immediately invisible to subsequent GET
+   - PUT (overwrite) → latest version always returned
+   
+   This REMOVED the need for eventual consistency workarounds that were required pre-2020.
+   
+   Practical implications:
+   - After uploading an object, immediately reading it will return the latest version
+   - After deleting an object, immediately reading it will return 404
+   - LIST operations are also strongly consistent
+   
+   STILL important to know:
+   - S3 is NOT a database — no transactions across multiple objects
+   - No atomic compare-and-swap (no conditional update on S3 object content)
+   - For distributed locking or atomic multi-object operations, use DynamoDB
+   
+   What's NOT atomic:
+   - Reading + writing (read-modify-write must be handled in your app logic)
+   - Multiple PutObject calls (last writer wins)
+   - For sequential processing: use SQS as coordinator, or DynamoDB conditional writes
+
+================================================================
+SECTION 5: SQS PATTERNS
+================================================================
+
+Q11: How do you implement idempotent SQS message processing in Java?
+
+A: SQS guarantees at-least-once delivery — same message can be delivered multiple times.
+   Idempotent consumers must handle duplicate processing safely.
+   
+   STRATEGY 1: Natural idempotency (best approach):
+   Design operations that are safe to repeat:
+   - Instead of "add 10 to counter" → "set counter to 110"
+   - Instead of "mark order created" → "upsert order with status PENDING"
+   
+   STRATEGY 2: Deduplication ID tracking (DynamoDB):
+   public class IdempotentHandler implements RequestHandler<SQSEvent, Void> {
+       
+       private static final DynamoDbTable<ProcessedMessage> PROCESSED_TABLE = 
+           enhancedClient.table("ProcessedMessages", 
+               TableSchema.fromBean(ProcessedMessage.class));
+       
+       @Override
+       public Void handleRequest(SQSEvent event, Context context) {
+           for (SQSEvent.SQSMessage msg : event.getRecords()) {
+               String messageId = msg.getMessageId();
+               
+               try {
+                   // Atomic: insert ONLY if not exists
+                   PROCESSED_TABLE.putItem(PutItemEnhancedRequest.builder(ProcessedMessage.class)
+                       .item(new ProcessedMessage(messageId, Instant.now()))
+                       .conditionExpression(Expression.builder()
+                           .expression("attribute_not_exists(messageId)")
+                           .build())
+                       .build());
+                   
+                   // If we get here: first time processing this message
+                   processMessage(msg.getBody());
+                   
+               } catch (ConditionalCheckFailedException e) {
+                   // Already processed — skip silently (idempotent)
+                   log.info("Duplicate message skipped: {}", messageId);
+               }
+           }
+           return null;
+       }
+   }
+   
+   STRATEGY 3: FIFO queues with message deduplication:
+   - SQS FIFO supports 5-minute deduplication window
+   - Set MessageDeduplicationId on messages
+   - Duplicate messages within 5min window are discarded by SQS
+   - Still need app-level idempotency for business logic
+
+---
+
+Q12: What is the SQS visibility timeout and how should you configure it for 
+     Lambda consumers?
+
+A: Visibility timeout: When a consumer receives a message, it's hidden from other 
+   consumers for the visibility timeout duration. If not deleted before timeout, 
+   it becomes visible again (redelivered).
+   
+   For Lambda consumers:
+   Rule: Visibility Timeout ≥ 6 × Lambda Timeout
+   
+   Why 6x? Lambda can process up to 5 retries on SQS batch before the event source 
+   mapping gives up. During retries, the message must stay hidden.
+   
+   Example:
+   - Lambda timeout: 30 seconds
+   - SQS visibility timeout: 6 × 30 = 180 seconds (3 minutes) minimum
+   
+   TOO SHORT:
+   - Lambda still processing when timeout expires
+   - Message becomes visible, another Lambda picks it up
+   - DUPLICATE PROCESSING (critical problem)
+   
+   TOO LONG:
+   - Lambda fails immediately (OOM, bug) but message is invisible for a long time
+   - Users see delays because failed messages aren't reprocessed quickly
+   - Recommendation: Lambda timeout × 6, capped at your acceptable retry delay
+   
+   EXTENDING VISIBILITY DURING PROCESSING:
+   If you can't guarantee processing within timeout, extend it mid-flight:
+   sqsClient.changeMessageVisibility(ChangeMessageVisibilityRequest.builder()
+       .queueUrl(queueUrl)
+       .receiptHandle(msg.receiptHandle())
+       .visibilityTimeout(60)  // Extend by 60 more seconds
+       .build());
+
+================================================================
+SECTION 6: SPRING BOOT ON AWS
+================================================================
+
+Q13: How do you use Spring Cloud AWS to consume SQS messages, and what 
+     happens when message processing fails?
+
+A: Spring Cloud AWS provides @SqsListener for message consumption:
+   
+   @Service
+   public class OrderConsumer {
+       
+       @SqsListener("order-processing-queue")
+       public void processOrder(OrderEvent event) {
+           orderService.process(event);
+           // SUCCESS: Spring Cloud AWS auto-deletes the message from SQS
+           // EXCEPTION: Spring Cloud AWS does NOT delete the message
+           //            Message becomes visible after visibility timeout
+           //            SQS retries up to MaxReceiveCount times
+           //            Then sends to DLQ
+       }
+   }
+   
+   FAILURE HANDLING APPROACHES:
+   
+   1. Let exceptions propagate (default — message retries):
+      Good for transient failures (network timeouts, DB unavailable)
+   
+   2. Catch and handle known exceptions:
+      @SqsListener("order-queue")
+      public void processOrder(OrderEvent event) {
+          try {
+              orderService.process(event);
+          } catch (DuplicateOrderException e) {
+              // Business error — not a processing failure
+              // ACK the message (delete it) without retrying
+              log.warn("Duplicate order ignored: {}", event.getOrderId());
+              // Return normally — message gets deleted
+          }
+          // Let other exceptions propagate for retry
+      }
+   
+   3. Manual acknowledgment:
+      @SqsListener("order-queue")
+      void process(Order order, Acknowledgement ack) throws Exception {
+          try {
+              processOrder(order);
+              ack.acknowledge();  // Explicit delete
+          } catch (RetryableException e) {
+              // Don't acknowledge → will retry
+          } catch (PoisonPillException e) {
+              ack.acknowledge();  // Skip unprocessable message
+              sendAlert(order);
+          }
+      }
+
+---
+
+Q14: How do you inject secrets and configuration from AWS Secrets Manager and 
+     SSM Parameter Store in a Spring Boot application?
+
+A: Spring Cloud AWS provides property source integration:
+   
+   DEPENDENCY (Spring Boot 3 / Spring Cloud AWS 3):
+   spring-cloud-aws-starter-parameter-store
+   spring-cloud-aws-starter-secrets-manager
+   
+   APPLICATION.YML:
+   spring:
+     cloud:
+       aws:
+         parameterstore:
+           enabled: true
+           prefix: /myapp
+         secretsmanager:
+           enabled: true
+           prefix: /myapp
+   
+   SSM Parameters created:
+   /myapp/prod/db.url = jdbc:postgresql://...
+   /myapp/prod/feature.new-checkout = true
+   
+   Secrets Manager secret:
+   Name: /myapp/prod/stripe-credentials
+   Value: {"apiKey":"sk_live_...", "webhookSecret":"whsec_..."}
+   
+   INJECTION:
+   @Value("${db.url}")              // From SSM Parameter Store
+   private String dbUrl;
+   
+   @Value("${stripe-credentials.apiKey}")   // From Secrets Manager JSON
+   private String stripeApiKey;
+   
+   // Loaded at startup — not automatically refreshed
+   // For dynamic refresh: use @RefreshScope + Spring Cloud Bus, or re-deploy
+   
+   BOOTSTRAP ORDER:
+   Spring Cloud AWS loads these property sources BEFORE the ApplicationContext is 
+   created — so they're available for DataSource auto-configuration, etc.
+   
+   IAM PERMISSIONS REQUIRED:
+   ssm:GetParametersByPath, ssm:GetParameter on /myapp/* resources
+   secretsmanager:GetSecretValue on /myapp/* resources
+
+================================================================
+SECTION 7: CI/CD AND DEPLOYMENT
+================================================================
+
+Q15: How would you design a blue/green deployment pipeline for a Java 
+     microservice on ECS/Fargate?
+
+A: Blue/Green on ECS uses CodeDeploy with traffic shifting:
+   
+   COMPONENTS:
+   - Two ECS Task Sets: Blue (current, 100% traffic), Green (new version, 0%)
+   - ALB with two target groups: TG-Blue, TG-Green
+   - CodeDeploy ECS deployment group with traffic shifting rules
+   
+   DEPLOYMENT FLOW:
+   1. CodeBuild: mvn package, docker build, push to ECR
+   2. CodePipeline → CodeDeploy ECS deployment
+   3. CodeDeploy creates new Green task set with new image
+   4. Green tasks register with TG-Green
+   5. ALB traffic shifts: Canary10Percent5Minutes (10% to Green, wait 5min)
+   6. CloudWatch alarms checked (error rate, latency)
+   7. If healthy: 100% traffic to Green (TG-Green becomes primary)
+   8. If alarms: Automatic rollback (100% back to Blue)
+   9. Blue task set terminated after stabilization period
+   
+   APPSPEC.YML (ECS):
+   version: 0.0
+   Resources:
+     - TargetService:
+         Type: AWS::ECS::Service
+         Properties:
+           TaskDefinition: "<TASK_DEFINITION>"
+           LoadBalancerInfo:
+             ContainerName: "order-service"
+             ContainerPort: 8080
+   Hooks:
+     - BeforeAllowTraffic: "arn:aws:lambda:...:TestHealthCheck"
+     - AfterAllowTraffic: "arn:aws:lambda:...:RunSmokeTests"
+   
+   ROLLBACK TRIGGERS:
+   - CodeDeploy CloudWatch alarm monitors ECS service error rate
+   - If alarm triggers during deployment → automatic rollback to Blue
+   
+   For Lambda (simpler):
+   - Use Lambda aliases with traffic shifting (Canary10Percent5Minutes)
+   - SAM: AutoPublishAlias + DeploymentPreference configuration
+
+================================================================
+SECTION 8: PERFORMANCE AND OPTIMIZATION
+================================================================
+
+Q16: How do you optimize DynamoDB read/write performance for a 
+     high-throughput Java application?
+
+A: DynamoDB performance optimization layered approach:
+   
+   1. CAPACITY PLANNING:
+      - On-Demand: No planning, scales instantly, higher cost per RCU/WCU
+      - Provisioned + Auto Scaling: Set target utilization (70%), specify min/max
+      - Hot partition mitigation: Add random suffix to partition key for high-write
+      
+   2. BATCH OPERATIONS:
+      // Read: BatchGetItem — up to 100 items, 1 round trip
+      BatchGetItemEnhancedRequest batchRead = BatchGetItemEnhancedRequest.builder()
+          .addReadBatch(ReadBatch.builder(Order.class)
+              .mappedTableResource(orderTable)
+              .addGetItem(key1).addGetItem(key2).addGetItem(key3)
+              .build())
+          .build();
+      
+      // Write: BatchWriteItem — up to 25 items per call
+      BatchWriteItemEnhancedRequest batchWrite = BatchWriteItemEnhancedRequest.builder()
+          .addWriteBatch(WriteBatch.builder(Order.class)
+              .mappedTableResource(orderTable)
+              .addPutItem(order1).addPutItem(order2)
+              .build())
+          .build();
+   
+   3. DAX (DynamoDB Accelerator):
+      - In-memory cache, microsecond latency vs single-digit ms
+      - Drop-in replacement: DaxClient implements same API
+      - Best for read-heavy, same data requested repeatedly
+      - Not suitable for strongly consistent reads (returns eventually consistent)
+   
+   4. PROJECTION in queries:
+      // Don't fetch entire item if you need only 2 attributes
+      QueryEnhancedRequest request = QueryEnhancedRequest.builder()
+          .queryConditional(QueryConditional.keyEqualTo(...))
+          .build();
+      // With low-level API: use ProjectionExpression to limit returned attributes
+   
+   5. GSI DESIGN:
+      - GSI for every non-PK access pattern (avoids full Scan)
+      - GSI capacity independent of table capacity
+      - For write-heavy: keep GSI updates minimal
+
+---
+
+Q17: How do you handle connection pool sizing for RDS in a containerized 
+     Java application on ECS?
+
+A: Connection pooling in containers requires careful math:
+   
+   PROBLEM:
+   ECS task (container) has HikariCP pool of 10 connections.
+   RDS max_connections = 100.
+   You scale to 20 ECS tasks → 200 connections needed → RDS fails.
+   
+   FORMULA:
+   max_connections_per_task ≤ rds_max_connections / max_tasks
+   
+   Example:
+   RDS db.t3.medium: max_connections ≈ 170
+   Buffer (keep 20 for admin): 150 usable
+   Max ECS tasks: 20
+   Pool per task: 150 / 20 = 7 connections max
+   
+   HIKARICP CONFIGURATION:
+   spring:
+     datasource:
+       hikari:
+         maximum-pool-size: 7
+         minimum-idle: 2
+         connection-timeout: 30000    # 30s to get a connection
+         idle-timeout: 600000         # 10min idle connection removal
+         max-lifetime: 1800000        # 30min max connection age (< RDS wait_timeout)
+   
+   RDS PROXY (recommended for Lambda/ECS):
+   - Acts as connection pool at RDS layer
+   - Multiplexes thousands of app connections to small DB connection pool
+   - Lambda functions don't maintain persistent connections (new per invocation)
+   - RDS Proxy: 1000 Lambda invocations → 10 actual DB connections
+   - Supports IAM auth (no password management) + Secrets Manager integration
+
+================================================================
+SECTION 9: SECURITY
+================================================================
+
+Q18: How do you implement fine-grained access control for S3 objects in a 
+     multi-tenant application?
+
+A: Multi-tenant S3 access control strategies:
+   
+   STRATEGY 1: Separate buckets per tenant (simple, expensive for many tenants):
+   - IAM policy: Allow only bucket/tenant-id/*
+   - Bucket-level encryption with tenant-specific KMS key
+   - CloudTrail per bucket
+   
+   STRATEGY 2: Prefix-based isolation (recommended):
+   Bucket: company-data
+   Prefix structure: tenants/{tenantId}/files/{filename}
+   
+   IAM policy with dynamic tenantId (using policy variables):
+   {
+     "Effect": "Allow",
+     "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+     "Resource": "arn:aws:s3:::company-data/tenants/${aws:PrincipalTag/TenantId}/*"
+   }
+   
+   // Tag the IAM role/user with TenantId
+   // Policy ${aws:PrincipalTag/TenantId} is replaced with the actual tag value
+   
+   STRATEGY 3: Presigned URLs with prefix restriction (application enforced):
+   @Service
+   public class TenantStorageService {
+       public URL getPresignedUrl(String tenantId, String filename, String userId) {
+           // Application enforces tenant isolation BEFORE generating URL
+           // Verify userId belongs to tenantId (DB check)
+           String key = "tenants/" + tenantId + "/files/" + filename;
+           return presigner.presignGetObject(GetObjectPresignRequest.builder()
+               .signatureDuration(Duration.ofMinutes(15))
+               .getObjectRequest(GetObjectRequest.builder()
+                   .bucket("company-data").key(key).build())
+               .build()).url();
+       }
+   }
+   
+   STRATEGY 4: KMS per tenant (data isolation + compliance):
+   // Each tenant has their own KMS CMK
+   // Data encrypted with tenant's key → even if object accessed by another tenant,
+   // decryption fails without their KMS key
+   PutObjectRequest.builder()
+       .bucket("company-data")
+       .key("tenants/" + tenantId + "/data")
+       .serverSideEncryption(ServerSideEncryption.AWS_KMS)
+       .ssekmsKeyId(tenantKmsKeyArn)
+       .build();
+
+================================================================
+SECTION 10: ARCHITECTURE
+================================================================
+
+Q19: Design a serverless order processing system using Java on AWS.
+     Walk through your architecture choices.
+
+A: 
+  ┌─────────────────────────────────────────────────────────────┐
+  │              SERVERLESS ORDER PROCESSING SYSTEM             │
+  └─────────────────────────────────────────────────────────────┘
+  
+  Client (React/Mobile)
+      │ HTTPS
+      ▼
+  API Gateway (REST)
+      │
+      ▼
+  Lambda: OrderPlacementFunction (Java 21, SnapStart, 1024MB)
+  ┌─────────────────────────────────────────────────────────┐
+  │  1. Validate request (Java Bean Validation)             │
+  │  2. Check idempotency (DynamoDB conditional write)      │
+  │  3. Write order to DynamoDB (Orders table)              │
+  │  4. Publish event to EventBridge                        │
+  │  5. Return 202 Accepted + orderId to client             │
+  └─────────────────────────────────────────────────────────┘
+      │ EventBridge event: OrderPlaced
+      │
+      ├──────────────────────────────────────────────────────┐
+      │                                                      │
+      ▼                                                      ▼
+  SQS: payment-queue                               SQS: inventory-queue
+      │                                                      │
+      ▼                                                      ▼
+  Lambda: PaymentFunction                     Lambda: InventoryFunction
+  (process payment, update order)             (reserve inventory, update order)
+      │                                                      │
+      ▼                                                      ▼
+  EventBridge: PaymentProcessed              EventBridge: InventoryReserved
+      └──────────────────────────────────────────┘
+                          │
+                          ▼
+                 Lambda: OrderFulfillmentFunction
+                 (create shipping label, notify user via SNS)
+  
+  DATA LAYER:
+  - DynamoDB: Orders table (single-table design, PK=ORDER#{orderId})
+  - DynamoDB TTL: expire completed orders after 90 days from hot table
+  - S3: Archive old orders (Lifecycle rule: DDB → S3 via DDB Streams + Lambda)
+  
+  OBSERVABILITY:
+  - Lambda Powertools: structured logging, X-Ray tracing, EMF metrics
+  - CloudWatch Dashboard: order throughput, payment success rate, P99 latency
+  - Alarms: payment failure rate > 5%, Lambda error rate > 1%
+  
+  JAVA SPECIFICS:
+  - SnapStart on all Lambda functions (Java 21)
+  - Static client initialization (DynamoDbEnhancedClient, SqsClient)
+  - DynamoDB @DynamoDbVersionAttribute for optimistic locking
+  - SQSBatchResponse for partial batch failure handling
+  - Idempotency via ConditionalCheckFailedException on OrderPlacement
+
+---
+
+Q20: How would you migrate a monolithic Spring Boot application to microservices on AWS?
+
+A: Strangler Fig pattern with incremental migration:
+   
+   PHASE 1: CONTAINERIZE THE MONOLITH (Week 1-2):
+   - Dockerize existing Spring Boot app (no code changes)
+   - Deploy to ECS Fargate behind ALB
+   - Connect to existing RDS
+   - Goal: Move to cloud without rewriting anything
+   
+   PHASE 2: EXTRACT HIGH-VALUE SERVICES (Months 2-4):
+   Identify modules by:
+   - High change frequency → extract first (deploy independently)
+   - High traffic → extract for independent scaling
+   - Clear domain boundary → extract cleanly
+   
+   Example: Extract Order Service from monolith:
+   1. Create new ECS service: order-service (Spring Boot)
+   2. Migrate order-related endpoints to new service
+   3. Add routing rule to ALB: /api/orders/* → order-service
+   4. Monolith: stub out order handling, call order-service via RestClient
+   5. Validate, monitor, iterate
+   
+   PHASE 3: EVENT-DRIVEN DECOUPLING (Months 4-6):
+   Replace synchronous calls between services with SQS/EventBridge:
+   - Services publish events: OrderPlaced, PaymentProcessed, InventoryUpdated
+   - Subscribers react asynchronously
+   - Remove point-to-point HTTP calls between services
+   
+   PHASE 4: DATA ISOLATION (Months 6-12):
+   - Currently: all services share one RDS database
+   - Extract service-specific tables to dedicated databases
+   - Order Service → own Aurora Serverless or DynamoDB
+   - Each service owns its data (no cross-service DB joins)
+   
+   STRANGLER FIG PATTERN:
+   New services run parallel to monolith. Traffic routed to new services 
+   incrementally. Monolith shrinks until eventually decommissioned.
+   
+   JAVA TOOLCHAIN:
+   - Spring Boot per microservice (start with same codebase, extract packages)
+   - Spring Cloud AWS for SQS/Parameter Store
+   - Micrometer + CloudWatch for metrics
+   - AWS X-Ray for distributed tracing (trace across service boundaries)
+   - CDK or Terraform for infrastructure definition
+
+================================================================
+QUICK REFERENCE: CRITICAL NUMBERS TO MEMORIZE
+================================================================
+
+  SQS:
+  - Max message size: 256 KB
+  - Visibility timeout: 0s to 12h, default 30s
+  - Message retention: 1min to 14 days, default 4 days
+  - Max in-flight messages: 120,000 (Standard), 20,000 (FIFO)
+  - Long polling timeout: 0-20s (20s recommended)
+  - Batch size: max 10 messages per receive/send/delete call
+
+  DynamoDB:
+  - Max item size: 400 KB
+  - Max partition throughput: 3,000 RCU or 1,000 WCU per partition
+  - Global Table replication lag: typically < 1 second
+  - TransactWriteItems: max 100 operations
+  - BatchWriteItem: max 25 operations
+  - BatchGetItem: max 100 operations
+
+  Lambda:
+  - Max timeout: 15 minutes
+  - Max memory: 10,240 MB (10 GB)
+  - Max deployment package (ZIP): 50 MB (250 MB unzipped)
+  - Max container image: 10 GB
+  - Max concurrent executions: 1,000 (regional, adjustable)
+  - 1 vCPU at exactly 1,769 MB memory
+
+  S3:
+  - Max object size: 5 TB
+  - Max single PUT: 5 GB
+  - Multipart: required above 5 GB, recommended above 100 MB
+  - Min multipart part size: 5 MB (except last part)
+  - Max presigned URL expiry: 7 days
+
+  API Gateway:
+  - Max timeout: 29 seconds
+  - Max payload: 10 MB (REST), 128 KB (WebSocket)
+  - Burst limit: 5,000 requests/sec (can be increased)
+
+================================================================

@@ -1,0 +1,270 @@
+================================================================================
+WEBSOCKETS vs SSE vs POLLING — DEEP COMPARISON
+================================================================================
+
+OVERVIEW
+---------
+Three strategies for pushing data from server to client (or enabling real-time
+communication). Each has distinct trade-offs in complexity, protocol overhead,
+compatibility, and scalability.
+
+================================================================================
+1. POLLING STRATEGIES
+================================================================================
+
+SHORT POLLING:
+  Client sends HTTP request every N seconds regardless of new data.
+  
+  // Client
+  setInterval(async () => {
+      const res = await fetch('/api/notifications');
+      const data = await res.json();
+      if (data.hasNew) displayNotifications(data.items);
+  }, 5000);
+  
+  Pros:  Simple; works everywhere; stateless
+  Cons:  High server load (empty responses); not real-time; min N seconds latency
+
+LONG POLLING:
+  Client sends request → server holds connection open until data arrives (or timeout).
+  Server responds → client immediately sends next request.
+  
+  // Client
+  async function longPoll() {
+      const res = await fetch('/api/events/poll?since=1714500000000');
+      const data = await res.json();
+      processEvent(data);
+      longPoll(); // immediately queue next poll
+  }
+  longPoll();
+  
+  // Server (Spring Boot)
+  @GetMapping("/events/poll")
+  public DeferredResult<EventResponse> poll(@RequestParam long since) {
+      DeferredResult<EventResponse> result = new DeferredResult<>(30_000L); // 30s timeout
+      
+      // Set timeout response
+      result.onTimeout(() ->
+          result.setResult(new EventResponse("timeout", null)));
+      
+      // Register listener — complete when event arrives
+      eventBus.addListener(since, event -> result.setResult(event));
+      
+      return result;
+  }
+  
+  Pros:  Near-real-time; simpler than WebSocket; HTTP compatible
+  Cons:  High connection count; each response creates a new request; complex server-side
+
+================================================================================
+2. SERVER-SENT EVENTS (SSE)
+================================================================================
+
+Single long-lived HTTP connection. Server pushes text/event-stream events.
+
+// Client
+const es = new EventSource('/api/events');
+es.onmessage = (e) => console.log(JSON.parse(e.data));
+es.addEventListener('orderUpdate', (e) => handleOrder(JSON.parse(e.data)));
+
+// Server (Spring)
+@GetMapping(value = "/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+public Flux<ServerSentEvent<Object>> stream() {
+    return eventService.getStream()
+        .map(e -> ServerSentEvent.builder()
+            .event(e.getType()).data((Object) e.getPayload()).build());
+}
+
+Wire format per message:
+  event: orderUpdate\n
+  id: 1001\n
+  data: {"orderId":"x","status":"SHIPPED"}\n\n
+
+================================================================================
+3. WEBSOCKETS
+================================================================================
+
+Full-duplex bidirectional channel over a single TCP connection.
+
+// Client (JavaScript)
+const ws = new WebSocket('wss://api.example.com/ws/chat');
+ws.onmessage = (e) => console.log(JSON.parse(e.data));
+ws.send(JSON.stringify({ type: 'message', content: 'Hello' }));
+
+// Server (Spring Boot + STOMP)
+@MessageMapping("/chat.send")
+@SendTo("/topic/chat")
+public ChatMessage handleMessage(ChatMessage message) {
+    return message;
+}
+
+================================================================================
+4. FULL COMPARISON TABLE
+================================================================================
+
+Dimension           | Short Polling  | Long Polling   | SSE            | WebSocket
+--------------------|----------------|----------------|----------------|------------------
+Direction           | Client pull    | Client pull    | Server → Client| Bidirectional
+Protocol            | HTTP           | HTTP           | HTTP           | ws:// (upgrade)
+Connection type     | Short-lived    | Held open      | Persistent     | Persistent
+Latency             | Up to N seconds| Near real-time | Real-time      | Real-time
+Server load         | High (empty)   | Medium         | Low            | Low
+Client complexity   | Very simple    | Simple         | Simple (native)| Moderate
+Binary support      | Yes            | Yes            | No (text only) | Yes
+Auto-reconnect      | Client manages | Client manages | Browser native | Client manages
+Last-Event-ID       | N/A            | Query param    | Native support | N/A
+HTTP/2 benefit      | No             | No             | Yes (multiplex)| N/A
+Proxy/firewall      | Works          | Works          | Works          | Sometimes blocked
+Scales horizontally | Easy           | Moderate       | Moderate       | Complex
+Browser support     | Universal      | Universal      | Universal      | All modern
+Good for            | Dashboards     | Simple chat    | Feeds, updates | Chat, games, collab
+
+================================================================================
+5. LATENCY COMPARISON
+================================================================================
+
+Short Polling (5s interval):
+  Event occurs → up to 5 seconds before client sees it
+  Average latency = N/2 = 2.5 seconds
+
+Long Polling:
+  Event occurs → server responds to held connection → client sees immediately
+  Latency ≈ server processing time (< 100ms typically)
+  But: after each response, client reconnects, creating brief gap
+
+SSE:
+  Event occurs → server pushes event on open stream
+  Latency ≈ network RTT (< 50ms on same region)
+  No reconnect gap (connection stays open)
+
+WebSocket:
+  Message sent → delivered to receiver immediately
+  Latency ≈ network RTT (< 10ms on same region)
+  No HTTP overhead per message (just WS frame headers)
+
+================================================================================
+6. SERVER RESOURCE COMPARISON
+================================================================================
+
+Short Polling (1000 clients, 5s interval):
+  1000 requests / 5s = 200 req/s
+  Each request: OS thread, TLS handshake, HTTP parsing
+  200 * 5ms processing = 1 CPU core fully loaded just for empty responses
+
+Long Polling (1000 clients, 30s timeout):
+  1000 persistent connections open
+  Each waiting connection blocks a thread (in blocking I/O model)
+  1000 threads = ~1GB RAM (default 1MB stack per thread)
+  → Use async handling (DeferredResult, Reactor) to avoid thread blocking
+
+SSE (1000 clients):
+  1000 persistent HTTP connections
+  With reactive WebFlux: 1000 subscribers on a Flux
+  Only 4-8 event loop threads needed (non-blocking)
+  Much more efficient than thread-per-connection
+
+WebSocket (1000 clients):
+  1000 TCP connections (persistent)
+  With reactive Netty: handled by event loop threads
+  Very efficient — each WS session is a lightweight object
+
+================================================================================
+7. USE CASE DECISION TREE
+================================================================================
+
+Do you need the CLIENT to send data to the SERVER in real-time?
+  YES → WebSocket (bidirectional needed)
+  NO  → continue below...
+
+Do you need real-time push (< 1 second latency)?
+  YES → SSE (server to client, simple) or WebSocket (if might need bidirectional later)
+  NO  → continue below...
+
+Is the update frequency low (> 30 seconds)?
+  YES → Short Polling (simple, low complexity justified)
+  NO  → Long Polling OR SSE
+
+Is binary data needed?
+  YES → WebSocket
+  NO  → SSE (simpler, auto-reconnect, HTTP native)
+
+Are you in a corporate environment with strict firewalls?
+  YES → SSE or Long Polling (pure HTTP, never blocked)
+  NO  → All options viable
+
+TYPICAL MAPPINGS:
+  Live sports scores       → SSE
+  Stock price ticker       → SSE or WebSocket
+  Chat application         → WebSocket (STOMP)
+  Collaborative editing    → WebSocket
+  Progress bar for job     → SSE
+  System logs streaming    → SSE
+  Multiplayer game         → WebSocket (low latency binary)
+  Notification bell        → SSE or Long Polling
+  Order status updates     → SSE with Last-Event-ID for resumability
+
+================================================================================
+8. HYBRID APPROACH — COMBINING SSE + WEBHOOKS
+================================================================================
+
+Common production pattern:
+  - Browser clients connected → SSE (push to active sessions)
+  - Background services / mobile apps → Webhooks (push to callbacks)
+  - Both triggered from the same event bus
+
+  @EventListener
+  public void handleOrderEvent(OrderStatusEvent event) {
+      // Push to active browser sessions via SSE
+      sseService.broadcast("orderStatus", event);
+      
+      // Push to registered webhooks
+      webhookService.deliver("order.status_changed", event);
+      
+      // Push to mobile via FCM/APNs
+      pushNotificationService.send(event.getUserId(), event);
+  }
+
+================================================================================
+9. INTERVIEW QUESTIONS — COMPARISON
+================================================================================
+
+Q1: When would you choose long polling over SSE?
+    Long polling when: you need to support very old browsers without EventSource,
+    or when each event needs a custom request (e.g., including current state
+    in the request body for conditional server logic). SSE is preferred when:
+    using modern browsers, you need automatic reconnect with Last-Event-ID,
+    you want simpler server code, or you're using HTTP/2 (SSE gets multiplexing).
+    Long polling has more reconnect overhead and complexity.
+
+Q2: How does SSE handle the HTTP/2 connection limit problem?
+    HTTP/1.1 browsers allow 6 connections per origin. Since SSE holds one
+    connection per stream, you can only have 6 SSE streams to the same origin.
+    HTTP/2 eliminates this: all streams are multiplexed on a single TCP
+    connection. Many SSE event streams to the same server all share one TCP
+    connection — no domain sharding needed. This is a significant advantage
+    of SSE over HTTP/1.1.
+
+Q3: Why is WebSocket harder to scale than SSE?
+    WebSocket is a stateful protocol — each session holds open a TCP connection
+    to a specific server node. In a cluster, if a client is connected to node A
+    but the event originates on node B, the event won't reach the client without
+    a shared relay (Redis Pub/Sub, Kafka). SSE has the same problem but runs on
+    standard HTTP — sticky sessions and reverse proxy support is more mature.
+    Both require a pub/sub broker layer for true horizontal scalability.
+
+Q4: What is the connection limit for WebSocket in a browser?
+    WebSocket connections are not subject to the per-origin HTTP connection limit
+    (6 for HTTP/1.1). Browsers allow many WebSocket connections (typically 50-100+
+    per origin). However, OS and server resources limit the total number of open
+    TCP connections per machine.
+
+Q5: Compare the server thread models for polling vs SSE vs WebSocket.
+    Short polling: each poll request uses a thread for its brief duration (cheap).
+    Long polling with blocking I/O: each held connection ties up a thread (expensive
+    at scale — 1000 connections = 1000 threads). Long polling with DeferredResult/
+    Reactor: async, only event loop threads needed. SSE with WebFlux: reactive Flux,
+    event loop threads, very scalable. WebSocket with Netty: event loop, lightweight.
+    The key insight: blocking thread-per-connection models break at 10k connections;
+    async/reactive models can handle 100k+ with the same hardware.
+
+================================================================================

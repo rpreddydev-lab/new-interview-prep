@@ -1,0 +1,260 @@
+================================================================================
+SERVICE CONFIGURATION MANAGEMENT
+================================================================================
+
+THE PROBLEM WITH CONFIGURATION IN MICROSERVICES
+-------------------------------------------------
+50 services × 5 environments (dev/staging/prod/qa/dr) = 250 configuration sets.
+Each service has database URLs, feature flags, timeouts, external service URLs...
+
+Anti-patterns:
+  ✗ Hardcoded values in code
+  ✗ Properties committed to Git (especially secrets)
+  ✗ Manual SSH to update .env files
+  ✗ Different config structure per service
+
+Best practice: Externalize ALL configuration, version control non-secrets, manage secrets separately.
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING CLOUD CONFIG SERVER
+============================
+
+Provides centralized external configuration for distributed systems.
+Services fetch config at startup from a central Git-backed config server.
+
+  [Git Repo]               [Config Server]              [Services]
+  config/                       │                    ← fetch on startup
+  ├── order-service.yml ────────┤                    ← /actuator/refresh
+  ├── order-service-prod.yml    │                      (runtime updates)
+  ├── payment-service.yml ──────┤
+  └── application.yml ──────────┘  (shared config)
+
+Config Server Setup:
+  # pom.xml (config server)
+  <dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-config-server</artifactId>
+  </dependency>
+
+  # application.yml (config server)
+  spring:
+    cloud:
+      config:
+        server:
+          git:
+            uri: https://github.com/myorg/config-repo
+            default-label: main
+            search-paths: '{application}'   # Config server looks in subdirectory per service
+            clone-on-start: true
+
+  @SpringBootApplication
+  @EnableConfigServer
+  public class ConfigServerApplication { ... }
+
+Client service setup:
+  # bootstrap.yml (loaded before application.yml)
+  spring:
+    application:
+      name: order-service           # Config server fetches order-service.yml
+    profiles:
+      active: production            # Also fetches order-service-production.yml
+    cloud:
+      config:
+        uri: http://config-server:8888
+        fail-fast: true             # Fail startup if config server unreachable
+        retry:
+          max-attempts: 6
+
+  # pom.xml (client)
+  <dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-config</artifactId>
+  </dependency>
+
+Config resolution order (later overrides earlier):
+  1. application.yml (shared, in config repo)
+  2. application-{profile}.yml
+  3. {service-name}.yml
+  4. {service-name}-{profile}.yml  ← most specific, wins
+
+Runtime refresh (without restart):
+  # Trigger refresh on single service:
+  curl -X POST http://order-service:8080/actuator/refresh
+
+  # Trigger refresh on all services via Spring Cloud Bus + Kafka:
+  spring:
+    cloud:
+      bus:
+        enabled: true
+  # One POST to config server propagates refresh to ALL services
+
+  # In service code — annotate beans to be refreshed:
+  @RefreshScope
+  @Service
+  public class FeatureFlagService {
+    @Value("${feature.new-checkout-flow:false}")
+    private boolean newCheckoutFlow;  // Updated on refresh without restart
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+KUBERNETES CONFIGMAP AND SECRETS
+==================================
+
+For Kubernetes-native config management:
+
+ConfigMap:
+  # Create from file:
+  kubectl create configmap order-service-config \
+    --from-file=application.yml \
+    --from-literal=APP_ENV=production
+
+  # YAML:
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: order-service-config
+    namespace: production
+  data:
+    application.yml: |
+      spring:
+        datasource:
+          url: jdbc:postgresql://postgres:5432/orders
+      feature:
+        new-checkout: true
+        max-items-per-order: 50
+
+  # Mount in pod:
+  spec:
+    volumes:
+    - name: config-volume
+      configMap:
+        name: order-service-config
+    containers:
+    - name: order-service
+      volumeMounts:
+      - name: config-volume
+        mountPath: /app/config
+        readOnly: true
+      env:
+      - name: SPRING_CONFIG_LOCATION
+        value: "file:/app/config/application.yml"
+
+K8s Secret for sensitive config:
+  # Encrypted at rest (requires EncryptionConfiguration in cluster)
+  apiVersion: v1
+  kind: Secret
+  metadata:
+    name: order-service-secrets
+  type: Opaque
+  stringData:           # Base64 automatically encoded by K8s
+    db-password: "mypassword"
+    jwt-secret: "mysecret"
+    stripe-api-key: "sk_live_xxx"
+
+────────────────────────────────────────────────────────────────────────────────
+
+FEATURE FLAGS
+==============
+
+Feature flags decouple deployment from release. Deploy code (inactive) then
+activate via flag without redeployment.
+
+Spring Boot + simple flags:
+  @Component
+  @RefreshScope
+  public class FeatureFlags {
+    @Value("${feature.new-payment-flow:false}")
+    private boolean newPaymentFlow;
+
+    @Value("${feature.order-limit:100}")
+    private int orderLimit;
+
+    public boolean isNewPaymentFlowEnabled() {
+      return newPaymentFlow;
+    }
+  }
+
+LaunchDarkly / Unleash / Split.io (enterprise feature flags):
+  @Service
+  public class PaymentService {
+    @Autowired private LDClient ldClient;
+
+    public PaymentResult process(Payment payment, String userId) {
+      LDUser user = new LDUser.Builder(userId)
+        .country("US")
+        .build();
+
+      boolean useNewFlow = ldClient.boolVariation("new-payment-flow", user, false);
+
+      if (useNewFlow) {
+        return processWithNewFlow(payment);
+      } else {
+        return processWithLegacyFlow(payment);
+      }
+    }
+  }
+
+Feature flag use cases:
+  - A/B testing (50% users get new UI)
+  - Canary feature releases (1% get new feature)
+  - Kill switches (disable feature if causing issues without deployment)
+  - Gradual rollout by user segment (beta users first)
+
+────────────────────────────────────────────────────────────────────────────────
+
+CONFIGURATION BEST PRACTICES
+================================
+
+1. EXTERNALIZE ALL ENVIRONMENT-SPECIFIC VALUES
+   URL, timeouts, feature flags → config server or ConfigMap
+   Passwords, API keys → Vault or K8s Secret
+
+2. HIERARCHY AND OVERRIDES
+   Defaults in code → application.yml → environment-specific yaml → env vars
+   
+3. VALIDATE CONFIGURATION AT STARTUP
+   @ConfigurationProperties + @Validated (javax/jakarta validation)
+   Fail fast: fail startup if required config is missing or invalid.
+
+   @ConfigurationProperties("payment")
+   @Validated
+   public record PaymentConfig(
+     @NotBlank String apiKey,
+     @Min(1) @Max(300) int timeoutSeconds,
+     @NotNull URI baseUrl
+   ) {}
+
+4. CONFIG CHANGE MANAGEMENT
+   Config changes should go through git PR + review (for GitOps)
+   Not manual edits directly in Config Server
+
+5. DOCUMENT ALL CONFIGURATION
+   README.md listing every property, its purpose, and default value
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is Spring Cloud Config Server?
+A: A centralized external configuration service backed by a Git repository.
+   Services fetch their config at startup. Config is organized by service name
+   and profile. Supports runtime refresh via /actuator/refresh endpoint or
+   Spring Cloud Bus for broadcast refresh without restarts.
+
+Q: What is the difference between ConfigMap and Secret in Kubernetes?
+A: Both are K8s objects for injecting configuration into pods. ConfigMap: for
+   non-sensitive data (database URLs, feature flags). Secret: for sensitive data
+   (passwords, API keys) stored base64-encoded and encrypted at rest if cluster
+   encryption is configured. For production, use Vault for secret management.
+
+Q: What are feature flags and why are they useful?
+A: Feature flags decouple code deployment from feature release. Deploy code
+   with flag disabled, then enable via configuration. Enables: gradual rollout
+   (1% → 10% → 100%), A/B testing, instant kill switches, beta testing with
+   specific users. Tools: LaunchDarkly, Unleash, Split.io, or simple
+   @Value/@RefreshScope beans for simple cases.
+
+================================================================================

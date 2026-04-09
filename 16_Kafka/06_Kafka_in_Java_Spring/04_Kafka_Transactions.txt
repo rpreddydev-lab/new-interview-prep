@@ -1,0 +1,211 @@
+================================================================================
+  SPRING KAFKA — TRANSACTIONS
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHY KAFKA TRANSACTIONS IN SPRING?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Use case: consume from topic A, process, produce to topic B — atomically.
+  - Without transactions: partial failures leave messages on B without committing
+    the offset on A → duplicates or lost processing on restart.
+  - With transactions: the produce to B AND the offset commit on A are a single
+    atomic operation (either both succeed or neither is visible).
+
+Key Kafka transaction features (recap):
+  - transactional.id — unique per producer instance, enables zombie fencing
+  - acks=all — forced by transactional producers
+  - isolation.level=read_committed — consumers skip uncommitted/aborted messages
+  - Transaction coordinator manages state in __transaction_state topic
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  # application.yml
+  spring:
+    kafka:
+      producer:
+        transaction-id-prefix: tx-order-service-   # enables transactional producer
+        acks: all
+        retries: 3
+      consumer:
+        isolation-level: read_committed             # skip uncommitted messages
+        enable-auto-commit: false                   # manual offset control
+
+  // Java Config:
+  @Bean
+  public ProducerFactory<String, Order> producerFactory() {
+    Map<String, Object> config = new HashMap<>();
+    config.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+    config.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "tx-order-service-");
+    config.put(ProducerConfig.ACKS_CONFIG, "all");
+    config.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true"); // implicit with txn
+    config.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+    config.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
+    return new DefaultKafkaProducerFactory<>(config);
+  }
+
+  @Bean
+  public KafkaTemplate<String, Order> kafkaTemplate() {
+    return new KafkaTemplate<>(producerFactory());
+  }
+
+  // Transaction manager bean (required for @Transactional):
+  @Bean
+  public KafkaTransactionManager<String, Order> kafkaTransactionManager() {
+    return new KafkaTransactionManager<>(producerFactory());
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. @Transactional WITH KafkaTransactionManager
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  @Service
+  public class OrderProcessingService {
+
+    @Autowired
+    private KafkaTemplate<String, Object> kafkaTemplate;
+
+    // @Transactional wraps all sends in a single transaction
+    // If ANY send fails → entire transaction aborted → all sends rolled back
+    @Transactional(transactionManager = "kafkaTransactionManager")
+    public void processOrderBatch(List<Order> orders) {
+      for (Order order : orders) {
+        kafkaTemplate.send("shipped-orders", order.getId(), order);
+        kafkaTemplate.send("inventory-updates", order.getId(), order.toInventoryUpdate());
+      }
+      // Both topics receive all messages or neither does
+    }
+  }
+
+  // If exception is thrown inside @Transactional, Spring calls abortTransaction()
+  // → WriteTxnMarker(ABORT) sent to all partitions → consumers with read_committed skip
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. executeInTransaction (PROGRAMMATIC TRANSACTIONS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For cases where @Transactional is not available (e.g., called from non-Spring code):
+
+  kafkaTemplate.executeInTransaction(ops -> {
+    ops.send("topic-a", "key1", value1);
+    ops.send("topic-b", "key2", value2);
+    // returns result of last statement
+    return true;
+  });
+
+  // ops is a KafkaOperations<K,V> within the transaction context.
+  // Any exception inside the lambda causes automatic abort + rollback.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. CONSUME-PROCESS-PRODUCE (EXACTLY-ONCE READ-PROCESS-WRITE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The canonical EOS pattern: consume from input topic, produce to output topic,
+and commit offset — all in one transaction.
+
+  @KafkaListener(topics = "input-orders",
+                 containerFactory = "transactionalFactory")
+  @Transactional(transactionManager = "kafkaTransactionManager")
+  public void consumeAndProduce(ConsumerRecord<String, Order> record) {
+    // Step 1: process
+    ShippedOrder shipped = orderService.processOrder(record.value());
+
+    // Step 2: produce to output topic (within transaction)
+    kafkaTemplate.send("shipped-orders", record.key(), shipped);
+
+    // Step 3: offset commit happens via sendOffsetsToTransaction (automatic
+    // when using KafkaTransactionManager + Spring Kafka container)
+  }
+
+How it works internally (Spring manages this automatically):
+  1. Container begins transaction: producer.beginTransaction()
+  2. Listener method executes → kafkaTemplate.send() within txn
+  3. Spring calls producer.sendOffsetsToTransaction(offsets, consumerGroupMetadata)
+     → offset committed atomically within the same transaction
+  4. Container calls producer.commitTransaction()
+  5. WriteTxnMarker(COMMIT) sent → output topic records become visible
+     AND input offset advanced atomically
+
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │  WITHOUT this: crash between send and offset commit → duplicate output │
+  │  WITH this:    crash at any point → transaction aborted on recovery     │
+  └────────────────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. CHAINED TRANSACTION MANAGER (KAFKA + DATABASE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Goal: write to DB AND produce to Kafka atomically.
+IMPORTANT: Kafka does not participate in XA/2PC. True 2PC is not possible.
+ChainedKafkaTransactionManager is a best-effort pattern (not true ACID across both).
+
+  @Bean
+  public ChainedKafkaTransactionManager<String, Order> chainedTxManager(
+      KafkaTransactionManager<String, Order> kafkaTm,
+      JpaTransactionManager jpaTm) {
+    // Kafka commits FIRST; if DB commit fails, can't roll back Kafka
+    // DB commits SECOND; if Kafka fails, DB is rolled back
+    // Safest order: DB first, Kafka second
+    return new ChainedKafkaTransactionManager<>(jpaTm, kafkaTm);
+  }
+
+  @Transactional(transactionManager = "chainedKafkaTransactionManager")
+  public void processWithDatabase(Order order) {
+    orderRepository.save(order);                        // JPA / DB write
+    kafkaTemplate.send("orders", order.getId(), order); // Kafka produce
+  }
+
+CAVEAT: If Kafka commit succeeds but DB commit fails → data inconsistency.
+  - Mitigate by: always writing to DB first, using idempotent consumers,
+    or using the outbox pattern instead.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: How does Spring Kafka integrate with Kafka transactions?
+A: Spring Kafka provides KafkaTransactionManager that plugs into Spring's
+   PlatformTransactionManager abstraction. Configure the ProducerFactory with a
+   transaction-id-prefix, then declare @Transactional(transactionManager =
+   "kafkaTransactionManager") on your service methods. Spring begins a Kafka
+   transaction before the method, and commits or aborts it based on whether the
+   method completes normally or throws. KafkaTemplate.send() calls within the
+   transaction are automatically enrolled in the open transaction.
+
+Q: How does consume-process-produce achieve exactly-once semantics in Spring Kafka?
+A: When a @KafkaListener method is annotated with @Transactional using
+   KafkaTransactionManager, the container automatically: (1) begins a Kafka
+   transaction on the transactional producer, (2) calls the listener, (3) after the
+   listener completes, calls producer.sendOffsetsToTransaction() to atomically commit
+   the consumer offset as part of the transaction, then (4) calls commitTransaction().
+   The atomic guarantee: output records become visible AND input offset advances
+   together, or neither happens on abort. This is full EOS for Kafka-to-Kafka pipelines.
+
+Q: What is the purpose of isolation.level=read_committed?
+A: Without it, consumers see all records including those from aborted transactions.
+   With read_committed, consumers only see records from committed transactions and
+   non-transactional records. They also wait at the Last Stable Offset (LSO) — the
+   highest offset up to which all transactions are resolved — rather than the High
+   Watermark, which means reads may be slightly behind HW when long-lived transactions
+   are open. Critical for EOS consume-side: prevents reading records from transactions
+   that may still be aborted.
+
+Q: What is the difference between @Transactional and executeInTransaction?
+A: @Transactional is declarative — Spring AOP wraps the method with begin/commit/abort
+   logic based on whether the method returns normally or throws. It requires a Spring
+   proxy to intercept calls (no self-invocation!). executeInTransaction is imperative —
+   you explicitly pass a lambda that runs inside a transaction, allowing fine-grained
+   control without needing Spring's AOP proxy. Both achieve the same result; use
+   @Transactional for service methods, executeInTransaction for utility/non-bean code.
+
+Q: Why can't you achieve true 2PC between Kafka and a relational database?
+A: True XA/2PC requires all participants to implement the XA protocol, which Kafka
+   does not support. ChainedKafkaTransactionManager chains two transaction managers
+   sequentially — if the first (e.g., DB) commits and the second (Kafka) fails, the
+   DB commit cannot be rolled back. The practical mitigation is the outbox pattern:
+   write the event to a DB table (outbox) in the same DB transaction, then a separate
+   process (Debezium CDC or a polling publisher) reads from the outbox and publishes
+   to Kafka, guaranteeing DB-side atomicity and at-least-once Kafka delivery.

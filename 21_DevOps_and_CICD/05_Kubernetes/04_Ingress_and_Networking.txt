@@ -1,0 +1,815 @@
+================================================================================
+INGRESS AND NETWORKING — KUBERNETES NETWORK GUIDE
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Kubernetes Networking Model
+2. CoreDNS — Cluster DNS
+3. Service Networking (recap and internals)
+4. Ingress — HTTP/HTTPS Traffic Management
+5. Ingress Controllers
+6. TLS Termination and cert-manager
+7. Network Policies — Pod-level Firewall
+8. Service Mesh Overview (Istio/Linkerd)
+9. Common Interview Questions & Answers
+10. Quick Reference Cheat Sheet
+
+================================================================================
+1. KUBERNETES NETWORKING MODEL
+================================================================================
+
+The Four Networking Problems:
+  1. Container-to-Container    (same pod: localhost)
+  2. Pod-to-Pod                (across nodes: CNI flat network)
+  3. Pod-to-Service            (stable endpoints: Services)
+  4. External-to-Service       (ingress traffic: NodePort/LoadBalancer/Ingress)
+
+Kubernetes Networking Requirements:
+  - Every pod gets a unique IP address
+  - Pods on the same node can communicate without NAT
+  - Pods on different nodes can communicate WITHOUT NAT
+  - The IP a pod sees for itself is the same IP other pods use to reach it
+  - Nodes can reach pods (and vice versa) without NAT
+  
+  This is called a "flat network" — no NAT barriers between pods.
+  CNI plugins (Calico, Flannel, Cilium) implement this.
+
+Pod IP Address:
+  Assigned from the cluster CIDR (configured at cluster creation).
+  Typically: 10.244.0.0/16 (Flannel) or 10.0.0.0/8 (Calico)
+  Each node gets a subnet: 10.244.1.0/24, 10.244.2.0/24, etc.
+  
+  Pod IP is:
+  - Not persistent (changes when pod is rescheduled)
+  - Not addressable from outside the cluster (without NodePort/LoadBalancer)
+  - Unique within the cluster
+
+Service CIDR:
+  Separate CIDR for Service ClusterIPs.
+  Typically: 10.96.0.0/12 (default kubeadm)
+  Virtual IPs — not assigned to any real interface.
+  kube-proxy creates iptables/IPVS rules for routing.
+
+DNS CIDR:
+  ClusterDNS (CoreDNS) has a fixed IP in the service CIDR.
+  Typically: 10.96.0.10 (first service after kubernetes.default)
+
+Port Ranges:
+  Container ports:  1-65535 (arbitrary, defined by app)
+  NodePort range:   30000-32767 (configurable via --service-node-port-range)
+  HostPort:         Can use any port on the node (requires privilege)
+
+================================================================================
+2. COREDNS — CLUSTER DNS
+================================================================================
+
+What is CoreDNS?
+  Kubernetes-native DNS server.
+  Replaced kube-dns since Kubernetes 1.13.
+  Runs as a Deployment in kube-system namespace.
+  All pods configured to use CoreDNS for DNS resolution.
+  
+  kubectl get pods -n kube-system -l k8s-app=kube-dns
+  kubectl get configmap coredns -n kube-system
+
+DNS Configuration in Pods:
+  Each pod has /etc/resolv.conf injected by kubelet:
+  
+  nameserver 10.96.0.10       # CoreDNS ClusterIP
+  search default.svc.cluster.local svc.cluster.local cluster.local
+  options ndots:5
+  
+  ndots:5 means: if name has fewer than 5 dots, try adding search domains first.
+  This is why my-service resolves to my-service.default.svc.cluster.local
+
+DNS Resolution Hierarchy:
+  
+  Query: my-service
+  1. Try: my-service.default.svc.cluster.local → FOUND → return ClusterIP
+  
+  Query: my-service.other-namespace
+  1. Try: my-service.other-namespace.svc.cluster.local → FOUND
+  
+  Query: external.example.com  (5+ dots after concatenation fails)
+  → CoreDNS forwards to upstream DNS (ISP/cloud DNS)
+
+Service DNS Records:
+  ClusterIP Service:   A record → ClusterIP
+  NodePort Service:    A record → ClusterIP (same as ClusterIP)
+  LoadBalancer Service: A record → ClusterIP (internal) + EXTERNAL-IP (external)
+  Headless Service:    A records → ALL pod IPs (multiple A records)
+  ExternalName:        CNAME → externalName value
+  
+  Full DNS name format:
+  <service-name>.<namespace>.svc.<cluster-domain>
+  
+  Examples:
+  my-api.production.svc.cluster.local
+  redis.cache.svc.cluster.local
+  postgres.default.svc.cluster.local
+  
+  Within same namespace (short name works):
+  http://my-api:8080 → CoreDNS expands to full name
+
+Pod DNS Records:
+  Pods also get DNS records:
+  <pod-ip-dashed>.<namespace>.pod.cluster.local
+  10-0-0-1.default.pod.cluster.local
+  
+  StatefulSet pods (with headless service):
+  <pod-name>.<headless-service>.<namespace>.svc.cluster.local
+  web-0.nginx-headless.default.svc.cluster.local
+
+================================================================================
+3. SERVICE NETWORKING (INTERNALS)
+================================================================================
+
+How kube-proxy Works (iptables mode):
+  
+  ClusterIP=10.96.100.50, Port=80, Backends: 10.0.0.1:8080, 10.0.0.2:8080
+  
+  iptables chain: PREROUTING → KUBE-SERVICES → KUBE-SVC-xxx → KUBE-SEP-yyy
+  
+  Rules created:
+  # Match traffic to ClusterIP
+  -A KUBE-SERVICES -d 10.96.100.50 -p tcp --dport 80 -j KUBE-SVC-ABCDEF
+  
+  # Randomly (50%) select backend 1
+  -A KUBE-SVC-ABCDEF -m statistic --mode random --probability 0.5 -j KUBE-SEP-POD1
+  
+  # Otherwise, backend 2
+  -A KUBE-SVC-ABCDEF -j KUBE-SEP-POD2
+  
+  # DNAT to backend pod
+  -A KUBE-SEP-POD1 -p tcp -j DNAT --to-destination 10.0.0.1:8080
+  -A KUBE-SEP-POD2 -p tcp -j DNAT --to-destination 10.0.0.2:8080
+  
+  This is done by kube-proxy watching Service + Endpoints objects.
+
+================================================================================
+4. INGRESS — HTTP/HTTPS TRAFFIC MANAGEMENT
+================================================================================
+
+What is Ingress?
+  API object that manages external HTTP/HTTPS access to services.
+  Layer 7 (application layer) routing.
+  
+  Ingress can:
+  - Route by hostname: api.example.com → api-service
+  - Route by path: example.com/api → api-service, example.com/web → web-service
+  - Terminate TLS (HTTPS → HTTP internally)
+  - Do URL rewriting, redirects, header manipulation (controller-specific)
+  
+  WITHOUT Ingress:
+  - Each service needs its own LoadBalancer (expensive: one LB per service)
+  - No L7 routing capabilities
+  
+  WITH Ingress:
+  - One LoadBalancer for the Ingress Controller
+  - Route many domains/paths to many services
+  - TLS certificates managed centrally
+
+Ingress Resource YAML:
+  
+  apiVersion: networking.k8s.io/v1
+  kind: Ingress
+  metadata:
+    name: my-app-ingress
+    namespace: production
+    annotations:
+      # Nginx-specific annotations
+      nginx.ingress.kubernetes.io/rewrite-target: /
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      nginx.ingress.kubernetes.io/rate-limit: "100"
+      # cert-manager annotation (auto-provision TLS cert)
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"
+  spec:
+    # Which Ingress Controller to use (K8s 1.18+)
+    ingressClassName: nginx
+    
+    # TLS configuration
+    tls:
+    - hosts:
+      - api.example.com
+      - www.example.com
+      secretName: my-tls-secret    # cert-manager will create this
+    
+    # Routing rules
+    rules:
+    # Rule 1: Host-based routing
+    - host: api.example.com
+      http:
+        paths:
+        - path: /
+          pathType: Prefix
+          backend:
+            service:
+              name: api-service
+              port:
+                number: 80
+    
+    # Rule 2: Path-based routing (no host = catch-all)
+    - http:
+        paths:
+        - path: /api/v1
+          pathType: Prefix
+          backend:
+            service:
+              name: api-v1-service
+              port:
+                number: 8080
+        - path: /api/v2
+          pathType: Prefix
+          backend:
+            service:
+              name: api-v2-service
+              port:
+                number: 8080
+        - path: /          # Default catch-all
+          pathType: Prefix
+          backend:
+            service:
+              name: frontend-service
+              port:
+                number: 80
+
+Path Types:
+  Exact        Matches exact URL path only: /foo matches /foo, NOT /foo/bar
+  Prefix       Matches path prefix: /foo matches /foo, /foo/bar, /foobar
+  ImplementationSpecific  Left to the Ingress Controller
+
+IngressClass:
+  Selects which Ingress Controller handles the Ingress.
+  K8s 1.18+ feature. Before 1.18, use kubernetes.io/ingress.class annotation.
+  
+  apiVersion: networking.k8s.io/v1
+  kind: IngressClass
+  metadata:
+    name: nginx
+    annotations:
+      ingressclass.kubernetes.io/is-default-class: "true"  # Default for all Ingress
+  spec:
+    controller: k8s.io/ingress-nginx
+
+================================================================================
+5. INGRESS CONTROLLERS
+================================================================================
+
+What is an Ingress Controller?
+  Ingress resource defines WHAT traffic to route.
+  Ingress Controller is the SOFTWARE that implements the routing.
+  
+  K8s doesn't include an Ingress Controller — you must install one.
+  Must be installed separately.
+
+NGINX Ingress Controller (most popular):
+  
+  # Install via Helm:
+  helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+  helm install ingress-nginx ingress-nginx/ingress-nginx \
+    --namespace ingress-nginx --create-namespace
+  
+  # Creates:
+  # - nginx Deployment in ingress-nginx namespace
+  # - LoadBalancer Service (gets external IP from cloud)
+  # - Watches Ingress objects → regenerates nginx.conf
+  
+  Architecture:
+  Internet → Cloud LB → NGINX pod → Pod (via ClusterIP)
+  
+  NGINX features via annotations:
+  nginx.ingress.kubernetes.io/rewrite-target: /         # URL rewrite
+  nginx.ingress.kubernetes.io/proxy-body-size: "10m"   # Upload limit
+  nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
+  nginx.ingress.kubernetes.io/rate-limit: "100"         # Req/sec per IP
+  nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8"
+  nginx.ingress.kubernetes.io/auth-url: "https://auth.example.com/verify"
+  nginx.ingress.kubernetes.io/affinity: "cookie"        # Sticky sessions
+  nginx.ingress.kubernetes.io/use-regex: "true"
+
+AWS ALB Ingress Controller (AWS Load Balancer Controller):
+  
+  # Creates an AWS Application Load Balancer per Ingress resource.
+  # Uses EC2 security groups, target groups.
+  
+  # Install: AWS Load Balancer Controller (Helm)
+  # Requires IAM permissions via IRSA
+  
+  metadata:
+    annotations:
+      kubernetes.io/ingress.class: alb
+      alb.ingress.kubernetes.io/scheme: internet-facing
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:...
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+      alb.ingress.kubernetes.io/group.name: my-app  # Share ALB across Ingresses
+
+Traefik:
+  Cloud-native, auto-discovery, middleware support.
+  Native Let's Encrypt integration.
+  Used by k3s by default.
+  Good for: Edge routing, microservices with many dynamic routes.
+
+GKE Ingress / Azure Application Gateway:
+  Cloud-native controllers that provision cloud-native LBs.
+
+================================================================================
+6. TLS TERMINATION AND CERT-MANAGER
+================================================================================
+
+Manual TLS:
+  
+  # Create TLS secret manually:
+  kubectl create secret tls my-tls \
+    --cert=tls.crt \
+    --key=tls.key \
+    -n production
+  
+  # Reference in Ingress:
+  spec:
+    tls:
+    - hosts: [example.com]
+      secretName: my-tls
+
+cert-manager (Automatic TLS):
+  Kubernetes-native certificate management.
+  Automatically provisions and renews TLS certificates from:
+  - Let's Encrypt (ACME protocol) — free, automatic
+  - Vault PKI
+  - Self-signed CA
+  - AWS Certificate Manager, Google Cloud CAS
+  
+  Installation:
+  helm repo add jetstack https://charts.jetstack.io
+  helm install cert-manager jetstack/cert-manager \
+    --namespace cert-manager --create-namespace \
+    --set installCRDs=true
+  
+  ClusterIssuer (Let's Encrypt):
+  apiVersion: cert-manager.io/v1
+  kind: ClusterIssuer
+  metadata:
+    name: letsencrypt-prod
+  spec:
+    acme:
+      server: https://acme-v02.api.letsencrypt.org/directory
+      email: admin@example.com
+      privateKeySecretRef:
+        name: letsencrypt-prod-key
+      solvers:
+      # HTTP-01 challenge (requires port 80 accessible from internet)
+      - http01:
+          ingress:
+            class: nginx
+      # DNS-01 challenge (for wildcard certs, works without port 80)
+      # - dns01:
+      #     route53:
+      #       region: us-east-1
+      #       hostedZoneID: XXXXX
+  
+  Using in Ingress (cert-manager watches for this annotation):
+  metadata:
+    annotations:
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"
+  spec:
+    tls:
+    - hosts: [api.example.com]
+      secretName: api-tls           # cert-manager creates this Secret
+  
+  cert-manager flow:
+  1. See Ingress with cert-manager annotation
+  2. Create Certificate resource (CRD)
+  3. Perform ACME challenge (HTTP-01 or DNS-01)
+  4. Receive certificate from Let's Encrypt
+  5. Store in Secret (secretName in spec.tls)
+  6. Auto-renew 30 days before expiry
+  
+  Check certificate status:
+  kubectl get certificate -n production
+  kubectl describe certificate api-tls -n production
+  kubectl get certificaterequest -n production
+
+================================================================================
+7. NETWORK POLICIES — POD-LEVEL FIREWALL
+================================================================================
+
+What is a NetworkPolicy?
+  Kubernetes resource that controls traffic flow at the IP/port level.
+  Acts as a firewall for pods.
+  
+  By default: ALL ingress and egress traffic is ALLOWED.
+  NetworkPolicy only takes effect when a CNI plugin supports it.
+  Supported: Calico, Cilium, Weave, Canal.
+  NOT supported: Flannel (alone), AmazonVPC CNI (need separate Calico).
+
+NetworkPolicy Basics:
+  - Policies are ADDITIVE (multiple policies are OR'd)
+  - Applies to pods selected by podSelector in the policy's namespace
+  - If no policy selects a pod: allow all
+  - If any policy selects a pod: only allow what policies allow
+
+Deny-All Default Policies (recommended baseline):
+  
+  # Deny all ingress to pods in namespace:
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: deny-all-ingress
+    namespace: production
+  spec:
+    podSelector: {}           # Selects ALL pods in namespace
+    policyTypes:
+    - Ingress
+    # No ingress rules = deny all ingress
+  ---
+  # Deny all egress from pods in namespace:
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: deny-all-egress
+    namespace: production
+  spec:
+    podSelector: {}
+    policyTypes:
+    - Egress
+    # No egress rules = deny all egress
+
+Allow Specific Traffic:
+  
+  # Allow ingress from specific pods:
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: allow-frontend-to-api
+    namespace: production
+  spec:
+    podSelector:
+      matchLabels:
+        app: api                    # Policy applies to API pods
+    policyTypes:
+    - Ingress
+    ingress:
+    - from:
+      - podSelector:                # Allow from frontend pods
+          matchLabels:
+            app: frontend
+      ports:
+      - protocol: TCP
+        port: 8080
+  ---
+  # Allow ingress from specific namespace:
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: allow-monitoring
+    namespace: production
+  spec:
+    podSelector: {}                   # All pods in production
+    policyTypes:
+    - Ingress
+    ingress:
+    - from:
+      - namespaceSelector:            # Allow from monitoring namespace
+          matchLabels:
+            kubernetes.io/metadata.name: monitoring
+        podSelector:                  # Only from prometheus pods
+          matchLabels:
+            app: prometheus
+      ports:
+      - protocol: TCP
+        port: 9090
+  ---
+  # Allow egress to DNS + specific services:
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: allow-egress
+    namespace: production
+  spec:
+    podSelector:
+      matchLabels:
+        app: api
+    policyTypes:
+    - Egress
+    egress:
+    # Allow DNS (ALWAYS needed if blocking egress)
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            k8s-app: kube-dns
+      ports:
+      - protocol: UDP
+        port: 53
+      - protocol: TCP
+        port: 53
+    # Allow to database
+    - to:
+      - podSelector:
+          matchLabels:
+            app: postgres
+      ports:
+      - protocol: TCP
+        port: 5432
+    # Allow external HTTPS
+    - to:
+      - ipBlock:
+          cidr: 0.0.0.0/0
+          except:
+          - 10.0.0.0/8      # Block internal IPs
+          - 172.16.0.0/12
+          - 192.168.0.0/16
+      ports:
+      - protocol: TCP
+        port: 443
+
+IMPORTANT: from with multiple selectors — AND vs OR:
+  # This is AND (pod must be in namespace AND have label):
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          env: production
+      podSelector:           # Same list item as namespaceSelector = AND
+        matchLabels:
+          app: frontend
+  
+  # This is OR (pod in namespace OR pod has label):
+  - from:
+    - namespaceSelector:    # Separate list item = OR
+        matchLabels:
+          env: production
+    - podSelector:          # OR
+        matchLabels:
+          app: frontend
+
+Testing NetworkPolicy:
+  # Test connectivity from a pod:
+  kubectl run test --rm -it --image=alpine --restart=Never \
+    -n production -- sh
+  # Inside pod:
+  nc -zv my-service 8080      # Test TCP connection
+  wget -qO- http://my-service:8080/health
+
+================================================================================
+8. SERVICE MESH OVERVIEW (ISTIO/LINKERD)
+================================================================================
+
+What is a Service Mesh?
+  Infrastructure layer for service-to-service communication.
+  Provides: mTLS, traffic management, observability, retries, circuit breaking.
+  
+  Implemented via sidecar proxies (Envoy, Linkerd2-proxy) injected into each pod.
+  All traffic goes: App → Sidecar → Network → Sidecar → App
+  
+  Benefits over NetworkPolicy alone:
+  - mTLS: All traffic encrypted AND authenticated (identity-based)
+  - Traffic management: canary, circuit breaker, retry, timeout
+  - Observability: Automatic metrics (RED: Rate, Errors, Duration), traces
+  - Fine-grained policies: "service A can only call /api/v1 on service B"
+
+ISTIO:
+  Most feature-rich service mesh. CNCF graduated.
+  Data plane: Envoy proxies (istio-proxy sidecar)
+  Control plane: Istiod (pilot, citadel, galley unified)
+  
+  Installation: istioctl, Helm, or Istio Operator
+  Sidecar injection: namespace label or pod annotation
+  
+  Key CRDs:
+  VirtualService:      Traffic routing rules (canary, A/B testing)
+  DestinationRule:     Connection pool settings, mTLS, circuit breaker
+  Gateway:             Configure ingress/egress (replaces Ingress for Istio)
+  ServiceEntry:        Register external services in mesh
+  PeerAuthentication:  mTLS mode (STRICT/PERMISSIVE)
+  AuthorizationPolicy: Fine-grained access control (like NetworkPolicy ++)
+  
+  Enable namespace injection:
+  kubectl label namespace production istio-injection=enabled
+
+LINKERD:
+  Simpler, lighter alternative to Istio.
+  Ultra-fast Rust proxy (linkerd2-proxy).
+  Focuses on: mTLS, observability, reliability.
+  Better for: Teams that want simple, not feature-heavy.
+  
+  CLI: linkerd
+  linkerd install | kubectl apply -f -
+  linkerd inject deployment.yaml | kubectl apply -f -
+  linkerd viz dashboard   # Web UI
+
+When to Use a Service Mesh:
+  ✓ Need mTLS between all services (zero-trust network)
+  ✓ Need canary deployments or traffic splitting
+  ✓ Need detailed inter-service observability (latency, errors)
+  ✓ Circuit breaking and retry logic without code changes
+  ✓ Large microservices architecture (50+ services)
+  
+  When NOT to:
+  ✗ Simple architecture (5-10 services)
+  ✗ Team unfamiliar with service mesh complexity
+  ✗ Performance is critical (sidecar adds latency, ~1ms)
+
+================================================================================
+9. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: What is the difference between a Service and an Ingress?
+A: They operate at different network layers and solve different problems:
+   
+   SERVICE (Layer 4 — TCP/UDP):
+   - Provides stable internal endpoint for a set of pods
+   - Works for ANY protocol (TCP, UDP, SCTP)
+   - Types: ClusterIP (internal), NodePort, LoadBalancer (external)
+   - No host/path based routing
+   - Each LoadBalancer service = one cloud LB (expensive)
+   
+   INGRESS (Layer 7 — HTTP/HTTPS):
+   - Routes external HTTP/HTTPS traffic to internal Services
+   - Content-based routing: by hostname, URL path
+   - TLS termination (HTTPS at Ingress → HTTP internally)
+   - One cloud LB (Ingress Controller) routes to many Services
+   - Requires an Ingress Controller (nginx, Traefik, ALB, etc.)
+   
+   Typical setup:
+   Internet → Cloud LB → Ingress Controller (nginx) → Service → Pods
+   
+   Use Service LoadBalancer: Non-HTTP protocols (TCP, GRPC on custom port),
+   or when you need a dedicated LB per service.
+   Use Ingress: HTTP/HTTPS traffic, multiple domains/paths, TLS management.
+
+Q2: Explain how Network Policies work and what CNI plugin is required.
+A: NetworkPolicy is a Kubernetes resource defining allowed traffic flows.
+   
+   How it works:
+   1. You create NetworkPolicy resources selecting pods via podSelector
+   2. The CNI plugin (not kube-proxy!) reads these policies
+   3. CNI configures iptables/eBPF rules on each node to enforce traffic
+   
+   Default behavior: Without any NetworkPolicy, ALL traffic is allowed.
+   When ANY NetworkPolicy selects a pod: ONLY allowed traffic passes.
+   
+   Key requirement: The CNI plugin MUST support NetworkPolicy.
+   - Calico ✓, Cilium ✓, Weave ✓, Canal ✓
+   - Flannel alone ✗ (need Calico alongside it)
+   - AmazonVPC CNI alone ✗ (need Calico add-on for NetworkPolicy)
+   
+   Best practice "default deny":
+   1. Apply deny-all ingress + deny-all egress to namespace
+   2. Explicitly allow only needed traffic
+   3. This follows zero-trust / least-privilege principle
+   
+   Common gotcha: Always allow egress to DNS (port 53)!
+   If you deny all egress without allowing DNS, pods can't resolve service names.
+   This is a very common mistake when implementing default deny.
+
+Q3: How does cert-manager work with Ingress for automatic TLS?
+A: cert-manager automates the TLS certificate lifecycle:
+   
+   Components:
+   - cert-manager controller: Watches Certificate and Ingress resources
+   - Issuer/ClusterIssuer: Configures which CA to use (Let's Encrypt, Vault...)
+   
+   Flow for Let's Encrypt HTTP-01:
+   1. You annotate Ingress: cert-manager.io/cluster-issuer: letsencrypt-prod
+   2. cert-manager sees the annotation + tls section
+   3. cert-manager creates a Certificate resource
+   4. cert-manager starts ACME challenge:
+      a. Creates an Ingress route for /.well-known/acme-challenge/<token>
+      b. Creates a Pod serving the challenge response
+      c. Let's Encrypt hits http://yourdomain.com/.well-known/acme-challenge/<token>
+      d. LE verifies → issues certificate
+   5. cert-manager stores cert + key in the specified Secret
+   6. Ingress uses the Secret for TLS termination
+   7. cert-manager monitors expiry → renews 30 days before expiration
+   
+   DNS-01 challenge: Used for wildcard certs (*.example.com).
+   cert-manager creates a TXT record in your DNS provider
+   instead of requiring port 80 access.
+   
+   Supported DNS providers: Route53, GCP CloudDNS, Cloudflare, AzureDNS, etc.
+   Useful for: Private clusters that aren't internet-facing.
+
+Q4: What is a service mesh and when would you use it?
+A: A service mesh is an infrastructure layer for service-to-service communication.
+   Implemented by injecting a sidecar proxy (Envoy/linkerd2-proxy) into each pod.
+   
+   What it provides beyond NetworkPolicy:
+   
+   SECURITY:
+   - mTLS: All service-to-service traffic encrypted AND authenticated
+   - Identity-based access control (not just IP-based)
+   - Zero-trust network: every service must prove its identity
+   
+   RELIABILITY:
+   - Automatic retries (configurable, with backoff)
+   - Timeouts (per-service, per-route)
+   - Circuit breaking (stop calling failing services)
+   - Outlier detection (remove unhealthy endpoints)
+   
+   TRAFFIC MANAGEMENT:
+   - Canary deployments (route 5% to v2, 95% to v1)
+   - Traffic mirroring (shadow traffic to test new version)
+   - A/B testing (route by header/cookie)
+   
+   OBSERVABILITY:
+   - Automatic metrics (latency, error rate, request rate per service pair)
+   - Distributed tracing (no code changes needed)
+   - Service graph visualization
+   
+   When to use:
+   - 50+ microservices with complex communication
+   - Compliance requiring encryption of all in-cluster traffic
+   - Need detailed inter-service observability
+   - Want traffic management without code changes
+   
+   When NOT to use: Small architectures, inexperienced teams, performance-critical
+   apps (sidecar adds ~0.5-1ms latency).
+
+Q5: How would you set up network isolation between namespaces?
+A: Use NetworkPolicy for granular control (requires NetworkPolicy-capable CNI):
+   
+   Strategy: Default deny all, explicitly allow what's needed.
+   
+   Step 1: Deny all ingress/egress in each namespace:
+   apiVersion: networking.k8s.io/v1
+   kind: NetworkPolicy
+   metadata: {name: default-deny-all, namespace: production}
+   spec:
+     podSelector: {}
+     policyTypes: [Ingress, Egress]
+   
+   Step 2: Allow necessary egress (DNS is critical!):
+   - Allow UDP/TCP port 53 to kube-system (CoreDNS)
+   - Allow egress to specific services by namespace/pod selector
+   
+   Step 3: Allow ingress where needed:
+   - Allow from monitoring namespace to scrape metrics
+   - Allow from ingress-nginx namespace to app pods
+   - Allow between namespaces that need to communicate
+   
+   Label namespaces for selector targeting:
+   kubectl label namespace monitoring kubernetes.io/metadata.name=monitoring
+   
+   Verify: Use kubectl run to test connectivity.
+   
+   Alternative for stronger isolation:
+   - Virtual clusters (vCluster)
+   - Separate physical clusters per tenant
+   - ServiceMesh AuthorizationPolicy (identity-based, stronger than IP-based)
+   
+   Note: Namespaces are NOT security boundaries by default.
+   NetworkPolicy + RBAC are required to achieve meaningful isolation.
+
+================================================================================
+10. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+DNS FORMAT:
+  <svc>.<ns>.svc.cluster.local     Full service DNS name
+  <svc>.<ns>                        Short cross-namespace
+  <svc>                             Within same namespace
+  <pod-0>.<headless-svc>.<ns>...   StatefulSet pod DNS
+
+INGRESS CONTROLLERS:
+  ingress-nginx       Most common, general purpose
+  AWS ALB Controller  Native AWS ALB per ingress
+  Traefik             Auto-discovery, middleware
+  GKE Ingress         Native GKE with Cloud Load Balancer
+
+CERT-MANAGER:
+  ClusterIssuer   → Configure CA (Let's Encrypt, Vault)
+  Certificate     → Request cert for domain
+  CertificateRequest → ACME challenge flow
+  Add annotation: cert-manager.io/cluster-issuer: letsencrypt-prod
+
+NETWORKPOLICY KEY POINTS:
+  Default: Allow ALL (no policy selected = allow)
+  Any policy selecting pod: Only allow explicitly defined
+  Policies are additive (OR'd together)
+  CNI must support: Calico, Cilium, Weave, Canal
+  ALWAYS allow DNS egress (port 53) or nothing resolves!
+
+FROM/TO SELECTOR LOGIC:
+  Same list item (namespaceSelector + podSelector) = AND
+  Separate list items = OR
+
+SERVICE MESH:
+  Istio:   Feature-rich, Envoy sidecar, VirtualService/DestinationRule CRDs
+  Linkerd: Simpler, lighter, Rust proxy, better for smaller teams
+
+COMMON PORTS:
+  kube-apiserver  6443
+  etcd            2379 (client), 2380 (peer)
+  kubelet         10250
+  kube-proxy      10249 (metrics)
+  scheduler       10259
+  ctrl-manager    10257
+  CoreDNS         53 (UDP+TCP)
+  NodePort range  30000-32767
+
+================================================================================
+END OF FILE
+================================================================================

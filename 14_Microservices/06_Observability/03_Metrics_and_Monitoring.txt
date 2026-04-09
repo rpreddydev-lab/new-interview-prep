@@ -1,0 +1,253 @@
+================================================================================
+METRICS AND MONITORING
+================================================================================
+
+METRICS IN MICROSERVICES
+--------------------------
+Metrics are numeric measurements sampled over time.
+Unlike logs (discrete events) or traces (request journeys), metrics show
+aggregate system behavior — trends, rates, distributions.
+
+Examples:
+  - http_requests_total{method="GET", status="200"} = 125843
+  - jvm_memory_used_bytes{area="heap"} = 314572800
+  - order_processing_duration_seconds{quantile="0.99"} = 2.3
+
+────────────────────────────────────────────────────────────────────────────────
+
+METRIC TYPES
+=============
+
+Counter:    Monotonically increasing value. Reset to 0 on restart.
+            Usage: total request count, total errors, total messages processed
+            Example: http_requests_total
+
+Gauge:      Current value, can go up or down.
+            Usage: current active connections, queue depth, JVM heap
+            Example: jvm_memory_used_bytes, active_connections
+
+Histogram:  Samples observations and counts them in configurable buckets.
+            Usage: request duration distribution, response size
+            Example: http_request_duration_seconds (computes P50/P95/P99)
+            Provides: _bucket, _count, _sum
+
+Summary:    Similar to histogram, computes quantiles at client side.
+            Less flexible (quantiles fixed at instrumentation time)
+            Use Histogram in most cases.
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING BOOT + MICROMETER + PROMETHEUS
+=======================================
+
+pom.xml:
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-registry-prometheus</artifactId>
+  </dependency>
+
+application.yml:
+  management:
+    endpoints:
+      web:
+        exposure:
+          include: health,metrics,prometheus,info
+    metrics:
+      distribution:
+        percentiles-histogram:
+          http.server.requests: true  # Enable histograms for latency
+        percentiles:
+          http.server.requests: 0.5, 0.95, 0.99  # P50, P95, P99
+        slo:
+          http.server.requests: 100ms, 500ms, 2s  # SLO buckets
+      tags:
+        application: ${spring.application.name}
+        environment: ${spring.profiles.active}
+
+Auto-instrumented by Micrometer + Spring Boot:
+  ✓ HTTP request metrics (rate, latency by endpoint/method/status)
+  ✓ JVM metrics (heap, GC, threads)
+  ✓ DataSource/HikariCP metrics (pool size, wait time, timeout)
+  ✓ Kafka consumer/producer metrics
+  ✓ Resilience4j metrics (circuit breaker state, failure rate)
+  ✓ Cache metrics
+
+Custom Metrics:
+  @Service
+  public class OrderService {
+
+    private final Counter ordersCreatedCounter;
+    private final Counter ordersFailedCounter;
+    private final Timer orderProcessingTimer;
+    private final AtomicLong activeOrders;
+    private final Gauge activeOrdersGauge;
+
+    public OrderService(MeterRegistry meterRegistry) {
+      ordersCreatedCounter = Counter.builder("orders.created")
+        .description("Total orders created")
+        .tag("service", "order-service")
+        .register(meterRegistry);
+
+      ordersFailedCounter = Counter.builder("orders.failed")
+        .description("Total order failures")
+        .register(meterRegistry);
+
+      orderProcessingTimer = Timer.builder("orders.processing.duration")
+        .description("Order processing duration")
+        .publishPercentileHistogram()
+        .sla(Duration.ofMillis(100), Duration.ofMillis(500), Duration.ofSeconds(2))
+        .register(meterRegistry);
+
+      this.activeOrders = new AtomicLong(0);
+      activeOrdersGauge = Gauge.builder("orders.active", activeOrders, AtomicLong::get)
+        .description("Currently active orders")
+        .register(meterRegistry);
+    }
+
+    public OrderDTO createOrder(CreateOrderRequest request) {
+      return orderProcessingTimer.recordCallable(() -> {
+        activeOrders.incrementAndGet();
+        try {
+          OrderDTO order = processOrder(request);
+          ordersCreatedCounter.increment();
+          return order;
+        } catch (Exception e) {
+          ordersFailedCounter.increment(
+            Tags.of("reason", e.getClass().getSimpleName())
+          );
+          throw e;
+        } finally {
+          activeOrders.decrementAndGet();
+        }
+      });
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+PROMETHEUS CONFIGURATION
+==========================
+
+prometheus.yml (Prometheus scrape config):
+  global:
+    scrape_interval: 15s
+    evaluation_interval: 15s
+
+  scrape_configs:
+  - job_name: 'order-service'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+    - targets: ['order-service:8080']
+
+  # Kubernetes service discovery (auto-discover pods)
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+    - role: pod
+    relabel_configs:
+    # Only scrape pods with annotation prometheus.io/scrape: "true"
+    - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+      action: keep
+      regex: true
+    - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+      action: replace
+      target_label: __metrics_path__
+      regex: (.+)
+    - source_labels: [__meta_kubernetes_pod_label_app]
+      target_label: service
+
+K8s Pod annotation:
+  metadata:
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/path: "/actuator/prometheus"
+      prometheus.io/port: "8080"
+
+────────────────────────────────────────────────────────────────────────────────
+
+PROMETHEUS QUERY LANGUAGE (PromQL)
+=====================================
+
+Request rate (per second, 5-minute window):
+  rate(http_server_requests_seconds_count{job="order-service"}[5m])
+
+Error rate:
+  rate(http_server_requests_seconds_count{status=~"5.."}[5m]) /
+  rate(http_server_requests_seconds_count[5m])
+
+P99 Latency:
+  histogram_quantile(0.99, 
+    rate(http_server_requests_seconds_bucket{job="order-service"}[5m])
+  )
+
+JVM Heap usage %:
+  jvm_memory_used_bytes{area="heap"} / jvm_memory_max_bytes{area="heap"} * 100
+
+Active DB connections:
+  hikaricp_connections_active{pool="order-service"}
+
+Circuit breaker state:
+  resilience4j_circuitbreaker_state{name="paymentService"} == 1  # 1 = OPEN
+
+────────────────────────────────────────────────────────────────────────────────
+
+GRAFANA DASHBOARDS
+===================
+
+Essential dashboards for microservices:
+
+1. Service Overview (RED metrics):
+   - Request rate per service (line graph)
+   - Error rate per service (line graph, alert threshold)
+   - P99 latency per service (line graph, alert threshold)
+
+2. JVM Dashboard:
+   - Heap used/max (area graph)
+   - GC pause duration (bar chart)
+   - Thread count (line graph)
+
+3. Database Dashboard:
+   - HikariCP pool active connections
+   - DB query latency
+   - Connection wait time
+
+4. Kafka Dashboard:
+   - Consumer lag per topic/partition
+   - Messages in/out rate
+   - Consumer offset
+
+Useful Grafana community dashboards:
+  - JVM Micrometer: ID 4701
+  - Spring Boot 3.x: ID 17175
+  - Kubernetes cluster: ID 15520
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is Micrometer and why is it used with Spring Boot?
+A: Micrometer is the instrumentation library for JVM applications. It provides
+   a vendor-neutral API for recording metrics, then exports to any monitoring
+   backend (Prometheus, Datadog, CloudWatch) via "registries". Spring Boot
+   auto-configures Micrometer with many built-in metrics.
+
+Q: What are the four main metric types in Prometheus?
+A: Counter (monotonically increasing — total requests), Gauge (current value —
+   heap usage, active connections), Histogram (distribution with buckets —
+   request duration, enables P50/P95/P99), Summary (similar to histogram,
+   computed at client side).
+
+Q: How do you expose custom business metrics?
+A: Use MeterRegistry to register Counter, Gauge, Timer, or DistributionSummary.
+   Inject MeterRegistry in the constructor, register metrics, then increment/
+   record in business logic. They're automatically exposed at /actuator/prometheus.
+
+Q: What PromQL query gives you the 99th percentile latency?
+A: `histogram_quantile(0.99, rate(http_server_requests_seconds_bucket[5m]))`
+   This works only if percentiles-histogram is enabled for the metric.
+
+================================================================================

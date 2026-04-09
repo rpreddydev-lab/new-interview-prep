@@ -1,0 +1,305 @@
+================================================================
+GRAPHQL EXECUTION MODEL
+================================================================
+
+1. HIGH-LEVEL EXECUTION FLOW
+------------------------------
+When a GraphQL request arrives, the runtime performs these steps:
+
+  1. PARSE     — Tokenize and parse the query string into an AST
+  2. VALIDATE  — Check the AST against the schema (type-checking)
+  3. EXECUTE   — Walk the AST, call resolvers, collect results
+  4. SERIALIZE — Format the result as JSON and return to client
+
+  If PARSE or VALIDATE fails → return 400 with an errors array (no execution)
+  If EXECUTE produces partial errors → return 200 with data + errors
+
+2. PARSING
+----------
+The query string is converted into an Abstract Syntax Tree (AST).
+
+  Query: `{ user(id: "1") { name email } }`
+
+  AST (simplified):
+  Document
+  └── OperationDefinition (Query)
+      └── SelectionSet
+          └── Field: user
+              ├── Arguments: id = "1"
+              └── SelectionSet
+                  ├── Field: name
+                  └── Field: email
+
+  Parsing errors:
+  - Syntax errors (missing braces, typos)
+  - Lexer errors (invalid characters)
+  These are caught before schema access.
+
+3. VALIDATION
+-------------
+The validator checks the AST against the schema rules. Validation catches:
+  - Querying a field that doesn't exist on a type
+  - Providing the wrong argument type
+  - Requesting a leaf field on a non-scalar type (object type must have sub-selections)
+  - Not providing sub-selections for object types
+  - Variable type mismatch
+  - Duplicate operation names
+  - Fragment cycles
+  - Unknown fragments
+
+  Example validation error:
+  ```graphql
+  { user(id: "1") { nonExistentField } }
+  ```
+  Error: "Cannot query field 'nonExistentField' on type 'User'."
+
+  Validation is CHEAP and MUST run before execution.
+  TIP: Validate on the client side too (gql-validator, GraphQL Code Generator).
+
+4. EXECUTION
+------------
+Execution traverses the AST depth-first and calls a resolver for each field.
+
+  4.1 RESOLVER EXECUTION ORDER
+  -----------------------------
+  Queries: Fields on the SAME level can execute in PARALLEL.
+  Mutations: Top-level mutation fields execute SERIALLY (one after another).
+
+  Example query:
+  ```graphql
+  {
+    user(id: "1") {   ← resolver called
+      name            ← resolver called (or default)
+      email           ← resolver called (or default) — PARALLEL with name
+      posts {         ← resolver called after user resolves
+        title         ← resolver called for each post — parallel per post
+      }
+    }
+  }
+  ```
+
+  4.2 THE RESOLVER FUNCTION
+  --------------------------
+  Signature: (parent, args, context, info) => value | Promise<value>
+
+  Parameters:
+    parent  — result of the parent resolver (for root fields: rootValue)
+    args    — key-value map of arguments from the query
+    context — shared per-request object (auth, DB, DataLoader instances)
+    info    — field name, return type, schema, path to field, AST fragment
+
+  Return value:
+    - A scalar → leaf resolution, execution stops here
+    - An object → passed as `parent` to child resolvers
+    - A Promise → execution waits for it to resolve
+    - null → field is null (error if the field is non-null!)
+    - An array → each element is processed through child resolvers
+
+  4.3 DEFAULT RESOLVERS
+  ----------------------
+  If no resolver is defined for a field, the default resolver is used:
+  ```javascript
+  (parent) => parent[fieldName]
+  ```
+  This means if the resolver for `user` returns `{ id: 1, name: "Alice" }`,
+  the `name` field resolves automatically without a custom resolver.
+
+  In Java (Spring for GraphQL), this is handled by the default bean property
+  access via reflection.
+
+  4.4 EXECUTION TRAVERSAL EXAMPLE
+  ---------------------------------
+  Schema:
+  ```graphql
+  type Query   { user(id: ID!): User }
+  type User    { id: ID!, name: String!, posts: [Post!]! }
+  type Post    { id: ID!, title: String! }
+  ```
+
+  Query:
+  ```graphql
+  { user(id: "1") { name posts { title } } }
+  ```
+
+  Execution steps:
+  1. Execute Query.user resolver → returns User{ id:"1", name:"Alice" }
+  2. Parallel:
+     a. Execute User.name resolver (default) → "Alice"
+     b. Execute User.posts resolver → [Post{id:"p1",title:"Hi"}, Post{id:"p2",title:"Hello"}]
+  3. For EACH post (parallel):
+     a. Execute Post.title resolver (default) → "Hi"
+     b. Execute Post.title resolver (default) → "Hello"
+
+  Result:
+  ```json
+  { "data": { "user": { "name": "Alice", "posts": [{"title":"Hi"},{"title":"Hello"}] } } }
+  ```
+
+5. NULL PROPAGATION
+--------------------
+Non-null field errors "bubble up" to the nearest nullable parent.
+
+  Schema: `type Query { user: User! }` and `type User { name: String! }`
+
+  If `name` resolver returns null (violating non-null):
+  - Error added to errors array
+  - `name` becomes null — but it's non-null! So the error propagates UP
+  - `user` (the nearest nullable parent) becomes null
+  - If `user` is also non-null, it propagates further to `data`
+  - `data` becomes null if there's no nullable parent to absorb the error
+
+  DESIGN LESSON: Be careful with non-null on fields that could realistically
+  fail. Make intermediate types nullable to limit null propagation blast radius.
+
+6. RESULT COERCION
+-------------------
+GraphQL coerces resolver return values to match the schema:
+
+  - Int field: resolver returns "3" (string) → coerced to 3 (int)
+  - Enum field: resolver returns "ACTIVE" (string) → coerced to ACTIVE enum value
+  - ID field: resolver returns 42 (int) → coerced to "42" (string)
+  - Boolean field: resolver returns 1 → coerced to true
+
+  If coercion fails (e.g., resolver returns "abc" for an Int field), a field
+  error is added and the field becomes null.
+
+7. FRAGMENT SPREADING DURING EXECUTION
+---------------------------------------
+Fragments are expanded inline during execution. When the executor encounters
+`...UserFragment`, it merges the fragment's selection set.
+
+  For inline fragments on abstract types (`... on User { name }`):
+  The executor calls the `__resolveType` function to determine the concrete
+  type of the returned object. Only matching inline fragments are applied.
+
+  ```graphql
+  # Schema: union SearchResult = User | Post
+  query { search(q: "alice") { ... on User { name } ... on Post { title } } }
+  ```
+  Executor: "Is this object a User or a Post? Call __resolveType to find out."
+
+8. INTROSPECTION EXECUTION
+---------------------------
+Introspection fields (__schema, __type, __typename) are special root fields
+built into every GraphQL server. They are resolved from the schema metadata
+itself, not from user-defined resolvers.
+
+  `__typename` is available on every object type and returns the type name:
+  ```graphql
+  { user(id: "1") { __typename name } }
+  ```
+  Returns: `{ "user": { "__typename": "User", "name": "Alice" } }`
+
+  This is how Apollo Client's normalized cache works — it uses `__typename`
+  + `id` as the cache key.
+
+9. DEFERRED EXECUTION (DEFER / STREAM)
+----------------------------------------
+GraphQL spec is evolving to support incremental delivery:
+
+  @defer — Deliver a fragment after the initial response
+  @stream — Deliver list items as they become available
+
+  ```graphql
+  query {
+    user(id: "1") {
+      name
+      # This heavy field is sent later via multipart HTTP
+      ... on User @defer { heavyComputedField }
+    }
+  }
+  ```
+
+  Status (2026): @defer and @stream are in the spec but not universally
+  supported. Apollo Server supports them experimentally.
+
+10. EXECUTION WITH DATALOADER (BATCHING)
+-----------------------------------------
+Without DataLoader, each `Post.author` resolver fires a separate DB query:
+  - Resolving 100 posts → 100 author queries (N+1)
+
+With DataLoader:
+  - All 100 author IDs are collected during this execution tick
+  - DataLoader batches them into ONE query: WHERE id IN (...)
+  - Results are distributed back to each waiting resolver
+
+  This works because JavaScript is single-threaded: all synchronous resolver
+  calls complete before the event loop resolves promises.
+
+  In Java (Spring): DataLoader works with CompleteableFuture + executor.
+
+11. ERROR HANDLING DURING EXECUTION
+-------------------------------------
+  Partial success: some fields resolve, others error:
+  ```json
+  {
+    "data": {
+      "user": {
+        "name": "Alice",
+        "posts": null
+      }
+    },
+    "errors": [{
+      "message": "Database unavailable",
+      "path": ["user", "posts"],
+      "locations": [{"line": 4, "column": 5}],
+      "extensions": { "code": "DATABASE_ERROR" }
+    }]
+  }
+  ```
+  - `user.posts` failed → null (nullable field absorbs the error)
+  - `user.name` succeeded → returned normally
+  - Error is in the errors array with the "path" showing exactly which field failed
+
+12. EXECUTION CONTEXT PER REQUEST
+-----------------------------------
+The context is built ONCE per request and injected into every resolver.
+It is NOT shared across requests (thread safety).
+
+  Typical context contents:
+  - Authenticated user (decoded from Bearer token)
+  - DataLoader instances (fresh per request for accurate batching)
+  - Database transaction (if using per-request transaction)
+  - Request ID / correlation ID for logging
+  - Feature flags
+
+13. INTERVIEW QUESTIONS & ANSWERS
+-----------------------------------
+
+Q: In what order do GraphQL resolvers execute?
+A: Fields at the same level within a query execute in parallel (except top-level
+   mutation fields, which execute serially). Child resolvers execute after their
+   parent resolver completes. This is a depth-first traversal.
+
+Q: What happens if a non-null field resolver returns null?
+A: The runtime adds a field error and propagates null upward to the nearest
+   nullable parent field. If all ancestors are non-null, data itself becomes
+   null. This is called "null propagation" and is why schema designers should
+   be careful with non-null modifiers.
+
+Q: What is the difference between a parse error and a validation error?
+A: A parse error means the query string is syntactically invalid (bad syntax).
+   A validation error means the syntax is valid but the query violates the
+   schema (unknown field, wrong type, etc.). Both result in no execution.
+
+Q: How does GraphQL execution differ between queries and mutations?
+A: Query root fields execute in parallel (the server can concurrently fetch
+   data for independent fields). Mutation root fields execute serially to
+   ensure a predictable order of side effects (e.g., createOrder before
+   processPayment).
+
+Q: What is `info` in the resolver signature and how is it used?
+A: `info` contains metadata about the current field: its name, type, the full
+   AST of the query, path from root to this field, and schema metadata. It is
+   used for: field-level caching, query cost analysis, selecting only needed
+   DB columns by inspecting child selections, and custom directive handling.
+
+Q: How does Apollo Client cache work with GraphQL execution?
+A: Apollo Client appends `__typename` and `id` to every selection via its
+   InMemoryCache. After execution, it normalizes the response into a flat
+   cache keyed by `TypeName:id` (e.g., "User:1"). Future queries for the same
+   object are served from cache without a network request.
+
+================================================================
+END OF FILE
+================================================================

@@ -1,0 +1,198 @@
+================================================================================
+  KAFKA REPLICATION AND DURABILITY
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. REPLICATION MECHANICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Kafka replicates data to provide fault tolerance. Each partition has:
+  - 1 LEADER replica: handles all reads and writes
+  - N-1 FOLLOWER replicas: passively replicate from the leader
+
+  Topic: orders, Partition 0, Replication Factor 3
+
+  Broker 1 (LEADER):  [0][1][2][3][4][5][6][7]    ← accepts writes, LEO=8
+  Broker 2 (FOLLOWER):[0][1][2][3][4][5][6]        ← ISR, HW=7 (slightly behind)
+  Broker 3 (FOLLOWER):[0][1][2][3][4][5]           ← ISR (behind but within lag threshold)
+
+Follower replication pull loop:
+  1. Follower sends FetchRequest to leader: "give me from offset N"
+  2. Leader returns records starting at N
+  3. Follower appends to its local log
+  4. Follower updates its fetch offset → leader tracks this
+  5. Leader advances High Watermark when ALL ISR members have the offset
+  6. Repeat
+
+Follower performance configs:
+  num.replica.fetchers = 2      → N threads per broker for replication (parallelism)
+  replica.fetch.min.bytes = 1   → min bytes before leader responds to fetch
+  replica.fetch.max.bytes = 1MB → max bytes per fetch
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. HIGH WATERMARK (HW) AND LEO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  LEO (Log End Offset):
+    - Highest offset in a partition's log + 1 (= next offset to write)
+    - Different per replica (followers may lag behind leader's LEO)
+
+  HW (High Watermark):
+    - Highest offset that has been replicated to ALL ISR replicas
+    - Consumers can only read up to HW (never beyond)
+    - The "committed" boundary — data below HW is safe (even if leader dies)
+
+  Example:
+    Leader LEO = 100    (wrote 100 records)
+    Follower A LEO = 98 (2 behind, in ISR)
+    Follower B LEO = 95 (5 behind, in ISR — within replica.lag.time.max.ms)
+    HW = 95             (minimum LEO across all ISR members = follower B's)
+    
+    Consumer can read offsets 0–94 (up to HW-1).
+    Offsets 95–99 written to leader but not yet safe (not fully replicated).
+
+HW update flow:
+  1. Follower B fetches up to offset 100 from leader
+  2. Leader sees follower B now has offset 100 → HW can advance
+  3. Leader piggybacks new HW in next fetch response
+  4. Followers update their HW from the response
+  5. Consumers now see HW=100
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. ISR (IN-SYNC REPLICAS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ISR = set of replicas considered up-to-date with the leader.
+
+Replica stays in ISR if:
+  - It has fetched from the leader within replica.lag.time.max.ms (default 30s)
+  - It has NOT fallen more than replica.lag.max.messages behind
+    (deprecated in newer Kafka — only time-based lag matters now)
+
+Replica leaves ISR when:
+  - Doesn't fetch within replica.lag.time.max.ms (network issue, GC pause, crash)
+  - Broker hosting the replica goes offline
+
+Replica rejoins ISR when:
+  - It fully catches up to the leader's LEO
+  - Then sends fetch request → leader adds it back to ISR
+
+ISR shrinkage impact:
+  - ISR=[1,2,3], write goes to all 3 → safe
+  - Broker 3 falls behind, ISR=[1,2]
+    - acks=all + min.insync.replicas=2 → write still succeeds (2 ISR = minimum)
+  - Broker 2 also goes down, ISR=[1]
+    - acks=all + min.insync.replicas=2 → WRITE FAILS: NotEnoughReplicasException
+    - This protects against data loss (1 replica is not enough to be safe)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. LEADER ELECTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When a partition's leader dies, a new leader must be elected.
+
+Clean election (from ISR):
+  - Kafka controller selects the first available broker in the ISR list
+  - This replica has all committed (HW) data → no data loss
+  - Preferred replica: the first broker in the replica assignment list
+    → kafka-preferred-replica-election.sh restores preferred replicas after recovery
+
+Unclean election (from out-of-ISR):
+  - Triggered if ALL ISR replicas are unavailable
+  - Only happens if unclean.leader.election.enable=true (default: false in production)
+  - The elected replica may be behind the HW → DATA LOSS
+  - Offsets consumers previously read may not exist on the new leader
+
+Leader epoch:
+  - A monotonically increasing counter incremented on each leader election
+  - Stored in __cluster_metadata (KRaft) or ZooKeeper
+  - Followers and consumers use it to detect stale reads after a leader change
+  - Prevents reading data from a replica that may have diverged
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. FOLLOWER READS (Kafka 2.4+)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+By default, ALL reads go to the partition LEADER.
+Kafka 2.4+ introduced rack-aware follower reads for geo-distributed deployments.
+
+  client.rack = us-east-1a   (set on consumer)
+  broker.rack = us-east-1a   (set on broker)
+
+  Consumer in us-east-1a → prefers follower in us-east-1a → reduces cross-AZ traffic
+
+Key constraint: follower can only serve reads up to its own HW.
+  → No stale reads: consumer always gets committed data, just from a local replica
+  → Small latency advantage: reduced cross-rack/cross-AZ hops
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. DURABILITY GUARANTEES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Kafka's durability model:
+
+  WRITE PATH:
+  Producer → Leader (writes to page cache + sends to ISR followers)
+  Leader acks producer after ALL ISR followers ack (with acks=all)
+  Data is in memory (page cache) on 3 brokers simultaneously
+
+  PERSISTENCE:
+  OS background thread flushes page cache to disk (not controlled by Kafka by default)
+  Kafka does NOT force fsync — it relies on replication for durability, not disk sync
+
+  Why no forced fsync?
+    - fsync is extremely expensive (blocks until disk I/O completes)
+    - With RF=3 and acks=all: data on 3 machines in page cache is MORE durable than
+      data on 1 machine synced to disk (single-server disk failure = data loss anyway)
+    - Kafka's design: replicated = durable; single-machine fsync = false security
+
+  Durability levels:
+    RF=1                   → vulnerable to single broker failure
+    RF=2, min.insync=1     → tolerates 1 failure, but can lose data
+    RF=3, min.insync=2     → tolerates 1 failure safely (standard production)
+    RF=3, min.insync=3     → tolerates no failures (max durability, low availability)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the relationship between HW, LEO, and what consumers can read?
+A: The Log End Offset (LEO) is the latest offset written to a partition log (per
+   replica). The High Watermark (HW) is the highest offset replicated to ALL ISR
+   members. Consumers can only read up to HW — guaranteeing they only see committed,
+   fully-replicated data. A record above HW exists on the leader but may not be on
+   all ISR replicas yet; if the leader fails before those replicas catch up, the
+   record could be lost.
+
+Q: What happens to ISR when a broker is slow or has GC pauses?
+A: If a follower doesn't send a FetchRequest to the leader within
+   replica.lag.time.max.ms (default 30s), it's removed from ISR. Once removed,
+   acks=all only requires confirmation from remaining ISR replicas. If the ISR
+   shrinks below min.insync.replicas, the broker REJECTS new writes
+   (NotEnoughReplicasException). The slow follower rejoins ISR once it fully
+   catches up to the leader's current LEO.
+
+Q: What is leader epoch and why was it introduced?
+A: Leader epoch is a counter incremented each time a partition gets a new leader.
+   It was introduced to solve the "offset divergence" problem: after a leader change,
+   a follower that was behind could have uncommitted records that the new leader
+   doesn't have. Without epoch tracking, a follower could accept diverged records.
+   With epoch fencing, followers truncate diverged records by fetching the epoch's
+   start offset from the new leader, ensuring all replicas have consistent logs.
+
+Q: Why doesn't Kafka force disk flushing (fsync) for durability?
+A: Kafka relies on REPLICATION (data on N independent machines) for durability, not
+   disk flushing. With RF=3 and acks=all, the same data is in page cache on 3 brokers.
+   Even if none has flushed to disk yet, the data is safe unless 3 machines fail
+   simultaneously. Forced fsync on every write would reduce throughput by 100x+.
+   Data naturally reaches disk when the OS flushes page cache, providing durability
+   for normal restarts.
+
+Q: How does Kafka handle data recovery after a broker restart?
+A: On restart, the broker reads its local log files (already on disk). It then
+   contacts the leader for each partition it follows and fetches any records it
+   missed (replays from its last LEO to the leader's current HW). If it falls
+   behind the leader's HW it's not in ISR until caught up. For the leader partition
+   — if the broker was the leader and cleanly shut down, it resumes leadership
+   after rejoining. If it crashed, the controller has already elected a new leader.

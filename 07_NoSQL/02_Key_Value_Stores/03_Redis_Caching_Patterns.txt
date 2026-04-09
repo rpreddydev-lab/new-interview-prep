@@ -1,0 +1,198 @@
+================================================================
+  REDIS CACHING PATTERNS
+================================================================
+
+================================================================
+WHY CACHE?
+================================================================
+
+  A cache stores frequently accessed data in fast memory
+  to reduce database load and improve response times.
+
+  Without cache: every request --> DB query (slow, expensive)
+  With cache:    most requests --> Redis read (sub-ms, free)
+
+================================================================
+CACHE-ASIDE (LAZY LOADING)
+================================================================
+
+  Most common pattern. Application manages the cache.
+
+  READ:
+  1. Check cache for key
+  2. Cache HIT  --> return cached value
+  3. Cache MISS --> query DB, store in cache, return value
+
+  WRITE:
+  1. Update DB
+  2. Invalidate (delete) cache key  (or update cache)
+
+  Code example:
+
+  public Product getProduct(Long id) {
+      String key = "product:" + id;
+      String cached = redisTemplate.opsForValue().get(key);
+      if (cached != null) {
+          return objectMapper.readValue(cached, Product.class);
+      }
+      Product p = productRepository.findById(id).orElseThrow();
+      redisTemplate.opsForValue().set(key, objectMapper.writeValueAsString(p),
+                                      Duration.ofMinutes(30));
+      return p;
+  }
+
+  Pros: Only loads data that is actually requested.
+        Cache failure doesn't break the app (falls back to DB).
+  Cons: First request per key is always a cache miss (cold start).
+        Stale data window after DB update.
+
+================================================================
+WRITE-THROUGH
+================================================================
+
+  On every DB write, also write to cache.
+  Cache is always in sync with DB.
+
+  public Product updateProduct(Product p) {
+      Product saved = productRepository.save(p);
+      String key = "product:" + saved.getId();
+      redisTemplate.opsForValue().set(key, toJson(saved), Duration.ofMinutes(30));
+      return saved;
+  }
+
+  Pros: Cache always fresh. No stale read after writes.
+  Cons: Every write incurs cache write overhead.
+        Cache fills with data that may never be read.
+
+================================================================
+WRITE-BEHIND (WRITE-BACK)
+================================================================
+
+  Write to cache first. Asynchronously flush to DB.
+
+  Application: SET cache_key value
+  Background:  flush cache writes to DB
+
+  Pros: Very fast writes (cache write only, DB async).
+  Cons: Risk of data loss if cache crashes before DB flush.
+        Complexity of background sync.
+
+  Use for: write-heavy workloads where millisecond write latency matters.
+
+================================================================
+READ-THROUGH
+================================================================
+
+  Cache sits in front of DB. On cache miss, cache fetches from DB itself
+  and returns to caller.
+
+  Application --> Cache --> (on miss) --> DB
+
+  Similar to cache-aside but the cache is responsible for loading.
+  Often implemented via a caching library (Spring @Cacheable).
+
+================================================================
+SPRING @CACHEABLE
+================================================================
+
+  @Cacheable(value = "products", key = "#id")
+  public Product getProduct(Long id) {
+      return productRepository.findById(id).orElseThrow();
+  }
+
+  @CachePut(value = "products", key = "#result.id")
+  public Product updateProduct(Product p) {
+      return productRepository.save(p);
+  }
+
+  @CacheEvict(value = "products", key = "#id")
+  public void deleteProduct(Long id) {
+      productRepository.deleteById(id);
+  }
+
+  @CacheEvict(value = "products", allEntries = true)
+  public void clearProductCache() {}
+
+  // Enable caching in Spring Boot:
+  @EnableCaching
+  @SpringBootApplication
+  public class App { ... }
+
+================================================================
+TTL STRATEGY
+================================================================
+
+  Short TTL (1-5 min):   Frequently changing data (prices, stock)
+  Medium TTL (30 min):   Moderately stable data (product details)
+  Long TTL (1-24 hours): Rarely changing data (categories, config)
+  No TTL (persistent):   Lookup tables that almost never change
+
+  Always set a TTL on cache entries. Without TTL, cache fills up
+  and Redis begins evicting based on eviction policy.
+
+================================================================
+CACHE EVICTION POLICIES
+================================================================
+
+  Policy              Behavior
+  ----------------    -------------------------------------------------
+  noeviction          Return error when memory full (default)
+  allkeys-lru         Evict least recently used from all keys
+  volatile-lru        Evict LRU from keys with TTL set
+  allkeys-lfu         Evict least frequently used from all keys
+  volatile-lfu        Evict LFU from keys with TTL
+  allkeys-random      Random eviction from all keys
+  volatile-random     Random eviction from keys with TTL
+  volatile-ttl        Evict keys with shortest TTL first
+
+  For a cache, use: allkeys-lru or allkeys-lfu
+
+================================================================
+CACHE WARMING (PRIMING)
+================================================================
+
+  Pre-populate the cache at startup or deployment to avoid
+  cache misses on the first wave of traffic.
+
+  @EventListener(ApplicationReadyEvent.class)
+  public void warmCache() {
+      List<Product> popular = productRepository.findTop100ByOrderByViewsDesc();
+      popular.forEach(p -> cache.put("product:" + p.getId(), p));
+  }
+
+================================================================
+CACHE STAMPEDE (THUNDERING HERD)
+================================================================
+
+  Problem: A popular cache key expires. Hundreds of requests
+  all miss the cache simultaneously and hammer the DB.
+
+  Solution 1: Mutex lock on cache miss.
+  Only one thread populates the cache; others wait.
+
+  Solution 2: Probabilistic early expiration.
+  Refresh cache slightly before it expires.
+
+  Solution 3: Stale-while-revalidate.
+  Serve stale data while refreshing in background.
+
+================================================================
+INTERVIEW Q&A
+================================================================
+
+  Q: What is the Cache-Aside pattern?
+  A: Application checks cache first. On miss, fetches from DB and
+     stores in cache. Application is responsible for cache population
+     and invalidation. Most widely used caching pattern.
+
+  Q: How do you handle cache invalidation when data changes?
+  A: On update/delete, call @CacheEvict to remove the stale key.
+     On write-through, update both DB and cache.
+     Can also use event-driven invalidation (Kafka message triggers eviction).
+
+  Q: What is a cache stampede and how do you prevent it?
+  A: When a popular cache key expires and many concurrent requests all miss
+     and hit the DB simultaneously. Prevent with mutex locking on miss,
+     probabilistic early refresh, or stale-while-revalidate.
+
+================================================================

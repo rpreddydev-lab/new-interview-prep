@@ -1,0 +1,431 @@
+================================================================
+PROTOBUF FIELD TYPES AND RULES
+================================================================
+
+----------------------------------------------------------------
+1. FIELD NUMBER RULES AND BEST PRACTICES
+----------------------------------------------------------------
+
+Field numbers are the heart of protobuf's wire format and
+backward/forward compatibility model.
+
+Rules (must follow):
+  1. Must be a positive integer (1 to 536,870,911)
+  2. Must be unique within a message
+  3. Cannot be changed once in production
+  4. Cannot be reused for different fields
+  5. Range 19000-19999 is reserved by protobuf implementation
+  6. Deleted field numbers must be marked reserved
+
+Cost of field numbers (bytes on wire):
+  Field numbers 1-15:     1 byte for tag (fits in single varint byte)
+  Field numbers 16-2047:  2 bytes for tag
+  Field numbers 2048+:    3+ bytes for tag
+
+Optimization rule: Use 1-15 for the most frequently populated fields!
+
+Example:
+  message ApiRequest {
+    string  request_id   = 1;  // 1 byte tag (frequent)
+    string  user_id      = 2;  // 1 byte tag (frequent)
+    bytes   payload      = 3;  // 1 byte tag (frequent)
+    
+    // These are less common, higher numbers are fine
+    map<string, string> metadata     = 16;  // 2 byte tag (OK for rare)
+    google.protobuf.Timestamp sent_at = 17;  // 2 byte tag (OK for rare)
+    string  debug_info   = 100;  // 2 byte tag (debug-only)
+  }
+
+----------------------------------------------------------------
+2. WIRE TYPES AND ENCODING RULES
+----------------------------------------------------------------
+
+Wire type determines how many bytes the VALUE occupies.
+Tag = (field_number << 3) | wire_type
+
+Wire Type 0 — Varint:
+  Used by: int32, int64, uint32, uint64, sint32, sint64, bool, enum
+  Encoding: 7 bits of data per byte, MSB=1 means "more bytes follow"
+  
+  Example: encode 300 as varint
+    300 in binary: 100101100
+    Split into 7-bit groups: 0000010 0101100
+    Reverse groups: 0101100 0000010
+    Add continuation bits: 10101100 00000010
+    Hex: AC 02  (2 bytes)
+  
+  Negative int32 quirk:
+    int32 = -1 encodes as: FFFFFFFF0F (10 bytes!)
+    sint32 = -1 encodes ZigZag to 1: 01 (1 byte)
+
+Wire Type 1 — 64-bit:
+  Used by: fixed64, sfixed64, double
+  Always 8 bytes, little-endian
+
+Wire Type 2 — Length-delimited:
+  Used by: string, bytes, embedded messages, packed repeated
+  Encoding: [varint length] [data bytes]
+  
+  Example: encode string "hello" (5 bytes)
+    Tag for field 1: 0x0A (field=1, wire=2)
+    Length varint: 0x05
+    Data: 68 65 6C 6C 6F
+    → 0A 05 68 65 6C 6C 6F  (7 bytes total)
+
+Wire Type 5 — 32-bit:
+  Used by: fixed32, sfixed32, float
+  Always 4 bytes, little-endian
+
+----------------------------------------------------------------
+3. INTEGER TYPE DEEP COMPARISON
+----------------------------------------------------------------
+
+Scenario: You need to store HTTP status codes (100-599) and
+error codes (-32768 to 32767). Which types to choose?
+
+HTTP status codes (always positive, 100-599):
+  int32: values 100-599 encode as 1 byte varints (< 128 is 1 byte, but 100 < 128 ✅)
+         Actually: 100 < 128 → 1 byte, 128-599 → 2 bytes
+  uint32: same varint encoding, but signals "always positive" in schema
+  → Use uint32 or int32 (either is fine, but uint32 is more semantic)
+
+Error codes (can be negative):
+  int32: -1 uses 10 bytes! (sign extends to 64-bit)
+  sint32: -1 uses 1 byte (ZigZag maps -1 → 1)
+  → Use sint32 when values are frequently negative
+
+Performance cheat sheet:
+  ┌──────────────┬──────────────────────────────────────────────┐
+  │ Use sint32   │ Frequently negative values (temperature,     │
+  │              │ delta/difference values, balance changes)     │
+  ├──────────────┼──────────────────────────────────────────────┤
+  │ Use int32    │ Usually non-negative values (counts, IDs)    │
+  ├──────────────┼──────────────────────────────────────────────┤
+  │ Use uint32   │ Always non-negative (lengths, versions,      │
+  │              │ unsigned flags)                               │
+  ├──────────────┼──────────────────────────────────────────────┤
+  │ Use fixed32  │ Values always large (> 268 million)          │
+  │              │ Hash values, Unix timestamps (uint32 range)  │
+  ├──────────────┼──────────────────────────────────────────────┤
+  │ Use int64    │ Large IDs, file sizes, Unix timestamps (ms)  │
+  ├──────────────┼──────────────────────────────────────────────┤
+  │ Use fixed64  │ Large values > 2^56 (content hashes/sha256)  │
+  └──────────────┴──────────────────────────────────────────────┘
+
+----------------------------------------------------------------
+4. STRING VS BYTES
+----------------------------------------------------------------
+
+string:
+  - Must be valid UTF-8
+  - Protobuf will reject invalid UTF-8 strings on deserialization
+  - Use for: names, descriptions, IDs, URLs, JSON strings
+
+bytes:
+  - Arbitrary binary data (no UTF-8 requirement)
+  - Use for: images, audio, file contents, encrypted data,
+    serialized nested format (e.g., embedded JSON, embedded proto)
+
+Same wire format, different semantics and validation.
+
+Example of when to use bytes:
+  message MediaFile {
+    string filename     = 1;   // UTF-8 filename
+    string content_type = 2;   // "image/jpeg"
+    bytes  data         = 3;   // raw binary file content
+    bytes  checksum     = 4;   // SHA-256 as raw bytes (32 bytes)
+    string checksum_hex = 5;   // same checksum as hex string (64 chars)
+    // Use bytes (checksum) for efficiency, string (checksum_hex) for readability
+  }
+
+----------------------------------------------------------------
+5. BOOL FIELD CONSIDERATIONS
+----------------------------------------------------------------
+
+bool fields:
+  - Encoded as varint: 0x00 (false) or 0x01 (true)
+  - Default value is false
+  - Cannot distinguish "not set" from "set to false" without optional
+
+Common anti-pattern:
+  message User {
+    bool is_deleted = 5;  // If default is false (not deleted), this works
+                          // But: is_deleted=false AND field not set look the same
+  }
+
+Better pattern for status:
+  enum UserStatus {
+    USER_STATUS_UNSPECIFIED = 0;
+    USER_STATUS_ACTIVE      = 1;
+    USER_STATUS_SUSPENDED   = 2;
+    USER_STATUS_DELETED     = 3;
+  }
+  
+  message User {
+    UserStatus status = 5;  // Unspecified means "we don't know", ACTIVE means active
+  }
+
+Proto3 optional bool:
+  message Config {
+    optional bool feature_enabled = 1;
+    // Now has_feature_enabled() distinguishes "not set" from "set to false"
+  }
+
+----------------------------------------------------------------
+6. REPEATED FIELD RULES
+----------------------------------------------------------------
+
+Repeated fields are lists/arrays. Key rules:
+
+Rule 1: Repeated fields cannot be "null" — only empty or non-empty
+  message Request {
+    repeated string ids = 1;  // empty by default, never null
+  }
+
+Rule 2: Order IS preserved for repeated fields
+  // Items come back in the order they were added
+  repeated OrderItem items = 1;
+
+Rule 3: Packed encoding for scalar repeated fields
+  // Efficient wire encoding: single tag + all values
+  repeated int32 scores = 1 [packed=true];   // proto2 explicit
+  repeated int32 scores = 1;                 // proto3: packed by default for scalars
+
+Rule 4: Repeated message fields are NOT packed
+  // Each message has its own tag+length prefix
+  repeated Product products = 1;  // never packed
+
+Rule 5: Cannot use repeated in oneof
+
+Repeated field performance tips:
+  - Large repeated int/fixed fields: very efficient (packed)
+  - Large repeated message fields: each message has overhead
+  - For large datasets: consider streaming instead of large repeated fields
+  - Max message size is 4MB by default (configurable)
+
+----------------------------------------------------------------
+7. MAP FIELD RULES
+----------------------------------------------------------------
+
+Maps have specific constraints:
+
+Rule 1: Key type restrictions
+  Valid:   bool, any int type (int32, int64, etc.), string
+  Invalid: float, double, bytes, enum, message types
+  
+  Reason: Map keys must be comparable/hashable in a language-agnostic way.
+  float/double don't have reliable equality semantics (NaN != NaN).
+
+Rule 2: Map fields cannot be repeated
+  ❌ repeated map<string, int32> counters = 1;  // INVALID
+
+Rule 3: Map values CAN be any type (including message)
+  map<string, google.protobuf.Any> extensions = 1;  // valid
+
+Rule 4: Map entry order is NOT guaranteed
+  - Different runtimes may serialize maps in different orders
+  - Don't rely on iteration order being consistent
+  - This is different from repeated fields (which preserve order)
+
+Rule 5: Duplicate keys behavior
+  - If the same key appears twice during parsing, the LAST value wins
+  - Avoid duplicates in serialized data
+
+Rule 6: Maps cannot be in oneof
+  ❌ oneof config { map<string, string> settings = 1; }  // INVALID
+
+Map vs repeated message comparison:
+  map<string, Product> products = 1;
+  // is equivalent to:
+  repeated ProductsEntry products = 1;
+  message ProductsEntry {
+    string  key   = 1;
+    Product value = 2;
+  }
+
+Use map when:
+  - You need O(1) key lookup
+  - Keys are unique identifiers
+  - Order doesn't matter
+
+Use repeated when:
+  - You need ordered list of key-value pairs
+  - Keys might be duplicated
+  - You need index-based access
+
+----------------------------------------------------------------
+8. ONEOF FIELD RULES
+----------------------------------------------------------------
+
+Rule 1: Only one field can be set at a time
+  Setting field A clears field B (if both are in same oneof)
+
+Rule 2: Fields in oneof share field number space with outer message
+  message Foo {
+    oneof bar {
+      string a = 1;  // field number 1 in Foo's namespace
+      int32  b = 2;  // field number 2 in Foo's namespace
+    }
+    string c = 3;    // field number 3 in Foo's namespace
+    // Cannot use 1 or 2 outside oneof (already taken)
+  }
+
+Rule 3: Repeated fields NOT allowed in oneof
+  ❌ oneof data { repeated string items = 1; }
+
+Rule 4: Maps NOT allowed in oneof
+  ❌ oneof config { map<string, string> settings = 1; }
+
+Rule 5: Cannot nest oneof in oneof
+  ❌ oneof outer {
+       oneof inner { ... }  // INVALID
+     }
+
+Rule 6: A message field in oneof IS valid
+  oneof result {
+    SuccessResult success = 1;
+    ErrorResult   error   = 2;
+  }
+
+Common pattern — result type:
+  message ApiResponse {
+    oneof outcome {
+      ResponsePayload payload = 1;
+      ErrorDetails    error   = 2;
+    }
+    string request_id = 3;
+  }
+
+----------------------------------------------------------------
+9. FIELD PRESENCE (PROTO3 SPECIFICS)
+----------------------------------------------------------------
+
+Proto3 initially removed field presence tracking:
+  - Cannot tell if int32 count = 1 was "not set" or "set to 0"
+  - All scalar fields have default values (0, "", false)
+
+Proto3 optional restores presence:
+  message Order {
+    optional int32  discount_percent = 1;  // has has_discount_percent()
+    optional string coupon_code     = 2;  // has has_coupon_code()
+  }
+  
+  if (order.hasDiscountPercent()) {
+    applyDiscount(order.getDiscountPercent());
+  }
+
+Fields that ALWAYS have presence in proto3:
+  - Message-type fields: always have has_XXX() method
+  - Fields in oneof: always have presence via getXxxCase()
+
+Fields that DON'T have presence by default:
+  - Scalar fields (int32, string, bool, etc.) without optional keyword
+
+Migrating from "use 0 as sentinel" to optional:
+  // Old pattern (fragile):
+  int32 retry_count = 1;  // -1 means "not set" — TERRIBLE
+  
+  // Better (using optional):
+  optional int32 retry_count = 1;  // null means "not set"
+  
+  // Even better (semantic enum):
+  enum RetryPolicy {
+    RETRY_POLICY_UNSPECIFIED = 0;
+    RETRY_POLICY_NONE        = 1;
+    RETRY_POLICY_LIMITED     = 2;
+    RETRY_POLICY_INFINITE    = 3;
+  }
+
+----------------------------------------------------------------
+10. FIELD OPTIONS
+----------------------------------------------------------------
+
+Fields can have options (annotations):
+
+Deprecation:
+  message LegacyUser {
+    string user_id    = 1;
+    string email      = 2;
+    string phone      = 3 [deprecated=true];  // generates compiler warning
+  }
+
+Packed (proto2):
+  repeated int32 scores = 1 [packed=true];   // default in proto3
+
+jstype (JSON serialization of int64):
+  int64 timestamp_ms = 1 [jstype=JS_STRING];  // JS loses precision on int64
+  // In JSON: "1705312200000" instead of 1705312200000
+
+Custom options (advanced):
+  import "google/protobuf/descriptor.proto";
+  
+  extend google.protobuf.FieldOptions {
+    optional string my_field_option = 50000;
+  }
+  
+  message Foo {
+    string name = 1 [(my_field_option) = "some value"];
+  }
+
+----------------------------------------------------------------
+11. VALIDATION PATTERNS (PROTOBUF DOESN'T VALIDATE CONTENT)
+----------------------------------------------------------------
+
+Protobuf ONLY validates structure (field types, required-ness).
+It does NOT validate content (min/max values, regex, etc.).
+
+Content validation must be done in application code.
+
+Libraries for protobuf validation:
+  - protoc-gen-validate (PGV): generates validation code from annotations
+  - buf.build validation rules (newer alternative)
+
+PGV example:
+  import "validate/validate.proto";
+  
+  message User {
+    string email = 1 [(validate.rules).string.email = true];
+    int32  age   = 2 [(validate.rules).int32 = {gte: 0, lte: 150}];
+    string name  = 3 [(validate.rules).string = {min_len: 1, max_len: 100}];
+  }
+
+Application-level validation (manual):
+  public void createUser(CreateUserRequest request, StreamObserver<User> resp) {
+    if (request.getEmail().isBlank()) {
+      resp.onError(Status.INVALID_ARGUMENT
+          .withDescription("email is required")
+          .asException());
+      return;
+    }
+    if (request.getAge() < 0 || request.getAge() > 150) {
+      resp.onError(Status.INVALID_ARGUMENT
+          .withDescription("age must be between 0 and 150")
+          .asException());
+      return;
+    }
+    // ... proceed
+  }
+
+----------------------------------------------------------------
+12. INTERVIEW SUMMARY TABLE
+----------------------------------------------------------------
+
+  Question                  | Answer
+  --------------------------|----------------------------------------------------
+  Tag byte cost             | Fields 1-15: 1 byte; 16-2047: 2 bytes
+  Negative int32            | Uses 10 bytes; use sint32 for negatives
+  Map key restriction       | Cannot be float, double, bytes, enum, message
+  Repeated in oneof?        | Not allowed
+  Map in oneof?             | Not allowed
+  Can map be repeated?      | No
+  Bool default              | false
+  String default            | "" (empty string, NOT null)
+  Bytes default             | empty byte array
+  Message field default     | null (Java) / empty instance (other languages)
+  Optional keyword          | Restores field presence detection in proto3
+  Unknown fields proto3     | Preserved and re-serialized (forward compat)
+  Max message size (default)| 4 MB
+
+================================================================
+END OF FILE
+================================================================

@@ -1,0 +1,281 @@
+================================================================================
+BULKHEAD PATTERN
+================================================================================
+
+WHAT IS THE BULKHEAD PATTERN?
+-------------------------------
+Named after the compartments (bulkheads) in a ship's hull — if one compartment
+floods, watertight bulkheads prevent the entire ship from sinking.
+
+In microservices: Isolate resources used for different operations so that a
+failure or resource exhaustion in one component doesn't affect others.
+
+Problem without Bulkhead:
+  Service A has a single thread pool (50 threads)
+  Service A calls: InventoryService, PaymentService, UserService
+
+  Scenario: InventoryService becomes slow (threads block for 2s each)
+  → All 50 threads get consumed by InventoryService calls
+  → PaymentService calls can't get threads (even though PaymentService is healthy)
+  → UserService calls can't get threads
+  → ENTIRE Service A is unresponsive, even for calls not involving InventoryService
+
+With Bulkhead:
+  Thread pool per downstream service:
+    InventoryService pool: 15 threads
+    PaymentService pool: 20 threads
+    UserService pool: 15 threads
+
+  InventoryService becomes slow → its 15 threads are exhausted
+  → PaymentService and UserService pools still have threads
+  → Service A can still process payment and user requests
+  → Failure is ISOLATED to the Inventory feature
+
+────────────────────────────────────────────────────────────────────────────────
+
+BULKHEAD TYPES
+===============
+
+1. THREAD POOL BULKHEAD (ThreadPoolBulkhead)
+   - Each operation type gets its own dedicated thread pool
+   - Heavy/slow operations don't starve faster operations
+   - Async (non-blocking) execution
+   - Good for: I/O-bound calls, calls with variable latency
+
+2. SEMAPHORE BULKHEAD (SemaphoreBulkhead)
+   - Limits number of concurrent calls using a counting semaphore
+   - Same thread as caller (synchronous)
+   - Lightweight (no thread pool overhead)
+   - Good for: CPU-bound operations, in-memory operations
+   - Less isolation than thread pool (caller thread still blocks)
+
+────────────────────────────────────────────────────────────────────────────────
+
+THREAD POOL BULKHEAD IN RESILIENCE4J
+=======================================
+
+Configuration:
+  resilience4j:
+    thread-pool-bulkhead:
+      instances:
+        inventoryService:
+          max-thread-pool-size: 15          # Max concurrent calls
+          core-thread-pool-size: 10         # Idle threads kept alive
+          queue-capacity: 50               # Pending call queue
+          keep-alive-duration: 20ms        # Idle thread keep-alive
+
+        paymentService:
+          max-thread-pool-size: 20
+          core-thread-pool-size: 15
+          queue-capacity: 30
+
+        userService:
+          max-thread-pool-size: 10
+          core-thread-pool-size: 5
+          queue-capacity: 20
+
+Usage (reactive):
+  @Service
+  public class ProductService {
+
+    @Bulkhead(name = "inventoryService", type = Bulkhead.Type.THREADPOOL,
+              fallbackMethod = "inventoryFallback")
+    public CompletableFuture<InventoryDTO> getInventoryAsync(Long productId) {
+      return CompletableFuture.supplyAsync(() ->
+        inventoryClient.getInventory(productId)
+      );
+    }
+
+    public CompletableFuture<InventoryDTO> inventoryFallback(Long productId,
+                                                              BulkheadFullException ex) {
+      log.warn("Inventory bulkhead full for product {}: {}", productId, ex.getMessage());
+      return CompletableFuture.completedFuture(
+        new InventoryDTO(productId, 0, InventoryStatus.UNKNOWN)
+      );
+    }
+  }
+
+When queue is full:
+  → BulkheadFullException is thrown immediately
+  → Fallback method is called
+  → Caller gets a response quickly (no waiting for thread pool to free up)
+
+────────────────────────────────────────────────────────────────────────────────
+
+SEMAPHORE BULKHEAD IN RESILIENCE4J
+=====================================
+
+Configuration:
+  resilience4j:
+    bulkhead:
+      instances:
+        userService:
+          max-concurrent-calls: 25           # Max simultaneous calls
+          max-wait-duration: 0               # Don't wait if full → immediate failure
+
+        reportService:
+          max-concurrent-calls: 5            # Low limit for heavy operation
+          max-wait-duration: 100ms           # Wait up to 100ms for a slot
+
+Usage:
+  @Service
+  public class ReportService {
+
+    @Bulkhead(name = "reportService", fallbackMethod = "fallbackReport")
+    public Report generateReport(ReportRequest request) {
+      return reportGenerator.generate(request);  // CPU-intensive
+    }
+
+    public Report fallbackReport(ReportRequest request, BulkheadFullException ex) {
+      log.warn("Report generation bulkhead full");
+      return Report.queued(request.getRequestId());  // Queue for later
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+COMBINING BULKHEAD WITH CIRCUIT BREAKER
+=========================================
+
+Best practice: Use BOTH together.
+
+  @CircuitBreaker(name = "inventoryCB", fallbackMethod = "fallback")
+  @Bulkhead(name = "inventoryBH", type = Bulkhead.Type.THREADPOOL, fallbackMethod = "fallback")
+  @Retry(name = "inventoryRetry")
+  public CompletableFuture<InventoryDTO> getInventory(Long productId) {
+    return CompletableFuture.supplyAsync(() ->
+      inventoryClient.getInventory(productId)
+    );
+  }
+
+  Execution order (outer to inner):
+  BulkheadFullException ← Bulkhead ← CircuitBreaker ← Retry ← Actual Call
+
+  Outer layer checked first:
+  1. Bulkhead: Thread pool full? → reject immediately
+  2. Circuit Breaker: Circuit OPEN? → reject immediately
+  3. Retry: Call fails? → retry up to N times
+  4. Actual call to inventory service
+
+────────────────────────────────────────────────────────────────────────────────
+
+BULKHEAD IN KUBERNETES
+========================
+
+Kubernetes Resource Quotas and Limits act as bulkheads at the infrastructure level:
+
+  # Pod resource limits — bulkhead at container level
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "500m"
+    limits:
+      memory: "512Mi"    # OOMKilled if exceeded (isolates memory leak)
+      cpu: "1000m"       # CPU throttled (doesn't kill other pods)
+
+  # Namespace ResourceQuota — bulkhead at team/namespace level
+  apiVersion: v1
+  kind: ResourceQuota
+  metadata:
+    name: compute-resources
+    namespace: payment-team
+  spec:
+    hard:
+      requests.cpu: "10"
+      requests.memory: 20Gi
+      limits.cpu: "20"
+      limits.memory: 40Gi
+      pods: "50"
+
+  # PodDisruptionBudget — ensures minimum healthy pods (availability bulkhead)
+  apiVersion: policy/v1
+  kind: PodDisruptionBudget
+  metadata:
+    name: order-service-pdb
+  spec:
+    minAvailable: 2     # At least 2 pods always running during disruptions
+    selector:
+      matchLabels:
+        app: order-service
+
+────────────────────────────────────────────────────────────────────────────────
+
+BULKHEAD SIZING GUIDELINES
+============================
+
+Thread Pool sizing formula (simplified):
+  maxThreads = (targetConcurrency) × (responseTime / acceptableLatency)
+
+Example:
+  - Expected: 100 concurrent inventory calls
+  - Inventory response time: 200ms average
+  - Acceptable: inventory calls complete within 500ms
+  - pool size ≈ 100 × (200/500) = 40 threads
+
+Or simpler: Start with low values, monitor metrics, tune up if needed.
+
+Warning: Over-provisioning thread pools wastes memory and CPU.
+         Under-provisioning causes unnecessary BulkheadFullException.
+
+Monitor these metrics:
+  resilience4j_bulkhead_available_concurrent_calls  # Available slots
+  resilience4j_bulkhead_max_allowed_concurrent_calls # Max configured
+  resilience4j_bulkhead_call_rejected_total          # Rejection count (should be 0 normally)
+
+────────────────────────────────────────────────────────────────────────────────
+
+REAL-WORLD BULKHEAD EXAMPLES
+==============================
+
+Netflix:
+  - Separate Hystrix thread pools per API endpoint type
+  - Heavy recommendation API has small pool (slow, high latency)
+  - Lightweight metadata API has large pool (fast, high throughput)
+  - Recommendation failures don't starve metadata calls
+
+Amazon:
+  - Separate connection pools per external dependency
+  - Database connection pool: 50 connections
+  - Payment gateway pool: 10 connections (throttled externally)
+  - S3 pool: 100 connections
+
+Service-level bulkhead in Spring:
+  @Bean("inventoryTaskExecutor")
+  public Executor inventoryTaskExecutor() {
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(5);
+    executor.setMaxPoolSize(15);
+    executor.setQueueCapacity(50);
+    executor.setThreadNamePrefix("inventory-");
+    executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+    return executor;
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is the Bulkhead pattern and why is it used?
+A: Named after ship compartments, bulkhead isolates resources (thread pools,
+   connections) per dependency/operation. Prevents one slow/failing dependency
+   from consuming all threads and affecting unrelated operations.
+
+Q: What's the difference between thread pool and semaphore bulkheads?
+A: Thread pool bulkhead executes calls in a separate dedicated thread pool —
+   full isolation, caller doesn't block. Semaphore bulkhead limits concurrent
+   calls using a counter — caller thread blocks until semaphore is available.
+   Thread pool is better for I/O-bound external calls; semaphore is lighter.
+
+Q: How does Bulkhead differ from Circuit Breaker?
+A: Circuit Breaker monitors failure rate and stops calls when service is failing.
+   Bulkhead limits concurrent calls to prevent thread starvation, regardless of
+   failure rate. Use both: Bulkhead limits concurrent load, Circuit Breaker
+   stops calls to persistent failures.
+
+Q: What exception is thrown when a Bulkhead is full?
+A: BulkheadFullException (semaphore) or BulkheadFullException with thread pool
+   type. This is separate from CallNotPermittedException (circuit breaker open).
+   Both can be handled by the same fallback method by accepting Exception.
+
+================================================================================

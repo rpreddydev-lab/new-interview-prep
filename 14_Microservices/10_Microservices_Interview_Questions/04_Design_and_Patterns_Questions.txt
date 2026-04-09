@@ -1,0 +1,332 @@
+================================================================================
+DESIGN AND PATTERNS INTERVIEW QUESTIONS
+================================================================================
+
+SCENARIO-BASED SYSTEM DESIGN + PATTERN RECOGNITION QUESTIONS
+
+================================================================================
+SCENARIO 1: Design a Ride-Sharing System (Uber-style)
+================================================================================
+
+QUESTION: Design the backend for a ride-sharing app supporting 10M daily rides.
+
+ANSWER FRAMEWORK:
+
+CLARIFY REQUIREMENTS:
+  - Functional: Request ride, match driver, track ride, process payment, rate driver
+  - Non-functional: < 3s to match driver, 99.99% payment reliability, real-time GPS
+  - Scale: 10M rides/day = ~116 rides/sec peak
+
+IDENTIFY SERVICES (Domain-Driven Decomposition):
+  1. User Service — registration, auth, profiles
+  2. Driver Service — driver onboarding, availability, location
+  3. Matching Service — match rider with nearest available driver
+  4. Ride Service — ride lifecycle (requested, in progress, completed)
+  5. Location Service — real-time GPS tracking, ETA calculation
+  6. Pricing Service — surge pricing, fare calculation
+  7. Payment Service — charge, refund, payout to drivers
+  8. Notification Service — push, SMS, email
+  9. Rating Service — post-ride ratings
+
+KEY DESIGN DECISIONS:
+
+Real-time location tracking:
+  Drivers send GPS every 5 seconds → high write throughput.
+  Use Redis Geo (sorted set with lat/long) for spatial queries.
+  "Find all drivers within 2km of (lat, lng)" → Redis GEORADIUS command.
+  Time-series location → Kafka for persistence, consumers update Redis.
+
+Matching algorithm:
+  Matching Service queries Redis Geo for nearby drivers.
+  Filters: driver available, driver accepted rating, car type.
+  Sends ride request to top N drivers (first to accept wins).
+  Uses Kafka for eventual assignment confirmation.
+
+Payment reliability:
+  Saga pattern: RideCompleted → charge rider → payout driver → update ride status.
+  Outbox pattern: ensure payment events published atomically.
+  Idempotency keys on every payment API call.
+
+Surge pricing:
+  Supply/demand ratio per geo zone.
+  Pricing Service subscribes to ride requests + driver availability events.
+  Updates surge multiplier in Redis (read by fare calculation).
+
+Architecture:
+  Rider App → API Gateway → [Ride Service, Location Service, Payment Service]
+  All services communicate via Kafka for state changes.
+  Redis: driver locations, surge prices, session caching.
+  PostgreSQL: orders, users, payments (ACID required).
+
+================================================================================
+SCENARIO 2: Design a Netflix-style Streaming Platform
+================================================================================
+
+QUESTION: Design a video streaming platform with recommendations.
+
+SERVICES:
+  1. Content Service — video metadata, catalog
+  2. Video Upload Service — encoding pipeline
+  3. Streaming Service — CDN-backed video delivery
+  4. User Service — accounts, subscriptions
+  5. Watch History Service — events, continuation
+  6. Recommendation Service — ML-powered suggestions
+  7. Search Service — full-text + faceted search
+  8. Notification Service — new releases, emails
+
+KEY TECHNICAL DECISIONS:
+
+Video storage and streaming:
+  Videos stored in S3/GCS after encoding to multiple bitrates (360p, 720p, 4K).
+  CDN (CloudFront/Akamai) for global delivery. Adaptive bitrate streaming (HLS).
+  Video Upload → Kafka → Encoding Service (multiple workers) → S3 → CDN.
+
+Watch history at scale:
+  1B+ events/day. Write-heavy. Cassandra (time-series, partition by user_id).
+  Continue watching: read latest watch event per video per user.
+  Partition key: (user_id). Clustering key: (watched_at DESC).
+
+Recommendation engine:
+  Offline: Spark ML job runs nightly, computes personalized recommendations.
+  Results stored in Redis (user_id → [videoIds]).
+  Real-time: User watches video → Kafka event → updates collaborative filtering model.
+  CQRS: Write model = events. Read model = recommendation cache.
+
+Search:
+  Elasticsearch for full-text search (title, description, cast).
+  Autocomplete with Edge N-gram tokenizer.
+  Content Service publishes events → Search indexer updates Elasticsearch.
+
+================================================================================
+SCENARIO 3: Design an E-commerce Checkout System
+================================================================================
+
+QUESTION: Design the checkout flow for an e-commerce platform (Amazon-scale).
+
+CHECKOUT FLOW:
+  1. Add to cart (Cart Service)
+  2. View cart + pricing (Price Service, Inventory check)
+  3. Enter shipping address (User Service)
+  4. Select payment method (Payment Method Service)
+  5. Place order (Order Service → Saga)
+  6. Order confirmation + email
+
+SAGA for order placement:
+  OrderService.placeOrder():
+    1. Create order (PENDING) + publish OrderCreated (Outbox)
+    2. PaymentService: authorize payment → PaymentAuthorized/PaymentFailed
+    3. InventoryService: reserve items → ItemsReserved/OutOfStock
+    4. OrderService: confirm order → publish OrderConfirmed
+    5. NotificationService: send confirmation email
+
+  Compensations:
+    If step 3 fails (OutOfStock) → PaymentService: release authorization
+    If step 2 fails (PaymentFailed) → OrderService: cancel order
+
+Inventory at scale:
+  Two-layer inventory check:
+  1. Soft reserve in Redis (fast, eventual): decrement Redis counter.
+     Allows immediate "in stock" feedback. Handle races.
+  2. Hard reserve in DB after order confirmed (ACID).
+  3. Redis synced from DB via CDC (Debezium) on inventory changes.
+
+Cart Service:
+  Redis for active carts (fast R/W, TTL for abandoned carts).
+  Cart events → Kafka → analytics, recommendations.
+
+Flash sale handling:
+  High concurrency on single product inventory.
+  Redis DECR is atomic: if DECR returns < 0, inventory exhausted.
+  Queue excess requests — Kafka consumer processes sequentially.
+  Rejection: return 409 with "product sold out."
+
+================================================================================
+SCENARIO 4: Design a Distributed Rate Limiter
+================================================================================
+
+QUESTION: Design a rate limiting system for an API gateway handling 1M req/sec.
+
+REQUIREMENTS:
+  - Per user: 100 req/sec
+  - Per API key: 1000 req/sec
+  - Globally across all gateway instances (10 instances)
+  - < 5ms overhead per request
+
+ALGORITHM CHOICE:
+  Token Bucket: tokens refill at fixed rate. Allow burst up to bucket size.
+  Best for API rate limiting — smooth burst handling.
+
+IMPLEMENTATION:
+
+  Single instance: In-memory (ConcurrentHashMap + AtomicLong). Not distributed.
+  
+  Distributed: Redis as central counter.
+  
+  Lua script for atomic token bucket in Redis:
+    local key = KEYS[1]                    -- "rate:user:42"
+    local rate = tonumber(ARGV[1])         -- 100 (tokens/sec)
+    local capacity = tonumber(ARGV[2])     -- 200 (burst capacity)
+    local now = tonumber(ARGV[3])          -- current timestamp
+    local requested = tonumber(ARGV[4])   -- tokens needed (usually 1)
+
+    local bucket = redis.call('hmget', key, 'tokens', 'last_refill')
+    local tokens = tonumber(bucket[1]) or capacity
+    local last_refill = tonumber(bucket[2]) or now
+
+    -- Refill tokens based on elapsed time
+    local elapsed = now - last_refill
+    tokens = math.min(capacity, tokens + elapsed * rate)
+
+    if tokens >= requested then
+      redis.call('hmset', key, 'tokens', tokens - requested, 'last_refill', now)
+      redis.call('expire', key, math.ceil(capacity / rate) + 1)
+      return 1  -- ALLOWED
+    else
+      return 0  -- DENIED
+    end
+
+  Lua script ensures atomicity (no race condition). Redis single-threaded.
+  Latency: < 1ms for Redis call on same network.
+
+Handling Redis failure:
+  Circuit breaker around Redis. On Redis failure: allow requests (fail open)
+  OR deny requests (fail closed). For API gateway: fail open preferred.
+
+================================================================================
+SCENARIO 5: Design a Notification Service
+================================================================================
+
+QUESTION: Design a notification service supporting email, SMS, push with 10M users.
+
+SERVICES:
+  Notification Service (orchestrator)
+  Email Service (SMTP, SendGrid)
+  SMS Service (Twilio)
+  Push Service (FCM, APNs)
+  Template Service (notification templates)
+  Preference Service (user notification preferences)
+
+DESIGN:
+
+Event-driven approach:
+  Any service publishes to Kafka: OrderConfirmed, PaymentFailed, ShipmentUpdate
+  Notification Service consumes all events, decides what notifications to send.
+
+  OrderConfirmedEvent → Notification Service:
+    1. Load user preferences (cache in Redis)
+    2. Check if user wants order confirmation emails
+    3. Load email template from Template Service
+    4. Render template with event data
+    5. Publish to email-queue Kafka topic
+  Email Service consumer → sends via SendGrid → updates delivery status
+
+Priority routing:
+  HIGH: SMS + Push (account security, fraud)
+  MEDIUM: Push + Email (order updates)
+  LOW: Email only (promotions, newsletters)
+
+At-scale email:
+  SendGrid handles 10M emails/day. Use batch sending API.
+  Separate Kafka partitions for priority tiers.
+  Email worker scales independently (KEDA based on Kafka lag).
+
+Template management:
+  Templates stored in DB. Cached in Redis.
+  Handlebars/Mustache for variable substitution.
+  A/B test notification templates.
+
+User preferences:
+  Stored in DB. Cached in Redis (with TTL).
+  User can opt out of each notification type.
+  GDPR: respect marketing consent.
+
+================================================================================
+PATTERN RECOGNITION GUIDE
+================================================================================
+
+"How do you ensure data consistency?" →
+  → Saga (choreography or orchestration) for distributed transactions
+  → Outbox pattern for reliable event publishing
+  → Idempotency keys for at-least-once consumers
+
+"How do you prevent cascading failures?" →
+  → Circuit Breaker (Resilience4j) for fast failure
+  → Bulkhead for thread isolation
+  → Timeout for bounded waiting
+  → Retry + backoff for transient failures
+
+"How do you handle high read traffic?" →
+  → CQRS: separate read model optimized for queries
+  → Redis caching for hot data
+  → CDN for static content
+  → Read replicas
+
+"How do you migrate from monolith?" →
+  → Strangler Fig: gradual extraction
+  → Anti-Corruption Layer: prevent model pollution
+  → Branch by abstraction: feature flag routing
+
+"How do you handle schema evolution?" →
+  → Additive changes (backward compatible)
+  → Schema registry with compatibility rules
+  → Event versioning (V1/V2)
+  → Expand-Contract DB migration
+
+"How do you handle real-time updates?" →
+  → WebSocket / SSE for long-lived connections
+  → Kafka for event streaming
+  → Redis Pub/Sub for lightweight fan-out
+  → gRPC server streaming for service-to-service
+
+"How do you test microservices?" →
+  → Unit tests (JUnit 5, Mockito) for business logic
+  → Contract tests (Pact) for API compatibility
+  → Integration tests (TestContainers) for DB/Kafka
+  → WireMock for HTTP stub dependencies
+  → Minimal E2E for critical paths
+
+================================================================================
+SYSTEM DESIGN INTERVIEW TIPS
+================================================================================
+
+1. CLARIFY REQUIREMENTS FIRST (2-3 minutes)
+   - Functional vs non-functional
+   - Scale numbers (users, transactions, data size)
+   - Consistency requirements (strong vs eventual)
+   - Read-heavy vs write-heavy
+
+2. ESTIMATE SCALE
+   - QPS = daily requests / 86400 (or / ~100,000 for easy math)
+   - Storage = events/day × avg event size
+   - Bandwidth = QPS × avg payload size
+
+3. IDENTIFY SERVICES (DDD)
+   - Each service = one bounded context
+   - 3-7 core services for any system
+   - Don't overdecompose initially
+
+4. CHOOSE COMMUNICATION PATTERN
+   - Query (needs immediate result) → REST/gRPC
+   - State change (can be async) → Kafka
+   - Real-time (live feed) → WebSocket / gRPC streaming
+
+5. IDENTIFY DATA PATTERNS
+   - Transactional writes → PostgreSQL
+   - High-speed reads → Redis
+   - Full-text search → Elasticsearch
+   - Time-series → InfluxDB/Cassandra
+   - Documents → MongoDB
+
+6. HANDLE FAILURE SCENARIOS
+   - What if Service X goes down?
+   - What if the DB is slow?
+   - What if Kafka lag builds up?
+   - Show circuit breakers, fallbacks, retries
+
+7. DISCUSS TRADEOFFS
+   - Strong consistency vs availability
+   - Latency vs throughput
+   - Simplicity vs flexibility
+   - Don't say "we'll use X everywhere" — show nuance
+
+================================================================================

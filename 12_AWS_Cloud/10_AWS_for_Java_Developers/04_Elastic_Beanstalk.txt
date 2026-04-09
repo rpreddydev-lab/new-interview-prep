@@ -1,0 +1,402 @@
+================================================================
+AWS FOR JAVA DEVELOPERS — ELASTIC BEANSTALK
+Complete Interview Preparation Guide
+================================================================
+
+1. ELASTIC BEANSTALK — OVERVIEW
+================================================================
+
+  Elastic Beanstalk is a PaaS (Platform as a Service) that manages the underlying 
+  infrastructure for deploying and scaling web applications.
+  
+  WHAT BEANSTALK MANAGES:
+  ┌─────────────────────────────────────────────────────────────┐
+  │  EC2 Instances + AMI selection                              │
+  │  Auto Scaling Group + scaling policies                      │
+  │  Application Load Balancer + target groups                  │
+  │  CloudWatch metrics + basic alarms                          │
+  │  Security Groups                                            │
+  │  OS patching + platform updates (optional)                  │
+  │  Health monitoring + notifications                          │
+  │  Log rotation + CloudWatch Logs integration                 │
+  └─────────────────────────────────────────────────────────────┘
+  
+  WHAT YOU CONTROL:
+  ┌─────────────────────────────────────────────────────────────┐
+  │  Application code (JAR/WAR/Docker)                          │
+  │  Environment variables                                      │
+  │  Instance type, min/max instance count                      │
+  │  RDS (optional, managed by you or Beanstalk)                │
+  │  VPC, subnets, security group rules                         │
+  │  HTTPS certificate (ACM)                                    │
+  │  Custom configuration via .ebextensions/                    │
+  └─────────────────────────────────────────────────────────────┘
+
+================================================================
+2. SUPPORTED PLATFORMS FOR JAVA
+================================================================
+
+  Platform          | Artifact | Notes
+  ──────────────────┼──────────┼────────────────────────────────
+  Java SE           | .jar     | Spring Boot executable JAR
+  Corretto 11/17/21 | .jar     | Amazon's OpenJDK distribution
+  Tomcat            | .war     | Traditional Java EE web apps
+  Docker            | Any      | Container with your own JDK
+  ──────────────────────────────────────────────────────────────
+  
+  // Spring Boot JAR is the most common choice
+  // package with: mvn clean package -DskipTests
+  // Deploy: application.jar (the executable JAR)
+
+================================================================
+3. ENVIRONMENT TYPES
+================================================================
+
+  ── WEB SERVER ENVIRONMENT ──────────────────────────────
+  
+  Purpose: HTTP web applications, REST APIs
+  
+  Architecture:
+  
+  Internet → Route 53 → ALB (optional, Beanstalk provisions)
+                              │
+                     ┌────────┴────────┐
+                     │ Auto Scaling    │
+                     │ ┌────┐ ┌────┐  │
+                     │ │EC2 │ │EC2 │  │
+                     │ └────┘ └────┘  │
+                     └─────────────────┘
+  
+  ── WORKER ENVIRONMENT ──────────────────────────────────
+  
+  Purpose: Background jobs, async processing
+  
+  Architecture:
+  
+  SQS Queue → Beanstalk Daemon → Your App (HTTP POST to localhost /path)
+  
+  Beanstalk's sqsd daemon:
+  - Polls SQS queue
+  - POSTs message body to http://localhost:80/your-endpoint
+  - If 200 response: deletes message from SQS
+  - If non-200 or timeout: message becomes visible again (retry)
+  
+  application.properties (Worker env):
+  server.port=5000
+  # sqsd daemon calls localhost:5000/process-order
+  
+  @RestController
+  public class WorkerController {
+      @PostMapping("/process-order")
+      public ResponseEntity<Void> process(@RequestBody Order order) {
+          orderService.process(order);
+          return ResponseEntity.ok().build(); // 200 → sqsd deletes from SQS
+      }
+  }
+  
+  Worker environment variable: 
+  AWS_BEANSTALK_SQSD_QUEUE_URL — the SQS queue URL being polled
+
+================================================================
+4. DEPLOYMENT POLICIES
+================================================================
+
+  ALL AT ONCE       Rolling          Rolling+Batch     Immutable        Blue/Green
+  ──────────────────────────────────────────────────────────────────────────────
+  Stop all → deploy  Update           Like Rolling but   Deploy all new   DNS swap to
+  to all at once     X% at a time,    launch new         instances in     new env
+                     brief downtime   batch first,       new ASG while
+                     per batch        never reduces      old still runs
+                     capacity
+  ──────────────────────────────────────────────────────────────────────────────
+  Fastest            Medium           Zero downtime      Zero downtime    Zero downtime
+  Has downtime       Brief downtime   Slightly slower    Safest rollback  Full isolation
+  Rollback: redeploy Rollback: redep  Rollback: redeploy Rollback: term.  Rollback: swap
+                                                         new instances    DNS back
+  ──────────────────────────────────────────────────────────────────────────────
+  Dev/Test           Non-critical     Production         Production       High-stakes
+                     prod             preferred          preferred        releases
+
+  DEPLOYMENT POLICY SELECTION:
+  - Dev/Test: All at Once (fastest, OK with downtime)
+  - Production APIs: Rolling with additional batch or Immutable
+  - High-stakes release with easy rollback: Blue/Green
+
+================================================================
+5. CONFIGURATION AND CUSTOMIZATION
+================================================================
+
+  ── ENVIRONMENT VARIABLES ──────────────────────────────
+  
+  Set in Beanstalk console, EB CLI, or .ebextensions:
+  
+  application.properties integration:
+  spring.datasource.url=${RDS_HOSTNAME}
+  spring.datasource.port=${RDS_PORT}
+  spring.datasource.username=${RDS_USERNAME}
+  spring.datasource.password=${RDS_PASSWORD}
+  
+  Custom variables (set in Beanstalk console):
+  MY_SERVICE_URL=https://api.internal.com
+  
+  @Value("${MY_SERVICE_URL}")
+  private String serviceUrl;
+
+  ── .ebextensions/ ──────────────────────────────────────
+  
+  Directory in your deployment ZIP (alongside JAR):
+  
+  .ebextensions/
+    01_java_options.config
+    02_packages.config
+    03_environment.config
+  
+  # .ebextensions/01_java_options.config
+  option_settings:
+    aws:elasticbeanstalk:application:environment:
+      SERVER_PORT: 5000
+      JAVA_TOOL_OPTIONS: "-Xmx512m -Xms256m"
+    
+    aws:autoscaling:asg:
+      MinSize: 2
+      MaxSize: 10
+    
+    aws:elasticbeanstalk:cloudwatch:logs:
+      StreamLogs: true
+      DeleteOnTerminate: false
+      RetentionInDays: 30
+    
+    aws:elb:loadbalancer:
+      CrossZone: true
+  
+  # .ebextensions/02_packages.config (install OS packages)
+  packages:
+    yum:
+      telnet: []
+      git: []
+  
+  # .ebextensions/03_custom_commands.config (run during deployment)
+  commands:
+    01_configure:
+      command: "echo 'Starting configuration'"
+  
+  container_commands:     # Run after application extracted, before app starts
+    migrate_db:
+      command: "java -jar db-migrate.jar"
+      leader_only: true   # Only run on one instance (not all)
+
+  ── PROCFILE ──────────────────────────────────────────
+  
+  # Procfile — customize how Beanstalk starts your application
+  web: java -jar application.jar --spring.profiles.active=prod
+
+================================================================
+6. EB CLI
+================================================================
+
+  # Install
+  pip install awsebcli
+  
+  # Initialize (creates .elasticbeanstalk/ directory)
+  eb init my-order-service \
+    --platform "Java 21 running on 64bit Amazon Linux 2023" \
+    --region us-east-1
+  
+  # Create environment
+  eb create production \
+    --instance-type t3.medium \
+    --min-instances 2 \
+    --max-instances 10 \
+    --cname order-service-prod \
+    --envvars SERVER_PORT=5000,SPRING_PROFILES_ACTIVE=prod
+  
+  # Deploy application (uses MANIFEST.MF or Procfile)
+  mvn clean package -DskipTests
+  eb deploy production
+  
+  # View environment status
+  eb status production
+  
+  # View recent logs
+  eb logs production
+  
+  # SSH into an EC2 instance
+  eb ssh production
+  
+  # View health
+  eb health production
+  
+  # Open application in browser
+  eb open production
+  
+  # Terminate environment (IRREVERSIBLE — deletes EC2, ALB, SGs)
+  eb terminate production
+  
+  # Environment variables
+  eb setenv SERVER_PORT=5000 SPRING_PROFILES_ACTIVE=prod
+  eb printenv
+
+================================================================
+7. RDS WITH ELASTIC BEANSTALK
+================================================================
+
+  Two options:
+  
+  1. Beanstalk-managed RDS (NOT recommended for production):
+     - RDS instance tied to Beanstalk environment
+     - Deleting environment DELETES the database
+     - Beanstalk injects RDS_HOSTNAME, RDS_PORT, RDS_USERNAME, RDS_PASSWORD env vars
+  
+  2. External RDS (recommended):
+     - Create RDS independently (via console, CDK, Terraform)
+     - Configure Security Group to allow Beanstalk's SG
+     - Inject connection string manually via environment variables
+     - RDS survives environment delete/rebuild
+  
+  ── EXTERNAL RDS SETUP ──────────────────────────────────
+  
+  application.yml:
+    spring:
+      datasource:
+        url: jdbc:postgresql://${DB_HOST}:${DB_PORT}/${DB_NAME}
+        username: ${DB_USERNAME}
+        password: ${DB_PASSWORD}
+        hikari:
+          maximum-pool-size: 10
+          minimum-idle: 2
+          connection-timeout: 30000
+  
+  # .ebextensions/database.config
+  option_settings:
+    aws:elasticbeanstalk:application:environment:
+      DB_HOST: mydb.cluster.us-east-1.rds.amazonaws.com
+      DB_PORT: 5432
+      DB_NAME: orders
+
+================================================================
+8. HEALTH MONITORING
+================================================================
+
+  HEALTH CHECK URL:
+  # .ebextensions/healthcheck.config
+  option_settings:
+    aws:elasticbeanstalk:application:
+      Application Healthcheck URL: /actuator/health
+  
+  Spring Boot Actuator with:
+  management.endpoint.health.show-details: never  # Don't expose internals
+  
+  ENHANCED HEALTH REPORTING:
+  - Beanstalk grades instances: Ok, Warning, Degraded, Severe, Unknown
+  - Check: HTTP status codes, app server log errors, CPU/RAM
+  
+  HEALTH COLORS:
+  Green  → All instances healthy
+  Yellow → Degraded performance
+  Red    → Severe — instances failing health checks
+  Grey   → Environment updating or no data
+
+================================================================
+9. WHEN TO CHOOSE BEANSTALK VS ALTERNATIVES
+================================================================
+
+  Service         | When to use
+  ────────────────┼────────────────────────────────────────────────────
+  EC2 (manual)    | Maximum control, custom OS, unique requirements
+  Beanstalk       | Spring Boot monolith, team wants PaaS simplicity,
+                  | familiar deployment (JAR/WAR), don't want Kubernetes
+  ECS/Fargate     | Containerized, multiple services, no K8s complexity,
+                  | per-task IAM roles, good scaling controls
+  EKS             | Already using Kubernetes, complex microservices,
+                  | multi-cloud strategy, advanced networking needs
+  Lambda          | Event-driven, sporadic traffic, stateless functions,
+                  | don't want to manage servers at all
+  ────────────────────────────────────────────────────────────────────
+  
+  Beanstalk sweet spot:
+  - Existing Spring Boot JAR/WAR you want to host quickly
+  - Team without Docker/K8s expertise
+  - Single-application monolith
+  - Want AWS to handle patching, scaling, load balancing
+
+================================================================
+10. INTERVIEW QUESTIONS
+================================================================
+
+Q: What is Elastic Beanstalk and what does it actually manage vs what you manage?
+A: Elastic Beanstalk is AWS's PaaS offering where you upload application code and 
+   AWS provisions and manages the supporting infrastructure automatically.
+   
+   Beanstalk CREATES and MANAGES:
+   - EC2 instances with the correct AMI for your platform (Java/Corretto/Tomcat)
+   - Auto Scaling Group with min/max instances and scaling triggers
+   - Application Load Balancer (optional, for multi-instance)
+   - Security Groups for instances and ALB
+   - CloudWatch alarms for basic health monitoring
+   - S3 bucket for application versions
+   - IAM instance profile (EC2 role to talk to AWS services)
+   
+   YOU control:
+   - Application code and dependencies
+   - Instance type, size (t3.micro, m5.large, etc.)
+   - Min/max instance count and scaling thresholds
+   - Environment variables (injected into the app)
+   - .ebextensions configuration files for customization
+   - Whether to use single instance (no ALB, dev) or load balanced (prod)
+   - HTTPS listener with ACM certificate
+   - VPC placement and subnet selection
+   
+   Beanstalk abstracts infrastructure complexity while still exposing all AWS 
+   resources — you can always view and modify the created EC2/ALB directly.
+
+Q: What's the difference between Rolling and Immutable deployment policies?
+A: Rolling: Updates instances in batches in-place.
+   - Takes existing EC2 instances, stops the old app version, deploys new version
+   - During deployment: X% of instances serve old version, X% serve new version
+   - Risk: If new version has a bug, some traffic already hit it before rollback
+   - Rollback: Must re-deploy the previous version
+   - Cost: No extra EC2 instances during deployment
+   
+   Immutable: Launches ALL new instances with new version, then swaps.
+   - Beanstalk starts a NEW Auto Scaling Group with new instances
+   - New instances get new version, pass health checks
+   - Then: doubles the instances briefly, moves traffic to new ones
+   - Then: terminates old instances
+   - Risk: Near zero — old instances untouched until new ones confirmed healthy
+   - Rollback: Terminate new instances (old ones still running) — instant
+   - Cost: Doubles instance count briefly during deployment
+   
+   For production: Immutable preferred. More expensive (brief 2x cost) but safest.
+   
+   Blue/Green (different from Rolling/Immutable): Creates an entirely separate 
+   Beanstalk environment (Blue), tests it, then does a CNAME swap in Route 53. 
+   Both environments run simultaneously. Rollback = swap CNAME back. This is the 
+   safest option for major releases where you want full environment isolation.
+
+Q: How would you deploy a Spring Boot application to Elastic Beanstalk in a CI/CD pipeline?
+A: Typical CodePipeline → Beanstalk deployment:
+   
+   Pipeline stages:
+   1. Source: CodeCommit/GitHub (trigger on push to main)
+   
+   2. Build (CodeBuild):
+      - buildspec.yml: mvn clean package -DskipTests
+      - Output: target/application.jar
+      - Package as ZIP: application.jar + .ebextensions/ + Procfile
+      
+   3. Deploy (Beanstalk action):
+      - Action Provider: AWS Elastic Beanstalk
+      - Application Name: order-service
+      - Environment Name: order-service-production
+      - Input artifact: the ZIP from Build stage
+   
+   Key best practices:
+   - Use immutable deployments in production (set in .ebextensions or environment config)
+   - Store sensitive configs in SSM Parameter Store, reference via environment variables
+   - Don't include RDS in the Beanstalk environment — keep it external
+   - Enable enhanced health reporting for better visibility
+   - Set health check URL to /actuator/health (Spring Boot Actuator)
+   - For blue/green: use two separate environments, CodePipeline with manual approval 
+     before CNAME swap
+
+================================================================

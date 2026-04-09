@@ -1,0 +1,222 @@
+================================================================
+  CACHE PROVIDERS — REDIS AND CAFFEINE/EHCACHE
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. PROVIDER COMPARISON
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Feature               | ConcurrentHashMap  | Caffeine           | Redis (Distributed)
+----------------------|--------------------|--------------------|-----------------------
+Location              | JVM heap           | JVM heap           | External server
+Shared across pods    | No                 | No                 | Yes
+Latency               | Nanoseconds        | Nanoseconds        | ~1ms (network)
+TTL support           | No                 | Yes                | Yes
+Eviction policies     | None               | LRU/LFU/TinyLFU   | LRU/LFU/volatile
+Survives restarts     | No                 | No                 | Yes (RDB/AOF)
+Max size control      | No                 | Yes (maximumSize)  | Yes (maxmemory)
+Serialization needed  | No                 | No                 | Yes (bytes)
+Use for               | Dev/testing        | Single instance    | Multi-instance/prod
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. REDIS CACHE CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+
+# application.yml
+spring:
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      password: secret
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 8
+          min-idle: 2
+
+@Configuration
+@EnableCaching
+public class RedisCacheConfig {
+
+    @Bean
+    public RedisCacheManager cacheManager(RedisConnectionFactory factory) {
+        // Default config: JSON serialization + 30 min TTL
+        RedisCacheConfiguration defaultConfig = RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofMinutes(30))
+            .serializeKeysWith(
+                RedisSerializationContext.SerializationPair.fromSerializer(new StringRedisSerializer()))
+            .serializeValuesWith(
+                RedisSerializationContext.SerializationPair.fromSerializer(
+                    new GenericJackson2JsonRedisSerializer()))
+            .disableCachingNullValues();
+
+        // Per-cache TTL overrides
+        Map<String, RedisCacheConfiguration> cacheConfigs = new HashMap<>();
+        cacheConfigs.put("products",
+            defaultConfig.entryTtl(Duration.ofHours(1)));
+        cacheConfigs.put("categories",
+            defaultConfig.entryTtl(Duration.ofHours(6)));
+        cacheConfigs.put("users",
+            defaultConfig.entryTtl(Duration.ofMinutes(10)));
+        cacheConfigs.put("rates",
+            defaultConfig.entryTtl(Duration.ofSeconds(30)));
+
+        return RedisCacheManager.builder(factory)
+            .cacheDefaults(defaultConfig)
+            .withInitialCacheConfigurations(cacheConfigs)
+            .transactionAware()          // syncs cache evict/put with @Transactional
+            .build();
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. REDIS SERIALIZATION — JACKSON
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+GenericJackson2JsonRedisSerializer stores the class type in JSON
+(so polymorphic types deserialize correctly):
+
+{
+  "@class": "com.example.Product",
+  "id": 1,
+  "name": "Widget",
+  "price": 9.99
+}
+
+Configure ObjectMapper for type inclusion:
+@Bean
+public GenericJackson2JsonRedisSerializer redisSerializer() {
+    ObjectMapper mapper = new ObjectMapper();
+    mapper.activateDefaultTyping(
+        mapper.getPolymorphicTypeValidator(),
+        ObjectMapper.DefaultTyping.NON_FINAL,
+        JsonTypeInfo.As.PROPERTY);
+    mapper.registerModule(new JavaTimeModule());
+    mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+    return new GenericJackson2JsonRedisSerializer(mapper);
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. CAFFEINE CACHE CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<dependency>
+    <groupId>com.github.ben-manes.caffeine</groupId>
+    <artifactId>caffeine</artifactId>
+</dependency>
+
+━ Option 1: YAML configuration (simple)
+
+spring:
+  cache:
+    type: caffeine
+    cache-names: products, categories, users
+    caffeine:
+      spec: maximumSize=500,expireAfterWrite=30m,recordStats
+
+━ Option 2: Programmatic configuration (per-cache settings)
+
+@Configuration
+@EnableCaching
+public class CaffeineCacheConfig {
+
+    @Bean
+    public CaffeineCacheManager cacheManager() {
+        CaffeineCacheManager manager = new CaffeineCacheManager();
+
+        // Different specs per cache
+        manager.registerCustomCache("products",
+            Caffeine.newBuilder()
+                .maximumSize(1000)
+                .expireAfterWrite(Duration.ofHours(1))
+                .expireAfterAccess(Duration.ofMinutes(30))
+                .recordStats()
+                .build());
+
+        manager.registerCustomCache("categories",
+            Caffeine.newBuilder()
+                .maximumSize(100)
+                .expireAfterWrite(Duration.ofHours(6))
+                .refreshAfterWrite(Duration.ofHours(1))   // async refresh
+                .build(key -> categoryRepository.findAll()));  // async loader
+
+        manager.registerCustomCache("rates",
+            Caffeine.newBuilder()
+                .maximumSize(50)
+                .expireAfterWrite(Duration.ofSeconds(30))
+                .build());
+
+        return manager;
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. CACHE STATISTICS AND MONITORING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Caffeine stats (exposed via Micrometer → Actuator → Prometheus)
+Caffeine.newBuilder()
+    .recordStats()   // enable stats collection
+    .build();
+
+# Enable cache metrics
+management:
+  endpoints:
+    web:
+      exposure:
+        include: caches, metrics
+
+# Access via Actuator:
+GET /actuator/caches               — lists all caches and their sizes
+GET /actuator/metrics/cache.gets   — hit/miss counts
+
+// Micrometer with Caffeine auto-exports:
+//   cache.gets (tag: result=hit|miss)
+//   cache.size
+//   cache.evictions
+//   cache.puts
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: How do you configure Redis as a Spring Boot cache provider?
+A: Add spring-boot-starter-data-redis, configure connection via
+   spring.data.redis.host/port/password. Define a RedisCacheManager @Bean
+   with RedisCacheConfiguration specifying TTL and serializer
+   (GenericJackson2JsonRedisSerializer for JSON). Use per-cache configs
+   for different TTL values. Spring Boot auto-configures a basic RedisCacheManager
+   if spring.cache.type=redis is set, but custom config gives more control.
+
+Q: Why must Redis-cached objects be serializable?
+A: Redis stores data as bytes. Spring must serialize Java objects to bytes before
+   storing and deserialize when reading. Without proper serialization, you get
+   SerializationException at runtime. Use GenericJackson2JsonRedisSerializer
+   for JSON (human-readable, compatible across language), or JdkSerializationRedisSerializer
+   (Java native, less portable). Ensure all cached types have a no-arg constructor
+   and no circular references.
+
+Q: What is the advantage of Caffeine over Ehcache for local caching?
+A: Caffeine is a modern high-performance local cache using the W-TinyLFU eviction
+   algorithm, which provides near-optimal cache hit rates. It supports:
+   expireAfterWrite (time-since-write TTL), expireAfterAccess (idle TTL),
+   refreshAfterWrite (async background refresh), async loading, and Micrometer
+   statistics integration. It is the recommended local cache for Spring Boot 3.x.
+
+Q: How do you set different TTLs for different caches with Redis?
+A: In the RedisCacheManager bean, call withInitialCacheConfigurations() passing
+   a Map<String, RedisCacheConfiguration>. Each entry sets per-cache configuration
+   including .entryTtl(Duration). The RedisCacheManager applies the matching
+   configuration when accessing a named cache, or falls back to the default.
+
+Q: What does transactionAware() mean on RedisCacheManager?
+A: When transactionAware() is enabled, cache put/evict operations are deferred
+   until the current @Transactional method commits. If the transaction rolls back,
+   the cache is not updated. This prevents writing to cache when the DB transaction
+   failed, avoiding stale/incorrect cached data.

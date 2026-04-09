@@ -1,0 +1,243 @@
+================================================================================
+ALERTING AND DASHBOARDS
+================================================================================
+
+ALERTING STRATEGY
+------------------
+Good alerts are actionable — they tell you WHAT is wrong and require action.
+Bad alerts are noise — they trigger on false positives or for known auto-healing issues.
+
+Alert on SYMPTOMS (user impact), not CAUSES (internal metrics):
+  ✓ "Error rate for checkout is above 5%" — user-facing symptom
+  ✗ "CPU usage > 80% on order-service-pod-abc" — internal metric, may not affect users
+
+SLO-Based Alerting (recommended):
+  Define SLOs (Service Level Objectives) and alert when you're at risk of breaching them.
+  Example: "99.9% of checkout requests complete in under 2 seconds"
+  Alert: "Error budget burn rate is 3× — will exhaust monthly budget in 8 days"
+
+────────────────────────────────────────────────────────────────────────────────
+
+PROMETHEUS ALERTING RULES
+===========================
+
+# prometheus-alerts.yaml
+groups:
+- name: order-service
+  rules:
+
+  # High error rate (SLO at risk)
+  - alert: OrderServiceHighErrorRate
+    expr: |
+      rate(http_server_requests_seconds_count{
+        job="order-service",
+        status=~"5.."
+      }[5m]) /
+      rate(http_server_requests_seconds_count{job="order-service"}[5m])
+      > 0.05
+    for: 2m          # Must be true for 2 minutes (avoid flapping)
+    labels:
+      severity: critical
+      service: order-service
+    annotations:
+      summary: "Order service error rate is {{ $value | humanizePercentage }}"
+      description: "The error rate for order-service has been above 5% for 2 minutes."
+      runbook: "https://wiki.example.com/runbooks/order-service-high-error-rate"
+
+  # High P99 latency
+  - alert: OrderServiceHighLatency
+    expr: |
+      histogram_quantile(0.99,
+        rate(http_server_requests_seconds_bucket{job="order-service"}[5m])
+      ) > 2
+    for: 5m
+    labels:
+      severity: warning
+      service: order-service
+    annotations:
+      summary: "Order service P99 latency is {{ $value }}s"
+      description: "P99 latency has been above 2 seconds for 5 minutes."
+
+  # Circuit breaker open
+  - alert: CircuitBreakerOpen
+    expr: resilience4j_circuitbreaker_state{name="paymentService"} == 1
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Circuit breaker {{ $labels.name }} is OPEN"
+      description: "Payment service circuit breaker has been open for 1 minute."
+
+  # High Kafka consumer lag
+  - alert: KafkaConsumerLagHigh
+    expr: kafka_consumer_lag{group="order-service"} > 10000
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Kafka consumer lag {{ $value }} messages"
+
+  # Pod memory usage
+  - alert: PodHighMemoryUsage
+    expr: |
+      container_memory_working_set_bytes{container="order-service"} /
+      container_spec_memory_limit_bytes{container="order-service"}
+      > 0.85
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Order service pod memory usage > 85%"
+
+────────────────────────────────────────────────────────────────────────────────
+
+ALERTMANAGER CONFIGURATION
+============================
+
+# alertmanager.yml
+global:
+  slack_api_url: 'https://hooks.slack.com/services/XXX'
+
+route:
+  group_by: ['alertname', 'service']
+  group_wait: 30s           # Wait 30s before firing (group related alerts)
+  group_interval: 5m        # Wait 5m before updating an existing group
+  repeat_interval: 4h       # Resend alert every 4h if still firing
+  receiver: 'slack-critical'
+
+  routes:
+  # Critical: PagerDuty (wake someone up)
+  - match:
+      severity: critical
+    receiver: 'pagerduty-critical'
+    continue: true  # Also send to Slack
+
+  # Warning: Slack only (no wake-up)
+  - match:
+      severity: warning
+    receiver: 'slack-warning'
+
+receivers:
+- name: 'slack-critical'
+  slack_configs:
+  - channel: '#alerts-critical'
+    send_resolved: true
+    title: '{{ .GroupLabels.alertname }}'
+    text: |
+      {{ range .Alerts }}
+      *Alert:* {{ .Annotations.summary }}
+      *Description:* {{ .Annotations.description }}
+      *Severity:* {{ .Labels.severity }}
+      *Runbook:* {{ .Annotations.runbook }}
+      {{ end }}
+
+- name: 'pagerduty-critical'
+  pagerduty_configs:
+  - service_key: '${PAGERDUTY_SERVICE_KEY}'
+    description: '{{ .GroupLabels.alertname }}: {{ .Annotations.summary }}'
+
+- name: 'slack-warning'
+  slack_configs:
+  - channel: '#alerts-warning'
+    send_resolved: true
+
+────────────────────────────────────────────────────────────────────────────────
+
+GRAFANA DASHBOARD ESSENTIALS
+================================
+
+Key dashboards every microservices system should have:
+
+1. SERVICE OVERVIEW DASHBOARD
+   - Request rate per service (rate graph)
+   - Error rate per service (with threshold line at SLO)
+   - P95 / P99 latency per service
+   - Active circuit breakers (table with status)
+
+2. JVM DASHBOARD
+   - Heap used vs max (gauge)
+   - GC pause time and frequency
+   - Thread count (live, daemon, peak)
+   - Loaded classes
+
+3. KUBERNETES CLUSTER DASHBOARD
+   - Pod resource usage (CPU, memory)
+   - Node resource usage
+   - Pod restarts count (>0 = problem)
+   - HPA scaling events
+
+4. KAFKA DASHBOARD
+   - Consumer lag per consumer group and topic
+   - Messages produced/consumed rate
+   - Broker metrics
+
+5. DATABASE DASHBOARD
+   - Active connections vs max pool
+   - Query latency P99
+   - Connection wait time
+   - Slow queries
+
+Dashboard as Code (Grafana JSON model or Grafonnet):
+  # Store dashboards in git:
+  # grafana/dashboards/order-service-overview.json
+  # Apply via Grafana provisioning:
+  apiVersion: 1
+  providers:
+  - name: Default
+    folder: Microservices
+    type: file
+    options:
+      path: /etc/grafana/dashboards
+
+────────────────────────────────────────────────────────────────────────────────
+
+SLI / SLO / SLA
+=================
+
+SLI (Service Level Indicator):
+  Quantitative measure of service behavior.
+  Example: "Percentage of requests completed in < 200ms"
+
+SLO (Service Level Objective):
+  Target value for an SLI.
+  Example: "99.5% of requests complete in < 200ms over 30 days"
+
+SLA (Service Level Agreement):
+  Legal/contractual commitment of an SLO.
+  Consequences if breached (refund, credits).
+  Example: "We guarantee 99.9% availability. If not, you get 10% credit."
+
+Error Budget:
+  Amount of allowed downtime/failures within the SLO.
+  SLO: 99.9% = 0.1% errors allowed = 43 minutes/month downtime budget.
+  If budget is exhausted → freeze deployments, focus on reliability.
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What makes a good alert vs a bad alert?
+A: Good: actionable, symptom-based (user impact), high signal-to-noise, includes
+   runbook. Bad: fires on internal metrics with no user impact (CPU%), triggers
+   frequently (noisy), fires on auto-healing events. Alert on symptoms first
+   (error rate, latency), add resource alerts only as supporting information.
+
+Q: What is an SLO and error budget?
+A: SLO (Service Level Objective) is a target reliability goal (e.g., 99.9%
+   availability). Error budget is the allowed failure budget (100% - SLO = 0.1%).
+   When error budget is exhausted, stop feature deployments and focus on
+   reliability. Balances reliability and feature velocity.
+
+Q: What is Alertmanager?
+A: Prometheus's alerting component. Receives alerts from Prometheus, deduplicates,
+   groups related alerts, applies routing rules, and sends to configured
+   receivers (Slack, PagerDuty, email). Handles alert inhibition and silencing.
+
+Q: How do you avoid alert fatigue?
+A: Alert on SLO-threatening symptoms (not causes). Use for: 2m+ duration to
+   avoid flapping. Group related alerts. Define different severities (critical:
+   PagerDuty, warning: Slack). Have runbooks for every alert. Review and remove
+   alerts that fire without requiring action.
+
+================================================================================

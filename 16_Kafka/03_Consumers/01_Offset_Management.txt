@@ -1,0 +1,295 @@
+================================================================================
+  KAFKA OFFSET MANAGEMENT
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHAT IS AN OFFSET?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+An offset is a unique, monotonically increasing integer that identifies
+the position of a record within a partition.
+
+  Partition 0: [offset 0] [offset 1] [offset 2] [offset 3] [offset 4] → ...
+  Consumer reads offset 0, 1, 2 → commits offset 3 (next to read)
+  On restart → consumer resumes from offset 3 (where it left off)
+
+Committed offset = the next offset the consumer will read after a restart.
+  - You commit offset N+1 (the NEXT record) not N (the current record)
+  - consumer.commitSync() commits the offset returned by the last poll() + 1
+  - consumer.commitSync(offsets) lets you commit a specific OffsetAndMetadata
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. __consumer_offsets TOPIC
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Consumer offsets are stored in a special internal Kafka topic: __consumer_offsets
+
+Properties:
+  - 50 partitions by default (offsets.topic.num.partitions)
+  - Replication factor: 3 (offsets.topic.replication.factor)
+  - Compacted topic: keeps only latest offset per (group, topic, partition)
+  - NOT for direct consumption by user applications
+
+Format:
+  Key:   <group.id, topic, partition>
+  Value: <offset, metadata, commit timestamp>
+
+Group Coordinator:
+  - The broker that "owns" the __consumer_offsets partition for a group
+  - Determined by: partition = abs(hash(group.id)) % 50
+  - That partition's leader broker is the group coordinator
+  - ALL offset commits for that group go to the group coordinator
+
+Viewing offsets (CLI):
+  kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+    --group my-group \
+    --describe
+
+  Output:
+  GROUP    TOPIC   PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG  CONSUMER-ID  HOST
+  my-group orders  0          1234            1240            6    ...          /10.0.0.1
+  my-group orders  1          5678            5678            0    ...          /10.0.0.2
+
+Resetting offsets (CLI):
+  # Reset to earliest (replay from beginning)
+  kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+    --group my-group \
+    --topic orders \
+    --reset-offsets \
+    --to-earliest \
+    --execute
+
+  # Reset to a specific offset
+  --to-offset 1000
+
+  # Reset to a specific timestamp
+  --to-datetime 2026-01-01T00:00:00.000
+
+  # Reset by shifting
+  --shift-by -100    # go back 100 messages
+
+  IMPORTANT: Consumer must NOT be running when resetting offsets
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. AUTO COMMIT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Config:
+  enable.auto.commit=true          (default)
+  auto.commit.interval.ms=5000     (default 5 seconds)
+
+Behavior:
+  - Background thread commits the last returned offset periodically
+  - First commit triggered after auto.commit.interval.ms since last commit
+  - Also committed synchronously on consumer.close()
+
+RISK — at-most-once delivery:
+  1. poll() returns records at offsets 100-199
+  2. Auto-commit fires → commits offset 200 (consumer will restart here)
+  3. Consumer crashes while processing record 150
+  4. Restart → reads from 200 → records 150-199 are SKIPPED (lost!)
+  
+  This means auto-commit gives AT-MOST-ONCE delivery:
+  messages may be committed before they're processed → possible loss on crash.
+
+RISK — at-least-once WITH auto-commit (subtle):
+  1. poll() returns records 100-199
+  2. Consumer processes all 100-199
+  3. Consumer crashes before next auto-commit fires
+  4. Restart → committed offset is still 100 → records 100-199 REPROCESSED (duplicate!)
+  
+  So auto-commit is actually at-least-once if you crash between processing and commit.
+
+Summary: auto-commit is appropriate for non-critical use cases where:
+  - Occasional message loss or duplicate is acceptable
+  - You want simple code (no manual offset management)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. MANUAL COMMIT — SYNCHRONOUS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+
+  while (true) {
+    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+    for (ConsumerRecord<String, String> record : records) {
+      processRecord(record); // process first
+    }
+    consumer.commitSync(); // then commit (blocks until coordinator acks)
+  }
+
+commitSync() behavior:
+  - Blocks the calling thread until the group coordinator acknowledges
+  - Commits ALL offsets across all assigned partitions up to last poll
+  - Retries on retriable errors (e.g., COORDINATOR_LOAD_IN_PROGRESS) automatically
+  - Throws non-retriable exceptions on unrecoverable errors
+
+Delivery guarantee: AT-LEAST-ONCE
+  - If crash between processing and commitSync() → reprocess on restart (duplicate)
+  - If crash after commitSync() → no reprocessing (offset committed)
+  - Handle duplicates at the application layer (idempotent processing)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. MANUAL COMMIT — ASYNCHRONOUS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  consumer.commitAsync((offsets, exception) -> {
+    if (exception != null) {
+      log.error("Failed to commit offsets: {}", offsets, exception);
+    }
+  });
+
+commitAsync() behavior:
+  - Non-blocking: fires commit request and returns immediately
+  - Callback invoked when commit succeeds or fails
+  - DOES NOT retry on failure (unlike commitSync)
+    → A failed async commit may leave offsets uncommitted until the next commit
+    → This is intentional: retrying could cause out-of-order offset commits
+       (e.g., commit for batch 2 succeeds, commit for batch 1 (retry) arrives later
+        and moves offset BACKWARDS)
+
+Best practice: combine async + sync:
+  try {
+    while (true) {
+      ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+      process(records);
+      consumer.commitAsync(); // normal path: fast, non-blocking
+    }
+  } catch (WakeupException e) {
+    // shutdown
+  } finally {
+    try {
+      consumer.commitSync(); // shutdown path: ensure last commit is durable
+    } finally {
+      consumer.close();
+    }
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. PER-RECORD COMMIT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For maximum reliability (at the cost of more broker requests):
+
+  for (ConsumerRecord<String, String> record : records) {
+    try {
+      processRecord(record);
+      
+      // Commit after EACH record
+      Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();
+      offsets.put(
+        new TopicPartition(record.topic(), record.partition()),
+        new OffsetAndMetadata(record.offset() + 1, "no metadata")
+      );
+      consumer.commitSync(offsets);
+      
+    } catch (ProcessingException e) {
+      log.error("Failed to process record at offset {}", record.offset(), e);
+      // Don't commit → record will be reprocessed
+    }
+  }
+
+Trade-offs:
+  - More reliable: at most 1 record will be reprocessed on crash
+  - More expensive: N commitSync() calls vs 1 per poll batch
+  - Throughput drops significantly
+  - Use only for very critical records where each message matters individually
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. STORING OFFSETS EXTERNALLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For exactly-once semantics (at the application layer), store offsets in the
+same transactional store as your processing results.
+
+Pattern:
+  // In a DB transaction:
+  BEGIN TRANSACTION
+    processRecord(record, dbConnection)  // write result to DB
+    saveOffset(topic, partition, offset + 1, dbConnection)  // save offset to DB
+  COMMIT TRANSACTION
+  // No offset commit to Kafka needed (or commit best-effort)
+
+On restart:
+  1. Query DB for last committed offset per partition
+  2. consumer.assign() specific partitions
+  3. consumer.seek() to the stored offset
+  4. Resume processing from exactly where you left off
+
+This achieves true exactly-once at the application layer without Kafka transactions.
+Used by: database change processors, exactly-once ETL pipelines.
+
+ConsumerRebalanceListener with external offset store:
+  consumer.subscribe(Arrays.asList("orders"), new ConsumerRebalanceListener() {
+    public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
+      saveOffsetsToDb(partitions, consumer); // flush current offsets to DB
+    }
+    public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
+      for (TopicPartition tp : partitions) {
+        long offset = getOffsetFromDb(tp); // restore offset from DB
+        consumer.seek(tp, offset);
+      }
+    }
+  });
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. auto.offset.reset
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This config determines what happens when a consumer joins a group but has no
+committed offset for a partition (new group or the committed offset was deleted).
+
+  auto.offset.reset=latest (DEFAULT)
+    - Consumer reads from the END of the log (LEO)
+    - Only sees messages produced AFTER the consumer starts
+    - Risk: if consumer is down during a burst of messages, those are MISSED
+    - Use for: consumers that only need real-time (fresh) data
+
+  auto.offset.reset=earliest
+    - Consumer reads from the BEGINNING (offset 0)
+    - Replays ALL history from the start of retention
+    - Use for: new consumer groups that need to process historical data
+               replay scenarios, initial loads
+
+  auto.offset.reset=none
+    - Throws NoOffsetForPartitionException if no committed offset found
+    - Use for: strict operations where you must explicitly manage offsets
+               alert if consumer runs without a prior commit (unexpected state)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: Why is enable.auto.commit=false recommended for production?
+A: Auto-commit fires on a timer, possibly committing offsets for records not yet
+   processed. If the consumer crashes after commit but before processing, those
+   records are lost (at-most-once). Manual commit (after processing) gives
+   at-least-once: a crash before commit means reprocessing, but no data loss.
+
+Q: What is the difference between commitSync and commitAsync?
+A: commitSync blocks until the coordinator confirms the commit (retries on error,
+   slower). commitAsync fires-and-forgets with a callback — faster but doesn't
+   retry. Best practice: use commitAsync in the normal poll loop for performance,
+   and commitSync in the finally block (shutdown) to ensure the last batch is
+   committed before closing.
+
+Q: What happens when you commit offset N for a partition?
+A: You commit N as "the next offset to read". On restart, the consumer will fetch
+   from offset N onwards. If you processed record 999 (offset 999), you commit
+   1000. Committing the CURRENT offset (999) instead of 1000 would cause record
+   999 to be re-read on restart.
+
+Q: How can you achieve exactly-once consumption in Kafka?
+A: True exactly-once requires storing the Kafka offset and the processing result
+   ATOMICALLY in the same transaction. For example: process record → write result
+   to database → update offset in the SAME database transaction. On crash+restart,
+   read the offset from the database and seek to it. This ensures the operation
+   happened exactly once even if Kafka replays the record.
+
+Q: What is auto.offset.reset and when does it apply?
+A: auto.offset.reset determines the starting position when a consumer has NO
+   committed offset (new group or offset expired). "earliest" starts from offset 0
+   (full replay). "latest" starts from the log end (new messages only). "none"
+   throws an exception. It does NOT affect consumers with an existing committed
+   offset — it only matters the first time a group reads a partition.

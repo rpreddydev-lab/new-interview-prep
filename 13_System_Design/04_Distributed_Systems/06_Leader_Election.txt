@@ -1,0 +1,149 @@
+================================================================
+LEADER ELECTION
+================================================================
+
+WHAT IS LEADER ELECTION?
+--------------------------
+In many distributed systems, one node needs to be designated as the
+"leader" (or "primary") — the single node that:
+  - Coordinates distributed transactions
+  - Holds the singleton lock
+  - Accepts all writes (in leader-based replication)
+  - Runs scheduled jobs (only one instance should run a cron job)
+  - Makes cluster-wide decisions
+
+The challenge: Nodes fail. The network partitions. We need to
+reliably agree on exactly one leader at any time.
+
+WHY IS THIS HARD?
+  - A node may appear dead (network partition) but actually still be alive.
+  - If we elect two leaders ("split brain"), data corruption can result.
+  - We must guarantee: at most one leader is active at any time (safety).
+  - We also want: a new leader elected quickly when old one fails (liveness).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+APPROACH 1: RAFT-BASED ELECTION (Best Practice)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Use a Raft-based coordination service (etcd, ZooKeeper, Consul).
+These provide strongly consistent primitives on top of consensus.
+
+etcd-based leader election:
+  1. Each node tries to acquire a lease key in etcd with a TTL.
+  2. The first node to successfully create the key becomes leader.
+  3. Leader periodically renews the lease (heartbeat to etcd).
+  4. If leader fails to renew → lease expires → other nodes compete.
+  5. First node to acquire the key becomes new leader.
+  
+  etcd provides compare-and-swap (CAS): only creates key if it doesn't exist.
+  This is atomic; only one node wins even with concurrent attempts.
+  
+  Leader detection: Other nodes watch the key; on deletion → trigger re-election.
+  
+  Safety: etcd uses Raft internally → at most one node holds the key at any time.
+
+Tools using etcd for leader election:
+  Kubernetes controller manager, scheduler (use etcd leader election)
+  Patroni (PostgreSQL HA manager)
+  Various custom microservices
+
+ZooKeeper ephemeral nodes:
+  Similar to etcd leases.
+  Nodes create ephemeral znodes. Ephemeral znodes auto-delete when session dies.
+  Leader = node that created a specific znode.
+  Others watch the znode; when it disappears → re-election.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+APPROACH 2: BULLY ALGORITHM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Classic distributed systems algorithm (not used in production today).
+Each node has a unique ID. Highest-ID node wins.
+
+PROCESS:
+  1. Node X notices leader has failed (timeout on heartbeat).
+  2. X sends ELECTION message to all nodes with higher ID.
+  3. If nobody responds → X becomes leader. Announces COORDINATOR message.
+  4. If a higher-ID node responds → X backs off.
+  5. Higher-ID node repeats the process until the highest-alive node wins.
+
+Problems:
+  ✗ O(N²) messages in worst case
+  ✗ New highest node always wins, even if it was recently unreliable
+  ✗ Doesn't handle partitions well
+
+RING ELECTION:
+  Nodes arranged in a logical ring.
+  Election message passed around ring with candidate's ID.
+  Each node appends its ID if higher than current candidate's ID.
+  When message returns to initiator with a winner → announce coordinator.
+  
+  Better message complexity: O(N) messages.
+  Still not used in production; Raft is better.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+APPROACH 3: LEASE-BASED ELECTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A lease is a time-limited authorization to act as leader.
+The leader must continuously renew its lease.
+If the leader fails to renew → lease expires → other nodes elect new leader.
+
+CHUBBY (Google's distributed lock service):
+  Cell of 5 replicas running Paxos consensus.
+  Clients acquire leases on files (locks).
+  Application services use Chubby for leader election and config.
+  
+  Lease length: typically 10-20 seconds.
+  Leader must renew lease every ~5 seconds to avoid expiry.
+  
+  On lease expiry: other nodes race to acquire the lease.
+  Guaranteed: no two nodes hold the same lock simultaneously.
+
+KEY CHALLENGE: CLOCK SKEW
+  Lease relies on wall-clock time. If leader's clock runs slow,
+  it may continue acting as leader after lease expires.
+  Solution: Leader should stop acting as leader slightly before lease
+  expiry, giving time for a new one to be elected safely.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FENCING TOKENS (Preventing Stale Leaders)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Problem: Stale leader (GC pause, slow network):
+  1. Leader 1 holds lease.
+  2. Leader 1 pauses for GC for 30 seconds.
+  3. Lease expires. Node 2 becomes Leader.
+  4. Node 2 writes data as new leader.
+  5. Leader 1 resumes (GC pause ends). Thinks it's still leader.
+  6. Leader 1 also writes data → conflict!
+
+Solution: Fencing Tokens
+  When acquiring a lock/lease, client gets a monotonically increasing TOKEN.
+  Token 1 → Leader 1
+  Token 2 → Leader 2 (after re-election)
+  
+  Leader includes token in all write requests to storage.
+  Storage REJECTS writes with a token older than the last seen token.
+  
+  Leader 1 (with token 1) tries to write → storage has seen token 2 → REJECTED.
+  Leader 2 (with token 2) writes → accepted.
+
+This prevents split-brain data corruption.
+Use in: Distributed caches, distributed file systems, DB writes.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IN INTERVIEWS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"How would you ensure only one instance of your job scheduler runs?"
+  Answer: Use a distributed lock via etcd or Redis with SETNX + TTL.
+          Instance acquiring the lock runs the job.
+          Lock has TTL (auto-expires if instance crashes).
+          Use fencing tokens to prevent stale leaders from causing damage.
+
+"How does Kubernetes elect a leader for its controllers?"
+  Answer: Uses etcd. The controller-manager and scheduler use a leader
+          election library that acquires a lease object in etcd.
+          Only the leader processes events; others stand by.
+          On failure: lease expires in N seconds, others race to acquire.

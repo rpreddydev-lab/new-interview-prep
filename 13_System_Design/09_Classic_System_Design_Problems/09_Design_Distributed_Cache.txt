@@ -1,0 +1,260 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DESIGN: DISTRIBUTED CACHE (LIKE REDIS / MEMCACHED)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FUNCTIONAL:
+  - GET(key) → value | null
+  - PUT(key, value, ttl)
+  - DELETE(key)
+  - TTL-based expiry (keys auto-expire after TTL)
+  - Eviction when memory full (configurable policy: LRU, LFU)
+  - Store arbitrary binary values (strings, serialized objects)
+  - Atomic operations: GET-SET, increment, compare-and-set
+
+NON-FUNCTIONAL:
+  - Latency: p99 < 1ms reads, < 1ms writes
+  - Throughput: 1M operations/second per cluster
+  - Memory: 1TB total cache storage (sharded across nodes)
+  - High availability: reads survive single node failure
+  - Partition tolerance: no split-brain (or detect and handle it)
+  - Data scale: 1B keys, each key-value up to 1MB (avg 1KB)
+
+SIZE:
+  1TB total / 8 nodes = 128GB per node
+  128GB / 1KB avg key-value = 128M keys per node
+  Total: 128M × 8 = 1B keys
+
+
+2. ARCHITECTURE OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Clients (application servers)
+       │
+  ┌────▼──────────────────────────────────────────────────┐
+  │  Client-side Routing Library (consistent hash ring)   │
+  │  - Given key, compute target cache node               │
+  │  - Direct connection to that node                     │
+  └────┬────────────────────────────────────────┬─────────┘
+       │                                        │
+  ┌────▼────────────────────┐  ┌────────────────▼────────┐
+  │  Cache Node 1           │  │  Cache Node 2           │
+  │  In-memory hash table   │  │  In-memory hash table   │
+  │  LRU eviction list      │  │  LRU eviction list      │
+  │  Replica of Node 3      │  │  Replica of Node 4      │
+  └─────────────────────────┘  └─────────────────────────┘
+        ... (8 total nodes)
+
+NO PROXY IN HOT PATH:
+  Client library does consistent hash → direct connection to cache node
+  No routing server (single point of failure, latency hop)
+  Alternative: Redis Cluster uses gossip protocol + MOVED redirects
+
+
+3. CONSISTENT HASHING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROBLEM: How to distribute keys across N nodes such that adding/removing
+         a node only remaps ~1/N of keys?
+
+NAIVE APPROACH: hash(key) % N
+  Node removed: N-1 nodes → almost ALL keys remap → cache miss storm!
+
+CONSISTENT HASH RING:
+  1. Hash space: 0 to 2^32 arranged as a ring
+  2. Each node placed at one position on the ring (hash of node hostname)
+  3. Each key mapped to the first node clockwise from hash(key)
+  
+  Ring positions:
+    Node A: 10
+    Node B: 30
+    Node C: 60
+    Node D: 90
+  
+  Key "user:123" → hash = 25 → clockwise → Node B (at 30)
+  Key "product:789" → hash = 55 → clockwise → Node C (at 60)
+  
+  Node B removed:
+    Only keys between Node A (10) and Node B (30) remap to Node C
+    = ~25% of keys remapped (vs ~100% with modulo hashing)
+
+VIRTUAL NODES (VNODES):
+  Problem: Few physical nodes → uneven distribution
+  Solution: Each physical node gets 100-150 virtual positions on the ring
+  
+  Node A → positions: 7, 23, 41, 67, 89, ... (150 positions)
+  Node B → positions: 14, 38, 55, 78, 92, ... (150 positions)
+  
+  Benefits:
+    - Even distribution across nodes (each has ~equal key share)
+    - Gradual redistribution when node added/removed
+    - Used by Cassandra, DynamoDB, Amazon Dynamo paper
+
+
+4. STORAGE ENGINE — IN-MEMORY HASH TABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+HASH TABLE IMPLEMENTATION:
+  Array of buckets with chaining (linked list for collision)
+  Load factor: 0.75 (resize when 75% full)
+  
+  Each Entry:
+    struct CacheEntry {
+      string key;
+      bytes  value;
+      int64  expiry_timestamp;  // 0 = no expiry
+      CacheEntry* lru_prev;     // for LRU list
+      CacheEntry* lru_next;
+    }
+  
+  Hash map: key → CacheEntry*
+
+TTL EXPIRY (LAZY + ACTIVE):
+  LAZY: On GET(key), check expiry_timestamp. If expired: delete, return null.
+  ACTIVE: Background thread scans 20 random keys/second, deletes expired ones.
+          (Redis's actual approach — avoids scanning all keys)
+
+EVICTION WHEN MEMORY FULL:
+  If memory > threshold, evict entries to free space before inserting.
+
+LRU (Least Recently Used) Eviction:
+  Maintain doubly-linked list ordered by recency
+  HEAD = most recently used, TAIL = least recently used
+  On GET: move accessed entry to HEAD
+  On eviction: remove from TAIL
+  
+  Implementation: HashMap + DoublyLinkedList
+    HashMap: O(1) key lookup → returns node pointer
+    LinkedList: O(1) move-to-front, O(1) remove-tail
+  
+  class LRUCache:
+    def get(key):
+      if key not in map: return null
+      node = map[key]
+      if node.expired(): delete and return null
+      move_to_front(node)          # O(1)
+      return node.value
+    
+    def put(key, value, ttl):
+      if map full: evict tail      # O(1)
+      node = CacheEntry(key, value, ttl)
+      map[key] = node
+      add_to_front(node)           # O(1)
+
+LFU (Least Frequently Used) Eviction:
+  Evict entry accessed least number of times
+  More complex: need frequency counter + doubly-linked list of freq buckets
+  Better than LRU for: stable hot data (same keys accessed repeatedly)
+
+
+5. REPLICATION FOR HIGH AVAILABILITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TOPOLOGY: 1 Leader + 1 Follower per shard (replication factor 2)
+  
+  Shard 1: Leader = Node1, Follower = Node2
+  Shard 2: Leader = Node3, Follower = Node4
+
+WRITE PATH: Write to leader only
+  Leader replicates to follower asynchronously
+  (Synchronous replication doubles write latency — not acceptable for cache)
+
+READ PATH: Options
+  Read from leader only:    STRONG consistency, leader bears all read load
+  Read from any replica:    EVENTUAL consistency, distributes read load, stale reads possible
+  Redis default: leader only reads (replica reads opt-in with REPLICA READ commands)
+
+LEADER FAILURE:
+  Follower detected via heartbeat (no heartbeat in 10 seconds → leader dead)
+  Follower promoted to leader (automatic, no manual intervention)
+  Client library: on connection refused → retry follower
+  Recovery: ~10 second downtime during leader failover
+  This is acceptable for cache (cache miss → go to DB) but not for DB
+
+CACHE MISS ON FAILOVER:
+  During leader switch: all keys of that shard are temporarily unavailable
+  Client: catch exception → go to backing database
+  This is fine: cache is not the source of truth; DB remains consistent
+
+
+6. WRITE POLICIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WRITE-THROUGH: Write to cache AND database simultaneously
+  Pros: Cache always consistent with DB (no stale reads after write)
+  Cons: Write latency = max(cache_write, DB_write) → slower writes
+  Use for: read-heavy workloads where consistency matters
+
+WRITE-BACK (WRITE-BEHIND): Write to cache, async write to DB later
+  Pros: Very low write latency (just cache write)
+  Cons: Data loss if cache node fails before DB flush!
+  Use for: metrics/analytics (some loss acceptable), write-heavy workloads
+
+WRITE-AROUND: Write directly to DB, skip cache
+  Cache filled on first read (read-through)
+  Pros: Avoids caching infrequently-accessed writes
+  Cons: First read is a cache miss (slightly higher latency)
+  Use for: large files, backup data (write-once, read-rarely)
+
+CACHE-ASIDE (MOST COMMON): Application manages cache
+  Read: check cache → if miss → read DB → populate cache
+  Write: write DB → delete/invalidate cache key
+  
+  Why DELETE (not update) cache on write?
+    If you update cache: race condition if another write happens concurrently
+    If you delete cache: next read fetches fresh value from DB
+    Delete = simpler, safer, preferred in distributed systems
+
+
+7. HOT KEY PROBLEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROBLEM: Key "product:super-bowl-ad-product" gets 1M reads/second
+         All requests routed to ONE cache node → that node overwhelmed
+
+SOLUTIONS:
+
+1. LOCAL IN-PROCESS CACHE (L1):
+   Each application server caches top hot keys locally (in-process)
+   No network hop at all. 1M requests/second split across 100 app servers = 10K/server
+   Limitation: stale data possible until TTL expires (10-30 seconds acceptable)
+
+2. KEY REPLICATION:
+   Store hot key on N nodes: "product:123:replica0", "product:123:replica1", ...:replicaN
+   On read: client randomly picks a replica
+   Load spread across N nodes
+   On write: update all replicas (or use short TTL + refresh)
+
+3. ADD JITTER TO TTL:
+   All replicas of key expire at same time → thundering herd
+   Fix: TTL = base_ttl + random(0, 10% of base_ttl)
+   Staggered expiry prevents simultaneous DB load
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWER — "How would you design a distributed cache?"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"The core components are: a consistent hash ring for key distribution,
+in-memory LRU hash tables per node, and replication for HA.
+
+Consistent hashing with virtual nodes ensures adding/removing nodes
+only remaps ~1/N of keys (not all keys like modulo hashing). Each physical
+node gets 150 virtual positions on the ring for even distribution.
+
+Each node's storage is a HashMap plus doubly-linked list for O(1) LRU
+eviction. TTL expiry is lazy on access plus a background thread doing
+probabilistic active expiry (checking 20 random keys/second).
+
+For replication: leader-follower per shard, async replication to minimize
+write latency. On leader failure, follower promotes automatically; clients
+see cache misses during the ~10-second window and fall back to the database.
+
+For hot keys: the most effective solution is L1 in-process caching in
+each application server. The hot key is cached locally, splitting
+1M requests/second across 100 app servers to 10K/server — no bottleneck.
+
+Write policy: cache-aside pattern. On DB write, delete the cache key
+(don't update it). This avoids race conditions between concurrent writes
+and keeps the implementation simple."

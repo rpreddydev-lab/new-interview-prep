@@ -1,0 +1,311 @@
+================================================================================
+FALLBACK PATTERN
+================================================================================
+
+WHAT IS THE FALLBACK PATTERN?
+------------------------------
+The Fallback pattern provides an alternative response when a service call fails.
+Instead of propagating the failure up the call chain, a "good enough" alternative
+response is returned.
+
+Goal: Graceful degradation — maintain partial functionality rather than complete failure.
+
+────────────────────────────────────────────────────────────────────────────────
+
+TYPES OF FALLBACK RESPONSES
+=============================
+
+1. STATIC FALLBACK (Default Value)
+   Return a hardcoded default value.
+   Use when: Predictable safe default exists.
+
+   Example:
+   - Can't reach recommendation service → return empty list []
+   - Can't load user preferences → return default settings
+   - Can't get exchange rate → return last cached rate with warning
+
+2. CACHED DATA FALLBACK
+   Return previously cached successful response.
+   Use when: Stale data is better than no data.
+
+   Example:
+   - Price service is down → return last known price (cached 5 min ago)
+   - Inventory service is slow → return cached stock count
+   - User profile service down → return cached profile from Redis
+
+3. FAIL SILENT
+   Return null / empty response without error.
+   Use when: The feature is entirely optional.
+
+   Example:
+   - Analytics event tracking fails → ignore (don't fail the main request)
+   - Non-critical audit log write fails → continue
+
+4. STUB RESPONSE
+   Return a placeholder/degraded response.
+   Use when: Full response unavailable but partial is useful.
+
+   Example:
+   - Payment service returns: { "status": "PENDING", "message": "Processing delayed" }
+   - Recommendation service returns generic top-selling items
+
+5. FAIL FAST WITH ERROR
+   Return an immediate error response.
+   Use when: Operation is critical and no degraded alternative exists.
+
+   Example:
+   - Authentication service is down → 503 Service Unavailable
+   - Can't determine user identity → must fail (security critical)
+
+────────────────────────────────────────────────────────────────────────────────
+
+FALLBACK IN RESILIENCE4J
+==========================
+
+@CircuitBreaker FALLBACK:
+  @Service
+  public class RecommendationService {
+
+    @CircuitBreaker(name = "recommendationCB", fallbackMethod = "defaultRecommendations")
+    @Retry(name = "recommendationRetry", fallbackMethod = "defaultRecommendations")
+    public List<ProductDTO> getRecommendations(Long userId) {
+      return recommendationClient.getPersonalized(userId);
+    }
+
+    // Fallback for Circuit Breaker
+    public List<ProductDTO> defaultRecommendations(Long userId, CallNotPermittedException ex) {
+      log.info("CB open, returning cached recommendations for user {}", userId);
+      return getTopSellingProducts();  // static/cached fallback
+    }
+
+    // Fallback for Retry exhaustion (and CB) — Exception catches all
+    public List<ProductDTO> defaultRecommendations(Long userId, Exception ex) {
+      log.warn("Recommendations failed for user {}: {}", userId, ex.getMessage());
+      return cacheService.getOrDefault("top-products", Collections.emptyList());
+    }
+
+    private List<ProductDTO> getTopSellingProducts() {
+      return productRepository.findTop10ByOrderBySalesCountDesc()
+        .stream()
+        .map(ProductDTO::from)
+        .collect(Collectors.toList());
+    }
+  }
+
+FALLBACK METHOD RULES:
+  1. Same return type as the original method
+  2. Additional last parameter: Throwable (or specific exception type)
+  3. Method must be in the same class
+  4. Can chain fallbacks (if fallback also fails)
+  5. Priority: most specific exception type → most generic (Exception/Throwable)
+
+FALLBACK METHOD OVERLOADING (by exception type):
+  public List<ProductDTO> defaultRecommendations(Long userId, 
+                                                   TimeoutException ex) {
+    // Specific handling for timeout — return stale cache
+    return cacheService.get("recommendations:" + userId).orElse(emptyList());
+  }
+
+  public List<ProductDTO> defaultRecommendations(Long userId, 
+                                                   BulkheadFullException ex) {
+    // Bulkhead full — return static popular items (fast response)
+    return STATIC_POPULAR_ITEMS;
+  }
+
+  public List<ProductDTO> defaultRecommendations(Long userId, Exception ex) {
+    // All other failures — generic fallback
+    return Collections.emptyList();
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+FALLBACK WITH FEIGN + FACTORY
+================================
+Feign FallbackFactory provides the cause exception:
+
+  @FeignClient(name = "inventory-service", 
+               fallbackFactory = InventoryFallbackFactory.class)
+  public interface InventoryClient {
+    @GetMapping("/api/v1/inventory/{productId}")
+    InventoryResponse getInventory(@PathVariable Long productId);
+
+    @PostMapping("/api/v1/inventory/reserve")
+    ReservationResponse reserve(@RequestBody ReservationRequest request);
+  }
+
+  @Component
+  @Slf4j
+  public class InventoryFallbackFactory implements FallbackFactory<InventoryClient> {
+    
+    @Autowired
+    private InventoryCache inventoryCache;
+
+    @Override
+    public InventoryClient create(Throwable cause) {
+      return new InventoryClient() {
+
+        @Override
+        public InventoryResponse getInventory(Long productId) {
+          log.warn("Inventory service unavailable for productId={}: {}",
+              productId, cause.getMessage());
+
+          // Try cache first
+          return inventoryCache.get(productId)
+            .map(cached -> InventoryResponse.fromCache(cached, true))
+            .orElse(InventoryResponse.unknown(productId));
+        }
+
+        @Override
+        public ReservationResponse reserve(ReservationRequest request) {
+          // Reservation is critical — fail with clear error
+          log.error("Cannot reserve inventory: {}", cause.getMessage());
+          throw new ServiceUnavailableException("Inventory service unavailable");
+        }
+      };
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+CACHE-BASED FALLBACK PATTERN
+================================
+
+Implement a cache-aside pattern with fallback:
+
+  @Service
+  public class PricingService {
+    
+    @Autowired private PricingClient pricingClient;
+    @Autowired private RedisTemplate<String, BigDecimal> redisTemplate;
+    
+    private static final Duration CACHE_TTL = Duration.ofMinutes(5);
+    private static final String CACHE_PREFIX = "price:";
+
+    public BigDecimal getPrice(Long productId) {
+      String cacheKey = CACHE_PREFIX + productId;
+      
+      try {
+        // Try live pricing service
+        BigDecimal price = pricingClient.getPrice(productId);
+        
+        // Update cache with fresh price
+        redisTemplate.opsForValue().set(cacheKey, price, CACHE_TTL);
+        
+        return price;
+      } catch (Exception e) {
+        log.warn("Pricing service failed for product {}, using cache: {}",
+            productId, e.getMessage());
+        
+        // Fallback to cache
+        BigDecimal cached = redisTemplate.opsForValue().get(cacheKey);
+        if (cached != null) {
+          log.info("Returning cached price for product {}", productId);
+          return cached;
+        }
+        
+        // No cache available — use a safe default or fail
+        log.error("No cached price for product {}, using default", productId);
+        return BigDecimal.ZERO;  // or throw exception depending on requirements
+      }
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+DESIGN PRINCIPLES FOR FALLBACKS
+==================================
+
+1. FALLBACK QUALITY MATTERS
+   A poor fallback is worse than no fallback.
+   BAD: Return null → causes NullPointerException upstream
+   GOOD: Return an empty collection, a default object, or a "degraded" flag
+
+2. COMMUNICATE DEGRADATION
+   Include a signal in the response that data is from fallback:
+   {
+     "recommendations": [],
+     "meta": {
+       "source": "fallback",
+       "reason": "recommendation-service-unavailable"
+     }
+   }
+
+3. SEPARATE CRITICAL FROM OPTIONAL FEATURES
+   Critical (must work):
+   - Authentication
+   - Checkout (core path)
+   - Payment processing
+   → These should NOT silently degrade; return errors with context
+
+   Optional (can degrade):
+   - Recommendations
+   - Social proof (reviews count)
+   - Personalized content
+   → These can return defaults/empty without user impact
+
+4. FALLBACK SHOULD NOT FAIL
+   The fallback itself must be simple and reliable.
+   BAD: Fallback calls another external service (which could also fail)
+   GOOD: Fallback reads from local cache or returns hardcoded defaults
+   ACCEPTABLE: Fallback reads from DB (reliable, fast query)
+
+5. LOG AND ALERT ON FALLBACK ACTIVATION
+   Every fallback activation should be logged (WARN level).
+   High fallback rates = underlying problem.
+   Set alerts: "Fallback rate for RecommendationService > 5% in 5 min"
+
+────────────────────────────────────────────────────────────────────────────────
+
+FALLBACK IN API GATEWAY (Spring Cloud Gateway)
+================================================
+(Also covered in API Gateway section — for completeness)
+
+@RestController
+public class GatewayFallbackController {
+
+  @GetMapping("/fallback/orders")
+  public ResponseEntity<Map<String, String>> ordersFallback(
+      @RequestHeader(value = "X-Correlation-Id", required = false) String correlationId) {
+    return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(Map.of(
+      "status", "error",
+      "message", "Order service is temporarily unavailable. Please try again in a few moments.",
+      "timestamp", Instant.now().toString(),
+      "correlationId", correlationId != null ? correlationId : "unknown"
+    ));
+  }
+}
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is the Fallback pattern and why is it important?
+A: Fallback provides an alternative response when a service call fails, enabling
+   graceful degradation instead of total failure. Critical vs optional features
+   are treated differently: optional features return defaults/cached data;
+   critical features fail with clear error messages.
+
+Q: What are the types of fallback responses?
+A: Static default (hardcoded safe value), cached data (stale is better than none),
+   fail silent (ignore optional failures), stub response (degraded but useful),
+   and fail fast with error (for critical operations).
+
+Q: What should a fallback method NOT do?
+A: Call another external service (introduces another failure point). The fallback
+   must be simple and reliable — read from local cache, return hardcoded defaults,
+   or query a local database. If the fallback can fail, you need a fallback for
+   the fallback.
+
+Q: How do you differentiate fallback behavior based on the exception type?
+A: Resilience4j allows multiple fallback methods overloaded with different
+   exception types. Most specific exception type takes priority. A TimeoutException
+   might try the cache; BulkheadFullException might return static data; generic
+   Exception might return an empty response.
+
+Q: How do you know if your fallbacks are triggering too often?
+A: Log and monitor fallback activation rate. Use Resilience4j metrics exposed to
+   Prometheus. Set alerts when fallback rate exceeds a threshold (e.g., >5% in
+   5 minutes). High fallback rate indicates a persistent issue with the dependency.
+
+================================================================================

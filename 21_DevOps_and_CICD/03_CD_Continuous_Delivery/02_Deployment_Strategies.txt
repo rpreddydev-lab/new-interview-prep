@@ -1,0 +1,1067 @@
+================================================================================
+DEPLOYMENT STRATEGIES — COMPREHENSIVE INTERVIEW GUIDE
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Why Deployment Strategies Matter
+2. Recreate (Big Bang) Deployment
+3. Rolling Deployment
+4. Blue-Green Deployment
+5. Canary Deployment
+6. A/B Testing
+7. Shadow Deployment
+8. Feature Flag Deployments
+9. Multi-Region Deployment Strategies
+10. Comparison Matrix
+11. Database Considerations for Each Strategy
+12. Kubernetes Deployment Strategy Configurations
+13. Common Interview Questions & Answers
+14. Quick Reference Cheat Sheet
+
+================================================================================
+1. WHY DEPLOYMENT STRATEGIES MATTER
+================================================================================
+
+The Problem:
+  You have a running application serving real users.
+  You need to update it to a new version.
+  You cannot afford downtime (or want to minimize it).
+  You want to minimize risk (catch issues before all users are affected).
+
+The Core Tension:
+  SPEED of deployment  ←──────────→  SAFETY of deployment
+  
+  Faster = less coordination, simpler = more risk, more downtime potential
+  Safer = more complex, takes longer, costs more infrastructure
+
+The Goals of Deployment Strategies:
+  1. ZERO DOWNTIME: Users should not see errors or unavailability
+  2. RISK REDUCTION: Detect bad deployments before all users are affected
+  3. FAST ROLLBACK: Revert quickly if something goes wrong
+  4. CONSISTENCY: Reproducible process every time
+  5. OBSERVABILITY: Know immediately if deployment is healthy
+
+Deployment Risk Factors:
+  - Scope of change (1 file vs entire rewrite)
+  - Traffic volume (1 QPS vs 100,000 QPS)
+  - State (stateless service vs stateful database-backed service)
+  - Database schema changes (forward vs backward compatible)
+  - External dependencies (third-party APIs, event systems)
+
+================================================================================
+2. RECREATE (BIG BANG) DEPLOYMENT
+================================================================================
+
+How It Works:
+  1. Stop all instances of old version (v1)
+  2. Deploy new version (v2) to all instances
+  3. Start new version
+  
+  [v1][v1][v1] → STOP → [--][--][--] → [v2][v2][v2]
+                         (DOWNTIME!)
+
+Characteristics:
+  Downtime:        YES — during swap
+  Rollback speed:  Slow (redeploy old version)
+  Complexity:      LOW
+  Infrastructure:  Minimal (no extra capacity needed)
+  Risk:            HIGH (all users affected if v2 has bugs)
+
+When to Use:
+  - Development / staging environments
+  - Batch processing systems (can tolerate downtime)
+  - Applications with minimal traffic or during maintenance windows
+  - Database migrations that can't support two schema versions simultaneously
+  - Early-stage applications where downtime is acceptable
+  - When new version is NOT backward compatible with old version
+
+Example — Docker Compose:
+  # v1 → v2 recreation
+  docker-compose pull
+  docker-compose up -d  # By default recreates containers with new image
+
+Example — Kubernetes Deployment (strategy: Recreate):
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: myapp
+  spec:
+    strategy:
+      type: Recreate       # Stop all v1 pods before starting v2
+    replicas: 3
+    selector:
+      matchLabels:
+        app: myapp
+    template:
+      spec:
+        containers:
+        - name: myapp
+          image: myapp:v2  # Change this to trigger redeploy
+
+When to Avoid:
+  - Production with real users (downtime is unacceptable)
+  - Applications with strict SLAs
+  - High-traffic systems
+  - Applications that need instant rollback capability
+
+================================================================================
+3. ROLLING DEPLOYMENT
+================================================================================
+
+How It Works:
+  Replace instances one at a time (or in small batches).
+  Both old and new versions temporarily run simultaneously.
+  
+  [v1][v1][v1] 
+  → Replace first pod:    [v2][v1][v1]   (v1 still receives traffic)
+  → Replace second pod:   [v2][v2][v1]   (v1 gets less traffic)
+  → Replace third pod:    [v2][v2][v2]   (done)
+
+Characteristics:
+  Downtime:        NO (if done correctly)
+  Rollback speed:  Medium (continue rolling in reverse, or redeploy)
+  Complexity:      MEDIUM
+  Infrastructure:  Minimal (+1 capacity margin during rollout)
+  Risk:            MEDIUM (only some users affected if v2 has bugs)
+
+Requirements:
+  - New version must be backward compatible with old version
+  - If both v1 and v2 share a database, both must work with current schema
+  - Load balancer must not route to pods that aren't ready (health checks!)
+
+Rolling Update Parameters:
+  
+  maxSurge: Maximum number of extra pods during rollout
+    - Default: 25%
+    - Example: 4 replicas, maxSurge=1 → 5 pods max during rollout
+  
+  maxUnavailable: Maximum number of pods that can be unavailable
+    - Default: 25%
+    - Example: 4 replicas, maxUnavailable=1 → at least 3 pods always running
+
+  Setting maxUnavailable=0 and maxSurge=1: Zero-downtime rolling
+  (Always have full capacity, create 1 new before removing 1 old)
+
+Kubernetes Rolling Update Configuration:
+  
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: myapp
+  spec:
+    replicas: 4
+    strategy:
+      type: RollingUpdate        # Default Kubernetes strategy
+      rollingUpdate:
+        maxSurge: 1              # Allow 1 extra pod (5 total max)
+        maxUnavailable: 0        # Never have less than 4 running (zero-downtime)
+    selector:
+      matchLabels:
+        app: myapp
+    template:
+      metadata:
+        labels:
+          app: myapp
+      spec:
+        containers:
+        - name: myapp
+          image: myapp:v2
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          # Kubernetes waits for readinessProbe BEFORE routing traffic to new pod
+          # and BEFORE removing old pod (with maxUnavailable=0)
+
+Rollback a Rolling Deployment:
+  
+  # Kubernetes: Rollback to previous revision
+  kubectl rollout undo deployment/myapp
+  
+  # Rollback to specific revision
+  kubectl rollout history deployment/myapp
+  kubectl rollout undo deployment/myapp --to-revision=3
+  
+  # Watch the rollback progress
+  kubectl rollout status deployment/myapp
+
+Limitations of Rolling Updates:
+  - Old and new versions must be compatible (database schema, API contracts)
+  - Slow for large deployments (replacing 100 pods one-by-one takes time)
+  - Hard to validate before full rollout (no clear "canary" traffic percentage)
+  - Rollback requires re-rolling, which takes time
+
+================================================================================
+4. BLUE-GREEN DEPLOYMENT
+================================================================================
+
+How It Works:
+  Run two identical environments: Blue (current) and Green (new).
+  Route traffic to Blue while deploying to Green.
+  Validate Green works.
+  Atomically switch traffic from Blue to Green.
+  
+  Step 1: Blue serving 100% traffic. Green is idle.
+  ┌─────────────────┐      ┌─────────────────┐
+  │   BLUE (v1)     │◄─────│  Load Balancer  │◄─── Users
+  │   [running]     │      └─────────────────┘
+  └─────────────────┘
+  ┌─────────────────┐
+  │   GREEN (v2)    │  (idle, not receiving traffic)
+  │   [idle]        │
+  └─────────────────┘
+  
+  Step 2: Deploy v2 to Green. Blue still serves traffic.
+  ┌─────────────────┐      ┌─────────────────┐
+  │   BLUE (v1)     │◄─────│  Load Balancer  │◄─── Users
+  │   [running]     │      └─────────────────┘
+  └─────────────────┘
+  ┌─────────────────┐
+  │   GREEN (v2)    │  ← Deploying v2, running tests
+  │   [deploying]   │
+  └─────────────────┘
+  
+  Step 3: Run smoke tests on Green.
+  
+  Step 4: SWITCH: Route all traffic from Blue to Green.
+  ┌─────────────────┐
+  │   BLUE (v1)     │  (idle, kept for rollback)
+  │   [standby]     │
+  └─────────────────┘
+  ┌─────────────────┐      ┌─────────────────┐
+  │   GREEN (v2)    │◄─────│  Load Balancer  │◄─── Users
+  │   [running]     │      └─────────────────┘
+  └─────────────────┘
+
+Characteristics:
+  Downtime:        NEAR-ZERO (only DNS propagation or LB switch time)
+  Rollback speed:  INSTANT (switch LB back to Blue)
+  Complexity:      MEDIUM-HIGH
+  Infrastructure:  DOUBLE (run two environments simultaneously)
+  Risk:            LOW-MEDIUM (validate before switching)
+
+Rollback:
+  Instant! Point load balancer back to Blue environment.
+  No re-deployment needed.
+  Blue is kept running until Green is confirmed healthy.
+
+DNS-Based Traffic Switch:
+  # Route53 example: Change A/CNAME record to point to Green LB
+  aws route53 change-resource-record-sets \
+    --hosted-zone-id Z1234567890 \
+    --change-batch '{
+      "Changes": [{
+        "Action": "UPSERT",
+        "ResourceRecordSet": {
+          "Name": "api.example.com",
+          "Type": "A",
+          "AliasTarget": {
+            "HostedZoneId": "Z35SXDOTRQ7X7K",
+            "DNSName": "green-lb-12345.us-east-1.elb.amazonaws.com",
+            "EvaluateTargetHealth": true
+          }
+        }
+      }]
+    }'
+  
+  CAVEAT: DNS propagation can take minutes. Use low TTL (60 seconds) before switch.
+  Use load balancer target group switch for truly instant switch.
+
+AWS ALB (Application Load Balancer) Target Group Switching:
+  
+  # Switch production target group from Blue to Green
+  aws elbv2 modify-listener \
+    --listener-arn $PROD_LISTENER_ARN \
+    --default-actions Type=forward,TargetGroupArn=$GREEN_TG_ARN
+  
+  # Rollback: switch back to Blue
+  aws elbv2 modify-listener \
+    --listener-arn $PROD_LISTENER_ARN \
+    --default-actions Type=forward,TargetGroupArn=$BLUE_TG_ARN
+
+Kubernetes Blue-Green with two Deployments:
+  
+  # blue-deployment.yaml
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: myapp-blue
+  spec:
+    replicas: 3
+    selector:
+      matchLabels:
+        app: myapp
+        version: blue
+    template:
+      metadata:
+        labels:
+          app: myapp
+          version: blue
+      spec:
+        containers:
+        - name: myapp
+          image: myapp:v1
+  
+  ---
+  # green-deployment.yaml
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: myapp-green
+  spec:
+    replicas: 3
+    selector:
+      matchLabels:
+        app: myapp
+        version: green
+    template:
+      metadata:
+        labels:
+          app: myapp
+          version: green
+      spec:
+        containers:
+        - name: myapp
+          image: myapp:v2  # New version
+  
+  ---
+  # service.yaml - switch by changing selector
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: myapp-service
+  spec:
+    selector:
+      app: myapp
+      version: blue    # Change to "green" to switch traffic
+    ports:
+    - port: 80
+      targetPort: 8080
+  
+  # To switch traffic to green:
+  kubectl patch service myapp-service \
+    -p '{"spec":{"selector":{"app":"myapp","version":"green"}}}'
+  
+  # To rollback to blue:
+  kubectl patch service myapp-service \
+    -p '{"spec":{"selector":{"app":"myapp","version":"blue"}}}'
+
+The Database Challenge:
+  Problem: Blue has schema v1, Green needs schema v2. If you switch to Green
+  but schema change breaks Blue-era data, rollback is problematic.
+  
+  Solution: Use Expand-Contract pattern (covered in CD_Overview.txt):
+  - Expand: Add new columns (backward compatible)
+  - Both Blue (v1) and Green (v2) work with expanded schema
+  - Switch to Green
+  - After Green is stable, run Contract phase (remove old columns)
+
+When to Use Blue-Green:
+  ✓ Need instant rollback capability
+  ✓ Stateless services (or with compatible schema changes)
+  ✓ Want to validate new version before any user traffic
+  ✓ Regulatory requirements for validated rollback capability
+  ✓ Budget for double infrastructure
+
+When to Avoid:
+  ✗ Very high infrastructure cost sensitivity
+  ✗ Stateful services with data written to both environments
+  ✗ Tight database schema coupling between versions
+
+================================================================================
+5. CANARY DEPLOYMENT
+================================================================================
+
+How It Works:
+  Gradually route a small percentage of traffic to the new version.
+  Monitor metrics.
+  Progressively increase traffic if metrics are healthy.
+  Abort and rollback if metrics degrade.
+  
+  Named after "canary in a coal mine" — send a small amount of traffic first
+  to detect problems before they affect all users.
+  
+  Traffic Split Progression:
+  
+  Step 0: v1 = 100%
+  ┌──────────────┐      ┌──────────────┐
+  │ v1 (stable) │◄─────│     LB       │◄─── 100% users
+  │  [100%]      │      └──────────────┘
+  └──────────────┘
+  
+  Step 1: v2 = 5% traffic (canary)
+  ┌──────────────┐
+  │ v1 (stable) │◄─── 95% users
+  └──────────────┘
+  ┌──────────────┐
+  │ v2 (canary) │◄─── 5% users (observe behavior)
+  └──────────────┘
+  
+  Step 2: Verify canary metrics healthy → increase to 25%
+  v1: 75% | v2: 25%
+  
+  Step 3: Verify healthy → 50%
+  v1: 50% | v2: 50%
+  
+  Step 4: Fully promote → v2: 100%
+  v2: 100% (v1 decommissioned)
+  
+  OR:
+  Step 2: Error rate higher in v2 → ROLLBACK: v2 = 0%, v1 = 100%
+
+Characteristics:
+  Downtime:        NO
+  Rollback speed:  FAST (shift traffic back, or auto-rollback)
+  Complexity:      HIGH (requires traffic splitting, metrics monitoring)
+  Infrastructure:  MODERATE (need capacity for both versions)
+  Risk:            VERY LOW (catch issues with 5% of traffic first)
+
+Canary Analysis:
+  The key of canary: Compare metrics between v1 (stable) and v2 (canary).
+  
+  Metrics to compare:
+  - HTTP 5xx error rate (canary should not be higher than baseline)
+  - Latency (P50, P95, P99 — canary should not be slower)
+  - Business metrics (conversion rate, sign-up rate, checkout completion)
+  - Custom application metrics (queue depth, cache hit rate)
+  
+  Decision:
+  - Canary error rate > baseline by X% → ROLLBACK automatically
+  - Canary latency P99 > threshold → ROLLBACK
+  - All metrics healthy for 10 minutes → PROMOTE to 25%
+
+Manual Canary with Kubernetes + NGINX Ingress:
+  
+  # stable-deployment.yaml
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: myapp-stable
+  spec:
+    replicas: 9    # 90% traffic = 9 pods (stable)
+    ...
+  
+  # canary-deployment.yaml
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: myapp-canary
+  spec:
+    replicas: 1    # 10% traffic = 1 pod (canary)
+    ...
+  
+  # Both deployments use same Service label = traffic split proportional to pods
+
+NGINX Ingress Canary Annotations:
+  
+  # canary-ingress.yaml
+  apiVersion: networking.k8s.io/v1
+  kind: Ingress
+  metadata:
+    name: myapp-canary
+    annotations:
+      nginx.ingress.kubernetes.io/canary: "true"
+      nginx.ingress.kubernetes.io/canary-weight: "10"  # 10% traffic to canary
+  spec:
+    rules:
+    - host: api.example.com
+      http:
+        paths:
+        - path: /
+          pathType: Prefix
+          backend:
+            service:
+              name: myapp-canary
+              port:
+                number: 80
+  
+  # To increase canary weight:
+  kubectl annotate ingress myapp-canary \
+    nginx.ingress.kubernetes.io/canary-weight="25" \
+    --overwrite
+
+Automated Canary with Argo Rollouts:
+  
+  # argo-rollout.yaml
+  apiVersion: argoproj.io/v1alpha1
+  kind: Rollout
+  metadata:
+    name: myapp
+  spec:
+    replicas: 10
+    strategy:
+      canary:
+        # Automatic canary analysis steps
+        canaryService: myapp-canary-svc
+        stableService: myapp-stable-svc
+        trafficRouting:
+          nginx:
+            stableIngress: myapp-ingress
+        steps:
+        - setWeight: 5          # Step 1: 5% traffic
+        - pause: {duration: 5m} # Wait 5 minutes
+        - setWeight: 20         # Step 2: 20% traffic
+        - pause: {duration: 10m}
+        - setWeight: 50         # Step 3: 50% traffic
+        - pause: {}             # Wait for manual approval or analysis
+        - setWeight: 100        # Fully promote
+        
+        # Automatic rollback if analysis fails
+        analysis:
+          templates:
+          - templateName: error-rate-check
+          args:
+          - name: service-name
+            value: myapp-canary-svc
+  
+  ---
+  # AnalysisTemplate: Define the metrics check
+  apiVersion: argoproj.io/v1alpha1
+  kind: AnalysisTemplate
+  metadata:
+    name: error-rate-check
+  spec:
+    metrics:
+    - name: error-rate
+      provider:
+        prometheus:
+          address: http://prometheus:9090
+          query: |
+            sum(rate(http_requests_total{
+              service="{{args.service-name}}",
+              status=~"5.."
+            }[5m])) /
+            sum(rate(http_requests_total{
+              service="{{args.service-name}}"
+            }[5m]))
+      successCondition: result[0] <= 0.05  # Success if error rate < 5%
+      failureCondition: result[0] > 0.10   # Failure if error rate > 10%
+      interval: 1m
+      count: 5         # Check 5 times before deciding
+
+Canary vs Blue-Green:
+  Blue-Green: All-or-nothing switch. Better for instant rollback, higher infra cost.
+  Canary: Gradual shift. Better risk reduction, more complex metrics analysis.
+
+================================================================================
+6. A/B TESTING
+================================================================================
+
+How It Works:
+  Unlike canary (which tests stability), A/B testing tests which version
+  performs BETTER on a business metric.
+  
+  Route different user SEGMENTS to different versions.
+  Measure which version achieves better business outcomes.
+  
+  A/B Test Example:
+  - Group A (50% of users): Blue checkout button
+  - Group B (50% of users): Green checkout button
+  - Measure: Checkout completion rate
+  - Winner: Group B had 3% higher conversion → deploy green button to 100%
+
+Key Difference from Canary:
+  CANARY: Detect if new version is BROKEN (error rate, latency)
+  A/B TEST: Determine which version PERFORMS BETTER (conversion, engagement)
+  
+  Canary rollback trigger: Error rate threshold exceeded
+  A/B test decision: Statistical significance of business metric difference
+
+How Users Are Segmented:
+  - RANDOM: Consistent user assignment (hash userId % 2)
+  - COOKIE-BASED: A/B group stored in browser cookie
+  - GEOGRAPHIC: US users see A, EU users see B
+  - DEMOGRAPHIC: Users over 30 see A, under 30 see B
+  - BEHAVIORAL: New users see A, existing users see B
+
+Statistical Significance:
+  A/B tests need enough data to be statistically significant.
+  Use chi-squared test or t-test to determine winner.
+  Tools: Google Optimize, Optimizely, VWO, Split.io
+
+Implementation (Feature Flag Based):
+  
+  # Using a feature flag system for A/B testing
+  user_variant = feature_flags.get_variant("checkout-button-color", user_id)
+  
+  if user_variant == "control":
+      render_blue_button()
+  elif user_variant == "treatment":
+      render_green_button()
+  
+  # Track conversion event
+  analytics.track("checkout_completed", {"variant": user_variant, "user_id": user_id})
+
+================================================================================
+7. SHADOW DEPLOYMENT
+================================================================================
+
+How It Works:
+  Deploy new version alongside old version.
+  Copy (mirror) real production traffic to the new version.
+  New version processes requests but its RESPONSES ARE DISCARDED.
+  Users only see responses from old version.
+  
+  ┌─────────────┐          ┌────────────┐ ── Real response to users
+  │ Users       │──────────│  v1 Stable │
+  └─────────────┘    │     └────────────┘
+                     │
+                     └────→ ┌────────────┐ ── Responses discarded
+                            │  v2 Shadow │ (logged for comparison)
+                            └────────────┘
+
+Use Cases:
+  - Testing a new version with real production traffic load
+  - Validating new service handles real-world data patterns
+  - Performance testing under real traffic (load and data patterns)
+  - Testing infrastructure changes (new database, caching layer)
+
+Tools:
+  - Envoy Proxy: Traffic mirroring via mirror filter
+  - Istio: HTTPRoute with mirror policy
+  - NGINX: mirror directive
+  - AWS Global Accelerator: Traffic mirroring
+
+Istio Shadow Deployment Example:
+  
+  apiVersion: networking.istio.io/v1alpha3
+  kind: VirtualService
+  metadata:
+    name: myapp
+  spec:
+    hosts:
+    - myapp
+    http:
+    - route:
+      - destination:
+          host: myapp-v1
+          port:
+            number: 8080
+        weight: 100
+      mirror:
+        host: myapp-v2    # Mirror 100% of traffic to v2
+        port:
+          number: 8080
+      mirrorPercentage:
+        value: 100.0      # Can be < 100 for sampling
+
+Shadow vs Canary:
+  Shadow: Both versions process the same request. Users only see v1 response.
+  Canary: A percentage of users actually get v2's response.
+  
+  Shadow is safer (no user impact), but doesn't test v2 in a real user-facing way.
+  Use shadow for: Performance validation, data migration testing, new infra testing.
+
+================================================================================
+8. FEATURE FLAG DEPLOYMENTS
+================================================================================
+
+This is covered in depth in 03_Feature_Flags.txt.
+
+Brief overview for comparison purposes:
+
+  Deploy code to all servers → feature flag OFF → 0% of users see feature
+  Gradually enable feature flag → 1%, 10%, 50%, 100%
+  
+  Unique benefits:
+  - Deploy and release are completely decoupled
+  - Rollback is instant (no deployment needed — just toggle flag)
+  - Works at the application layer (no infrastructure/load balancer changes)
+  - Enables per-user targeting (VIP users first, beta testers, etc.)
+  - A/B testing built-in (50% see feature A, 50% see feature B)
+
+================================================================================
+9. MULTI-REGION DEPLOYMENT STRATEGIES
+================================================================================
+
+Why Multi-Region:
+  - Latency: Serve users from nearest region
+  - Availability: Survive regional outages
+  - Compliance: Data residency requirements (GDPR)
+
+Deployment Order:
+  SAFE DEPLOYMENT ORDER:
+  1. Start in smallest/least-critical region (e.g., ap-northeast-2)
+  2. Validate metrics for 15-30 minutes
+  3. Deploy to medium-traffic regions
+  4. Deploy to primary region last (us-east-1, eu-west-1)
+  
+  "Deploy East Last": Because your primary region has the most traffic,
+  save it for last after validating in smaller regions.
+
+Active-Active vs Active-Passive:
+  
+  ACTIVE-ACTIVE:
+    Traffic flows to all regions simultaneously.
+    All regions serve users.
+    Rolling deployment across regions.
+    
+  ACTIVE-PASSIVE (Disaster Recovery):
+    Traffic normally goes to primary region only.
+    Standby region receives traffic during primary failure.
+    Blue-Green at the region level.
+
+AWS CodeDeploy Multi-Region Example:
+  # Pipeline in CodePipeline:
+  # Stage 1: Deploy to us-west-2 (dev/canary region)
+  # Stage 2: Manual approval gate
+  # Stage 3: Deploy to us-east-1 (primary)
+  # Stage 4: Deploy to eu-west-1 (Europe)
+  # Stage 5: Deploy to ap-southeast-1 (APAC)
+
+================================================================================
+10. COMPARISON MATRIX
+================================================================================
+
+STRATEGY      DOWNTIME  ROLLBACK    COMPLEXITY  INFRA COST  RISK REDUCTION  USE CASE
+────────────────────────────────────────────────────────────────────────────────────────
+Recreate       YES       Redeploy    LOW         Minimal     None            Dev/batch
+Rolling        NO        Slow reroll MEDIUM      +~25%       Partial         Default K8s
+Blue-Green     NO        INSTANT     MEDIUM-HIGH 2×          Good            Production
+Canary         NO        Fast        HIGH        +10-25%     Excellent       Production
+A/B Test       NO        Moderate    HIGH        +25-50%     Different goal  Feature opt
+Shadow         NO        N/A         HIGH        2×          Risk-free test  Validation
+Feature Flags  NO        INSTANT     MEDIUM*     Minimal     Excellent       Any
+
+*Feature flags complexity depends on flag management tooling
+
+================================================================================
+11. DATABASE CONSIDERATIONS FOR EACH STRATEGY
+================================================================================
+
+The Hardest Part of Zero-Downtime Deployments
+
+RECREATE:
+  - Can run destructive schema changes (DROP COLUMN, RENAME TABLE)
+  - Both old and new code don't run simultaneously → no compatibility needed
+  - BUT: Downtime during schema migration
+
+ROLLING:
+  - Both v1 and v2 run simultaneously → schema must be compatible with BOTH
+  - Cannot remove/rename columns that v1 still reads
+  - Use: Expand-Contract (add new column first, remove old later)
+  - Risk: v2 writes to new column, v1 reads old column → data inconsistency
+
+BLUE-GREEN:
+  - Schema must work with both Blue (v1) and Green (v2)
+  - During switch: Green could have written data Blue can't read (if not careful)
+  - Solution: Expand-Contract, or shared database with compatible schema
+  - Database is typically NOT blue-green (shared between blue and green)
+  - Exception: Separate read replicas can be switched, but primary is shared
+
+CANARY:
+  - Same as rolling: both v1 and v2 write to same database
+  - Schema must be compatible with both versions simultaneously
+  - Expand-Contract required for schema changes
+
+FEATURE FLAGS:
+  - Cleanest option for database changes
+  - New code behind flag → can add new columns when flag is off
+  - Only deploy schema when feature flag is ready to turn on
+  - Can use flag to control data migration timing
+
+Expand-Contract Pattern:
+  
+  Goal: Rename column 'username' to 'user_name' with zero downtime
+  
+  PHASE 1 — EXPAND:
+    ALTER TABLE users ADD COLUMN user_name VARCHAR(255);
+    -- Deploy v2 code that writes to BOTH username AND user_name
+    -- v1 code still reads from username
+    -- v2 code reads from user_name
+    
+  PHASE 2 — MIGRATE:
+    UPDATE users SET user_name = username WHERE user_name IS NULL;
+    -- Both columns populated
+    
+  PHASE 3 — CONTRACT:
+    -- All v1 instances replaced with v2
+    ALTER TABLE users DROP COLUMN username;
+    -- Deploy v3 code that only uses user_name
+  
+  Total time: 3 separate deployments over days/weeks
+
+Database Migration Tools:
+  FLYWAY:
+    - SQL-based migrations
+    - Versioned migrations: V1__create_users.sql, V2__add_email.sql
+    - Runs automatically on application startup
+    
+  LIQUIBASE:
+    - XML/YAML/SQL changeset format
+    - More advanced rollback support
+    - Enterprise features (diff, compare schemas)
+  
+  ALEMBIC (Python/SQLAlchemy):
+    - Python migration scripts
+    - Auto-generate from model changes
+  
+  DJANGO MIGRATIONS:
+    - Built-in to Django ORM
+    - Class-based migration definitions
+
+================================================================================
+12. KUBERNETES DEPLOYMENT STRATEGY CONFIGURATIONS
+================================================================================
+
+Kubernetes Native Strategies:
+  
+  # RollingUpdate (DEFAULT):
+  spec:
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxSurge: 1          # 1 extra pod during rollout
+        maxUnavailable: 0    # Never go below desired replicas
+  
+  # Recreate:
+  spec:
+    strategy:
+      type: Recreate         # All old pods stopped before new ones start
+
+Third-Party Tools for Advanced Strategies:
+
+  ARGO ROLLOUTS (CNC Foundation):
+    - Provides: Canary, Blue-Green, Experiment strategies
+    - Automated analysis with Prometheus, Datadog, CloudWatch
+    - Web UI for rollout management
+    - CLI: kubectl argo rollouts ...
+    
+    Install:
+    kubectl create namespace argo-rollouts
+    kubectl apply -n argo-rollouts -f \
+      https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
+    
+    Blue-Green Rollout:
+    spec:
+      strategy:
+        blueGreen:
+          activeService: myapp-active
+          previewService: myapp-preview
+          autoPromotionEnabled: false  # Manual promotion
+          scaleDownDelaySeconds: 30    # Keep old version for 30s after switch
+  
+  FLAGGER (Weaveworks):
+    - Automated canary deployments using Istio, Linkerd, or NGINX
+    - Metrics-based progressive delivery
+    - Webhooks for custom validation
+    - Works with existing Kubernetes Deployments (no CRD changes needed)
+    
+    Flagger Canary:
+    apiVersion: flagger.app/v1beta1
+    kind: Canary
+    metadata:
+      name: myapp
+    spec:
+      targetRef:
+        apiVersion: apps/v1
+        kind: Deployment
+        name: myapp
+      progressDeadlineSeconds: 60
+      service:
+        port: 80
+      analysis:
+        interval: 1m
+        threshold: 5         # Max 5 failed checks before rollback
+        maxWeight: 50        # Max 50% traffic to canary
+        stepWeight: 10       # Increase by 10% per interval
+        metrics:
+        - name: request-success-rate
+          min: 99            # Minimum 99% success rate
+          interval: 1m
+        - name: request-duration
+          max: 500           # Maximum 500ms P99
+          interval: 30s
+
+Service Mesh for Traffic Control:
+  ISTIO:
+    Fine-grained traffic routing via VirtualService/DestinationRule.
+    Header-based routing, weight-based routing, fault injection.
+    
+    # Route 90% to v1, 10% to v2:
+    apiVersion: networking.istio.io/v1alpha3
+    kind: VirtualService
+    metadata:
+      name: myapp
+    spec:
+      hosts:
+      - myapp
+      http:
+      - route:
+        - destination:
+            host: myapp
+            subset: v1
+          weight: 90
+        - destination:
+            host: myapp
+            subset: v2
+          weight: 10
+    
+    ---
+    apiVersion: networking.istio.io/v1alpha3
+    kind: DestinationRule
+    metadata:
+      name: myapp
+    spec:
+      host: myapp
+      subsets:
+      - name: v1
+        labels:
+          version: v1
+      - name: v2
+        labels:
+          version: v2
+
+================================================================================
+13. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: What is the difference between Blue-Green and Canary deployment?
+A: Both are zero-downtime deployment strategies, but they differ in approach:
+   
+   Blue-Green: Two identical environments (Blue = current, Green = new).
+   Traffic switches ALL AT ONCE from Blue to Green. The main benefit is instant
+   rollback — if Green has issues, you flip traffic back to Blue immediately.
+   The cost is running double infrastructure.
+   
+   Canary: Gradually shift traffic from old to new (5% → 25% → 50% → 100%).
+   The canary serves real user traffic, and you monitor for errors or degraded
+   performance. If the canary fails, you shift traffic back. This limits the
+   blast radius of a bad deployment to only the canary percentage.
+   
+   Key differences:
+   - Blue-Green: All-or-nothing switch; instant rollback; 2× infrastructure cost
+   - Canary: Gradual shift; needs metrics monitoring; less infrastructure waste
+   - Use Blue-Green when: You need instant rollback capability or testing new
+     version before ANY user traffic
+   - Use Canary when: You want to detect issues with minimal user impact and
+     have good monitoring in place
+
+Q2: How do you handle database migrations with zero-downtime deployments?
+A: Database migrations are the hardest part because the database is stateful
+   and shared between old and new code versions.
+   
+   The solution is Expand-Contract (also called parallel change):
+   
+   1. EXPAND: Add new column/table (backward-compatible with old code).
+      Deploy new code that writes to BOTH old and new structures.
+      Old code reads old structure; new code can read new structure.
+   
+   2. MIGRATE: Backfill data from old to new structure.
+   
+   3. CONTRACT: Remove old column (after ALL old code instances replaced).
+   
+   This spreads one "logical" schema change across 3 deployments over days.
+   The key rule: Never make a schema change that breaks the currently running version.
+   
+   Tools: Flyway and Liquibase manage migration scripts with versioning,
+   running automatically on startup in the right order.
+
+Q3: When would you choose a Rolling Update over Blue-Green?
+A: Rolling updates are the default choice when:
+   - Infrastructure cost is a concern (Blue-Green needs 2× the servers)
+   - The application is stateless and the new version is backward-compatible
+   - You don't need instant rollback (rolling rollback is slower but works)
+   - You're using Kubernetes (it's the built-in default)
+   
+   Blue-Green is worth the extra cost when:
+   - You need instant rollback capability (critical production systems)
+   - You want to fully validate the new version before any real user traffic
+   - You have strict SLAs and cannot afford extended periods of mixed versions
+   - You're making significant changes and want a clean switch point
+
+Q4: Explain how Argo Rollouts or Flagger automates canary deployments.
+A: Argo Rollouts and Flagger add automated progressive delivery to Kubernetes.
+   
+   Without these tools, canary requires manual traffic weight changes and manual
+   monitoring checks before each step.
+   
+   With Argo Rollouts:
+   - You define a Rollout resource with canary steps and analysis templates
+   - When you update the image, Rollout automatically follows the steps:
+     deploy 5% → pause 5 minutes → check Prometheus metrics → if healthy,
+     increase to 25% → repeat until 100%
+   - If the AnalysisTemplate shows error rate exceeding threshold → auto-rollback
+   - You can also pause at a step for manual review
+   
+   With Flagger:
+   - Wraps your existing Deployment
+   - Integrates with Istio/NGINX for traffic splitting
+   - Continuously checks metrics at each step
+   - Auto-promotes on success, auto-rolls back on failure
+   
+   The key value: Removes human judgment from routine "is the canary healthy?"
+   decisions, using objective metrics instead.
+
+Q5: What is a Shadow deployment and when would you use it?
+A: Shadow deployment (also called dark launch or mirroring) routes real
+   production traffic to a new version, but discards the new version's response.
+   Users only ever see responses from the stable version.
+   
+   The new (shadow) service processes real traffic but its output is logged for
+   comparison — you're essentially stress-testing it with production load
+   without risk to users.
+   
+   Use cases:
+   - Load/performance testing with realistic traffic patterns
+   - Validating a rewrite of a service behaves identically to the original
+   - Testing infrastructure changes (new database cluster) with real queries
+   - Warming up caches or connections before switching traffic
+   
+   Tools: Envoy proxy mirror filter, Istio traffic mirroring, AWS Global Accelerator
+   
+   The trade-off: Shadow is the safest way to test with production traffic,
+   but it's more complex to set up and can't test user-facing behavior changes.
+
+================================================================================
+14. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+RECREATE:
+  Stop all → Deploy new → Start all. Has downtime. Lowest complexity.
+  Use for: Dev, batch, testing, DB migrations with tight coupling.
+
+ROLLING UPDATE:
+  Replace instances one-by-one. Both versions run simultaneously.
+  Kubernetes default: maxSurge=25%, maxUnavailable=25%.
+  Zero-downtime config: maxSurge=1, maxUnavailable=0.
+  Requirement: New/old code must be compatible with same DB schema.
+
+BLUE-GREEN:
+  Two environments. All traffic switches atomically.
+  Instant rollback: Switch LB back to Blue.
+  Cost: Double infrastructure.
+  DB: Shared; use expand-contract for schema changes.
+
+CANARY:
+  Gradual traffic shift: 5% → 25% → 50% → 100%.
+  Monitor error rate and latency at each step.
+  Auto-rollback if metrics degrade.
+  Tools: Argo Rollouts, Flagger, NGINX Ingress annotations, Istio.
+
+A/B TESTING:
+  Different versions for different USER SEGMENTS.
+  Goal: Which version achieves better BUSINESS METRICS?
+  Decision: Statistical significance of conversion/engagement difference.
+
+SHADOW:
+  Mirror real traffic to new version. Responses discarded.
+  Risk-free production traffic testing.
+  Tools: Istio mirror, Envoy mirror filter.
+
+Database Migrations — Expand-Contract:
+  Step 1: Add new column (EXPAND). Both versions compatible.
+  Step 2: Backfill data. Deploy new version.
+  Step 3: Remove old column (CONTRACT) after all old code replaced.
+
+Kubernetes Strategies:
+  Native: Recreate, RollingUpdate (maxSurge, maxUnavailable)
+  Third-party: Argo Rollouts (Blue-Green, Canary), Flagger (metrics-driven)
+  Service Mesh: Istio VirtualService weights, header-based routing
+
+================================================================================
+END OF FILE
+================================================================================

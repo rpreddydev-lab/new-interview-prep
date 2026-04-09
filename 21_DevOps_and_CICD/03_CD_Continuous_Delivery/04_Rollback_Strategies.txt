@@ -1,0 +1,751 @@
+================================================================================
+ROLLBACK STRATEGIES — COMPREHENSIVE INTERVIEW GUIDE
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Why Rollback Strategy Matters
+2. Forward vs Backward Philosophy
+3. Rollback Techniques by Deployment Type
+4. Automated vs Manual Rollback
+5. Database Rollback Challenges
+6. Rollback Triggers — When to Roll Back
+7. Rollback in Kubernetes
+8. Rollback and Stateful Services
+9. Post-Rollback Analysis
+10. Common Interview Questions & Answers
+11. Quick Reference Cheat Sheet
+
+================================================================================
+1. WHY ROLLBACK STRATEGY MATTERS
+================================================================================
+
+The Problem:
+  No matter how good your testing, bad deployments happen.
+  Production behavior cannot always be predicted by staging tests.
+  When a bad deployment happens, the most important thing is:
+  
+  HOW FAST CAN YOU RECOVER?
+  
+  MTTR (Mean Time to Recovery) is a DORA key metric.
+  Elite teams recover in < 1 hour.
+  Low-performing teams take > 1 week.
+
+Rollback Defined:
+  Rollback: The process of reverting a system to a previous, known-good state
+  after a failed or problematic deployment.
+
+The Rollback Decision:
+  When is it better to ROLLBACK vs ROLL FORWARD?
+  
+  ROLLBACK (Revert):
+  - Deploy previous version
+  - Fast for simple stateless services
+  - Limited by database schema compatibility
+  
+  ROLL FORWARD (Fix Forward):
+  - Deploy a new version with the fix applied
+  - Better when rollback is risky (DB schema changes)
+  - Requires ability to fix quickly
+  
+  The choice depends on:
+  1. How quickly can you ship a fix? (minutes vs hours)
+  2. Has the database schema changed in a way that makes rollback dangerous?
+  3. Is the bug critical enough to justify the risk of rollback?
+
+Cost of Not Having a Rollback Plan:
+  - Extended incident duration (engineers manually debugging under pressure)
+  - Data inconsistency if schema was changed
+  - Service-to-service inconsistency in microservices
+  - Loss of user trust
+  - Revenue impact (every minute of e-commerce downtime costs money)
+  
+  "Rollback should be boring. If it's scary, you haven't practiced enough."
+
+================================================================================
+2. FORWARD VS BACKWARD PHILOSOPHY
+================================================================================
+
+"FIX FORWARD" PHILOSOPHY:
+  - Focus on making the next deployment rather than reverting
+  - The fix is applied on top of the bad change
+  - Preferred by high-velocity teams (Netflix, Amazon)
+  
+  When it works well:
+  - You can write and deploy a fix in minutes
+  - Database schema changes make reverting dangerous
+  - The bug is non-critical (degraded feature, not outage)
+  - Your CI/CD pipeline is fast (< 15 minutes to production)
+  
+  Example: Amazon's guideline:
+  "With small, incremental deployments and fast pipelines, rolling forward
+  to fix is usually faster than rolling back."
+
+"ROLLBACK" PHILOSOPHY:
+  - Keep old version hot and ready to serve
+  - Switch traffic back to known-good version instantly
+  - Preferred when correctness is more important than speed
+  
+  When it works well:
+  - Blue-Green deployments (instant traffic switch)
+  - Feature flags (toggle off in seconds)
+  - No database schema changes in the current deployment
+  - Bug is critical and needs immediate resolution
+
+The Modern Approach — Both:
+  1. First: Reduce blast radius (shift canary back to 0%, or toggle feature flag)
+  2. Then: Assess if rollback or fix-forward is appropriate
+  3. Usually: Fix-forward if fix is < 30 minutes away; rollback if longer
+
+Rollback as a Safety Net vs Rollback as the Plan:
+  DON'T: Design your deployment assuming rollback is always possible
+  DO:   Design for zero-downtime deployment and consider rollback an emergency option
+  
+  If you rely on rollback as your primary safety mechanism,
+  you're not investing enough in pre-deployment validation.
+
+================================================================================
+3. ROLLBACK TECHNIQUES BY DEPLOYMENT TYPE
+================================================================================
+
+RECREATE DEPLOYMENT:
+  No rollback mechanism — just redeploy old version.
+  
+  Rollback:
+    # Re-run pipeline with previous artifact version
+    docker pull myapp:v1
+    docker stop myapp
+    docker run -d --name myapp myapp:v1
+  
+  Speed: SLOW (requires re-deployment)
+  Complexity: LOW
+
+ROLLING UPDATE ROLLBACK:
+  Issue: Mid-rollout, some v2 pods are running, some v1 pods are running.
+  You need to revert to 100% v1.
+  
+  Kubernetes rollback:
+    kubectl rollout undo deployment/myapp
+    kubectl rollout status deployment/myapp  # Watch progress
+  
+  This triggers a reverse rolling update: v2 pods are replaced by v1 pods.
+  
+  Speed: MEDIUM (as fast as rolling updates take)
+  Complexity: LOW (Kubernetes handles it)
+  
+  Risk: While rolling back, you still have mixed versions running.
+  Ensure your API is backward compatible during the rollback.
+
+BLUE-GREEN ROLLBACK:
+  The gold standard for rollback speed.
+  
+  Blue is still running (we kept it up after switching to Green).
+  Rollback = switch load balancer back to Blue.
+  
+  # AWS ALB rollback
+  aws elbv2 modify-listener \
+    --listener-arn $PROD_LISTENER_ARN \
+    --default-actions Type=forward,TargetGroupArn=$BLUE_TG_ARN
+  
+  # DNS rollback (slower — propagation time)
+  aws route53 change-resource-record-sets ...
+  
+  Speed: INSTANT (load balancer switch)
+  Complexity: LOW (single command)
+  
+  Critical requirement: Keep Blue running for a rollback window (e.g., 30 min
+  to 1 hour after switching to Green). After that window, Blue can be scaled down.
+  
+  Database: If Green wrote data incompatible with Blue, rollback may cause data issues.
+
+CANARY ROLLBACK:
+  Shift traffic from canary (v2) back to stable (v1).
+  
+  # Manual: Change NGINX Ingress canary weight back to 0
+  kubectl annotate ingress myapp-canary \
+    nginx.ingress.kubernetes.io/canary-weight="0" --overwrite
+  
+  # Argo Rollouts: Abort the rollout
+  kubectl argo rollouts abort myapp
+  
+  # Argo Rollouts UI: Click "Abort" button
+  
+  Speed: FAST (traffic weight change takes effect immediately)
+  Complexity: LOW (if using Argo Rollouts; manual annotation if not)
+
+FEATURE FLAG ROLLBACK:
+  The fastest rollback possible. No infrastructure change needed.
+  
+  Turn off the feature flag.
+  
+  # LaunchDarkly SDK call from admin script
+  ld_client.toggle_flag("broken-feature", enabled=False)
+  
+  # Or: Click toggle in feature flag management UI (takes < 1 second)
+  
+  Speed: ALMOST INSTANT (flag evaluation is real-time)
+  Complexity: ZERO (toggle flag)
+  
+  Limitations:
+  - Only works if the problem is in the flagged code path
+  - Doesn't help if the bug is in unflagged code
+
+================================================================================
+4. AUTOMATED VS MANUAL ROLLBACK
+================================================================================
+
+MANUAL ROLLBACK:
+  Engineer detects issue → Decides to roll back → Executes rollback steps
+  
+  Problems:
+  - Human detection latency (how long before someone notices?)
+  - Decision-making under pressure (might make wrong call)
+  - Execution time (oncall engineer might not know the commands)
+  - Alert fatigue (false alarms → real alerts ignored)
+  
+  When appropriate:
+  - Simple environments without automation infrastructure
+  - When human judgment is genuinely needed
+  - Low-traffic systems where an engineer can monitor during deployment
+
+AUTOMATED ROLLBACK:
+  Monitoring detects threshold breach → Automatically triggers rollback
+  
+  Metrics-based automatic rollback:
+  - Error rate > threshold → Rollback
+  - P99 latency > threshold → Rollback
+  - Success rate < threshold → Rollback
+  
+  Example: Argo Rollouts with Prometheus analysis:
+  
+  apiVersion: argoproj.io/v1alpha1
+  kind: AnalysisTemplate
+  metadata:
+    name: http-error-rate
+  spec:
+    metrics:
+    - name: error-rate
+      interval: 1m
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://prometheus:9090
+          query: |
+            sum(rate(istio_requests_total{
+              destination_service_name="{{args.service-name}}",
+              response_code=~"5.*"
+            }[5m])) /
+            sum(rate(istio_requests_total{
+              destination_service_name="{{args.service-name}}"
+            }[5m]))
+      successCondition: result[0] <= 0.01  # Success: < 1% errors
+      failureCondition: result[0] >= 0.05  # Fail: >= 5% errors
+  
+  # Argo Rollouts: If AnalysisRun fails, rollout is automatically aborted
+  # and traffic shifts back to stable version
+
+Example — GitHub Actions with automated rollback:
+  
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Deploy new version
+      id: deploy
+      run: |
+        kubectl set image deployment/myapp myapp=myapp:${{ env.VERSION }}
+        kubectl rollout status deployment/myapp --timeout=120s
+    
+    - name: Wait and validate
+      id: validate
+      run: |
+        sleep 60  # Wait 60 seconds after deploy
+        ERROR_RATE=$(curl -s "http://prometheus:9090/api/v1/query?query=\
+          sum(rate(http_requests_total{status=~'5..'}[5m]))/\
+          sum(rate(http_requests_total[5m]))" | jq '.data.result[0].value[1]')
+        
+        echo "Error rate: $ERROR_RATE"
+        
+        # Fail if error rate > 5%
+        if (( $(echo "$ERROR_RATE > 0.05" | bc -l) )); then
+          echo "ERROR: Error rate $ERROR_RATE exceeds threshold"
+          exit 1
+        fi
+    
+    - name: Rollback on failure
+      if: failure() && steps.deploy.conclusion == 'success'
+      run: |
+        echo "Deployment validation failed. Rolling back..."
+        kubectl rollout undo deployment/myapp
+        kubectl rollout status deployment/myapp
+        # Notify on-call
+        curl -X POST $PAGERDUTY_URL \
+          -d '{"event_action":"trigger","payload":{"summary":"Auto-rollback triggered"}}'
+
+Automated Rollback Decision Criteria:
+  
+  GOOD METRICS FOR AUTO-ROLLBACK:
+  ✓ HTTP 5xx error rate (clear signal of application failure)
+  ✓ P99 latency (performance regression)
+  ✓ Success rate of critical user journeys (synthetic monitoring)
+  ✓ Application-level error rate (from application metrics)
+  ✓ JVM heap usage (if OOM causing failures)
+  
+  BAD METRICS FOR AUTO-ROLLBACK (use for alerting, not auto-rollback):
+  ✗ CPU utilization (too noisy, normal during deployment)
+  ✗ Memory usage (may increase legitimately with new features)
+  ✗ Request volume (unrelated to deployment quality)
+
+Auto-Rollback Best Practices:
+  - Have a "bake time": Wait N minutes after deployment before declaring success
+  - Set conservative thresholds initially; tighten as you build confidence
+  - Alert engineers when auto-rollback triggers (even if handled automatically)
+  - Test the auto-rollback mechanism regularly (chaos engineering)
+  - Have a post-auto-rollback runbook (what should oncall do after?)
+
+================================================================================
+5. DATABASE ROLLBACK CHALLENGES
+================================================================================
+
+The Hard Part:
+  Application rollback is straightforward: redeploy old binary.
+  Database rollback is much harder because databases have STATE.
+  
+  If new code wrote to a new schema, rolling back the application doesn't
+  automatically rollback the data.
+
+Schema Compatibility:
+  BACKWARD-COMPATIBLE SCHEMA (Rollback is safe):
+  ✓ Adding a new nullable column (old code ignores it)
+  ✓ Adding a new table (old code doesn't use it)
+  ✓ Adding a new index (transparent to application code)
+  ✓ Changing a DEFAULT value (neutral to existing queries)
+  
+  BACKWARD-INCOMPATIBLE SCHEMA (Rollback is dangerous):
+  ✗ Renaming a column old code references
+  ✗ Removing a column old code reads/writes
+  ✗ Changing a column type (e.g., VARCHAR → INT)
+  ✗ Adding a NOT NULL column without default (old code may not set it)
+  ✗ Changing constraints (removing NOT NULL old code relied on)
+
+Handling Data Written by New Code:
+  If v2 wrote data to a new_column that v1 doesn't know about:
+  - Rolling back to v1: No problem (v1 ignores new_column)
+  
+  If v2 stopped writing to old_column (migration completed) and v1 reads old_column:
+  - Rolling back to v1: v1 reads stale/empty old_column → data appears missing
+  
+  Solution: During expand phase, write to BOTH columns simultaneously.
+  Then even if you roll back to v1, old_column is still populated.
+
+Flyway / Liquibase Rollbacks:
+  
+  FLYWAY:
+    Pro: Clean versioned migrations, simple to use
+    Con: Paid tier required for rollback scripts (Community doesn't support it)
+    
+    Versioned migrations: V1__create_users.sql, V2__add_email.sql
+    Flyway tracks which scripts have run in a schema_version table.
+    Rolling back: Run the inverse manually or use Flyway Undo scripts (paid).
+    
+    Best practice: Make every migration forward-only and backward-compatible.
+    Don't rely on Flyway rollback; use expand-contract instead.
+  
+  LIQUIBASE:
+    Better rollback support: Each changeset can have a <rollback> element.
+    Can auto-generate rollback for simple changes (ADD COLUMN → DROP COLUMN).
+    
+    <changeSet id="2" author="alice">
+        <addColumn tableName="users">
+            <column name="email" type="VARCHAR(255)"/>
+        </addColumn>
+        <rollback>
+            <dropColumn tableName="users" columnName="email"/>
+        </rollback>
+    </changeSet>
+    
+    # Liquibase rollback to a tag:
+    liquibase --tag=release-2.0 rollback
+    
+    # Liquibase rollback last N changesets:
+    liquibase rollbackCount 1
+
+The Expand-Contract Pattern (Repeat from CD Overview — critical for rollback):
+  
+  Always add before removing:
+  
+  Goal: Change behavior/schema with ability to rollback at any point.
+  
+  PHASE 1 (Expand + New Code):
+    - Add new_column (nullable, backward-compatible)
+    - Deploy new code: writes to BOTH old_column AND new_column
+    - If rollback needed: Roll back to version that writes to old_column
+    - SAFE: old_column still populated
+  
+  PHASE 2 (Cutover):
+    - New code reads exclusively from new_column
+    - If rollback needed: Roll back to PHASE 1 code (writes to both)
+    - SAFE: new_column still has recent data; old_column still populated by Phase 1
+  
+  PHASE 3 (Contract):
+    - After stability confirmed, remove old_column from new code
+    - If rollback: Roll back to Phase 2 code (reads new_column, writes both)
+    - RISKY: Rolling back to PHASE 1 is now dangerous (old_column has stale data)
+    - Mitigation: Run backfill before Phase 3 to populate old_column from new_column
+
+Zero-Downtime Database Rollback Checklist:
+  ✓ Is this migration backward-compatible? (Can old code still run with new schema?)
+  ✓ Can we roll back the schema change without data loss?
+  ✓ Have we tested rollback in staging?
+  ✓ If using Expand-Contract, are we in the right phase?
+  ✓ Is old code still writing to all columns it reads?
+
+================================================================================
+6. ROLLBACK TRIGGERS — WHEN TO ROLL BACK
+================================================================================
+
+Automatic Rollback Triggers:
+  
+  HARD THRESHOLDS (immediate rollback):
+  - HTTP 5xx error rate > 5% for 2 consecutive minutes
+  - P99 latency > 2× baseline for 2 minutes
+  - Health check endpoint returning non-200
+  - Application crashing/OOMKilled
+  
+  SOFT ALERTS (human decision):
+  - Business metric degradation (conversion rate down 10%)
+  - Error rate slightly elevated but within normal variance
+  - Performance degradation in non-critical endpoints
+  - External dependency issues (not caused by your deployment)
+
+Manual Rollback Decision Matrix:
+  
+  SEVERITY    ROLLBACK?   ACTION
+  ──────────────────────────────────────────────────────────────────────
+  P0 Outage   ALWAYS      Rollback immediately, ask questions later
+  P1 Critical  Usually    Rollback unless fix is < 15 minutes away
+  P2 Major    Maybe       Evaluate rollback vs fix-forward
+  P3 Minor    Rarely      Fix-forward, add feature flag kill-switch
+
+The Bake Time:
+  Don't declare a deployment successful immediately after deploy.
+  Wait for a "bake time" — usually 10-30 minutes — to collect enough
+  signal that the deployment is healthy.
+  
+  Deployment timeline:
+  0:00 - Deploy starts
+  0:05 - Deploy complete
+  0:05 - Smoke tests pass
+  0:35 - Bake time complete (30 minutes of metrics collected)
+  0:35 - Deployment declared SUCCESSFUL (rollback window closed)
+  
+  If any threshold exceeded during bake time → ROLLBACK
+
+"Canary" as a Built-in Bake Period:
+  Canary deployments build in the bake time automatically:
+  - 5% traffic to canary for 10 minutes → Check metrics
+  - 25% traffic for 15 minutes → Check metrics
+  - 50% traffic for 15 minutes → Check metrics
+  - 100% → Bake complete
+  
+  Total bake time: 40 minutes before full rollout. Issues catch before impact.
+
+================================================================================
+7. ROLLBACK IN KUBERNETES
+================================================================================
+
+Kubernetes Native Rollback:
+  
+  # View rollout history
+  kubectl rollout history deployment/myapp
+  # REVISION  CHANGE-CAUSE
+  # 1         kubectl apply --record
+  # 2         docker-build-push v2
+  # 3         docker-build-push v3
+  
+  # Rollback to previous revision
+  kubectl rollout undo deployment/myapp
+  
+  # Rollback to specific revision
+  kubectl rollout undo deployment/myapp --to-revision=2
+  
+  # Monitor rollback
+  kubectl rollout status deployment/myapp
+  # Waiting for deployment "myapp" rollout to finish: 2 out of 3 new replicas...
+  # deployment "myapp" successfully rolled out
+  
+  # Verify rollback
+  kubectl get pods -l app=myapp -o jsonpath='{.items[*].spec.containers[0].image}'
+
+Kubernetes Deployment Revision History:
+  
+  # By default, Kubernetes keeps 10 revision history
+  # Configure in spec.revisionHistoryLimit
+  spec:
+    revisionHistoryLimit: 5  # Keep last 5 revisions for rollback
+  
+  # Each Deployment update creates a new ReplicaSet
+  # kubectl rollout undo switches back to the previous ReplicaSet
+
+Rollback with Helm:
+  
+  # View release history
+  helm history myapp-release
+  # REVISION  STATUS       CHART         DESCRIPTION
+  # 1         superseded   myapp-1.0.0   Install complete
+  # 2         superseded   myapp-1.1.0   Upgrade complete
+  # 3         deployed     myapp-1.2.0   Upgrade complete
+  
+  # Rollback to previous version
+  helm rollback myapp-release
+  
+  # Rollback to specific revision
+  helm rollback myapp-release 2
+  
+  # View rollback diff
+  helm diff revision myapp-release 3 2
+
+Argo CD Rollback:
+  
+  GitOps: The git repository is the source of truth.
+  
+  # Argo CD rollback = reverting the git commit that triggered the deploy
+  git revert HEAD --no-edit
+  git push origin main
+  # Argo CD detects the revert and deploys the reverted version
+  
+  # Or from Argo CD UI: History → Select previous sync → Rollback
+  
+  # From CLI:
+  argocd app rollback myapp [--revision 2]
+
+Flux CD Rollback:
+  Similar GitOps approach — revert the commit, Flux reconciles automatically.
+  
+  # Suspend reconciliation (to stop forward changes during incident)
+  flux suspend kustomization myapp
+  
+  # Revert in git, then resume
+  flux resume kustomization myapp
+
+================================================================================
+8. ROLLBACK AND STATEFUL SERVICES
+================================================================================
+
+The Stateful Problem:
+  Stateless services: Easy rollback (same behavior regardless of state)
+  Stateful services: Hard rollback (state may have changed during new version)
+
+Stateful Applications:
+  - Databases (covered in section 5)
+  - Message queues: If new code changed message format, old code may not parse them
+  - Caches: If new code changed cache format/keys, old code may get unexpected data
+  - File storage: If new code changed file format, old code can't read new files
+
+Message Queue Compatibility:
+  Problem: v2 produces messages in new format. After rollback, v1 consumer
+  can't parse v2 format messages still in the queue.
+  
+  Solution:
+  - BACKWARD COMPATIBILITY: v1 consumer can parse both old and new formats
+  - VERSIONED MESSAGE FORMAT: Include version in message; consumers route accordingly
+  - CONSUMER-DRIVEN CONTRACT TESTING: v2 producer validates v1 consumer can parse
+
+Cache Compatibility:
+  Problem: v2 changed cache key format. After rollback, v1 can't find cached data.
+  
+  Solutions:
+  - Use versioned cache keys: "user:v2:{userId}" → v1 falls back to cache miss
+  - Cache miss = slow but correct (falls back to database)
+  - Usually not critical: Cache miss is a performance issue, not a correctness issue
+
+File Format Changes:
+  - Blue-Green helps here: v1 environment reads v1-format files; v2 reads v2-format
+  - Feature flag: v2 only writes new format when flag is on
+  - Migration: Always write with backward-compatible format during transition
+
+================================================================================
+9. POST-ROLLBACK ANALYSIS
+================================================================================
+
+After a rollback, always conduct a post-mortem:
+
+POST-ROLLBACK CHECKLIST:
+  ✓ Timeline: What happened and when?
+  ✓ Detection: How was the problem detected? (Monitoring? User reports? How long did it take?)
+  ✓ Decision: Who decided to rollback? On what criteria?
+  ✓ Execution: How long did rollback take? Was it difficult?
+  ✓ Root cause: What in the new code caused the problem?
+  ✓ Why tests didn't catch it: What gap in testing allowed this to reach production?
+  ✓ Prevention: What can prevent this class of bug in the future?
+  ✓ Detection improvement: How can we detect this faster next time?
+
+Blameless Post-Mortem Culture:
+  Focus on SYSTEMS, not individuals.
+  "Why did the SYSTEM allow this to happen?" not "Who made this mistake?"
+  
+  5 Whys technique:
+  - Why did the deployment fail? Error rate spiked.
+  - Why did error rate spike? NullPointerException in new code path.
+  - Why wasn't it caught in testing? We didn't test with null userId.
+  - Why didn't we test null userId? No test for edge cases.
+  - Why no edge case tests? We focus on happy path only.
+  → Action: Add contract tests for null/edge case inputs.
+
+Impact Metrics to Record:
+  - Duration of impact (from deployment to rollback completion)
+  - Users affected (number or percentage)
+  - Revenue impact (if applicable)
+  - Error rate during incident
+
+================================================================================
+10. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: What is the difference between rollback and roll-forward?
+A: Both are strategies for recovering from a bad deployment:
+   
+   ROLLBACK: Revert to the previous version of the application.
+   Trade-off: Fast if blue-green or feature flags are in place, but dangerous
+   if database schema was changed in an incompatible way.
+   
+   ROLL FORWARD (Fix Forward): Deploy a new version with the bug fixed, rather
+   than reverting. This creates version N+1 rather than reverting to N-1.
+   Preferred when: the fix is simple and fast; database changes make rollback risky;
+   the team has a fast CI/CD pipeline.
+   
+   High-velocity teams (Netflix, Amazon) prefer roll-forward because their
+   pipelines are fast enough that a fix can be deployed in minutes. The mantra:
+   "Deploy small changes frequently so rollback is rarely needed, and when it is,
+   roll forward with the fix instead."
+
+Q2: How does database schema change affect rollback strategy?
+A: Database changes are the hardest constraint on rollback:
+   
+   BACKWARD-COMPATIBLE changes (adding nullable columns, adding indexes) allow
+   safe rollback — old code still works with the new schema.
+   
+   BACKWARD-INCOMPATIBLE changes (removing columns, renaming columns, changing
+   types) make rollback dangerous — rolling back the application with old code
+   that references a removed column will cause errors.
+   
+   Solution: Expand-Contract pattern:
+   1. Expand: Add new elements (backward-compatible)
+   2. Migrate: Move to new structure with new code
+   3. Contract: Remove old elements ONLY after confirmed stable
+   
+   This way, rollback is always possible until Phase 3 (Contract), because old
+   code still works with the schema at any phase before Contract.
+   
+   Tools like Flyway and Liquibase track schema versions, but write rollback
+   scripts manually or use Expand-Contract to avoid needing rollback scripts.
+
+Q3: What makes Blue-Green deployment the best strategy for rollback?
+A: Blue-Green keeps the previous version (Blue) running and hot while deploying
+   to the new environment (Green). Traffic is switched at the load balancer level.
+   
+   Rollback = switch the load balancer back to Blue. This is:
+   - INSTANT: Load balancer changes take effect in milliseconds
+   - SIMPLE: One API call or UI click
+   - SAFE: Blue was just serving 100% traffic; it's in a known-good state
+   - NO RE-DEPLOYMENT: Blue is still running, just not receiving traffic
+   
+   The trade-off is cost: You're running double infrastructure.
+   The rollback window: Blue should stay running for at least 30 minutes after
+   switching to Green. After that window, if Green is healthy, scale down Blue.
+   
+   The limitation: If Green made incompatible database changes, switching back to
+   Blue may cause data issues. This is why Blue-Green doesn't fully solve
+   database rollback problems.
+
+Q4: When should you use automated rollback vs manual rollback?
+A: Automated rollback is better for:
+   - High-traffic services where every second of degradation matters
+   - Clear, objective metric thresholds (error rate > 5%)
+   - Overnight/weekend deployments with no one monitoring
+   - Canary stages where the rollback is low-risk (only 5% of traffic)
+   
+   Manual rollback is better for:
+   - Ambiguous metrics (is this spike due to the deployment or external traffic?)
+   - Complex multi-service deployments where a rollback affects multiple services
+   - When rollback itself carries risk (database schema changes)
+   - Situations requiring human judgment about business impact
+   
+   Best practice: Use automated rollback for well-defined technical thresholds,
+   but have engineers always notified and able to override. Automated systems
+   should reduce response time, not remove human judgment for complex decisions.
+
+Q5: How do you design a deployment pipeline to minimize rollback risk?
+A: Design the pipeline so rollbacks are rarely needed in the first place:
+   
+   1. Comprehensive automated tests: Catch issues pre-production
+   2. Staging environment parity: Staging behaves like production
+   3. Feature flags: Hide risky features; toggle off without deployment
+   4. Canary deployments: Expose bugs with 5% traffic before affecting all users
+   5. Automated canary analysis: Machine-driven promotion/rollback decisions
+   6. Expand-Contract for database: Schema always backward-compatible
+   7. Contract testing: Microservices don't break each other's consumers
+   8. Small, frequent deployments: Smaller changes = smaller blast radius
+   
+   When rollbacks do happen:
+   - Blue-Green for instant traffic switch
+   - Kubernetes rollout undo for rolling updates
+   - Feature flag toggle as fastest rollback mechanism
+   - Post-mortem to prevent recurrence
+
+================================================================================
+11. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+ROLLBACK vs ROLL FORWARD:
+  Rollback: Revert to N-1. Fast if blue-green/flags. Risky with DB changes.
+  Roll Forward: Fix and deploy N+1. Preferred when fix is fast.
+
+Rollback Speed by Strategy:
+  Feature Flag:  INSTANT  (toggle off, no deploy)
+  Blue-Green:    INSTANT  (switch LB back)
+  Canary:        FAST     (shift traffic to 0%)
+  Rolling:       MEDIUM   (reverse rolling update)
+  Recreate:      SLOW     (redeploy old artifact)
+
+Kubernetes Rollback Commands:
+  kubectl rollout undo deployment/myapp
+  kubectl rollout undo deployment/myapp --to-revision=2
+  kubectl rollout history deployment/myapp
+  kubectl rollout status deployment/myapp
+
+Helm Rollback:
+  helm rollback <release-name>
+  helm rollback <release-name> <revision>
+  helm history <release-name>
+
+Database Rollback Strategy:
+  Use Expand-Contract:
+  EXPAND → MIGRATE → (safe to rollback here) → CONTRACT
+  After CONTRACT: Rollback is risky (old code missing schema elements)
+  
+  Tools: Flyway (V1__migration.sql versioned scripts)
+         Liquibase (XML/YAML/SQL changesets with rollback blocks)
+
+Automated Rollback Triggers (good metrics):
+  - HTTP 5xx error rate > threshold (e.g., 5%)
+  - P99 latency > Nx baseline (e.g., 2× baseline)
+  - Health check failing
+  - OOMKilled pods
+
+Post-Rollback:
+  1. Collect timeline/metrics
+  2. Blameless post-mortem (5 Whys)
+  3. Root cause: What didn't tests catch?
+  4. Add tests for the missed case
+  5. Improve detection speed (lower MTTD)
+
+DORA Metric: MTTR
+  Elite: < 1 hour | High: < 1 day | Medium: < 1 week | Low: > 1 week
+
+Key Principle:
+  "If rollback is scary, you haven't practiced it enough."
+  — Practice rollbacks in staging regularly.
+
+================================================================================
+END OF FILE
+================================================================================

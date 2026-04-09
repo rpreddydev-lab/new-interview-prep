@@ -1,0 +1,253 @@
+================================================================
+USERINFO ENDPOINT — OIDC
+================================================================
+
+WHAT IS THE USERINFO ENDPOINT?
+--------------------------------
+The UserInfo endpoint is an OAuth2-protected resource that returns
+claims about the authenticated user. It's defined in OIDC Core spec.
+
+Endpoint URL: /userinfo (or as published in the discovery document)
+
+To call it:
+  GET /userinfo
+  Authorization: Bearer <access_token>
+
+The access token must have the "openid" scope to access this endpoint.
+
+================================================================
+USERINFO vs ID TOKEN
+================================================================
+
+                    ID Token                    UserInfo Endpoint
+------------------------------------------------------------------
+Format              JWT                         JSON (or JWT)
+Timing              At login (one time)         Any time after login
+Network call        No                          Yes (HTTP GET)
+Freshness           Stale (snapshot at login)   Current data
+Signature verify    Yes (required)              Trusted (authenticated)
+Use case            Prove identity at login     Get fresh/more claims
+Claims              Limited by scope+token      Potentially more claims
+Access token needed No                          Yes
+
+WHY USE USERINFO OVER ID TOKEN?
+  1. User updated their profile after login → get fresh claims
+  2. You need claims not included in the ID token (e.g., address)
+  3. AS limits ID token size → full claims only at UserInfo
+  4. Token privacy — minimize claims in ID token
+
+================================================================
+USERINFO REQUEST
+================================================================
+
+GET /userinfo HTTP/1.1
+Host: auth-server.com
+Authorization: Bearer eyJhbGciOiJSUzI1NiJ9...  ← access token
+
+Response (JSON):
+{
+  "sub": "user-12345",
+  "name": "John Doe",
+  "given_name": "John",
+  "family_name": "Doe",
+  "email": "john@example.com",
+  "email_verified": true,
+  "picture": "https://example.com/pic.jpg",
+  "locale": "en-US",
+  "updated_at": 1713481200
+}
+
+IMPORTANT: sub in UserInfo MUST match sub in the ID Token.
+  If they differ → reject (possible token mix-up).
+
+================================================================
+USERINFO AS JWT
+================================================================
+
+The UserInfo endpoint CAN return a JWT (signed or encrypted) instead of plain JSON.
+This allows verification of response integrity.
+
+Content-Type: application/jwt
+
+JWT UserInfo payload:
+{
+  "iss": "https://auth-server.com",
+  "sub": "user-12345",
+  "aud": "my-client-id",
+  "name": "John Doe",
+  "email": "john@example.com"
+}
+
+When to use JWT format:
+  - When response integrity matters (prevent MITM modification)
+  - When response must be encrypted (privacy)
+  - Enterprise/high-security scenarios
+
+================================================================
+SPRING SECURITY — USERINFO ENDPOINT
+================================================================
+
+SPRING AUTOMATICALLY CALLS USERINFO:
+  When using OAuth2 login with OIDC, Spring Security calls the
+  UserInfo endpoint automatically after receiving the ID token.
+  The claims are merged into the OidcUser principal.
+
+// Spring Security OAuth2 Login with OIDC
+@Bean
+public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http.oauth2Login(oauth2 -> oauth2
+        .userInfoEndpoint(userInfo -> userInfo
+            .oidcUserService(customOidcUserService())
+        )
+    );
+    return http.build();
+}
+
+// Custom OIDC user service — called after UserInfo is fetched
+@Bean
+public OidcUserService customOidcUserService() {
+    OidcUserService delegate = new OidcUserService();
+
+    // Specify which scopes trigger UserInfo fetch
+    Set<String> noUserInfoForScopes = new HashSet<>();
+    noUserInfoForScopes.add("openid"); // only openid → don't call UserInfo
+    delegate.setAccessibleScopes(noUserInfoForScopes);
+
+    return new OidcUserService() {
+        @Override
+        public OidcUser loadUser(OidcUserRequest request) {
+            OidcUser oidcUser = delegate.loadUser(request);
+
+            // Merge custom attributes from your DB
+            String userId = oidcUser.getSubject();
+            UserProfile dbProfile = userService.findBySub(userId)
+                .orElseGet(() -> userService.createFromOidc(oidcUser));
+
+            // Return with combined authorities
+            Set<GrantedAuthority> authorities = new HashSet<>(oidcUser.getAuthorities());
+            dbProfile.getRoles().stream()
+                .map(role -> new SimpleGrantedAuthority("ROLE_" + role))
+                .forEach(authorities::add);
+
+            return new DefaultOidcUser(
+                authorities,
+                oidcUser.getIdToken(),
+                oidcUser.getUserInfo()
+            );
+        }
+    };
+}
+
+// Manually call UserInfo endpoint
+@Service
+public class UserInfoService {
+
+    private final WebClient webClient;
+    private final String userInfoUri;
+
+    public Map<String, Object> getUserInfo(String accessToken) {
+        return webClient.get()
+            .uri(userInfoUri)
+            .header("Authorization", "Bearer " + accessToken)
+            .retrieve()
+            .bodyToMono(new ParameterizedTypeReference<Map<String, Object>>() {})
+            .block();
+    }
+}
+
+================================================================
+CLAIMS AGGREGATION — DISTRIBUTED CLAIMS
+================================================================
+
+OIDC supports Distributed Claims — claims stored at external endpoints.
+The UserInfo response contains a reference instead of the value:
+
+{
+  "sub": "user-12345",
+  "name": "John Doe",
+  "_claim_names": {
+    "payment_info": "src1",
+    "shipping_address": "src2"
+  },
+  "_claim_sources": {
+    "src1": {
+      "endpoint": "https://payments.example.com/claims",
+      "access_token": "access_token_for_payments"
+    },
+    "src2": {
+      "endpoint": "https://shipping.example.com/claims"
+    }
+  }
+}
+
+Client fetches claims from each external source.
+Useful for: regulated industries where claims from different systems.
+
+================================================================
+USERINFO ENDPOINT SECURITY
+================================================================
+
+PROTECT THE ENDPOINT:
+  - Require valid access token with "openid" scope
+  - Validate token claims (sub matches the token's sub)
+  - Rate limit (prevent data scraping)
+  - Return only claims relevant to the requested scopes
+
+RATE LIMITING CONSIDERATION:
+  If your app calls UserInfo on every request → performance issue.
+  Cache UserInfo response for a reasonable duration (e.g., session lifetime).
+
+PRIVACY:
+  Only return claims the user consented to (by scope).
+  Enforce scope-based claim filtering.
+
+================================================================
+SCOPE TO CLAIMS MAPPING
+================================================================
+
+Scope               Claims Returned
+-----------------------------------------------------------------------
+openid              sub (required)
+profile             name, family_name, given_name, middle_name,
+                    nickname, preferred_username, profile, picture,
+                    website, gender, birthdate, zoneinfo, locale,
+                    updated_at
+email               email, email_verified
+address             address (structured JSON object)
+phone               phone_number, phone_number_verified
+
+EXAMPLE:
+  scope=openid email → sub + email + email_verified
+  scope=openid profile email → sub + all profile claims + email + email_verified
+
+================================================================
+COMMON INTERVIEW QUESTIONS
+================================================================
+
+Q: What is the UserInfo endpoint and when would you use it?
+A: The UserInfo endpoint is an OAuth2-protected OIDC resource that returns
+   current claims about the user. Use it when: (1) you need fresh claims
+   (user updated profile), (2) the ID token doesn't include all needed
+   claims, (3) you need claims only available via specific scopes.
+
+Q: What is the difference between claims in the ID token and UserInfo?
+A: ID token claims are a snapshot at login time — they don't change once
+   issued. UserInfo returns current data from the IdP. UserInfo requires
+   an API call; ID token is self-contained. Spring Security automatically
+   merges both into the OidcUser principal.
+
+Q: Is the sub in UserInfo response always the same as in the ID token?
+A: Yes — they MUST match. The spec requires UserInfo to return the same
+   sub as the ID token. If they differ, the client must reject the
+   response (possible attack or misconfiguration).
+
+Q: How does Spring Security use the UserInfo endpoint?
+A: When OAuth2 login completes, Spring's OidcUserService automatically
+   calls the UserInfo endpoint (discovered from the provider's discovery
+   document). Claims from the ID token and UserInfo are merged into the
+   OidcUser principal available via authentication.getPrincipal().
+
+Q: What scopes control what claims are returned from UserInfo?
+A: openid (sub), profile (name, picture, etc.), email (email,
+   email_verified), address (structured address), phone (phone_number).
+   The AS should only return claims corresponding to granted scopes.

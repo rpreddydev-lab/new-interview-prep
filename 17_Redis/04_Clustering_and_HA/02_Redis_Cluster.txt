@@ -1,0 +1,261 @@
+================================================================================
+REDIS CLUSTER — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. WHAT IS REDIS CLUSTER?
+───────────────────────────
+  Redis Cluster is the built-in distributed solution that provides:
+    - Horizontal sharding: data split across multiple primary nodes
+    - High availability: automatic failover per shard
+    - Scalability: add nodes online to redistribute load
+    - No single point of failure
+
+  Trade-offs vs standalone:
+    - Multi-key operations restricted (keys must be in same slot)
+    - Slightly more complex client and operations
+    - Minimum 3 primary nodes (6 nodes with replicas)
+
+
+2. HASH SLOTS — THE SHARDING MECHANISM
+─────────────────────────────────────────
+  Redis Cluster divides the key space into 16,384 hash slots (0 – 16383).
+
+  Key → Slot mapping:
+    slot = CRC16(key) % 16384
+
+  Hash tag (force co-location):
+    If key contains {...}, only content inside braces is hashed:
+    {user:42}:session → CRC16("user:42") % 16384
+    {user:42}:profile → CRC16("user:42") % 16384
+    → Same slot! Multi-key commands work between these two keys.
+
+  3 primary node example:
+    Node A: slots 0–5460      (1/3 of key space)
+    Node B: slots 5461–10922  (1/3 of key space)
+    Node C: slots 10923–16383 (1/3 of key space)
+
+  Why 16384 slots (not more)?
+    - Each node sends a 16384-bit (2KB) bitmap in heartbeat messages
+    - 65536 would be too large for heartbeats (overhead)
+    - 16384 is sufficient for 1000 nodes (16 slots/node average)
+    - CRC16 produces 16-bit values → 16384 is a practical subset
+
+
+3. CLUSTER TOPOLOGY
+─────────────────────
+  Minimum recommended: 6 nodes (3 primary + 3 replicas)
+
+  Node roles:
+    Primary: serves reads and writes for its slots
+    Replica: replicates from its primary; serves reads (optional)
+
+  Node communication:
+    All nodes communicate with each other via Redis Cluster Bus
+    (TCP port: data_port + 10000, e.g., 6379 → 16379 for bus)
+    Uses gossip protocol to share cluster state.
+
+  Cluster state:
+    OK: all slots covered, no primary is failing
+    FAIL: at least one primary has failed AND no replica can take over
+    (The cluster stops serving requests for failed slots if no replica exists)
+
+  CLUSTER INFO output key fields:
+    cluster_enabled:1
+    cluster_state:ok
+    cluster_slots_assigned:16384
+    cluster_slots_ok:16384
+    cluster_known_nodes:6
+    cluster_size:3           ← number of primaries
+
+
+4. CLUSTER COMMANDS
+─────────────────────
+  Node management:
+    CLUSTER INFO                      → cluster-level stats
+    CLUSTER NODES                     → all nodes, IDs, roles, slots
+    CLUSTER MYID                      → this node's ID
+    CLUSTER MEET ip port              → add a new node to cluster
+    CLUSTER FORGET node-id            → remove node from cluster table
+    CLUSTER REPLICATE node-id         → make this node a replica of node-id
+    CLUSTER FAILOVER [FORCE|TAKEOVER] → manual failover
+    CLUSTER RESET [HARD|SOFT]         → reset cluster state
+
+  Slot management:
+    CLUSTER ADDSLOTS slot [slot …]    → assign slots to this node
+    CLUSTER DELSLOTS slot [slot …]    → remove slots from this node
+    CLUSTER SETSLOT slot IMPORTING node-id  → migration: start import
+    CLUSTER SETSLOT slot MIGRATING node-id  → migration: start migrate
+    CLUSTER SETSLOT slot NODE node-id       → assign slot to node (after migration)
+
+  Key/slot utilities:
+    CLUSTER KEYSLOT mykey             → compute slot for a key
+    CLUSTER GETKEYSINSLOT slot count  → list keys in a slot (for migration)
+    CLUSTER COUNTKEYSINSLOT slot      → count keys in a slot
+
+  Resharding tool (redis-cli):
+    redis-cli --cluster reshard <host>:<port>
+
+
+5. REDIRECTIONS: MOVED AND ASK
+──────────────────────────────────
+  When a client sends a command for a key to the WRONG node:
+
+  MOVED redirect (permanent):
+    Server: -MOVED 7638 127.0.0.1:6380
+    Meaning: slot 7638 permanently lives at 6380.
+    Client must update its slot map and reconnect to 6380.
+    Indicates a stable routing error (client has stale topology).
+
+  ASK redirect (temporary, during migration):
+    Server: -ASK 7638 127.0.0.1:6380
+    Meaning: slot 7638 is MIGRATING to 6380 right now.
+    Client must send ASKING to 6380 first, then the command.
+    ASK is temporary — don't update slot map.
+    After migration completes, MOVED will be used.
+
+  Smart clients (Jedis, Lettuce) handle both automatically.
+  Dumb clients (redis-cli) follow-the-redirect manually.
+
+  ASKING command:
+    When you receive ASK redirect:
+    → Connect to new node
+    → Send ASKING (one-time override to accept the migrating slot)
+    → Send the actual command
+
+
+6. FAILOVER IN CLUSTER
+────────────────────────
+  Primary failure:
+    1. Other nodes detect primary is unreachable (cluster bus ping timeout)
+    2. Nodes mark primary as PFAIL (possible fail)
+    3. When majority of primaries agree: primary marked FAIL
+    4. One of the primary's replicas starts election
+    5. Replica with highest replication offset sends FAILOVER_AUTH_REQUEST
+    6. Majority of primaries vote and grant FAILOVER_AUTH_GRANTED
+    7. Elected replica becomes new primary for those slots
+    8. Old primary (if recovers) becomes replica
+
+  Failover time: typically 1–10 seconds (much faster than Sentinel).
+
+  Manual failover (zero downtime):
+    On the replica you want to promote:
+    CLUSTER FAILOVER           → graceful (waits for replication to catch up)
+    CLUSTER FAILOVER FORCE     → forceful (don't wait for acks)
+    CLUSTER FAILOVER TAKEOVER  → no election needed (dangerous: split-brain risk)
+
+
+7. MULTI-KEY OPERATIONS IN CLUSTER
+────────────────────────────────────
+  Problem: MSET, MGET, SUNIONSTORE, EVAL, MULTI/EXEC
+    → these require multiple keys to be on the SAME node.
+
+  Solutions:
+
+  1. Hash tags:
+     MSET {user:42}:name "Alice" {user:42}:age "30"
+     → both in same slot
+
+  2. Client-side aggregation:
+     Get keys one-by-one and merge in application code.
+
+  3. Pipelining:
+     Send multiple GET commands pipelined — client routes each to correct shard.
+     Lettuce handles this natively.
+
+  Commands blocked in cluster:
+    KEYS * (runs on connected node only, not all nodes)
+    SCAN cursor (runs on connected node — use per-node scan or redis-cli --cluster call)
+    DEBUG OBJECT (per-node)
+    SELECT db (cluster uses only db 0)
+
+
+8. CLUSTER RESHARDING
+──────────────────────
+  Adding a new node and redistributing slots:
+
+  Step 1: Start new Redis node
+  Step 2: Add to cluster:
+    redis-cli --cluster add-node new-host:port existing-host:port
+
+  Step 3: Reshard (move slots):
+    redis-cli --cluster reshard existing-host:port
+    → Prompts: how many slots to move, source nodes, target node
+
+  Step 4: Verify:
+    CLUSTER INFO
+    CLUSTER NODES
+
+  Online resharding:
+    During migration, IMPORTING/MIGRATING flags are set on nodes.
+    ASK redirects handle in-flight requests for migrating slots.
+    No downtime required.
+
+
+9. CLUSTER SCALING EXAMPLE
+────────────────────────────
+  Start with 3 primaries (each ~5461 slots):
+    Node A: 0–5460
+    Node B: 5461–10922
+    Node C: 10923–16383
+
+  Add Node D:
+    redis-cli --cluster add-node D:6379 A:6379
+    Reshard: move 4096 slots from A, B, C to D:
+    Node A: 0–4096
+    Node B: 5461–9556
+    Node C: 10923–15019
+    Node D: 4097–5460, 9557–10922, 15020–16383
+
+
+10. CLUSTER CONFIGURATION
+───────────────────────────
+  redis.conf settings:
+    cluster-enabled yes
+    cluster-config-file nodes.conf       # auto-managed cluster state file
+    cluster-node-timeout 15000           # ms before node considered failing
+    cluster-require-full-coverage yes    # if any slot is uncovered → FAIL state
+    cluster-migration-barrier 1          # min replicas primary must have for migration
+    cluster-allow-reads-when-down no     # allow reads during partial failure
+    cluster-replica-no-failover no       # disable auto-failover (manual control)
+
+  cluster-require-full-coverage:
+    yes (default): cluster goes to FAIL state if ANY slot uncovered
+    no: cluster continues serving requests for covered slots
+    → Set to no for partial availability during failures
+
+
+11. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: How does Redis Cluster shard data?
+  A: Using 16,384 hash slots. Each key maps to a slot via CRC16(key) % 16384.
+     Each primary node owns a range of slots. This allows linear slot assignment
+     and efficient rebalancing — only move slots between nodes, not all keys.
+
+  Q: What is a hash tag and why is it important?
+  A: A hash tag forces multiple keys into the same hash slot by using only the
+     content inside {} for slot calculation. {user:42}:session and {user:42}:profile
+     both hash using "user:42", so they land on the same shard. This enables
+     multi-key commands (MSET, pipelines, transactions) between related keys
+     in a cluster.
+
+  Q: What's the difference between MOVED and ASK redirects?
+  A: MOVED is a permanent redirect — the slot has been fully migrated to the
+     new node. The client should update its slot map. ASK is a temporary redirect
+     during slot migration — the client must send ASKING first, use the redirect
+     just once, but NOT update its slot map (migration may still be in progress).
+
+  Q: What happens when a primary fails in Redis Cluster?
+  A: Other cluster nodes detect the failure via gossip. Once a majority of
+     primaries mark it as FAIL, an election begins among its replicas. The
+     replica with the highest replication offset requests votes from primaries.
+     On receiving majority votes, it promotes itself and takes over the slots.
+     Typical recovery is 1–10 seconds.
+
+  Q: Why does Redis Cluster use 16,384 hash slots instead of a larger number?
+  A: Each cluster node sends a bitmap of its slot assignments in heartbeat
+     messages. 16,384 bits = 2KB, which is acceptable overhead. Using 65,536
+     would require 8KB per heartbeat — too expensive. 16,384 also supports
+     thousands of nodes (each with at least 1 slot) and provides smooth
+     resharding granularity.
+
+================================================================================

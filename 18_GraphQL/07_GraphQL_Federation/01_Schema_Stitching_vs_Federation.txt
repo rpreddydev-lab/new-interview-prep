@@ -1,0 +1,235 @@
+================================================================
+SCHEMA STITCHING vs APOLLO FEDERATION
+================================================================
+
+1. WHAT IS SCHEMA STITCHING?
+================================================================
+
+1.1 Definition
+Schema stitching is the process of combining multiple GraphQL schemas
+into a single gateway schema. The gateway merges type definitions from
+multiple services and proxies (delegates) resolver calls to the appropriate
+service.
+
+1.2 How Stitching Works
+```
+Client → Gateway → User Service (localhost:4001)
+                 → Product Service (localhost:4002)
+                 → Order Service (localhost:4003)
+```
+
+The gateway:
+1. Introspects or receives SDL from each service
+2. Merges schemas (renaming conflicts, linking types)
+3. For each field, knows which service to delegate to
+4. Builds a merged schema that clients query
+
+1.3 Tools for Schema Stitching
+- graphql-tools (@graphql-tools/stitch) — Node.js library
+- Spring + manual SDL merging — Java approach
+- Hasura Remote Schemas — database-first approach
+
+1.4 Schema Stitching Example (Node.js)
+```javascript
+const { stitchSchemas } = require('@graphql-tools/stitch');
+
+const gatewaySchema = stitchSchemas({
+  subschemas: [
+    {
+      schema: usersSchema,
+      executor: httpExecutor('http://users-service/graphql'),
+    },
+    {
+      schema: postsSchema,
+      executor: httpExecutor('http://posts-service/graphql'),
+      // tell the gateway: Post.author should be fetched from usersSchema
+      merge: {
+        User: {
+          fieldName: 'user',
+          selectionSet: '{ id }',
+          args: (partialUser) => ({ id: partialUser.id }),
+        }
+      }
+    }
+  ]
+});
+```
+
+The gateway must explicitly declare how to resolve cross-service references
+(merge config) — this is manual and grows complex with many services.
+
+
+2. WHAT IS APOLLO FEDERATION?
+================================================================
+
+2.1 Definition
+Apollo Federation is a specification where each subgraph declares its own
+entities and extensions using Federation directives. A Router composes the
+subgraph schemas automatically — no manual merge configuration required.
+
+2.2 How Federation Works
+```
+Client → Apollo Router (composed supergraph)
+              → Users Subgraph
+              → Products Subgraph
+              → Orders Subgraph
+```
+
+Each subgraph annotates its own schema:
+```graphql
+# Users Subgraph — declares ownership of User entity
+type User @key(fields: "id") {
+  id: ID!
+  name: String!
+}
+
+# Posts Subgraph — references User entity
+type User @key(fields: "id") {
+  id: ID! @external
+  posts: [Post!]!
+}
+```
+
+The Router auto-composes these into one supergraph schema without any
+gateway-level merge configuration.
+
+
+3. SIDE-BY-SIDE COMPARISON
+================================================================
+
+| Dimension              | Schema Stitching                          | Apollo Federation                          |
+|------------------------|-------------------------------------------|--------------------------------------------|
+| Configuration          | Gateway configures how schemas link       | Each subgraph configures itself            |
+| Cross-service typing   | Explicit merge config at gateway          | @key / @external directives in subgraph    |
+| Ownership model        | Gateway owns the linking logic            | Each service owns its schema slice          |
+| Team independence      | Teams must coordinate through gateway     | Teams own their subgraphs independently    |
+| Schema composition     | Manual (code in gateway)                  | Automatic (via Federation spec)             |
+| Tooling                | graphql-tools, custom code                | Apollo Router, Apollo Studio, rover CLI    |
+| Language support       | Node.js primarily                         | Any language (Java, Python, Go, etc.)      |
+| Performance (gateway)  | Node.js (moderate throughput)             | Rust Apollo Router (high throughput)       |
+| Introspection required | Yes (or manual SDL sharing)               | Subgraphs expose _service { sdl }         |
+| Error detection        | Runtime, hard to track                    | Composition validation in CI (rover check)|
+| Gradual adoption       | Harder                                     | Easy — add subgraphs incrementally         |
+| Production use         | Declining                                  | Industry standard for GraphQL microservices|
+
+
+4. WHEN TO USE EACH
+================================================================
+
+Use Schema Stitching when:
+  ✔ You already have existing GraphQL services you can't modify
+  ✔ You need to combine third-party schemas
+  ✔ Your stack is primarily Node.js
+  ✔ Small number of services (2-3)
+  ✔ Schema is relatively stable
+
+Use Apollo Federation when:
+  ✔ Multiple teams working independently
+  ✔ Many services (4+) with growth expected
+  ✔ Services in different languages/frameworks
+  ✔ You want CI/CD schema validation (rover subgraph check)
+  ✔ You want the Router's built-in query planning / performance
+
+
+5. MIGRATION PATH: STITCHING → FEDERATION
+================================================================
+
+Step 1: Add @key directives to entity types in each service
+```graphql
+# Before (stitching — plain type)
+type User {
+  id: ID!
+  name: String!
+}
+
+# After (federation — annotated entity)
+type User @key(fields: "id") {
+  id: ID!
+  name: String!
+}
+```
+
+Step 2: Add reference resolver (_entities) to each service
+```java
+@QueryMapping("_entities")
+public List<Object> entities(@Argument List<Map<String,Object>> representations) {
+  return representations.stream()
+    .map(r -> userRepo.findById(Long.valueOf(r.get("id").toString())).orElse(null))
+    .collect(Collectors.toList());
+}
+```
+
+Step 3: Replace explicit merge config at gateway with @external/@key
+   in extending subgraphs
+
+Step 4: Deploy Apollo Router alongside existing stitching gateway
+
+Step 5: Gradually shift traffic from stitching gateway to Router
+
+Step 6: Decommission old stitching gateway
+
+
+6. TECHNICAL INTERNALS: HOW EACH RESOLVES CROSS-SERVICE TYPES
+================================================================
+
+Schema Stitching:
+```
+Client: { post { title author { name } } }
+
+Gateway:
+1. Route 'post' to Posts Service → get { title, authorId: "42" }
+2. Route 'author' lookup to Users Service using merge config:
+   userService.query: user(id: "42") { name }
+3. Merge response
+```
+
+Apollo Federation:
+```
+Client: { post { title author { name } } }
+
+Router:
+1. post { title author { id } }  →  Posts Subgraph
+   (Router knows it will need author.name from Users, so fetches author.id first)
+2. _entities([{__typename: "User", id: "42"}])  →  Users Subgraph
+3. Merge: author = { id: "42", name: "Alice" }
+4. Return unified response
+```
+
+Key difference: In stitching, the gateway contains the logic for how to
+join types. In Federation, the subgraphs contain that information in their
+own schema annotations — the Router computes the query plan from those
+annotations at runtime.
+
+
+7. INTERVIEW QUESTIONS & ANSWERS
+================================================================
+
+Q: Can schema stitching and Federation coexist?
+A: Yes. You can have a gateway that stitches some schemas while also
+   federating others. Teams often use this as a migration strategy —
+   legacy services stay stitched while new services use Federation.
+
+Q: What is the main architectural difference between stitching and Federation?
+A: In stitching, the gateway holds the cross-service wiring knowledge.
+   In Federation, each subgraph holds its own wiring information (via directives),
+   and the Router just composes what's declared.
+
+Q: Why is schema stitching considered "declining"?
+A: It requires manual gateway configuration that grows unbounded as services
+   multiply. Federation moved the responsibility to where it belongs — the
+   service that owns the type — making it infinitely more scalable across teams.
+
+Q: Does Federation require Apollo-specific infrastructure?
+A: For full features (Apollo Studio, managed federation, schema validation),
+   yes. But the Federation spec itself is open — there are open-source routers
+   (Apollo Router is source-available) and Federation-compatible implementations
+   for most languages (including Spring for GraphQL with federation add-on).
+
+Q: Is Federation v2 backward compatible with stitching consumers?
+A: Federation changes the server-side schema annotations. The client API
+   remains identical — clients don't know they're talking to a federated
+   graph. The transition is invisible to consumers.
+
+================================================================
+END OF FILE
+================================================================

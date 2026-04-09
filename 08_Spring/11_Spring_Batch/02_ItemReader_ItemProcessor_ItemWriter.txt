@@ -1,0 +1,246 @@
+================================================================
+  SPRING BATCH — ItemReader, ItemProcessor, ItemWriter
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Chunk-oriented processing reads one item at a time, processes each,
+then writes a chunk (N items) in a single transaction.
+
+ItemReader<T>    — reads ONE item; returns null to signal end of input
+ItemProcessor<I,O> — transforms one item (I → O); returns null to SKIP
+ItemWriter<O>    — writes a List<O> (one chunk); called once per chunk
+
+These interfaces are generic — you swap implementations per use case.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. BUILT-IN ITEM READERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━ FlatFileItemReader (CSV/fixed-width files) ━━━━━━━━━━━━━━━
+
+@Bean
+@StepScope
+public FlatFileItemReader<RawOrder> csvOrderReader(
+    @Value("#{jobParameters['input.file']}") String filePath) {
+
+    return new FlatFileItemReaderBuilder<RawOrder>()
+        .name("csvOrderReader")
+        .resource(new FileSystemResource(filePath))
+        .linesToSkip(1)                           // skip header
+        .delimited()
+        .delimiter(",")
+        .names("orderId", "customerId", "total", "status")
+        .fieldSetMapper(new BeanWrapperFieldSetMapper<>() {{
+            setTargetType(RawOrder.class);
+        }})
+        .build();
+}
+
+━ JdbcCursorItemReader (DB cursor — single thread) ━━━━━━━━━
+
+@Bean
+@StepScope
+public JdbcCursorItemReader<Order> jdbcCursorReader(DataSource dataSource) {
+    return new JdbcCursorItemReaderBuilder<Order>()
+        .name("jdbcCursorReader")
+        .dataSource(dataSource)
+        .sql("SELECT id, customer_id, total, status FROM orders WHERE status = 'PENDING'")
+        .rowMapper(new BeanPropertyRowMapper<>(Order.class))
+        .fetchSize(100)   // JDBC fetch size — rows to buffer
+        .build();
+}
+
+━ JdbcPagingItemReader (DB paging — safe for multi-thread) ━━
+
+@Bean
+@StepScope
+public JdbcPagingItemReader<Order> jdbcPagingReader(DataSource dataSource) {
+    Map<String, Order> sortKeys = Map.of("id", Order.class);
+
+    return new JdbcPagingItemReaderBuilder<Order>()
+        .name("jdbcPagingReader")
+        .dataSource(dataSource)
+        .selectClause("SELECT id, customer_id, total, status")
+        .fromClause("FROM orders")
+        .whereClause("WHERE status = 'PENDING'")
+        .sortKeys(Map.of("id", Order.SortOrder.ASCENDING))
+        .pageSize(100)
+        .rowMapper(new BeanPropertyRowMapper<>(Order.class))
+        .build();
+}
+
+━ StaxEventItemReader (XML) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Bean
+public StaxEventItemReader<Product> xmlReader() {
+    return new StaxEventItemReaderBuilder<Product>()
+        .name("xmlProductReader")
+        .resource(new ClassPathResource("products.xml"))
+        .addFragmentRootElements("product")   // root element per item
+        .unmarshaller(jaxb2Marshaller())
+        .build();
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. CUSTOM ITEM READER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Implement ItemReader<T> for custom sources (Kafka, REST API, etc.):
+
+@Component
+@StepScope
+public class ApiOrderReader implements ItemReader<RawOrder> {
+
+    private final OrderApiClient apiClient;
+    private final Queue<RawOrder> buffer = new LinkedList<>();
+    private int pageNumber = 0;
+    private boolean exhausted = false;
+
+    @Override
+    public RawOrder read() {
+        if (buffer.isEmpty() && !exhausted) {
+            Page<RawOrder> page = apiClient.getOrders(pageNumber++, 100);
+            buffer.addAll(page.getContent());
+            if (!page.hasNext()) {
+                exhausted = true;
+            }
+        }
+        return buffer.poll();  // returns null when buffer empty and exhausted
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. ITEM PROCESSOR
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Component
+public class OrderProcessor implements ItemProcessor<RawOrder, Order> {
+
+    private final CustomerService customerService;
+
+    @Override
+    public Order process(RawOrder raw) throws Exception {
+        // Return null to skip this item (not written)
+        if (raw.getTotal() == null || raw.getTotal().compareTo(BigDecimal.ZERO) <= 0) {
+            log.warn("Skipping invalid order: {}", raw.getOrderId());
+            return null;
+        }
+
+        Customer customer = customerService.findById(raw.getCustomerId());
+        if (customer == null) {
+            throw new UnknownCustomerException("No customer: " + raw.getCustomerId());
+        }
+
+        return Order.builder()
+            .externalId(raw.getOrderId())
+            .customerId(raw.getCustomerId())
+            .total(raw.getTotal())
+            .status(OrderStatus.valueOf(raw.getStatus()))
+            .build();
+    }
+}
+
+// Composing processors:
+CompositeItemProcessor<RawOrder, Order> composite = new CompositeItemProcessorBuilder<RawOrder, Order>()
+    .delegates(validationProcessor, enrichmentProcessor, transformationProcessor)
+    .build();
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. BUILT-IN ITEM WRITERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━ JdbcBatchItemWriter (SQL batch insert/update) ━━━━━━━━━━━━
+
+@Bean
+public JdbcBatchItemWriter<Order> jdbcOrderWriter(DataSource dataSource) {
+    return new JdbcBatchItemWriterBuilder<Order>()
+        .dataSource(dataSource)
+        .sql("""
+            INSERT INTO orders (external_id, customer_id, total, status)
+            VALUES (:externalId, :customerId, :total, :status)
+            ON CONFLICT (external_id) DO UPDATE
+            SET status = EXCLUDED.status, total = EXCLUDED.total
+            """)
+        .beanMapped()   // maps Order fields to :namedParams
+        .build();
+}
+
+━ RepositoryItemWriter (Spring Data) ━━━━━━━━━━━━━━━━━━━━━━
+
+@Bean
+public RepositoryItemWriter<Order> repositoryWriter(OrderRepository orderRepository) {
+    return new RepositoryItemWriterBuilder<Order>()
+        .repository(orderRepository)
+        .methodName("save")
+        .build();
+}
+
+━ FlatFileItemWriter (CSV output) ━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Bean
+@StepScope
+public FlatFileItemWriter<Order> csvWriter(
+    @Value("#{jobParameters['output.file']}") String outputPath) {
+    return new FlatFileItemWriterBuilder<Order>()
+        .name("csvOrderWriter")
+        .resource(new FileSystemResource(outputPath))
+        .delimited()
+        .delimiter(",")
+        .names("externalId", "customerId", "total", "status")
+        .headerCallback(w -> w.write("orderId,customerId,total,status"))
+        .build();
+}
+
+━ Custom ItemWriter ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Component
+public class KafkaOrderWriter implements ItemWriter<Order> {
+
+    private final KafkaTemplate<String, OrderEvent> kafka;
+
+    @Override
+    public void write(Chunk<? extends Order> chunk) {
+        chunk.getItems().forEach(order ->
+            kafka.send("orders", order.getExternalId(),
+                new OrderEvent(order.getExternalId(), "IMPORTED")));
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: When should you use JdbcCursorItemReader vs JdbcPagingItemReader?
+A: JdbcCursorItemReader keeps an open database cursor across the entire step
+   execution — efficient for single-threaded processing but not thread-safe.
+   JdbcPagingItemReader issues a fresh paginated query for each chunk — safe
+   for multi-threaded or partitioned steps. Use cursor for simpler single-thread
+   jobs; use paging for parallel steps.
+
+Q: How do you skip an item in ItemProcessor?
+A: Return null from process(). Spring Batch will not pass null items to the
+   ItemWriter — they are silently skipped. This is useful for filtering out
+   invalid or irrelevant records. Combine with skip counting in the step
+   configuration to fail the job if too many items are skipped.
+
+Q: What is the difference between FlatFileItemReader and JdbcCursorItemReader
+   in terms of restart behavior?
+A: Both support restart. FlatFileItemReader remembers the last-read line number
+   in the ExecutionContext. On restart, it seeks forward to the saved position.
+   JdbcCursorItemReader stores the last processed row's cursor position.
+   JdbcPagingItemReader stores the last page number and resumes from there.
+
+Q: What does CompositeItemProcessor do?
+A: It chains multiple ItemProcessors in sequence. The output of each processor
+   becomes the input of the next. If any processor returns null, the item is
+   skipped and subsequent processors are not called. Useful for separating
+   validation, enrichment, and transformation into distinct reusable components.
+
+Q: What is a Chunk in Spring Batch?
+A: A Chunk<T> is the container that holds all items read during one chunk cycle
+   before they are written. The writer receives a Chunk (Chunk<? extends Order>)
+   — you get the items with chunk.getItems(). The chunk size (commit-interval)
+   determines how many items are processed before a DB commit.

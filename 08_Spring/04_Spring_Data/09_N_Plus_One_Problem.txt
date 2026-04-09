@@ -1,0 +1,238 @@
+================================================================
+  THE N+1 SELECT PROBLEM IN JPA / HIBERNATE
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. WHAT IS THE N+1 PROBLEM?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+N+1 occurs when loading a list of N entities causes N additional
+queries to fetch each entity's lazy-loaded association.
+
+Example:
+  List<Order> orders = orderRepo.findAll();  // 1 query → N orders
+  for (Order o : orders) {
+      System.out.println(o.getCustomer().getName());  // N queries!
+  }
+
+SQL emitted:
+  SELECT * FROM orders;                    -- query 1 (1)
+  SELECT * FROM customers WHERE id = 1;   -- query 2 (N)
+  SELECT * FROM customers WHERE id = 2;   -- query 3
+  SELECT * FROM customers WHERE id = 3;   -- query 4
+  ...                                      -- total: 1 + N queries
+
+With N = 1000 orders → 1001 queries to the database!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. ROOT CAUSES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. LAZY fetch with loop access (most common)
+2. EAGER fetch without JOIN causes N SELECT instead of 1 JOIN
+   (@ManyToOne is EAGER by default)
+3. Missing JOIN FETCH in JPQL
+4. Nested relationships: order → customer → address → city = N^3
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. SOLUTION 1: JOIN FETCH IN JPQL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Query("SELECT DISTINCT o FROM Order o JOIN FETCH o.customer")
+List<Order> findAllWithCustomer();
+
+SQL emitted:
+  SELECT DISTINCT o.*, c.*
+  FROM orders o
+  INNER JOIN customers c ON o.customer_id = c.id;
+
+One query instead of N+1. ✓
+
+Nested associations:
+@Query("""
+    SELECT DISTINCT o FROM Order o
+    JOIN FETCH o.customer c
+    JOIN FETCH c.address
+    JOIN FETCH o.items i
+    JOIN FETCH i.product
+    """)
+List<Order> findAllWithDetails();
+
+⚠️  DISTINCT is required when fetching collections (items) to avoid
+    duplicate Order rows in result (Hibernate deduplicates in memory).
+    SQL may still return duplicates — Hibernate filters them.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. SOLUTION 2: @EntityGraph
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Ad-hoc entity graph on repository method
+@EntityGraph(attributePaths = {"customer", "items", "items.product"})
+List<Order> findAll();
+
+// Named entity graph on entity
+@NamedEntityGraph(name = "Order.full",
+    attributeNodes = {
+        @NamedAttributeNode("customer"),
+        @NamedAttributeNode(value = "items", subgraph = "items")
+    },
+    subgraphs = @NamedSubgraph(name = "items",
+        attributeNodes = @NamedAttributeNode("product"))
+)
+@Entity
+public class Order { ... }
+
+@EntityGraph("Order.full")
+Optional<Order> findById(Long id);
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. SOLUTION 3: BATCH FETCHING (Hibernate-specific)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Instead of 1+N queries, batch fetching issues 1+(N/batchSize) queries.
+
+On entity:
+  @Entity
+  @BatchSize(size = 25)
+  public class Customer { ... }
+
+On collection:
+  @OneToMany
+  @BatchSize(size = 25)
+  private List<OrderItem> items;
+
+Global (application.properties):
+  spring.jpa.properties.hibernate.default_batch_fetch_size=25
+
+Behavior: when accessing customers[0].getName() triggers a lazy load,
+Hibernate fetches 25 customers in one SELECT...IN(...) query.
+
+  SELECT * FROM customers WHERE id IN (1, 2, 3, ... 25);
+
+Tradeoff: Not as efficient as JOIN FETCH but simpler to configure
+and avoids cartesian products for multiple collection fetches.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. SOLUTION 4: SUBSELECT FETCHING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@OneToMany
+@Fetch(FetchMode.SUBSELECT)
+private List<OrderItem> items;
+
+Fetches all items for all loaded orders using one subselect:
+  SELECT * FROM order_items
+  WHERE order_id IN (SELECT id FROM orders WHERE ...);
+
+Total: 2 queries regardless of N. Good for moderate-sized collections.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. N+1 WITH EAGER LOADING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚠️  EAGER fetch does NOT automatically use JOINs!
+    Hibernate may still issue N separate SELECT statements.
+
+  @ManyToOne(fetch = FetchType.EAGER)  // ← still triggers N+1 !
+  private Customer customer;
+
+Hibernate 5 and earlier: EAGER @ManyToOne → Hibernate uses SELECT
+for each row. To force JOIN, you must use JOIN FETCH or @EntityGraph.
+
+Hibernate 6: improved — uses JOIN for @ManyToOne EAGER by default.
+But best practice is still LAZY + intentional fetching.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. DETECTING N+1 IN PRACTICE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+a) Enable SQL logging:
+   spring.jpa.show-sql=true
+   spring.jpa.properties.hibernate.format_sql=true
+   logging.level.org.hibernate.SQL=DEBUG
+   logging.level.org.hibernate.orm.jdbc.bind=TRACE  # bind params
+
+b) Hibernate statistics:
+   spring.jpa.properties.hibernate.generate_statistics=true
+   logging.level.org.hibernate.stat=DEBUG
+
+c) Datasource Proxy:
+   Use p6spy or datasource-proxy to log and count all SQL statements.
+
+d) Testing with @DataJpaTest:
+   Verify the number of queries executed in a test.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  9. SOLUTION COMPARISON TABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Solution            | Queries  | Code Change | Notes
+  ────────────────────┼──────────┼─────────────┼──────────────────────────
+  JOIN FETCH (JPQL)   | 1        | Medium      | Best for single assoc
+  @EntityGraph        | 1        | Low         | Reusable, declarative
+  Batch Fetching      | 1+N/batch| Very Low    | Global setting easy
+  SUBSELECT fetch     | 2        | Low         | Good for large collections
+  DTO projection      | 1        | Medium      | Best for read-only views
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  10. PAGINATION AND COLLECTION FETCH WARNING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Combining JOIN FETCH on a collection with Pageable results in:
+  "HHH90003004: firstResult/maxResults specified with collection fetch;
+   applying in memory!"
+
+Hibernate fetches ALL rows and paginates in JVM memory — disaster for large data.
+
+Fix — Two-query approach:
+  // Step 1: paginate on IDs only (no collection fetch)
+  @Query("SELECT o.id FROM Order o WHERE o.status = :status")
+  Page<Long> findIdsByStatus(@Param("status") OrderStatus status,
+                              Pageable pageable);
+
+  // Step 2: fetch full entities by ID list (with collection fetch)
+  @Query("SELECT DISTINCT o FROM Order o JOIN FETCH o.items " +
+         "WHERE o.id IN :ids")
+  List<Order> findByIdIn(@Param("ids") List<Long> ids);
+
+  // Service:
+  Page<Long> ids = orderRepo.findIdsByStatus(status, pageable);
+  List<Order> orders = orderRepo.findByIdIn(ids.getContent());
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  11. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the N+1 problem?
+A: Loading N parent entities followed by N separate queries to load
+   each entity's association, resulting in N+1 total queries instead
+   of 1 JOIN query. It degrades performance severely at scale.
+
+Q: How would you detect an N+1 problem in a Spring Boot application?
+A: Enable spring.jpa.show-sql=true and hibernate statistics. Look for
+   repeated SELECT statements with different primary key values. Use
+   p6spy or datasource-proxy to count queries in integration tests.
+
+Q: What is the best solution for N+1?
+A: Depends on use case. JOIN FETCH or @EntityGraph for fetching single
+   associations eagerly when you know you'll need them. Batch fetching
+   (hibernate.default_batch_fetch_size) as a safety net for unexpected
+   lazy loading. DTO projections for read-only queries to avoid ORM
+   overhead entirely.
+
+Q: Does setting FetchType.EAGER fix N+1?
+A: No! EAGER means Hibernate will load the association immediately,
+   but it may still issue a separate SELECT per entity rather than
+   a JOIN. To ensure a JOIN, use JOIN FETCH in JPQL or @EntityGraph.
+
+Q: What warning do you see when doing JOIN FETCH with pagination?
+A: "firstResult/maxResults specified with collection fetch; applying
+   in memory!" — Hibernate can't apply SQL LIMIT with a JOIN on a
+   collection (wrong row count), so it loads all rows and applies
+   pagination in memory. Fix with the two-query pattern.
+
+Q: What is batch fetching and how does it help?
+A: Batch fetching groups lazy loads into batches (e.g., SELECT WHERE
+   id IN (1,2,...,25)), reducing N queries to N/batchSize queries.
+   Configure globally with hibernate.default_batch_fetch_size=25.
+   It doesn't eliminate the problem but greatly reduces its impact.

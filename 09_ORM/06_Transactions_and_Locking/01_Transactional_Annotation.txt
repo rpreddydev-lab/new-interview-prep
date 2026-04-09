@@ -1,0 +1,185 @@
+================================================================
+@Transactional — Deep Dive
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. @TRANSACTIONAL ATTRIBUTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Transactional(
+    propagation     = Propagation.REQUIRED,          // default
+    isolation       = Isolation.DEFAULT,              // default (DB default)
+    readOnly        = false,                          // default
+    timeout         = -1,                             // default (no timeout), in SECONDS
+    rollbackFor     = {},                             // rollback on these exception types
+    noRollbackFor   = {}                              // do NOT rollback on these types
+)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. HOW SPRING APPLIES @TRANSACTIONAL (AOP Proxy)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Spring wraps the bean in a proxy (JDK dynamic proxy or CGLIB):
+
+orderService.placeOrder(...)
+      ↓
+  TransactionInterceptor (AOP proxy)
+      ↓ BEGIN TRANSACTION
+  orderService.placeOrder(...)    ← actual method runs
+      ↓ SUCCESS → COMMIT
+      ↓ RuntimeException → ROLLBACK
+
+The proxy intercepts only calls from OUTSIDE the bean.
+Internal (self) calls bypass the proxy — see File 05 Pitfalls.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. CLASS-LEVEL vs METHOD-LEVEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Service
+@Transactional               // applies to ALL public methods
+public class OrderService {
+
+    public Order create(Order o) { ... }      // inherits class-level
+
+    @Transactional(readOnly = true)           // overrides class-level
+    public Order find(Long id) { ... }
+
+    @Transactional(propagation = REQUIRES_NEW)
+    public void logAudit(String msg) { ... }  // always new transaction
+}
+
+// Method-level annotation takes precedence over class-level.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. ROLLBACK RULES IN DETAIL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Default rollback behavior:
+  RuntimeException (including custom)   → ROLLBACK
+  Error                                 → ROLLBACK
+  Checked Exception (e.g., IOException) → COMMIT (no rollback!)
+
+This is the most common interview gotcha:
+  @Transactional
+  public void processFile(String path) throws IOException {
+      repo.save(entity);
+      fileService.readFile(path);   // throws IOException
+      // Entity IS COMMITTED even though IOException was thrown!
+  }
+
+Fix:
+  @Transactional(rollbackFor = Exception.class)
+  public void processFile(String path) throws IOException { ... }
+
+Or catch and rethrow as RuntimeException:
+  try {
+      fileService.readFile(path);
+  } catch (IOException e) {
+      throw new RuntimeException("File error", e);
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. READONLY AND TIMEOUT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ReadOnly:
+  @Transactional(readOnly = true)
+  public List<User> getUsers() { ... }
+  // Hibernate skips dirty checking; 1LC entities marked read-only
+  // Spring passes connection as read-only → can route to read replica
+  // Does NOT prevent writes physically — just signals intent
+
+Timeout (seconds):
+  @Transactional(timeout = 10)   // rollback if method takes > 10 seconds
+  public void processSlowJob() { ... }
+  // Throws TransactionTimedOutException and rolls back on expiry
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. WHERE TO PLACE @TRANSACTIONAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Rules:
+1. Only on public methods (private/protected methods are NOT proxied)
+2. On the @Service layer, NOT on @Repository (Spring Data JPA already adds it)
+3. NOT on @Entity or internal utility classes
+4. NOT on interfaces for JDK proxies (Spring Boot uses CGLIB by default)
+
+// Correct:
+@Service
+@Transactional
+public class OrderService { ... }
+
+// Wrong — won't work (not a Spring-managed bean call chain):
+@Component
+public class Helper {
+    @Transactional   // bypassed in self-call from within same bean!
+    private void doWork() { ... }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. PROGRAMMATIC TRANSACTION MANAGEMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When you need fine-grained control:
+
+@Autowired
+private TransactionTemplate transactionTemplate;
+
+public void processConditionally(boolean condition) {
+    transactionTemplate.execute(status -> {
+        if (!condition) {
+            status.setRollbackOnly();   // mark for rollback without throwing
+            return null;
+        }
+        userRepo.save(new User());
+        return null;
+    });
+}
+
+// Or PlatformTransactionManager:
+@Autowired
+private PlatformTransactionManager txManager;
+
+public void manualTx() {
+    TransactionStatus status = txManager.getTransaction(new DefaultTransactionDefinition());
+    try {
+        userRepo.save(new User());
+        txManager.commit(status);
+    } catch (Exception e) {
+        txManager.rollback(status);
+        throw e;
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. INTERVIEW QUICK HITS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: Does @Transactional work on private methods?
+A: No. Spring AOP creates a proxy around the bean. The proxy only intercepts
+   calls made FROM OUTSIDE the bean through the proxy. Private methods are
+   not visible to the proxy. Also, internal self-invocation (this.method())
+   bypasses the proxy entirely.
+
+Q: What exceptions trigger a rollback by default?
+A: RuntimeException (and its subclasses) and Error. Checked exceptions do
+   NOT trigger a rollback by default. Use rollbackFor = Exception.class to
+   rollback on all exceptions, including checked ones.
+
+Q: Can you use @Transactional on an interface method?
+A: Yes, but it's not recommended. Spring recommends placing @Transactional
+   on the concrete class, because CGLIB subclass-based proxies (Spring Boot
+   default) don't handle interface annotations as cleanly. JDK dynamic proxies
+   do support interface annotations, but CGLIB proxies are now the default.
+
+Q: What does setRollbackOnly() do?
+A: It marks the current transaction to be rolled back when it commits, even
+   if no exception is thrown. Used in TransactionTemplate or when you need to
+   conditionally rollback without throwing an exception.
+
+Q: What is the difference between @Transactional on @Service vs @Repository?
+A: Spring Data JPA already applies @Transactional at the repository level
+   for CRUD operations. Adding @Transactional on the @Service layer creates
+   a single, larger transaction that spans multiple repository calls —
+   ensuring all-or-nothing semantics across the entire service method.

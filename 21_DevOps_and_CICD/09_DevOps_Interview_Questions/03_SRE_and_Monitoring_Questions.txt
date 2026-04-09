@@ -1,0 +1,512 @@
+================================================================================
+SRE & MONITORING INTERVIEW QUESTIONS
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+Section A: SLIs, SLOs, SLAs, and Error Budgets
+Section B: Prometheus & PromQL
+Section C: Alerting Best Practices
+Section D: Incident Response & On-Call
+Section E: Observability & Distributed Systems
+Section F: Chaos Engineering
+
+================================================================================
+SECTION A: SLIs, SLOs, SLAs, AND ERROR BUDGETS
+================================================================================
+
+Q1: Explain SLI, SLO, SLA, and error budgets. How do they relate to engineering decisions?
+
+A: Definitions:
+   
+   SLI (Service Level Indicator):
+   - A quantitative measurement of service behavior
+   - Examples: request success rate, p99 latency, uptime percentage
+   - Formula: (good events / total events) over time window
+   
+   SLO (Service Level Objective):
+   - The TARGET value for an SLI
+   - Internal agreement (between SRE and product teams)
+   - Example: "99.9% of requests return 2xx in < 500ms, measured monthly"
+   - Should be SLIGHTLY stricter than SLA (buffer for errors)
+   
+   SLA (Service Level Agreement):
+   - External contract with customers/users
+   - Legal and financial consequences if violated
+   - Example: "99.9% uptime guaranteed; 10x credit if violated"
+   - Typically less strict than internal SLO
+   
+   Error Budget:
+   - Allowed failure budget before SLO is breached
+   - 99.9% SLO = 0.1% failures allowed = ~43.8 min/month downtime
+   - 99.99% SLO = 0.01% failures = ~4.4 min/month
+   
+   Error budget as an engineering decision tool:
+   
+   Scenario 1 — Budget healthy (< 50% consumed):
+   - Engineering can take risks: deploy more frequently, try new tech
+   - SRE supports feature velocity
+   
+   Scenario 2 — Budget burning fast (50-90% consumed):
+   - Slow deployment cadence
+   - Prioritize reliability improvements
+   - Require extra review for risky changes
+   
+   Scenario 3 — Budget exhausted (> 100%):
+   - Feature freeze: no new deploys until budget recovers
+   - All-hands on reliability
+   - Post-mortem + reliability roadmap required to resume
+   
+   Key insight: Error budgets align incentives — both SRE and dev team own the SLO.
+   Neither can blame the other. If budget is burned on incidents, that's less
+   budget for moving fast on features.
+
+---
+
+Q2: How do you set meaningful SLOs? What's a good SLO?
+
+A: Starting point — use SLI categories:
+   
+   Availability:
+   SLI = (successful requests / total requests) * 100
+   Start with: 99.9% (industry standard for web services)
+   
+   Latency:
+   SLI = (requests completing in < Xms / total requests) * 100
+   Common: p50, p95, p99 — choose ONE to define SLO
+   Use p99, not average (average hides tail latency)
+   Start with: "99% of requests < 500ms"
+   
+   Data freshness (for async systems):
+   SLI = (pipelines completing within SLA / total pipelines)
+   Example: "95% of data pipeline runs complete within 30 minutes"
+   
+   How to set the number:
+   1. Measure actual performance for 30-60 days
+   2. Calculate current percentile performance
+   3. Set SLO slightly lower than current performance
+      (Don't set target you're already frequently missing)
+   4. Tighten over time as reliability improves
+   
+   Common mistakes:
+   - 100% SLO: impossible, gives zero error budget, burns team out on every incident
+   - SLO too loose: never triggers action, useless
+   - Measuring at load balancer: doesn't catch internal errors; measure at user level
+   - Annual windows: too slow to react; use rolling 28-day windows
+
+================================================================================
+SECTION B: PROMETHEUS & PROMQL
+================================================================================
+
+Q3: How does Prometheus collect metrics? What is the pull model and why does it matter?
+
+A: Prometheus Pull Model:
+   
+   Traditional (Push):
+   Services → send metrics → central collector
+   Problem: if collector is overloaded, it creates backpressure on services
+   
+   Prometheus (Pull):
+   Prometheus → scrapes /metrics endpoint → on schedule (e.g., every 15s)
+   
+   Why pull model is better:
+   - Prometheus controls the load (it decides when to scrape)
+   - Service configuration stays in Prometheus (not scattered across services)
+   - If service goes down → Prometheus knows (no scrape = up=0)
+   - Easy to verify: just curl the /metrics endpoint yourself
+   
+   Prometheus scrape config:
+   scrape_configs:
+   - job_name: 'myapp'
+     static_configs:
+     - targets: ['myapp:8080']
+     scrape_interval: 15s
+     metrics_path: /metrics
+   
+   # K8s pod annotation-based auto-discovery:
+   - job_name: 'kubernetes-pods'
+     kubernetes_sd_configs:
+     - role: pod
+     relabel_configs:
+     - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+       action: keep
+       regex: 'true'
+     - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+       target_label: __metrics_path__
+   
+   Pushgateway (for batch jobs):
+   Short-lived jobs can't be scraped (they finish before Prometheus pulls).
+   Solution: push to Pushgateway, Prometheus scrapes Pushgateway.
+   
+   # Push job metrics:
+   cat << EOF | curl --data-binary @- http://pushgateway:9091/metrics/job/backup
+   # TYPE backup_duration_seconds gauge
+   backup_duration_seconds 42.3
+   EOF
+
+---
+
+Q4: Write PromQL queries for common SRE scenarios.
+
+A: Essential PromQL patterns:
+   
+   Request rate (per second over 5 min):
+   rate(http_requests_total{job="myapp"}[5m])
+   
+   Error rate (percentage of 5xx):
+   sum(rate(http_requests_total{status=~"5.."}[5m]))
+   /
+   sum(rate(http_requests_total[5m]))
+   * 100
+   
+   Apdex score (fraction satisfactory + tolerating/2):
+   (
+     sum(rate(http_request_duration_seconds_bucket{le="0.3"}[5m]))
+     +
+     sum(rate(http_request_duration_seconds_bucket{le="1.2"}[5m]))
+   ) / 2
+   / sum(rate(http_request_duration_seconds_count[5m]))
+   
+   p99 latency (histogram_quantile):
+   histogram_quantile(
+     0.99,
+     sum by (le) (rate(http_request_duration_seconds_bucket{job="myapp"}[5m]))
+   )
+   
+   CPU usage by pod:
+   sum by (pod) (
+     rate(container_cpu_usage_seconds_total{namespace="production"}[5m])
+   )
+   
+   Memory usage (MB) by pod:
+   sum by (pod) (
+     container_memory_working_set_bytes{namespace="production"}
+   ) / 1024 / 1024
+   
+   Pods not ready:
+   kube_pod_status_ready{condition="false"} == 1
+   
+   Error budget burn rate (multi-window alerting):
+   # Fast burn (burn 2% budget in 1h → fire immediately):
+   (
+     sum(rate(http_requests_total{status=~"5.."}[1h]))
+     /
+     sum(rate(http_requests_total[1h]))
+   ) > (14.4 * 0.001)     # 14.4x faster than allowed for 99.9% SLO
+   AND
+   (
+     sum(rate(http_requests_total{status=~"5.."}[5m]))
+     /
+     sum(rate(http_requests_total[5m]))
+   ) > (14.4 * 0.001)
+
+================================================================================
+SECTION C: ALERTING BEST PRACTICES
+================================================================================
+
+Q5: What makes a good alert vs a bad alert?
+
+A: Bad alert characteristics:
+   - Fires frequently and teams have learned to ignore it
+   - No clear action: "disk is 80% full" (but won't fill for 6 months)
+   - Point-in-time metric that auto-recovers: CPU spike for 1 minute
+   - Alerts on cause (metric is high) not symptom (users are impacted)
+   - Requires expert knowledge to interpret (no runbook linked)
+   
+   Good alert characteristics:
+   
+   1. Actionable:
+      Always has a clear response. If you don't know what to do, the alert is wrong.
+      Include runbook URL in every alert.
+   
+   2. Symptom-based (not cause-based):
+      BAD:  "CPU > 80%" (cause)
+      GOOD: "p99 latency > 2s" (symptom — users are experiencing slow responses)
+      Users don't care about CPU. They care about response time and errors.
+   
+   3. Multi-window / burn rate for SLOs:
+      Don't alert on instantaneous error rate (too noisy).
+      Alert on error BUDGET BURN RATE — how fast are you consuming your error budget?
+      Fast burn (1h + 5m window) → page immediately
+      Slow burn (6h window) → ticket, next business day
+   
+   4. Clear severity:
+      P1/Critical: Page on-call engineer immediately (lost revenue, all users affected)
+      P2/High:     Slack notification (degraded service, some users affected)
+      P3/Medium:   Ticket to backlog (non-impacting issue)
+   
+   5. Low false-positive rate:
+      Aim for < 1 false positive per on-call shift.
+      Every false positive trains the team to ignore alerts (alert fatigue).
+   
+   AlertManager routing example:
+   route:
+     group_by: ['alertname', 'cluster']
+     receiver: 'slack-default'
+     routes:
+     - match:
+         severity: critical
+       receiver: pagerduty-production
+       repeat_interval: 1h
+     - match:
+         severity: warning
+       receiver: slack-warnings
+       repeat_interval: 4h
+
+================================================================================
+SECTION D: INCIDENT RESPONSE & ON-CALL
+================================================================================
+
+Q6: Walk me through your incident response process for a P0 outage.
+
+A: P0 = all users affected, service completely down or critically degraded.
+   
+   Phase 1 — Detect (0-5 min):
+   - Alertmanager fires → PagerDuty → page on-call engineer
+   - On-call acknowledges within SLA (typically 5-10 min)
+   - Open incident Slack channel: #incident-YYYY-MM-DD-service-name
+   - Assign Incident Commander (IC) — coordinates, doesn't fix
+   
+   Phase 2 — Triage (5-15 min):
+   - First question: "Is this new? What changed in last 30 min?"
+   - Check recent deploys: kubectl rollout history, ArgoCD, deployment log
+   - Check dashboards: error rate graph, latency, upstream dependencies
+   - Initial status page update: "We are investigating an issue with X"
+   - Assess scope: are all users affected? Which regions? Which features?
+   
+   Phase 3 — Mitigate (15-60 min):
+   - Priority: restore service FIRST, find root cause LATER
+   - Mitigation options:
+     * Rollback last deploy (if deploy is suspected)
+     * Scale up (if resource exhaustion)
+     * Toggle feature flag (if bad feature is isolated)
+     * Enable maintenance mode / circuit breaker
+   - Update status page every 15-20 min
+   - Communicate: all stakeholders know what's happening
+   
+   Phase 4 — Resolve:
+   - Service restored. Metrics back to baseline.
+   - Status page: "Service has been restored. Monitoring closely."
+   - All-clear to stakeholders
+   
+   Phase 5 — Post-mortem (within 48-72 hours):
+   - Blameless post-mortem document
+   - Timeline of events
+   - 5 Whys root cause analysis
+   - Action items with owners and deadlines
+   - Share with organization (prevent same issue elsewhere)
+
+---
+
+Q7: How do you reduce on-call burden and alert fatigue?
+
+A: Three categories of work:
+   
+   1. Reduce alert noise:
+   - Audit ALL alerts that fire over 30 days
+   - For every alert that fires but isn't acted on → delete or fix it
+   - Consolidate related alerts (don't page for every pod crash — page when ALL pods crash)
+   - Raise thresholds (if error rate alert fires at 0.01% — raise to 0.1%)
+   - Multi-window alerting (slow burns → tickets, not pages)
+   
+   2. Reduce incident frequency:
+   - Fix top 3 recurring incidents (80% of pages come from 20% of causes)
+   - Better testing and canary deploys (catch before production)
+   - Fix flaky services (keep crashing → find root cause)
+   - Better capacity planning (don't get surprised by traffic)
+   
+   3. Reduce time to resolution (MTTR):
+   - Better runbooks: "When this alert fires, do THIS" step-by-step
+   - Automated runbook execution (AWS Systems Manager, runbooks in Backstage)
+   - Better dashboards: alert should link directly to relevant Grafana panel
+   - Better access: on-call should have right permissions without waiting
+   - Better observability: structured logs, distributed traces, correlation IDs
+   
+   Measuring on-call health:
+   - Pages per day: should be < 2 (actionable, not noise)
+   - MTTA (mean time to acknowledge): < 5 minutes
+   - MTTR (mean time to resolve): trending down over quarters
+   - Escalations: rate of secondary on-call being needed
+   - Post-shift survey: "Was this on-call rotation sustainable?"
+
+================================================================================
+SECTION E: OBSERVABILITY & DISTRIBUTED SYSTEMS
+================================================================================
+
+Q8: What is the difference between monitoring and observability?
+
+A: Monitoring:
+   Collect and alert on predefined metrics.
+   Good for: known failure modes (disk full, CPU high, pod down).
+   Limitation: you must KNOW WHAT TO MEASURE in advance.
+   "Known unknowns" — you prepare for failures you can anticipate.
+   
+   Observability:
+   The ability to understand system internal state from its external outputs.
+   Three pillars: metrics, logs, and traces.
+   Allows you to investigate any question about system behavior,
+   even for failure modes you didn't anticipate.
+   "Unknown unknowns" — investigate novel failures with general-purpose tooling.
+   
+   Practical difference:
+   Monitoring tells you something is wrong.
+   Observability tells you WHY it's wrong.
+   
+   Observability requirements for microservices:
+   
+   Metrics (What is happening?):
+   - Request rate, error rate, latency (RED method)
+   - Resource utilization (CPU, memory, connections)
+   
+   Logs (What happened?):
+   - Structured JSON logs with: timestamp, level, service, trace_id, request_id
+   - Centralized log aggregation (Loki, Elasticsearch)
+   
+   Traces (Where did time go?):
+   - Distributed trace showing the full path of a request across services
+   - Spans with duration — identify bottlenecks
+   - Correlation: trace_id in logs, linked to trace in Jaeger/Tempo
+   
+   The key test: "If a user reports an issue you've never seen before,
+   can you investigate and find root cause in < 30 minutes?"
+   If yes → good observability. If no → you have monitoring, not observability.
+
+---
+
+Q9: How does distributed tracing work in a microservices architecture?
+
+A: Problem: A request passes through 5 services. Latency is 3 seconds.
+   Which service is slow? Logs are scattered across 5 services.
+   
+   Distributed tracing solution:
+   
+   Trace: Unique ID (trace_id) representing the entire request journey
+   Span: Individual unit of work (one service handling the request)
+   Parent Span: Calling service's span ID (establishes hierarchy)
+   
+   Context propagation:
+   When Service A calls Service B, it passes trace context in HTTP headers:
+   W3C traceparent: 00-{trace_id}-{span_id}-01
+   
+   Visual representation:
+   trace_id: abc123
+   
+   ┌─ Payment Service (200ms) ──────────────────────────────────────────────┐
+   │  ├─ Auth Service (10ms) ──────────┤                                   │
+   │  ├─ Inventory Service (50ms) ─────────────┤                           │
+   │  ├─ Pricing Service (15ms) ────────┤                                  │
+   │  └─ Database Query (120ms) ─────────────────────────────────────────┤ │
+   └────────────────────────────────────────────────────────────────────────┘
+   
+   Instantly visible: Database query is the bottleneck (120ms of 200ms total).
+   
+   OpenTelemetry (OTel):
+   Vendor-neutral tracing API. Instrument once, export to any backend.
+   Backends: Jaeger (open source), Tempo (Grafana), Datadog APM, AWS X-Ray
+   
+   Auto-instrumentation (no code changes):
+   # Python — zero-code instrumentation:
+   opentelemetry-instrument python app.py
+   
+   # Java — JVM agent:
+   java -javaagent:opentelemetry-javaagent.jar \
+     -Dotel.service.name=payment-service \
+     -Dotel.exporter.otlp.endpoint=http://otel-collector:4317 \
+     app.jar
+
+================================================================================
+SECTION F: CHAOS ENGINEERING
+================================================================================
+
+Q10: What is chaos engineering and when is it appropriate?
+
+A: Chaos engineering: intentionally inject failures into a system to verify
+   it handles them gracefully and your monitoring/alerting catches them.
+   
+   Netflix coined it with "Chaos Monkey" (randomly terminates production instances).
+   
+   Principles:
+   1. Hypothesis: "System should handle X failure with Y behavior"
+   2. Blast radius: Start small — one service, one AZ, off-peak hours
+   3. Abort criteria: Pre-defined conditions that stop the experiment
+   4. Measure: Verify monitoring detected the failure AND system recovered
+   
+   Common chaos experiments:
+   - Pod/node kill: does K8s restart the pod? Does app recover?
+   - Network latency injection: does service degrade gracefully?
+   - Dependency failure: does circuit breaker work?
+   - Resource exhaustion: what happens when memory limit is hit?
+   
+   Tools:
+   Chaos Monkey (Netflix): Randomly kills EC2 instances
+   LitmusChaos (CNCF):    K8s-native chaos experiments (ChaosEngine CRD)
+   Chaos Mesh:            K8s chaos (network, IO, Pod, Node)
+   AWS Fault Injection:   Managed chaos for AWS services
+   
+   # LitmusChaos example:
+   apiVersion: litmuschaos.io/v1alpha1
+   kind: ChaosEngine
+   metadata:
+     name: pod-kill-experiment
+   spec:
+     appinfo:
+       appns: production
+       applabel: app=myapp
+     experiments:
+     - name: pod-delete
+       spec:
+         components:
+           env:
+           - name: TOTAL_CHAOS_DURATION
+             value: "30"        # Kill pods for 30 seconds
+           - name: CHAOS_INTERVAL
+             value: "10"        # Kill a pod every 10 seconds
+           - name: FORCE
+             value: "false"     # Graceful termination
+   
+   When NOT to do chaos engineering:
+   - Before establishing baseline observability (you need to measure the impact)
+   - In development/staging-only teams (practice in prod-like env first)
+   - Without runbooks (team must know how to respond before testing)
+
+================================================================================
+QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+SLO ERROR BUDGETS (monthly):
+  99%    = 7.3 hours downtime allowed
+  99.5%  = 3.6 hours
+  99.9%  = 43.8 minutes
+  99.95% = 21.9 minutes
+  99.99% = 4.4 minutes
+
+BURN RATE ALERTING (Google SRE approach):
+  Fast burn: 14.4x rate × 1h + 5m windows → page immediately
+  Slow burn:  1x rate × 6h + 30m windows → ticket/Slack
+
+INCIDENT SEVERITY:
+  P0: All users affected, revenue impact → page immediately
+  P1: Partial user impact → 30 min SLA
+  P2: Degraded service → 2 hour response
+  P3: Minor issues → next business day
+
+PROMETHEUS KEY FUNCTIONS:
+  rate()                 Per-second rate (for counters)
+  increase()             Total increase over range
+  histogram_quantile()   Calculate percentile from histogram
+  avg_over_time()        Average of gauge over range
+  sum by ()              Aggregate with grouping
+
+FOUR GOLDEN SIGNALS (Google SRE):
+  Latency   How long requests take (include errors separately)
+  Traffic   How much demand on the system
+  Errors    Rate of failed requests
+  Saturation  How full the system is (CPU, disk, queue depth)
+
+USE/RED METHODS:
+  USE (resources): Utilization, Saturation, Errors
+  RED (services):  Rate, Errors, Duration
+
+================================================================================
+END OF FILE
+================================================================================

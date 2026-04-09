@@ -1,0 +1,190 @@
+================================================================================
+  KAFKA RETENTION AND LOG COMPACTION
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. LOG RETENTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Kafka retains records on disk for a configurable period regardless of whether
+they've been consumed. This is a key feature enabling:
+  - Consumer replay (re-read historical data)
+  - Multiple independent consumers (each group has its own offset)
+  - Decoupling of producer and consumer speeds
+
+Retention by TIME:
+  log.retention.hours = 168         → 7 days (default)
+  log.retention.minutes             → (overrides hours)
+  log.retention.ms                  → (overrides all; -1 = infinite)
+
+  Per-topic override:
+  kafka-configs.sh --alter \
+    --entity-type topics \
+    --entity-name orders \
+    --add-config retention.ms=86400000    # 1 day
+
+Retention by SIZE:
+  log.retention.bytes = -1          → no size limit by default
+  Per-topic: retention.bytes
+
+  Both time AND size apply (whichever limit is hit first causes deletion)
+
+Retention granularity = LOG SEGMENT:
+  - Kafka deletes entire log segments, not individual records
+  - A segment is only eligible for deletion when ALL records in it are older than
+    the retention period
+  - If one record in a 500MB segment is still within retention → entire segment kept
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. LOG SEGMENTS AND DELETION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Partition storage on disk:
+  00000000000000000000.log        ← active segment (append target)
+  00000000000000000000.index      ← offset index
+  00000000000000000000.timeindex  ← timestamp index
+  00000000000001000000.log        ← older segment (eligible for deletion)
+  00000000000001000000.index
+  00000000000001000000.timeindex
+
+Segment rolling (creating a new active segment):
+  log.segment.bytes = 1073741824  → roll on size (default 1GB)
+  log.roll.ms / log.roll.hours    → roll on time (default 7 days)
+  → First trigger wins
+
+Log cleaner thread:
+  - Background thread checks segments for retention policy violation
+  - Runs on a configurable schedule (log.retention.check.interval.ms)
+  - Deletes entire segments whose last record timestamp < now - retention
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. CLEANUP POLICIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  log.cleanup.policy = delete      → standard time/size-based deletion (default)
+  log.cleanup.policy = compact     → keep only latest record per key
+  log.cleanup.policy = compact,delete → compact AND delete old compacted segments
+
+DELETE:
+  - Remove old segments after retention time/size exceeded
+  - Simple, predictable disk usage
+  - Use for: event streams where old data is no longer needed
+
+COMPACT:
+  - Keep only the LATEST value per key in the partition
+  - Tombstone (null value) records are kept for a grace period, then removed
+  - Disk usage is bounded by the number of unique keys × average record size
+  - Use for: KTable changelog topics, user profiles, configuration data
+
+  Before compaction:           After compaction:
+  [k1:A] [k2:B] [k1:C] [k3:D] → [k2:B] [k1:C] [k3:D]
+  (k1:A removed, k1:C is latest)
+
+COMPACT + DELETE:
+  - Apply compaction to reduce to latest-per-key
+  - Then delete the compacted segments after the retention period
+  - Use for: event-sourced state with expiry (keep latest but don't keep forever)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. LOG COMPACTION MECHANICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The Log Cleaner is a background thread that performs compaction.
+
+Partition log anatomy:
+  ┌────────────────────────────────────────────────────────────┐
+  │ HEAD (clean section)  │  TAIL (dirty section — not yet     │
+  │ Already compacted     │  compacted; may have duplicates)   │
+  └────────────────────────────────────────────────────────────┘
+             ↑                         ↑
+         highWatermark          activeSegment
+
+Compaction process:
+  1. Log cleaner picks a dirty log (tail that hasn't been compacted)
+  2. Builds an offset map: key → latest offset seen in dirty region
+  3. Copies records: SKIP records where a newer value for the same key exists
+  4. Writes compacted segments (old keys eliminated)
+  5. Swaps in the new segments atomically
+
+Compaction configs:
+  log.cleaner.enable = true          → enables log cleaner (default true)
+  log.cleaner.threads = 1            → parallel cleaner threads
+  log.cleaner.min.cleanable.ratio = 0.5  → clean when 50% is dirty
+  log.cleaner.min.compaction.lag.ms = 0  → min time before record eligible for compaction
+  log.cleaner.max.compaction.lag.ms      → max time a message can stay uncompacted
+  min.cleanable.dirty.ratio = 0.5        → per-topic; triggers cleaner when dirty ratio exceeded
+
+Tombstones:
+  - A record with null value is a TOMBSTONE — signals deletion of that key
+  - Tombstones are kept until delete.retention.ms (default: 24 hours) after compaction
+  - After that grace period → tombstone itself is removed
+  - Consumers reading during the grace period will see the tombstone → know to delete
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. INTERNAL KAFKA TOPICS AND THEIR RETENTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  __consumer_offsets       → compacted (keeps latest offset per group+topic+partition)
+  __transaction_state      → compacted (keeps latest transaction state)
+  _confluent-command       → compacted (ksqlDB command log)
+  Kafka Streams changelogs → compacted (keeps latest state per key)
+
+Do NOT manually change retention on internal topics — it can corrupt state.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. RETENTION POLICY SELECTION GUIDE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌───────────────────────────────┬──────────────┬────────────────────────────┐
+  │ Topic Type                    │ Policy       │ Example                    │
+  ├───────────────────────────────┼──────────────┼────────────────────────────┤
+  │ Transaction/event stream      │ delete       │ orders, payments, clicks   │
+  │ Current state / reference     │ compact      │ user-profiles, inventory   │
+  │ State + expiry needed         │ compact,del  │ session state (30-day TTL) │
+  │ Audit / compliance archive    │ delete (long)│ retention.ms=Long.MAX_VALUE│
+  │ Kafka Streams changelog       │ compact      │ auto-created by Streams    │
+  │ Dead letter queue (DLQ)       │ delete (long)│ 7-30 days for investigation│
+  └───────────────────────────────┴──────────────┴────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the difference between delete and compact cleanup policies in Kafka?
+A: DELETE removes old log segments once they exceed the retention time or size limit.
+   COMPACT keeps only the latest record per key, regardless of age — disk usage is
+   bounded by unique key count. COMPACT+DELETE combines both: compaction removes
+   superseded records, and remaining segments are still deleted after the retention
+   period. Use delete for event streams; compact for state/changelog topics; compact
+   +delete for stateful data with a long but finite lifetime.
+
+Q: What is a tombstone in a compacted Kafka topic?
+A: A tombstone is a record with a null value. It signals that the key should be
+   DELETED from the compacted log. After compaction runs, the tombstone itself
+   (and all previous records for that key) is removed — but only after
+   delete.retention.ms (default 24h) has elapsed. This grace period ensures
+   consumers who are slightly behind can see the deletion event. Without tombstones,
+   compacted topics would grow forever.
+
+Q: Why might a consumer still see old records from a topic with a short retention?
+A: Retention applies to LOG SEGMENTS, not individual records. A segment is only
+   deleted when ALL of its records are older than the retention period. If one
+   record in a large segment is still within retention, the entire segment is kept.
+   The consumer may see old records from the same segment. Segments roll when they
+   hit log.segment.bytes (1GB default) or log.roll.hours (7 days default).
+
+Q: How does log compaction work for KTable in Kafka Streams?
+A: Kafka Streams creates a changelog topic for every stateful operation (count,
+   aggregate, reduce, table). This changelog is compacted — it stores the latest
+   state value per key. When a Streams instance restores state after failure, it
+   replays the changelog from the beginning; compaction ensures the replay is fast
+   (only the latest value per key, not full history). The KTable is reconstructed
+   from the compacted changelog.
+
+Q: What happens if you set retention.ms to -1 (infinite)?
+A: Kafka keeps ALL records forever (never deletes any segment based on time). Disk
+   usage grows unbounded unless retention.bytes is also set. Useful for audit logs,
+   compliance archives, or event-sourced systems that need full history. Monitor disk
+   carefully — once a broker runs out of disk, it can't accept writes and the
+   cluster becomes unavailable for those partitions.

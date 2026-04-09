@@ -1,0 +1,366 @@
+================================================================
+gRPC-WEB FROM REACT
+================================================================
+
+gRPC is a high-performance RPC framework using Protocol Buffers.
+gRPC-Web adapts it for browser clients. Used in performance-critical
+or microservice-heavy environments.
+
+================================================================
+1. WHAT IS gRPC?
+================================================================
+
+gRPC (Google Remote Procedure Call) is a modern RPC framework:
+  - Uses Protocol Buffers (protobuf) for serialization (binary, fast)
+  - Runs over HTTP/2
+  - Supports 4 communication patterns:
+      Unary       — single request, single response (like REST)
+      Server streaming — one request, stream of responses
+      Client streaming — stream of requests, one response
+      Bidirectional — stream both ways
+  - Strongly typed via .proto schema files
+  - Code-generated clients in any language
+
+================================================================
+2. WHY gRPC-WEB?
+================================================================
+
+Browsers cannot use gRPC natively because:
+  - Browsers don't expose HTTP/2 trailers (required for gRPC)
+  - Fetch/XHR don't support gRPC framing at the wire level
+
+gRPC-Web is a protocol adaptation that:
+  - Wraps gRPC messages to work over HTTP/1.1 or HTTP/2
+  - Requires a proxy (Envoy, grpc-web-proxy) to translate
+    gRPC-Web ↔ native gRPC
+
+  Browser (gRPC-Web) → Envoy proxy → Spring Boot (gRPC)
+
+================================================================
+3. PROTO FILE EXAMPLE
+================================================================
+
+  // user.proto
+  syntax = "proto3";
+
+  package user;
+
+  service UserService {
+    rpc GetUser(GetUserRequest) returns (User);
+    rpc ListUsers(ListUsersRequest) returns (stream User);
+    rpc CreateUser(CreateUserRequest) returns (User);
+  }
+
+  message User {
+    string id = 1;
+    string name = 2;
+    string email = 3;
+    int32 age = 4;
+  }
+
+  message GetUserRequest {
+    string id = 1;
+  }
+
+  message ListUsersRequest {
+    int32 page = 1;
+    int32 limit = 2;
+  }
+
+  message CreateUserRequest {
+    string name = 1;
+    string email = 2;
+    int32 age = 3;
+  }
+
+================================================================
+4. CODE GENERATION
+================================================================
+
+Install tools:
+  npm install -D grpc-tools grpc_tools_node_protoc_ts
+  npm install grpc-web @grpc/grpc-js google-protobuf
+
+Or using buf (modern, recommended):
+  npm install -D @bufbuild/buf @bufbuild/protoc-gen-es @connectrpc/protoc-gen-connect-es
+  npm install @connectrpc/connect @connectrpc/connect-web @bufbuild/protobuf
+
+buf.gen.yaml:
+  version: v1
+  plugins:
+    - plugin: es
+      out: src/gen
+      opt: target=ts
+    - plugin: connect-es
+      out: src/gen
+      opt: target=ts
+
+Generate:
+  npx buf generate
+
+This creates TypeScript files in src/gen/:
+  user_pb.ts — message types
+  user_connect.ts — service client interface
+
+================================================================
+5. USING CONNECT-WEB (MODERN APPROACH)
+================================================================
+
+ConnectRPC is the modern, buf-maintained gRPC-Web client.
+It works directly without an Envoy proxy when used with a
+Connect-compatible server.
+
+  // src/grpc/client.ts
+  import { createPromiseClient } from '@connectrpc/connect';
+  import { createConnectTransport } from '@connectrpc/connect-web';
+  import { UserService } from '../gen/user_connect';
+
+  const transport = createConnectTransport({
+    baseUrl: import.meta.env.VITE_GRPC_URL,
+    // interceptors for auth:
+    interceptors: [
+      (next) => async (req) => {
+        req.header.set('Authorization', `Bearer ${getToken()}`);
+        return next(req);
+      },
+    ],
+  });
+
+  export const userClient = createPromiseClient(UserService, transport);
+
+  // Unary call
+  async function getUser(id: string) {
+    const user = await userClient.getUser({ id });
+    // user is a fully typed User message
+    return user;
+  }
+
+  // Server streaming
+  async function streamUsers(page: number) {
+    const users: User[] = [];
+    for await (const user of userClient.listUsers({ page, limit: 20 })) {
+      users.push(user);
+    }
+    return users;
+  }
+
+================================================================
+6. REACT HOOK FOR gRPC
+================================================================
+
+  // src/hooks/useGrpcQuery.ts
+  import { useState, useEffect } from 'react';
+
+  type Status = 'loading' | 'success' | 'error';
+
+  export function useGrpcQuery<T>(
+    queryFn: () => Promise<T>,
+    deps: unknown[] = []
+  ) {
+    const [data, setData] = useState<T | null>(null);
+    const [status, setStatus] = useState<Status>('loading');
+    const [error, setError] = useState<string | null>(null);
+
+    useEffect(() => {
+      let cancelled = false;
+      setStatus('loading');
+
+      queryFn()
+        .then((result) => {
+          if (!cancelled) {
+            setData(result);
+            setStatus('success');
+          }
+        })
+        .catch((err) => {
+          if (!cancelled) {
+            setError(err.message);
+            setStatus('error');
+          }
+        });
+
+      return () => { cancelled = true; };
+    }, deps);
+
+    return { data, status, error, isLoading: status === 'loading' };
+  }
+
+  // Usage
+  function UserProfile({ userId }: { userId: string }) {
+    const { data: user, isLoading, error } = useGrpcQuery(
+      () => userClient.getUser({ id: userId }),
+      [userId]
+    );
+
+    if (isLoading) return <Spinner />;
+    if (error) return <p>Error: {error}</p>;
+
+    return <div>{user?.name}</div>;
+  }
+
+================================================================
+7. ERROR HANDLING WITH gRPC STATUS CODES
+================================================================
+
+gRPC uses its own status codes (not HTTP):
+
+  import { Code, ConnectError } from '@connectrpc/connect';
+
+  try {
+    const user = await userClient.getUser({ id: '999' });
+  } catch (err) {
+    if (err instanceof ConnectError) {
+      switch (err.code) {
+        case Code.NotFound:
+          setError('User not found');
+          break;
+        case Code.Unauthenticated:
+          logout();
+          break;
+        case Code.PermissionDenied:
+          setError('Access denied');
+          break;
+        case Code.Unavailable:
+          setError('Service unavailable, try again');
+          break;
+        default:
+          setError(`Error: ${err.message}`);
+      }
+    }
+  }
+
+gRPC STATUS CODES:
+  OK (0)              — success
+  CANCELLED (1)       — request cancelled
+  NOT_FOUND (5)       — resource doesn't exist
+  ALREADY_EXISTS (6)  — duplicate creation
+  PERMISSION_DENIED (7) — authorization failure
+  UNAUTHENTICATED (16)  — missing/invalid credentials
+  RESOURCE_EXHAUSTED (8) — rate limited
+  UNAVAILABLE (14)    — service down, safe to retry
+  DEADLINE_EXCEEDED (4) — timeout
+
+================================================================
+8. SERVER STREAMING IN REACT
+================================================================
+
+  function LiveUserFeed() {
+    const [users, setUsers] = useState<User[]>([]);
+    const [streaming, setStreaming] = useState(true);
+
+    useEffect(() => {
+      const abortController = new AbortController();
+
+      async function streamUsers() {
+        try {
+          for await (const user of userClient.listUsers(
+            { page: 1, limit: 100 },
+            { signal: abortController.signal }
+          )) {
+            setUsers((prev) => [...prev, user]);
+          }
+          setStreaming(false);
+        } catch (err) {
+          if (err instanceof ConnectError && err.code === Code.Canceled) {
+            return; // aborted on unmount
+          }
+          console.error(err);
+          setStreaming(false);
+        }
+      }
+
+      streamUsers();
+      return () => abortController.abort();
+    }, []);
+
+    return (
+      <div>
+        {streaming && <Spinner />}
+        {users.map((u) => <UserCard key={u.id} user={u} />)}
+      </div>
+    );
+  }
+
+================================================================
+9. SPRING BOOT gRPC SERVER (grpc-spring-boot-starter)
+================================================================
+
+  // build.gradle
+  implementation 'net.devh:grpc-server-spring-boot-starter:2.15.0.RELEASE'
+  implementation 'io.grpc:grpc-protobuf:1.62.0'
+  implementation 'io.grpc:grpc-stub:1.62.0'
+
+  // application.yml
+  grpc:
+    server:
+      port: 9090
+
+  // Service implementation
+  @GrpcService
+  public class UserGrpcService extends UserServiceGrpc.UserServiceImplBase {
+
+    @Autowired
+    private UserRepository userRepository;
+
+    @Override
+    public void getUser(GetUserRequest request, StreamObserver<User> response) {
+      userRepository.findById(request.getId())
+          .ifPresentOrElse(
+              user -> {
+                response.onNext(toProto(user));
+                response.onCompleted();
+              },
+              () -> response.onError(
+                  Status.NOT_FOUND.withDescription("User not found")
+                      .asRuntimeException()
+              )
+          );
+    }
+
+    @Override
+    public void listUsers(ListUsersRequest request, StreamObserver<User> response) {
+      userRepository.findAll(PageRequest.of(request.getPage(), request.getLimit()))
+          .forEach(user -> response.onNext(toProto(user)));
+      response.onCompleted();
+    }
+  }
+
+================================================================
+10. INTERVIEW QUESTIONS
+================================================================
+
+Q: What is Protocol Buffers and why is it faster than JSON?
+A: Protocol Buffers (protobuf) is a binary serialization format.
+   Messages are encoded as binary using field numbers (not field names),
+   making them 3-10x smaller than equivalent JSON. Encoding/decoding
+   is faster than text parsing. The schema (.proto file) enables
+   strong typing and code generation in any language.
+
+Q: Why can't browsers use standard gRPC?
+A: Browsers don't expose HTTP/2 trailers at the fetch/XHR API level,
+   which gRPC requires for end-of-stream signaling. gRPC-Web adapts
+   the protocol to use HTTP/1.1 or HTTP/2 in a way browsers can handle.
+   A proxy (Envoy) translates between gRPC-Web (browser) and native
+   gRPC (backend).
+
+Q: What is ConnectRPC and how is it different from grpc-web?
+A: ConnectRPC (by Buf) is a newer protocol that supports gRPC, gRPC-Web,
+   and its own Connect protocol. The Connect protocol works in browsers
+   natively over HTTP/1.1 without a special proxy (when the server
+   supports it). It uses JSON or binary protobuf and plain HTTP headers.
+   It's simpler to set up than traditional gRPC-Web with Envoy.
+
+Q: When would you choose gRPC over REST or GraphQL for a React app?
+A: gRPC is worth the complexity when: (1) the backend microservices
+   already use gRPC internally, (2) you need server-streaming for
+   large data transfers, (3) performance and payload size are critical,
+   (4) you need strongly typed, schema-driven API contracts across
+   many teams. Most React apps are better served by REST or GraphQL
+   due to simpler tooling and better browser support.
+
+Q: How do you handle gRPC errors in React?
+A: Catch ConnectError and check err.code against gRPC status codes
+   (NOT_FOUND, UNAUTHENTICATED, UNAVAILABLE, etc.). Map them to
+   user-facing messages. For UNAUTHENTICATED, refresh the token or
+   redirect to login. For UNAVAILABLE, implement retry with exponential
+   backoff. For DEADLINE_EXCEEDED, retry or show a timeout message.

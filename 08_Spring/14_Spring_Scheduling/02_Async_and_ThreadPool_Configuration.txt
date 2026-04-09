@@ -1,0 +1,236 @@
+================================================================
+  @Async AND THREAD POOL CONFIGURATION
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. @Async FUNDAMENTALS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Async runs a method in a background thread using Spring's TaskExecutor.
+The caller returns immediately (non-blocking from caller's perspective).
+
+Requirements:
+  - @EnableAsync on configuration class or @SpringBootApplication
+  - @Async on the target method
+  - Method must be on a Spring bean (AOP proxy requirement)
+  - Self-invocation bypasses the proxy (same class call won't be async)
+
+@Service
+public class NotificationService {
+
+    // void return — fire-and-forget
+    @Async
+    public void sendWelcomeEmail(User user) {
+        log.info("Sending email on thread: {}", Thread.currentThread().getName());
+        emailClient.send(user.getEmail(), "Welcome!", buildBody(user));
+    }
+
+    // CompletableFuture — caller can wait for result
+    @Async
+    public CompletableFuture<String> generateReport(Long reportId) {
+        String content = reportService.generatePdf(reportId);  // slow
+        return CompletableFuture.completedFuture(content);
+    }
+
+    // Combining multiple async calls (parallel execution)
+    public ReportData loadParallel(Long orderId) throws Exception {
+        CompletableFuture<Order>    orderFuture    = asyncOrderService.findById(orderId);
+        CompletableFuture<Customer> customerFuture = asyncCustomerService.findById(100L);
+        CompletableFuture<List<OrderItem>> itemsFuture = asyncItemService.findByOrder(orderId);
+
+        CompletableFuture.allOf(orderFuture, customerFuture, itemsFuture).join();
+
+        return new ReportData(orderFuture.get(), customerFuture.get(), itemsFuture.get());
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. THREAD POOL CONFIGURATION — ThreadPoolTaskExecutor
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+By default @Async uses SimpleAsyncTaskExecutor (creates a new thread per call —
+no pooling, bad for production). Configure a proper thread pool:
+
+@Configuration
+@EnableAsync
+public class AsyncConfig implements AsyncConfigurer {
+
+    @Override
+    @Bean(name = "taskExecutor")
+    public Executor getAsyncExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(5);           // keep-alive threads
+        executor.setMaxPoolSize(20);           // max threads under load
+        executor.setQueueCapacity(100);        // queued tasks before new thread created
+        executor.setThreadNamePrefix("async-");
+        executor.setKeepAliveSeconds(60);
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy()); // caller runs if pool full
+        executor.initialize();
+        return executor;
+    }
+
+    // Handle uncaught exceptions in @Async methods
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (throwable, method, params) ->
+            log.error("Async exception in {}: {}", method.getName(), throwable.getMessage(), throwable);
+    }
+}
+
+// Or configure via YAML:
+spring:
+  task:
+    execution:
+      pool:
+        core-size: 5
+        max-size: 20
+        queue-capacity: 100
+        keep-alive: 60s
+      thread-name-prefix: async-
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. NAMED EXECUTOR — MULTIPLE THREAD POOLS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Different tasks may need different pool sizes. Define named executors:
+
+@Configuration
+@EnableAsync
+public class AsyncConfig {
+
+    @Bean("emailExecutor")
+    public Executor emailExecutor() {
+        ThreadPoolTaskExecutor exec = new ThreadPoolTaskExecutor();
+        exec.setCorePoolSize(3);
+        exec.setMaxPoolSize(10);
+        exec.setQueueCapacity(200);
+        exec.setThreadNamePrefix("email-");
+        exec.initialize();
+        return exec;
+    }
+
+    @Bean("reportExecutor")
+    public Executor reportExecutor() {
+        ThreadPoolTaskExecutor exec = new ThreadPoolTaskExecutor();
+        exec.setCorePoolSize(2);
+        exec.setMaxPoolSize(5);
+        exec.setQueueCapacity(20);
+        exec.setThreadNamePrefix("report-");
+        exec.initialize();
+        return exec;
+    }
+}
+
+// Reference by name:
+@Async("emailExecutor")
+public void sendEmail(String to, String body) { ... }
+
+@Async("reportExecutor")
+public CompletableFuture<String> generateReport(Long id) { ... }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. SCHEDULING THREAD POOL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Scheduled tasks use a separate ThreadPoolTaskScheduler:
+
+spring:
+  task:
+    scheduling:
+      pool:
+        size: 5          # default 1 (single-threaded)
+      thread-name-prefix: scheduler-
+
+// Or programmatically:
+@Configuration
+@EnableScheduling
+public class SchedulerConfig implements SchedulingConfigurer {
+
+    @Override
+    public void configureTasks(ScheduledTaskRegistrar registrar) {
+        ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+        scheduler.setPoolSize(5);
+        scheduler.setThreadNamePrefix("sched-");
+        scheduler.setErrorHandler(t -> log.error("Scheduled task error", t));
+        scheduler.initialize();
+        registrar.setTaskScheduler(scheduler);
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. SECURITY CONTEXT PROPAGATION WITH @Async
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+By default, Spring Security's SecurityContext (stored in ThreadLocal) is NOT
+propagated to async threads. Fix with a DelegatingSecurityContextAsyncTaskExecutor:
+
+@Bean("taskExecutor")
+public Executor taskExecutor() {
+    ThreadPoolTaskExecutor delegate = new ThreadPoolTaskExecutor();
+    delegate.setCorePoolSize(5);
+    delegate.setMaxPoolSize(20);
+    delegate.setQueueCapacity(100);
+    delegate.setThreadNamePrefix("async-");
+    delegate.initialize();
+
+    // Wraps delegate to propagate SecurityContext to child threads
+    return new DelegatingSecurityContextAsyncTaskExecutor(delegate);
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. THREADPOOL SIZING GUIDELINES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For I/O-bound tasks (DB queries, HTTP calls, email sending):
+  corePoolSize = CPU cores * 2
+  maxPoolSize  = 2× to 4× CPU cores  (or higher for I/O-heavy workloads)
+  queueCapacity = 100–500 (absorbs bursts)
+
+For CPU-bound tasks (computation, report generation):
+  corePoolSize = CPU cores
+  maxPoolSize  = CPU cores + 1
+  queueCapacity = small (10–50)
+
+Rejection policies:
+  AbortPolicy     — throw RejectedExecutionException (default)
+  CallerRunsPolicy — caller thread runs the task (back-pressure, slows producer)
+  DiscardPolicy   — silently drop new tasks
+  DiscardOldestPolicy — drop oldest queued task to make room
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What happens if an @Async method throws an exception?
+A: If the return type is void, the exception is handled by AsyncUncaughtExceptionHandler.
+   Without a custom handler, exceptions are logged and silently swallowed. If the
+   return type is CompletableFuture, the exception is captured in the Future — the
+   caller can retrieve it via .get() (throws ExecutionException) or handle it with
+   .exceptionally(). Always configure AsyncUncaughtExceptionHandler for void async methods.
+
+Q: Why does @Async fail when called from the same class?
+A: @Async relies on Spring AOP proxies. When a method is called from within the
+   same class (self-invocation), the call bypasses the proxy and goes directly to
+   the bean instance — no async behavior occurs, the call runs synchronously. Fix:
+   extract the async method to a separate bean, or use AopContext.currentProxy()
+   (requires @EnableAspectJAutoProxy(exposeProxy = true)).
+
+Q: What is SimpleAsyncTaskExecutor and why should you replace it?
+A: SimpleAsyncTaskExecutor creates a new Thread for each @Async call — no
+   thread pooling. Under load, this creates thousands of threads, exhausting JVM
+   resources and causing performance degradation or OutOfMemoryError. In production,
+   always configure a ThreadPoolTaskExecutor with bounded pool size, queue capacity,
+   and rejection policy.
+
+Q: What is the difference between TaskExecutor and TaskScheduler?
+A: TaskExecutor is for immediate (or queued) task execution — it runs submitted
+   Runnable/Callable tasks as soon as a thread is available. Used by @Async.
+   TaskScheduler extends this with time-based scheduling — run at a fixed rate,
+   fixed delay, or cron expression. Used by @Scheduled.
+
+Q: How do you size a thread pool for async email sending?
+A: Email sending is I/O-bound (network wait for SMTP). Rule: corePoolSize = CPUs * 2
+   (e.g., 4 cores → 8 core threads), maxPoolSize = 20–40, queueCapacity = 200
+   (absorbs spikes). If the email queue has strict SLA (must send within 30s),
+   reduce queue depth and increase maxPoolSize. Monitor with Micrometer metrics
+   (executor.pool.size, executor.queue.size) and tune based on throughput.

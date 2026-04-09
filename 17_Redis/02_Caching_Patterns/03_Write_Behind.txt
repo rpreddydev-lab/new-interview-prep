@@ -1,0 +1,230 @@
+================================================================================
+WRITE-BEHIND (WRITE-BACK) CACHING — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. WHAT IS WRITE-BEHIND?
+─────────────────────────
+Write-Behind (also called Write-Back) is a caching strategy where:
+  1. Writes go ONLY to the cache (fast, in-memory)
+  2. DB writes are deferred — the cache asynchronously flushes dirty data
+     to the database in batches
+
+The application gets immediate (sub-millisecond) write responses because
+it doesn't wait for the database.
+
+  Application → WRITE(key, value)
+  ↓
+  Cache → stores in Redis immediately → returns OK to App (fast!)
+  ↓ (asynchronously, in background)
+  Cache → flushes to DB in batches
+
+
+2. FLOW DIAGRAM
+────────────────
+  Write path (fast):
+    App → SET(key, value) → Redis → ACK (immediate, no DB wait)
+
+  Async flush (background):
+    Background worker reads dirty keys from Redis
+    → Batches DB writes (INSERT/UPDATE)
+    → Marks entries as clean
+
+  Read path:
+    App → GET(key) → Redis (always fresh, since writes always hit Redis)
+    → No DB read needed (cache is authoritative)
+
+
+3. IMPLEMENTATION APPROACHES
+──────────────────────────────
+
+3a. Using Redis List as a Write Queue:
+  # On write: update Redis + add to write queue
+  def write_behind(product_id, new_data):
+      key = f"product:{product_id}"
+      redis.set(key, serialize(new_data))      # update cache immediately
+      redis.rpush("writebehind:queue", json.dumps({
+          "key": key,
+          "product_id": product_id,
+          "data": new_data,
+          "ts": time.time()
+      }))
+
+  # Background worker (runs every few seconds or on queue size threshold)
+  def flush_worker():
+      while True:
+          batch = []
+          while len(batch) < 100:
+              item = redis.lpop("writebehind:queue")
+              if not item:
+                  break
+              batch.append(json.loads(item))
+          if batch:
+              db.batch_update(batch)  # single batch SQL write
+          time.sleep(1)
+
+3b. Using Redis Streams for Durable Write-Behind:
+  # On write: update cache + append to stream
+  def write_behind_stream(product_id, new_data):
+      key = f"product:{product_id}"
+      redis.set(key, serialize(new_data))
+      redis.xadd("stream:db-writes", {
+          "type": "UPDATE",
+          "entity": "product",
+          "id": str(product_id),
+          "data": json.dumps(new_data)
+      })
+
+  # Background consumer group
+  def db_writer_consumer():
+      XREADGROUP GROUP db-writers worker1 COUNT 50 BLOCK 1000 STREAMS stream:db-writes >
+      # Write batch to DB
+      db.batch_update(messages)
+      XACK stream:db-writes db-writers *ids
+
+
+3c. Redisson Write-Behind (Java):
+  MapOptions<String, Product> options = MapOptions.<String, Product>defaults()
+      .writer(new ProductMapWriter(productRepo))
+      .writeMode(MapOptions.WriteMode.WRITE_BEHIND)
+      .writeBehindDelay(2000)      // 2 second delay
+      .writeBehindBatchSize(50);   // batch up to 50 writes
+
+
+4. ADVANTAGES OF WRITE-BEHIND
+───────────────────────────────
+  ✓ Ultra-low write latency: application never waits for DB
+  ✓ Absorbs write spikes: burst of writes queued, DB sees smoothed rate
+  ✓ Natural write batching: many updates to the same key → only one DB write
+    (coalescing: 10 updates to user:42 → 1 DB write with final state)
+  ✓ Reduced DB load: fewer, larger batch writes instead of individual queries
+  ✓ Cache always has the latest value (reads are always fast and fresh)
+
+
+5. DISADVANTAGES & RISKS
+──────────────────────────
+  ✗ DATA LOSS RISK: if Redis crashes before flush, unsynced writes are lost!
+     Mitigation: AOF persistence, replicas, frequent flush intervals
+
+  ✗ COMPLEXITY: dirty tracking, batch workers, failure recovery needed
+
+  ✗ CONSISTENCY RISK: DB is temporarily stale. Other systems reading DB
+     directly see outdated data.
+
+  ✗ ORDERING: concurrent writes to same key must be applied in correct order
+
+  ✗ FAILURE RECOVERY: if DB write fails (DB outage), how long do you retry?
+     Need dead-letter queue for failed DB writes.
+
+  ✗ NOT suitable for financial/audit data where every transaction must be
+     atomically committed to DB before acknowledgment.
+
+
+6. WRITE COALESCING (KEY BENEFIT)
+────────────────────────────────────
+  Scenario: user updates their profile 10 times in 30 seconds.
+  
+  Write-Through: 10 DB writes
+  Write-Behind:  1 DB write (final state, after the delay window)
+
+  This is called WRITE COALESCING — multiple writes to the same key are
+  merged into a single DB write with the latest value.
+
+  Implementation: track "dirty keys" with a timestamp. Worker reads keys
+  that haven't been flushed for > N seconds.
+
+  Using a Sorted Set for dirty tracking:
+  ZADD dirty:keys <current_ts> "product:42"   # mark dirty on write
+  # Worker: ZRANGEBYSCORE dirty:keys 0 (now - 2000)  → flush these
+
+
+7. HANDLING FAILURES
+──────────────────────
+  Redis Crash (before flush):
+    → Data in Redis but not yet in DB is LOST
+    → Use Redis persistence (AOF) to reduce this window
+    → Accept: Write-Behind is for non-critical or eventually-consistent data
+
+  DB Down (during flush):
+    → Writer can't commit to DB
+    → Queue the failed batch in a dead-letter queue
+    → Retry with exponential backoff
+    → Alert ops team if queue grows beyond threshold
+
+  Worker Crash (mid-flush):
+    → Use Redis Streams + consumer groups for exactly-once-ish processing
+    → XREADGROUP + XACK ensures messages aren't lost (stay in PEL)
+    → On worker restart: XAUTOCLAIM pending messages and retry
+
+
+8. WRITE-BEHIND vs WRITE-THROUGH COMPARISON
+─────────────────────────────────────────────
+  Aspect                │ Write-Through           │ Write-Behind
+  ──────────────────────┼─────────────────────────┼──────────────────────────
+  Write latency         │ High (waits for DB)      │ Low (Redis only)
+  Data durability       │ Strong (DB written sync) │ Weak (async, loss risk)
+  DB consistency        │ Always consistent        │ Temporarily stale
+  Write throughput      │ DB-limited               │ Very high (cache speed)
+  Coalescing            │ No                       │ Yes (same-key dedup)
+  Complexity            │ Medium                   │ High
+  Use case              │ CRUD apps, profiles      │ Analytics, counters,
+                        │ financial updates         │ write-heavy workloads
+
+
+9. REAL-WORLD USE CASES FOR WRITE-BEHIND
+──────────────────────────────────────────
+  ✓ Real-time analytics counters (INCR view counts in Redis, flush to DB hourly)
+  ✓ Gaming scores (update scores in Redis instantly, flush to leaderboard DB)
+  ✓ Activity tracking (log user events to Redis stream, batch-insert to analytics DB)
+  ✓ Shopping cart updates (user adds/removes items rapidly, final cart state flushed)
+  ✓ Metrics aggregation (collect metrics in Redis, batch-write to time-series DB)
+  ✓ Social media likes/views (non-critical counters, approximate DB sync OK)
+
+  NOT suitable for:
+  ✗ Financial transactions (payment records must be in DB before ACK)
+  ✗ Order placement (order must be in DB before "Order Placed" response)
+  ✗ Authentication tokens (security-critical, must be immediately durable)
+
+
+10. HYBRID APPROACH: WRITE-BEHIND WITH IMMEDIATE READ
+───────────────────────────────────────────────────────
+  Pattern: Write-Behind for DB + Immediate Redis Cache Update
+    - Cache is ALWAYS up-to-date (Redis is written synchronously)
+    - DB sync is async
+    - Reads are always from cache (always fresh, since cache is the write target)
+    - This is safer than a pure Write-Behind because reads see the latest state
+
+  Critical: The cache becomes the system of record temporarily.
+  Ensure Redis persistence is enabled to minimize data loss window.
+
+
+11. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: What is Write-Behind caching and when would you use it?
+  A: Write-Behind writes immediately to the cache (Redis) and defers DB writes
+     asynchronously in batches. Use it for write-heavy workloads where write
+     latency is critical and eventual consistency with the DB is acceptable.
+     Examples: analytics counters, gaming scores, shopping cart updates.
+     Avoid for financial transactions or any data where loss is unacceptable.
+
+  Q: What is the biggest risk with Write-Behind caching?
+  A: Data loss. If Redis crashes before the async flush completes, the unsynced
+     data is lost. Mitigations: enable Redis AOF persistence (reduces loss
+     window), use replicas, use short flush intervals, and restrict Write-Behind
+     to non-critical or eventually-consistent data only.
+
+  Q: How does write coalescing work in Write-Behind?
+  A: Multiple writes to the same cache key within the flush window are merged
+     into a single DB write with the latest value. For example, if a user
+     updates their profile 10 times in 2 seconds, and the flush interval is
+     2 seconds, only one DB UPDATE occurs with the final profile state.
+     This significantly reduces DB write load.
+
+  Q: How would you implement Write-Behind safely in production?
+  A: (1) Write to Redis synchronously on each app write.
+     (2) Add a record to a Redis Stream (XADD) for each write.
+     (3) A background worker XREADGROUP reads the stream and batch-writes to DB.
+     (4) XACK after successful DB write.
+     (5) On DB failure: retry with backoff, dead-letter after max retries.
+     (6) Enable Redis AOF for persistence (reduces data loss window on crash).
+
+================================================================================

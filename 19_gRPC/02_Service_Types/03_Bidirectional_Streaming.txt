@@ -1,0 +1,646 @@
+================================================================
+BIDIRECTIONAL STREAMING RPC - COMPLETE GUIDE
+================================================================
+
+----------------------------------------------------------------
+1. WHAT IS BIDIRECTIONAL STREAMING?
+----------------------------------------------------------------
+
+Bidirectional (bidi) streaming:
+  - Client sends a STREAM of requests
+  - Server sends a STREAM of responses
+  - BOTH streams are independent — neither side waits for the other to finish
+  - The two streams can be interleaved in any order
+
+Proto definition:
+  rpc MethodName (stream RequestMessage) returns (stream ResponseMessage);
+                  ^^^^^^                          ^^^^^^
+              both sides use "stream"
+
+HTTP/2 behavior:
+  - Single HTTP/2 stream
+  - Client: HEADERS, then DATA frames over time, finally DATA [END_STREAM]
+  - Server: HEADERS (or wait), then DATA frames, finally TRAILERS [END_STREAM]
+  - Either side can send at any time; they don't alternate
+
+Key distinction from server streaming:
+  Client streaming: client sends stream, server sends ONE response
+  Server streaming: client sends ONE request, server sends stream
+  Bidi streaming:   both send streams SIMULTANEOUSLY and INDEPENDENTLY
+
+Common use cases:
+  ✅ Real-time chat (each message is independent, no pairing)
+  ✅ Collaborative editing (send operations, receive remote operations)
+  ✅ Financial trading (client sends orders, server streams fills/quotes)
+  ✅ IoT device control (device streams readings, server sends commands)
+  ✅ Search-as-you-type (client streams keystrokes, server streams results)
+  ✅ Load testing / protocol negotiation
+
+----------------------------------------------------------------
+2. PROTO DEFINITIONS
+----------------------------------------------------------------
+
+syntax = "proto3";
+package com.example.bidi.v1;
+
+option java_package = "com.example.bidi.v1";
+option java_multiple_files = true;
+
+// ── CHAT SERVICE ──────────────────────────────────────────────
+
+message ChatMessage {
+  string message_id = 1;
+  string sender_id  = 2;
+  string room_id    = 3;
+  string text       = 4;
+  int64  timestamp  = 5;
+}
+
+// ── TRADING SERVICE ───────────────────────────────────────────
+
+message TradeOrder {
+  string order_id   = 1;
+  string symbol     = 2;
+  string side       = 3;  // "BUY" or "SELL"
+  int64  quantity   = 4;
+  double price      = 5;
+  string order_type = 6;  // "LIMIT" or "MARKET"
+}
+
+message TradeEvent {
+  string order_id   = 1;
+  string event_type = 2;  // "ACCEPTED", "FILLED", "REJECTED", "PARTIAL_FILL"
+  int64  filled_qty = 3;
+  double fill_price = 4;
+  string reason     = 5;  // for REJECTED
+}
+
+// ── IoT DEVICE CONTROL ────────────────────────────────────────
+
+message DeviceMessage {
+  oneof payload {
+    SensorReading reading = 1;
+    Heartbeat     heartbeat = 2;
+  }
+}
+
+message ServerCommand {
+  oneof command {
+    ConfigUpdate config = 1;
+    ShutdownCommand shutdown = 2;
+    AckMessage ack = 3;
+  }
+}
+
+message SensorReading { string sensor_id = 1; double value = 2; int64 ts = 3; }
+message Heartbeat { int64 timestamp = 4; }
+message ConfigUpdate { string key = 5; string value = 6; }
+message ShutdownCommand { string reason = 7; }
+message AckMessage { string message_id = 8; }
+
+// ── SERVICES ─────────────────────────────────────────────────
+
+service ChatService {
+  rpc Chat(stream ChatMessage) returns (stream ChatMessage);
+}
+
+service TradingService {
+  rpc Trade(stream TradeOrder) returns (stream TradeEvent);
+}
+
+service DeviceService {
+  rpc Connect(stream DeviceMessage) returns (stream ServerCommand);
+}
+
+----------------------------------------------------------------
+3. BIDI STREAMING INTERACTION MODELS
+----------------------------------------------------------------
+
+There are three common interaction patterns for bidi streaming:
+
+MODEL A — "Ping-Pong" (Request-Reply over a stream)
+  Client: msg1 ──────────────────────────►
+  Server:       ◄──── reply1 ─────────────
+  Client:                  msg2 ──────────►
+  Server:                       ◄── reply2
+  
+  Use case: RPC-like but with session state across calls
+
+MODEL B — "Parallel" (Fully independent streams)
+  Client: msg1 ──► msg2 ──► msg3 ──────────►
+  Server: ◄── evt1 ◄── evt2 ◄── evt3 ◄──────
+  
+  Both sides send without waiting. Common in trading/IoT.
+
+MODEL C — "Funnel" (Many requests, batched responses)
+  Client: m1 ─► m2 ─► m3 ─► m4 ─► m5 ─────►
+  Server:                         ◄── batch1
+  
+  Server buffers incoming messages and sends responses in batches.
+
+----------------------------------------------------------------
+4. SERVER IMPLEMENTATION (JAVA)
+----------------------------------------------------------------
+
+// ── CHAT SERVER ───────────────────────────────────────────────
+
+@GrpcService
+public class ChatServiceImpl extends ChatServiceGrpc.ChatServiceImplBase {
+  
+  // Map of room -> list of active response observers
+  private final ConcurrentHashMap<String, Set<StreamObserver<ChatMessage>>> rooms
+      = new ConcurrentHashMap<>();
+  
+  @Override
+  public StreamObserver<ChatMessage> chat(StreamObserver<ChatMessage> responseObserver) {
+    
+    // We don't know the room until the first message, so we track
+    // which room this connection joined
+    AtomicReference<String> roomRef = new AtomicReference<>();
+    
+    return new StreamObserver<ChatMessage>() {
+      
+      @Override
+      public void onNext(ChatMessage message) {
+        String roomId = message.getRoomId();
+        
+        // Register this client in the room on first message
+        rooms.computeIfAbsent(roomId, k -> ConcurrentHashMap.newKeySet())
+             .add(responseObserver);
+        roomRef.set(roomId);
+        
+        // Broadcast to all OTHER clients in the room
+        Set<StreamObserver<ChatMessage>> room = rooms.get(roomId);
+        for (StreamObserver<ChatMessage> observer : room) {
+          if (observer != responseObserver) {
+            try {
+              observer.onNext(message);
+            } catch (Exception e) {
+              // Client disconnected — remove it
+              room.remove(observer);
+            }
+          }
+        }
+      }
+      
+      @Override
+      public void onError(Throwable t) {
+        // Client disconnected unexpectedly
+        log.warn("Chat client error: {}", Status.fromThrowable(t));
+        removeFromRoom(roomRef.get(), responseObserver);
+      }
+      
+      @Override
+      public void onCompleted() {
+        // Client politely disconnected
+        removeFromRoom(roomRef.get(), responseObserver);
+        responseObserver.onCompleted();
+      }
+    };
+  }
+  
+  private void removeFromRoom(String roomId, StreamObserver<?> observer) {
+    if (roomId != null) {
+      Set<?> room = rooms.get(roomId);
+      if (room != null) room.remove(observer);
+    }
+  }
+}
+
+// ── TRADING SERVER ────────────────────────────────────────────
+
+@GrpcService
+public class TradingServiceImpl extends TradingServiceGrpc.TradingServiceImplBase {
+  
+  private final MatchingEngine matchingEngine;
+  
+  @Override
+  public StreamObserver<TradeOrder> trade(StreamObserver<TradeEvent> responseObserver) {
+    
+    // Register a callback: matching engine calls this lambda when an order is filled
+    String sessionId = UUID.randomUUID().toString();
+    matchingEngine.registerFillCallback(sessionId, (orderId, qty, price) -> {
+      // This may be called from a DIFFERENT thread than the gRPC thread!
+      // StreamObserver is NOT thread-safe; we must synchronize or use
+      // a dedicated response-sending mechanism.
+      synchronized (responseObserver) {
+        responseObserver.onNext(TradeEvent.newBuilder()
+            .setOrderId(orderId)
+            .setEventType("FILLED")
+            .setFilledQty(qty)
+            .setFillPrice(price)
+            .build());
+      }
+    });
+    
+    return new StreamObserver<TradeOrder>() {
+      
+      @Override
+      public void onNext(TradeOrder order) {
+        // Submit order to matching engine
+        // Response will come via the fill callback above
+        try {
+          boolean accepted = matchingEngine.submit(sessionId, order);
+          if (!accepted) {
+            synchronized (responseObserver) {
+              responseObserver.onNext(TradeEvent.newBuilder()
+                  .setOrderId(order.getOrderId())
+                  .setEventType("REJECTED")
+                  .setReason("Invalid price or quantity")
+                  .build());
+            }
+          }
+        } catch (Exception e) {
+          synchronized (responseObserver) {
+            responseObserver.onError(
+                Status.INTERNAL.withDescription(e.getMessage()).asException());
+          }
+        }
+      }
+      
+      @Override
+      public void onError(Throwable t) {
+        log.warn("Trading client disconnected: {}", Status.fromThrowable(t));
+        matchingEngine.deregister(sessionId);
+      }
+      
+      @Override
+      public void onCompleted() {
+        matchingEngine.deregister(sessionId);
+        synchronized (responseObserver) {
+          responseObserver.onCompleted();
+        }
+      }
+    };
+  }
+}
+
+// ── IoT DEVICE SERVER ─────────────────────────────────────────
+
+@GrpcService
+public class DeviceServiceImpl extends DeviceServiceGrpc.DeviceServiceImplBase {
+  
+  @Override
+  public StreamObserver<DeviceMessage> connect(StreamObserver<ServerCommand> responseObserver) {
+    
+    // Send periodic heartbeat acks using a scheduled executor
+    ScheduledFuture<?> heartbeatTask = scheduler.scheduleAtFixedRate(() -> {
+      try {
+        responseObserver.onNext(ServerCommand.newBuilder()
+            .setAck(AckMessage.newBuilder().setMessageId("heartbeat-" + System.currentTimeMillis()))
+            .build());
+      } catch (Exception ignored) {
+        // Stream closed
+      }
+    }, 0, 30, TimeUnit.SECONDS);
+    
+    return new StreamObserver<DeviceMessage>() {
+      
+      @Override
+      public void onNext(DeviceMessage msg) {
+        switch (msg.getPayloadCase()) {
+          case READING -> {
+            SensorReading reading = msg.getReading();
+            // Check if anomaly detected — push command back to device
+            if (anomalyDetector.isAnomaly(reading)) {
+              responseObserver.onNext(ServerCommand.newBuilder()
+                  .setConfig(ConfigUpdate.newBuilder()
+                      .setKey("alert_level")
+                      .setValue("HIGH"))
+                  .build());
+            }
+          }
+          case HEARTBEAT -> {
+            // Reset watchdog timer
+            watchdog.reset(msg.getHeartbeat().getTimestamp());
+          }
+          default -> log.warn("Unknown payload case");
+        }
+      }
+      
+      @Override
+      public void onError(Throwable t) {
+        heartbeatTask.cancel(true);
+        log.warn("Device disconnected with error: {}", Status.fromThrowable(t));
+      }
+      
+      @Override
+      public void onCompleted() {
+        heartbeatTask.cancel(true);
+        responseObserver.onCompleted();
+      }
+    };
+  }
+}
+
+----------------------------------------------------------------
+5. CLIENT IMPLEMENTATION (JAVA)
+----------------------------------------------------------------
+
+// ── BASIC BIDI CLIENT ─────────────────────────────────────────
+
+@Component
+public class ChatClient {
+  
+  private final ChatServiceGrpc.ChatServiceStub asyncStub;
+  
+  public StreamObserver<ChatMessage> joinRoom(String roomId, String userId,
+      Consumer<ChatMessage> onMessage) {
+    
+    // 1. Start bidi stream — get requestObserver back
+    StreamObserver<ChatMessage> requestObserver = asyncStub
+        .withDeadlineAfter(24, TimeUnit.HOURS)
+        .chat(new StreamObserver<ChatMessage>() {
+          
+          // This is called for each message the SERVER sends to US
+          @Override
+          public void onNext(ChatMessage message) {
+            onMessage.accept(message);
+          }
+          
+          @Override
+          public void onError(Throwable t) {
+            log.warn("Chat stream error: {}", Status.fromThrowable(t));
+            // Trigger reconnect logic
+          }
+          
+          @Override
+          public void onCompleted() {
+            log.info("Chat stream ended by server");
+          }
+        });
+    
+    // Return requestObserver so the caller can send messages
+    return requestObserver;
+  }
+  
+  // Usage:
+  public void demo() {
+    StreamObserver<ChatMessage> chat = joinRoom("room-1", "alice",
+        msg -> System.out.println(msg.getSenderId() + ": " + msg.getText()));
+    
+    // Send messages whenever user types
+    chat.onNext(ChatMessage.newBuilder()
+        .setMessageId(UUID.randomUUID().toString())
+        .setSenderId("alice")
+        .setRoomId("room-1")
+        .setText("Hello, World!")
+        .build());
+    
+    // When done
+    chat.onCompleted();
+  }
+}
+
+// ── TRADING CLIENT WITH RESPONSE PROCESSOR ───────────────────
+
+@Component  
+public class TradingClient {
+  
+  private final TradingServiceGrpc.TradingServiceStub asyncStub;
+  private StreamObserver<TradeOrder> requestObserver;
+  
+  @PostConstruct
+  public void connect() {
+    requestObserver = asyncStub.trade(new StreamObserver<TradeEvent>() {
+      
+      @Override
+      public void onNext(TradeEvent event) {
+        switch (event.getEventType()) {
+          case "FILLED" -> handleFill(event);
+          case "REJECTED" -> handleRejection(event);
+          case "PARTIAL_FILL" -> handlePartialFill(event);
+        }
+      }
+      
+      @Override
+      public void onError(Throwable t) {
+        log.error("Trading stream failed", t);
+        reconnect();  // implement retry logic
+      }
+      
+      @Override
+      public void onCompleted() {
+        log.info("Trading session ended");
+      }
+    });
+  }
+  
+  public void submitOrder(TradeOrder order) {
+    requestObserver.onNext(order);  // non-blocking send
+  }
+  
+  public void disconnect() {
+    requestObserver.onCompleted();
+  }
+}
+
+----------------------------------------------------------------
+6. HALF-CLOSE SEMANTICS
+----------------------------------------------------------------
+
+In bidi streaming, either side can "half-close" its stream:
+
+Client half-close:
+  - Client calls requestObserver.onCompleted()
+  - Sends DATA [END_STREAM] to server
+  - Server receives this as StreamObserver.onCompleted()
+  - Server can still send more responses before calling its onCompleted()
+
+Server half-close:
+  - Server calls responseObserver.onCompleted()
+  - Sends TRAILERS [END_STREAM] to client
+  - Client receives this as onCompleted() on its response observer
+  - Client's requestObserver.onNext() may still work for a moment
+
+Example:
+  Client sends 10 orders, then calls onCompleted()
+  Server is still processing those orders, keeps sending fills
+  Server calls onCompleted() when all fills are sent
+  
+  Timeline:
+    C: order1 ─► order2 ─► order3 ─► [END_STREAM]
+    S:       ◄─ fill1 ◄─ fill2 ◄─ fill3 ◄─ [TRAILERS+END_STREAM]
+
+----------------------------------------------------------------
+7. ORDERING AND CORRELATION IDs
+----------------------------------------------------------------
+
+Bidi streaming does NOT guarantee a 1-to-1 pairing between
+requests and responses by default.
+
+ANTI-PATTERN (wrong assumption):
+  client.onNext(order1)  // expect response[0] = fill for order1
+  client.onNext(order2)  // expect response[1] = fill for order2
+  // WRONG — server responses can arrive out of order
+
+CORRECT PATTERN (correlation IDs):
+  message TradeOrder { string order_id = 1; ... }
+  message TradeEvent { string order_id = 1; ... }  // same ID
+  
+  // Client maps order_id to pending requests
+  Map<String, CompletableFuture<TradeEvent>> pendingOrders = new ConcurrentHashMap<>();
+  
+  String orderId = UUID.randomUUID().toString();
+  CompletableFuture<TradeEvent> future = new CompletableFuture<>();
+  pendingOrders.put(orderId, future);
+  
+  requestObserver.onNext(TradeOrder.newBuilder().setOrderId(orderId)...build());
+  
+  // In response handler:
+  @Override
+  public void onNext(TradeEvent event) {
+    CompletableFuture<TradeEvent> f = pendingOrders.remove(event.getOrderId());
+    if (f != null) f.complete(event);
+  }
+
+----------------------------------------------------------------
+8. FLOW CONTROL AND BACK-PRESSURE
+----------------------------------------------------------------
+
+Like server streaming, bidi streaming uses HTTP/2 flow control:
+
+ClientCallStreamObserver for client back-pressure:
+  StreamObserver<TradeOrder> requestObserver = asyncStub.trade(responseHandler);
+  ClientCallStreamObserver<TradeOrder> clientCallObserver =
+      (ClientCallStreamObserver<TradeOrder>) requestObserver;
+  
+  // Check before each send
+  if (clientCallObserver.isReady()) {
+    clientCallObserver.onNext(order);
+  }
+  
+  // Set callback for when the stream becomes ready again
+  clientCallObserver.setOnReadyHandler(() -> {
+    // Resume sending
+    resumeOrderSubmission();
+  });
+
+ServerCallStreamObserver for server back-pressure (same as server streaming).
+
+----------------------------------------------------------------
+9. ERROR HANDLING IN STREAMS
+----------------------------------------------------------------
+
+When either side calls onError():
+  - The entire stream terminates immediately
+  - The other side receives onError() on their observer
+
+Strategy: Design idempotent, resumable streams where possible.
+
+// Client reconnection pattern:
+private void startStreamWithRetry() {
+  StreamObserver<ChatMessage> requestObserver = asyncStub
+      .withDeadlineAfter(1, TimeUnit.HOURS)
+      .chat(new StreamObserver<>() {
+        @Override
+        public void onError(Throwable t) {
+          Status status = Status.fromThrowable(t);
+          if (isRetryable(status)) {
+            Executors.newSingleThreadScheduledExecutor()
+                     .schedule(() -> startStreamWithRetry(), 1, TimeUnit.SECONDS);
+          }
+        }
+        @Override
+        public void onCompleted() { /* handle graceful close */ }
+        @Override
+        public void onNext(ChatMessage m) { handleMessage(m); }
+      });
+}
+
+private boolean isRetryable(Status status) {
+  return status.getCode() == Status.Code.UNAVAILABLE
+      || status.getCode() == Status.Code.INTERNAL;
+}
+
+----------------------------------------------------------------
+10. THREAD SAFETY CRITICAL NOTE
+----------------------------------------------------------------
+
+⚠️  StreamObserver implementations are NOT thread-safe.
+⚠️  Never call onNext() from multiple threads simultaneously.
+
+WRONG:
+  // Two threads calling onNext() concurrently — DATA CORRUPTION
+  executor.submit(() -> responseObserver.onNext(msg1));
+  executor.submit(() -> responseObserver.onNext(msg2));
+
+RIGHT - Option 1 (synchronized):
+  synchronized (responseObserver) {
+    responseObserver.onNext(msg1);
+  }
+
+RIGHT - Option 2 (single-threaded executor):
+  ExecutorService sender = Executors.newSingleThreadExecutor();
+  sender.submit(() -> responseObserver.onNext(msg1));
+  sender.submit(() -> responseObserver.onNext(msg2));
+
+RIGHT - Option 3 (message queue):
+  BlockingQueue<ResponseMessage> queue = new LinkedBlockingQueue<>();
+  // Producer: any thread
+  queue.offer(msg);
+  // Consumer: single background thread draining queue and calling onNext()
+
+----------------------------------------------------------------
+11. COMPARING ALL FOUR RPC TYPES
+----------------------------------------------------------------
+
+┌─────────────────────────┬────────────────────────────────────────────────┐
+│ RPC Type                │ Example Use Case                               │
+├─────────────────────────┼────────────────────────────────────────────────┤
+│ Unary                   │ GetUser, CreateOrder, Login                    │
+│ Server Streaming        │ GetStockFeed, WatchEvents, DownloadFile        │
+│ Client Streaming        │ UploadFile, BatchInsert, StreamSensorData      │
+│ Bidi Streaming          │ Chat, Trading, IoT control, Collaboration      │
+└─────────────────────────┴────────────────────────────────────────────────┘
+
+┌─────────────────────────┬────────────┬────────────┬────────────┬──────────┐
+│ Property                │  Unary     │ Server     │ Client     │  Bidi    │
+│                         │            │ Streaming  │ Streaming  │Streaming │
+├─────────────────────────┼────────────┼────────────┼────────────┼──────────┤
+│ Client sends multiple   │    No      │    No      │    Yes     │   Yes    │
+│ Server sends multiple   │    No      │    Yes     │    No      │   Yes    │
+│ Blocking stub available │    Yes     │    Yes     │    No      │   No     │
+│ Correlation required    │    No      │    No      │    No      │ Often    │
+│ Complexity              │    Low     │   Medium   │   Medium   │  High    │
+└─────────────────────────┴────────────┴────────────┴────────────┴──────────┘
+
+----------------------------------------------------------------
+12. INTERVIEW KEY POINTS
+----------------------------------------------------------------
+
+Q: How does bidi streaming differ from two separate unary RPCs?
+A: Bidi streaming maintains a single persistent connection (HTTP/2
+   stream) with shared state. Two unary RPCs are independent stateless
+   calls — each creates a new connection and has no shared context.
+   Bidi streaming is more efficient (single connection), maintains
+   ordering guarantees within the stream, and allows the server to
+   correlate messages across the session without external state lookups.
+
+Q: What happens if one side calls onError() in a bidi stream?
+A: The entire stream terminates. Calling onError() is equivalent to
+   sending RST_STREAM on the HTTP/2 level, which signals the other
+   side to abort. Both sides will receive onError() on their
+   StreamObserver. Neither side can send any more messages after this.
+
+Q: Why is StreamObserver not thread-safe and what can you do about it?
+A: gRPC's StreamObserver is designed for single-threaded use. If you
+   have callbacks from external systems (like a trading engine) that
+   call responseObserver.onNext() from multiple threads, you must
+   synchronize access (synchronized block), funnel through a single-
+   threaded executor, or use a lock-free queue with a single consumer
+   thread calling onNext().
+
+Q: How would you implement heartbeat detection in a bidi stream?
+A: Use a oneof in the message type with a Heartbeat variant. Client
+   sends heartbeat messages periodically. Server resets a watchdog
+   timer on each heartbeat. If no message (including heartbeat)
+   arrives within the timeout period, the server closes the stream
+   with Status.DEADLINE_EXCEEDED or calls onCompleted(). Client
+   handles onError() or onCompleted() and reconnects. This is
+   superior to relying on TCP keepalive because it works at the
+   application layer and detects logical hangs, not just TCP hangs.
+
+================================================================
+END OF FILE
+================================================================

@@ -1,0 +1,250 @@
+================================================================================
+END-TO-END TESTING IN MICROSERVICES
+================================================================================
+
+WHAT IS END-TO-END TESTING?
+-----------------------------
+E2E tests verify complete user journeys across multiple services.
+No mocks or stubs — real services, real infrastructure.
+
+Example E2E test:
+  1. User places an order (API call to Order Service)
+  2. Payment is processed (Payment Service called internally)
+  3. Inventory is reserved (Inventory Service called internally)
+  4. Confirmation email received (Notification Service sends email)
+  5. Order appears in user's order history (Order Service query)
+
+────────────────────────────────────────────────────────────────────────────────
+
+THE CHALLENGE WITH E2E TESTS
+==============================
+
+Pros:
+  ✓ Tests real system behavior
+  ✓ Catches integration bugs unit/contract tests miss
+  ✓ Validates complete user journeys
+  ✓ Tests infrastructure (network policies, K8s routing)
+
+Cons:
+  ✗ Slow (minutes per test run)
+  ✗ Expensive to maintain (test data, environment management)
+  ✗ Flaky (network issues, timing, data pollution)
+  ✗ Late feedback (run in staging/pre-prod, not dev)
+  ✗ Hard to diagnose failures (which of 10 services failed?)
+
+Recommendation:
+  - Have FEW (10-20) E2E tests, only for critical business flows
+  - Critical paths: checkout, payment, auth/login, core CRUD
+  - Supplement with contract tests to catch API changes early
+
+────────────────────────────────────────────────────────────────────────────────
+
+E2E TESTING STRATEGIES
+========================
+
+STRATEGY 1: Separate E2E Test Environment
+  - Dedicated staging environment with all services deployed
+  - E2E tests run after each service deployment
+  - CI pipeline: Build → Unit/Integration → Deploy to Staging → E2E
+
+STRATEGY 2: Docker Compose (local E2E)
+  - docker-compose.yml defines all services for local E2E
+  - Cheaper than cloud staging environment
+  - Good for critical path testing during development
+
+STRATEGY 3: Synthetic Monitoring (production E2E)
+  - Scheduled tests running against production
+  - Use test accounts / test data isolated from real data
+  - Alerts if critical flows break in production
+  - Tools: Grafana Synthetic Monitoring, Datadog Synthetics
+
+────────────────────────────────────────────────────────────────────────────────
+
+DOCKER COMPOSE E2E SETUP
+==========================
+
+  # docker-compose.e2e.yml
+  version: '3.8'
+  services:
+    order-service:
+      image: myregistry.io/order-service:${VERSION}
+      ports:
+        - "8080:8080"
+      environment:
+        SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/orders
+        KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+        INVENTORY_SERVICE_URL: http://inventory-service:8081
+        PAYMENT_SERVICE_URL: http://payment-service:8082
+      depends_on:
+        postgres:
+          condition: service_healthy
+        kafka:
+          condition: service_healthy
+
+    inventory-service:
+      image: myregistry.io/inventory-service:latest
+      ports:
+        - "8081:8081"
+
+    payment-service:
+      image: myregistry.io/payment-service:latest
+      ports:
+        - "8082:8082"
+
+    postgres:
+      image: postgres:16-alpine
+      environment:
+        POSTGRES_USER: app
+        POSTGRES_PASSWORD: test
+      healthcheck:
+        test: ["CMD-SHELL", "pg_isready -U app"]
+        interval: 5s
+        retries: 5
+
+    kafka:
+      image: confluentinc/cp-kafka:7.5.0
+      environment:
+        KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      healthcheck:
+        test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+        interval: 10s
+        retries: 5
+
+E2E Test with REST Assured:
+  @SpringBootTest(webEnvironment = NONE)  // No Spring context — pure HTTP tests
+  @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+  class OrderFlowE2ETest {
+
+    private static final String ORDER_SERVICE_URL = "http://localhost:8080";
+    private static Long createdOrderId;
+
+    @Test
+    @Order(1)
+    void shouldCreateOrderSuccessfully() {
+      String requestBody = """
+        {
+          "userId": 1,
+          "items": [{"productId": 100, "quantity": 2}]
+        }
+        """;
+
+      Response response = given()
+        .baseUri(ORDER_SERVICE_URL)
+        .header("Authorization", "Bearer " + getTestUserToken())
+        .contentType(ContentType.JSON)
+        .body(requestBody)
+        .when()
+        .post("/api/orders")
+        .then()
+        .statusCode(201)
+        .body("status", equalTo("PENDING"))
+        .body("id", notNullValue())
+        .extract().response();
+
+      createdOrderId = response.jsonPath().getLong("id");
+    }
+
+    @Test
+    @Order(2)
+    void shouldTransitionOrderToPaymentProcessing() {
+      // Wait for async payment processing
+      await()
+        .atMost(30, SECONDS)
+        .pollInterval(2, SECONDS)
+        .untilAsserted(() -> {
+          given()
+            .baseUri(ORDER_SERVICE_URL)
+            .header("Authorization", "Bearer " + getTestUserToken())
+            .when()
+            .get("/api/orders/" + createdOrderId)
+            .then()
+            .statusCode(200)
+            .body("status", anyOf(equalTo("PAYMENT_PROCESSING"), equalTo("CONFIRMED")));
+        });
+    }
+
+    @Test
+    @Order(3)
+    void shouldAppearInOrderHistory() {
+      given()
+        .baseUri(ORDER_SERVICE_URL)
+        .header("Authorization", "Bearer " + getTestUserToken())
+        .queryParam("userId", 1)
+        .when()
+        .get("/api/orders")
+        .then()
+        .statusCode(200)
+        .body("content.id", hasItem(createdOrderId.intValue()));
+    }
+
+    private String getTestUserToken() {
+      // Get JWT token from auth service using test credentials
+      return given()
+        .baseUri("http://localhost:8085")
+        .formParam("username", "testuser@example.com")
+        .formParam("password", "test-password")
+        .formParam("grant_type", "password")
+        .when()
+        .post("/oauth2/token")
+        .then()
+        .statusCode(200)
+        .extract().jsonPath().getString("access_token");
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+TEST DATA MANAGEMENT
+=====================
+
+E2E test data challenges:
+  - Test data must exist across multiple service databases
+  - Tests must not pollute each other (isolation)
+  - Cleanup after tests
+
+Strategies:
+  1. Database transaction rollback (within same service only)
+  2. Test data setup/teardown APIs (dedicated test endpoints in non-prod)
+  3. Unique test data per test run (userId = "test-" + UUID)
+  4. Regular database snapshots/restore between test suites
+
+  // Strategy 3: Unique per run
+  @BeforeEach
+  void setUp() {
+    testUserId = "test-user-" + UUID.randomUUID();
+    // Create test user via API
+    userService.createTestUser(testUserId);
+  }
+
+  @AfterEach
+  void tearDown() {
+    userService.deleteTestUser(testUserId);
+    orderService.deleteOrdersByUserId(testUserId);
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: How many E2E tests should a microservices system have?
+A: Very few — typically 10-20 tests covering critical business flows only
+   (checkout, login, payment). E2E tests are slow, expensive, and flaky.
+   Compensate with: many unit tests (70%), integration tests with TestContainers
+   (20%), contract tests (Pact) to catch API breaking changes. E2E tests verify
+   the system works together, not every code path.
+
+Q: What is the biggest challenge with E2E testing in microservices?
+A: Test flakiness. Multiple services mean multiple failure points. Async operations
+   require polling with timeouts (Awaitility). Test data management across
+   services is complex. Service version mismatches cause unexpected failures.
+   Diagnosing failures requires distributed tracing across services.
+
+Q: What is synthetic monitoring?
+A: Running scheduled test scenarios against production to verify critical user
+   journeys work. Unlike CI/CD E2E tests (pre-deployment), synthetic monitoring
+   tests the live system continuously. Catches production-specific issues (CDN
+   problems, real external API failures). Tools: Grafana Synthetic Monitoring,
+   Datadog Synthetics, Checkly.
+
+================================================================================

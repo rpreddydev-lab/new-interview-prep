@@ -1,0 +1,852 @@
+================================================================================
+KUBERNETES ARCHITECTURE — DEEP DIVE GUIDE
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. High-Level Architecture Overview
+2. Control Plane — Deep Dive
+3. Worker Nodes — Deep Dive
+4. Container Runtime Interface (CRI)
+5. Container Network Interface (CNI)
+6. Container Storage Interface (CSI)
+7. Admission Controllers and Webhooks
+8. High Availability Architecture
+9. Component Communication and Security
+10. Common Interview Questions & Answers
+11. Quick Reference Cheat Sheet
+
+================================================================================
+1. HIGH-LEVEL ARCHITECTURE OVERVIEW
+================================================================================
+
+Kubernetes Cluster Structure:
+  
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │                           Kubernetes Cluster                                │
+  │                                                                             │
+  │  ┌──────────────────────────────────────────────────────────────────────┐   │
+  │  │                        Control Plane                                  │   │
+  │  │   ┌─────────────┐  ┌──────────────┐  ┌─────────────────────────┐    │   │
+  │  │   │ API Server  │  │     etcd     │  │  Controller Manager     │    │   │
+  │  │   │  :6443      │  │   :2379/2380 │  │  (many controllers)     │    │   │
+  │  │   └─────────────┘  └──────────────┘  └─────────────────────────┘    │   │
+  │  │   ┌─────────────┐  ┌──────────────────────────────────────────┐     │   │
+  │  │   │  Scheduler  │  │        Cloud Controller Manager          │     │   │
+  │  │   │  :10259     │  │        (cloud-provider specific)         │     │   │
+  │  │   └─────────────┘  └──────────────────────────────────────────┘     │   │
+  │  └──────────────────────────────────────────────────────────────────────┘   │
+  │                                                                             │
+  │         HTTPS/TLS (port 6443)    kubectl, CI/CD, Operators                 │
+  │         ↕                        ↕                                          │
+  │  ┌──────────────────────────────────────────────────────────────────────┐   │
+  │  │                         Worker Nodes                                  │   │
+  │  │                                                                       │   │
+  │  │  ┌─────────────────────────┐    ┌─────────────────────────┐         │   │
+  │  │  │       Worker Node 1     │    │      Worker Node 2      │  ...    │   │
+  │  │  │                         │    │                         │         │   │
+  │  │  │  ┌─────┐  ┌──────────┐  │    │  ┌─────┐  ┌──────────┐ │         │   │
+  │  │  │  │kube │  │   kube   │  │    │  │kube │  │   kube   │ │         │   │
+  │  │  │  │-let │  │  -proxy  │  │    │  │-let │  │  -proxy  │ │         │   │
+  │  │  │  └─────┘  └──────────┘  │    │  └─────┘  └──────────┘ │         │   │
+  │  │  │  ┌──────────────────┐   │    │  ┌──────────────────┐  │         │   │
+  │  │  │  │ Container Runtime │   │    │  │ Container Runtime │  │         │   │
+  │  │  │  │   (containerd)   │   │    │  │   (containerd)   │  │         │   │
+  │  │  │  └──────────────────┘   │    │  └──────────────────┘  │         │   │
+  │  │  │  Pods: [P1][P2][P3]     │    │  Pods: [P4][P5]        │         │   │
+  │  │  └─────────────────────────┘    └─────────────────────────┘         │   │
+  │  └──────────────────────────────────────────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+Request Flow (kubectl apply -f deployment.yaml):
+  
+  1. kubectl sends HTTP POST to kube-apiserver (:6443)
+  2. API Server: authenticate + authorize + validate
+  3. API Server: run admission controllers (mutating → validating)
+  4. API Server: persist to etcd
+  5. Deployment Controller watches etcd → notices new Deployment
+  6. Deployment Controller creates ReplicaSet
+  7. ReplicaSet Controller creates Pod objects (unscheduled)
+  8. Scheduler watches for unscheduled pods → finds best node → sets pod.spec.nodeName
+  9. kubelet on assigned node watches its pods → calls CRI to start containers
+  10. Container runtime (containerd) pulls image, creates container
+  11. kubelet reports pod status → API server → etcd
+
+================================================================================
+2. CONTROL PLANE — DEEP DIVE
+================================================================================
+
+KUBE-APISERVER — The API Gateway
+────────────────────────────────
+  Role: ALL cluster operations flow through here.
+  
+  Request Pipeline:
+  
+  HTTP Request
+      ↓
+  Authentication       Who are you?
+      ↓                (certs, Bearer tokens, OIDC, service accounts)
+  Authorization        Can you do this?
+      ↓                (RBAC, ABAC, Node, Webhook)
+  Admission Control    Should this be allowed / mutated?
+      ↓                (Mutating webhooks → Validating webhooks)
+  Validation           Is the object schema valid?
+      ↓
+  Persist to etcd      Store the desired state
+      ↓
+  Return response      201 Created / 200 OK
+  
+  Key characteristics:
+  - Only component that talks to etcd directly
+  - Stateless (can be horizontally scaled behind a load balancer)
+  - Serves the OpenAPI spec (auto-generated API docs)
+  - Watch mechanism: Clients watch for changes using long-lived HTTP connections
+  
+  API Server Flags (important):
+  --etcd-servers          etcd endpoints
+  --service-cluster-ip-range  CIDR for Services
+  --service-node-port-range   NodePort range (default 30000-32767)
+  --allow-privileged      Whether privileged containers are allowed
+  --authorization-mode    RBAC,Node,Webhook (comma-separated)
+
+ETCD — The Source of Truth
+──────────────────────────
+  Type: Distributed key-value store
+  Algorithm: Raft consensus (handles split-brain)
+  Ports: 2379 (client), 2380 (peer)
+  
+  What's stored:
+  - All Kubernetes objects (pods, services, deployments...)
+  - Cluster configuration
+  - Secrets (base64 encoded, optionally encrypted at rest)
+  - ServiceAccount tokens
+  - Lease objects (for leader election)
+  
+  Key characteristics:
+  - STRONGLY CONSISTENT (linearizable reads)
+  - WATCH support (etcd watch → controller watch → reconciliation)
+  - Maximum recommended object size: 1.5MB
+  - Maximum database size: 8GB default (affects performance)
+  
+  Raft and Quorum:
+  - Requires majority of nodes (quorum) to elect leader and accept writes
+  - Write only succeeds when majority acknowledges
+  - 3 nodes → quorum = 2 → tolerate 1 failure
+  - 5 nodes → quorum = 3 → tolerate 2 failures
+  - Always run odd number of etcd nodes
+  
+  Backup and restore:
+  ETCDCTL_API=3 etcdctl snapshot save /backup/snapshot.db \
+    --endpoints=https://127.0.0.1:2379 \
+    --cacert=/etc/etcd/ca.crt \
+    --cert=/etc/etcd/etcd.crt \
+    --key=/etc/etcd/etcd.key
+  
+  ETCDCTL_API=3 etcdctl snapshot restore /backup/snapshot.db \
+    --data-dir=/var/lib/etcd-restored
+  
+  Encryption at rest (EncryptionConfiguration):
+  apiVersion: apiserver.config.k8s.io/v1
+  kind: EncryptionConfiguration
+  resources:
+  - resources:
+    - secrets
+    providers:
+    - aescbc:
+        keys:
+        - name: key1
+          secret: <base64-encoded-32-byte-key>
+    - identity: {}   # fallback for reading unencrypted data
+
+KUBE-SCHEDULER — Pod Placement
+────────────────────────────────
+  Role: Assigns pods to nodes. Two-phase process:
+  
+  PHASE 1 — FILTERING (Predicates):
+    Eliminate nodes that don't satisfy requirements.
+    
+    Built-in filters:
+    NodeResourcesFit     Node has enough CPU/memory for pod requests
+    NodeAffinity         Node matches pod's nodeAffinity rules
+    TaintToleration      Node taints are tolerated by pod
+    NodePorts            Node port availability
+    PodTopologySpread    Spread constraints
+    VolumeBinding        Nodes with required PVs
+    InterPodAffinity     Pods that must be co-located or separated
+  
+  PHASE 2 — SCORING (Priorities):
+    Rank filtered nodes by preference (0-100).
+    
+    Built-in scoring functions:
+    LeastAllocated       Prefer nodes with most available resources
+    BalancedAllocation   Spread memory/CPU usage evenly
+    ImageLocality        Prefer nodes that already have the image
+    InterPodAffinity     Prefer nodes based on co-location rules
+    NodeAffinity         Score nodes by affinity preference
+  
+  Node with highest score wins. Ties broken randomly.
+  
+  Influencing scheduling:
+  
+  # NodeSelector (simple, must match exactly):
+  spec:
+    nodeSelector:
+      kubernetes.io/os: linux
+      disktype: ssd
+  
+  # Node Affinity (complex expressions, soft/hard):
+  spec:
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:   # Hard
+          nodeSelectorTerms:
+          - matchExpressions:
+            - key: topology.kubernetes.io/zone
+              operator: In
+              values: [us-east-1a, us-east-1b]
+        preferredDuringSchedulingIgnoredDuringExecution:  # Soft
+        - weight: 100
+          preference:
+            matchExpressions:
+            - key: disktype
+              operator: In
+              values: [ssd]
+  
+  # Taints and Tolerations (node repels pods unless tolerated):
+  # Taint a node:
+  kubectl taint nodes gpu-node dedicated=gpu:NoSchedule
+  
+  # Pod tolerates the taint:
+  spec:
+    tolerations:
+    - key: dedicated
+      operator: Equal
+      value: gpu
+      effect: NoSchedule
+  
+  # Taint Effects:
+  NoSchedule       New pods without toleration won't schedule here
+  PreferNoSchedule Soft version of NoSchedule
+  NoExecute        Evict existing pods without toleration (+ no new ones)
+  
+  # Pod Topology Spread (even distribution):
+  spec:
+    topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          app: myapp
+
+KUBE-CONTROLLER-MANAGER
+────────────────────────
+  Runs many controllers in a single process.
+  Each controller is an independent reconciliation loop.
+  
+  KEY CONTROLLERS:
+  
+  Deployment Controller:
+    Watches Deployments → creates/updates/deletes ReplicaSets
+    Implements rolling update strategy
+  
+  ReplicaSet Controller:
+    Watches ReplicaSets → creates/deletes Pods to match desired replica count
+    The actual self-healing mechanism for pods
+  
+  Node Controller:
+    Monitors node health via heartbeats (node.status.conditions)
+    40s no heartbeat → node Unknown
+    5m after Unknown → evict pods (mark for deletion)
+  
+  Service Account Controller:
+    Creates default ServiceAccount in each new namespace
+  
+  Namespace Controller:
+    Cleans up all resources when namespace is deleted
+  
+  Job Controller:
+    Creates pods for Jobs, tracks completions/failures
+  
+  Endpoints Controller (EndpointSlice):
+    Populates Service endpoints by watching pods with matching labels
+  
+  Leader Election:
+    Only one controller manager is active at a time.
+    Uses etcd for leader lease (--leader-elect flag).
+
+================================================================================
+3. WORKER NODES — DEEP DIVE
+================================================================================
+
+KUBELET — The Node Agent
+─────────────────────────
+  Runs on every node. The bridge between K8s and the container runtime.
+  
+  Responsibilities:
+  1. Registers node with API server (sends Node object with capacity/labels)
+  2. Watches API server for pods assigned to this node
+  3. Starts/stops containers via CRI
+  4. Runs health checks (liveness/readiness/startup probes)
+  5. Reports pod and node status back to API server
+  6. Manages volumes (mounts/unmounts)
+  7. Pulls container images via CRI
+  8. Garbage collects unused containers and images
+  
+  Key kubelet flags:
+  --config                Path to kubelet config file
+  --kubeconfig            How kubelet authenticates to API server
+  --container-runtime-endpoint  CRI socket (e.g., unix:///run/containerd/containerd.sock)
+  --pod-manifest-path     Static pod directory (control plane uses this!)
+  --eviction-hard         Thresholds for node pressure eviction
+  
+  Static Pods:
+    Pods defined as YAML files in a directory on the node.
+    kubelet starts them without API server involvement.
+    Control plane components (apiserver, etcd, scheduler) run as static pods
+    in kubeadm-managed clusters.
+    Visible in kubectl but managed by kubelet directly.
+    
+  Node Pressure Eviction:
+    kubelet evicts pods when node is under resource pressure.
+    
+    Default eviction thresholds:
+    memory.available < 100Mi   → evict pods (memory pressure)
+    nodefs.available < 10%     → evict pods (disk pressure)
+    imagefs.available < 15%    → evict pods (image filesystem pressure)
+    
+    Eviction order:
+    1. BestEffort (no requests/limits)
+    2. Burstable (requests < limits)
+    3. Guaranteed (requests == limits) — last to be evicted
+    
+    QoS Classes are set automatically based on resource configuration.
+
+KUBE-PROXY — Service Networking
+─────────────────────────────────
+  Runs on every node. Maintains network rules for Service routing.
+  
+  How Services work:
+  - Service is assigned a ClusterIP (virtual IP) by API server
+  - ClusterIP doesn't actually exist on any interface
+  - kube-proxy creates rules to route packets destined for ClusterIP to pod IPs
+  
+  Operating modes:
+  
+  IPTABLES MODE (default):
+    Creates iptables DNAT rules in KUBE-SERVICES chain.
+    Traffic to ClusterIP → randomly pick a pod IP and DNAT.
+    Performance scales linearly with number of Services/pods.
+    No connection tracking overhead for simple cases.
+  
+  IPVS MODE (better for large clusters):
+    Uses Linux kernel IPVS (IP Virtual Server).
+    Supports multiple load balancing algorithms:
+    rr (round-robin), lc (least connection), dh (destination hashing)
+    O(1) lookup instead of O(n) iptables rules.
+    Better for 1000+ Services.
+    
+    Enable: --proxy-mode=ipvs in kube-proxy config
+  
+  eBPF mode (with Cilium CNI):
+    Bypasses kube-proxy entirely.
+    Uses eBPF programs in kernel for fast packet processing.
+
+================================================================================
+4. CONTAINER RUNTIME INTERFACE (CRI)
+================================================================================
+
+CRI Overview:
+  Kubernetes doesn't talk to Docker or containerd directly.
+  It talks to any compliant CRI implementation.
+  CRI defines: RunPodSandbox, CreateContainer, StartContainer, StopContainer...
+  
+  kubelet → CRI → container runtime
+  
+  Docker history:
+  K8s 1.0-1.23: Docker was supported via dockershim (built into kubelet)
+  K8s 1.24:     dockershim removed. Must use containerd or CRI-O.
+  (Docker images still work — Docker just uses containerd internally now)
+
+Supported Container Runtimes:
+  
+  CONTAINERD (recommended, most common):
+    Originally part of Docker, now a standalone CNCF graduated project.
+    Default runtime in most managed K8s (EKS, GKE, AKS).
+    Minimal, focused on container lifecycle.
+    Config: /etc/containerd/config.toml
+    Socket: unix:///run/containerd/containerd.sock
+    CLI: ctr (low-level), crictl (Kubernetes-facing)
+  
+  CRI-O:
+    Lightweight runtime designed specifically for Kubernetes.
+    Implements CRI directly, no extra features.
+    Default in OpenShift.
+    Socket: unix:///var/run/crio/crio.sock
+  
+  crictl (CRI-compatible CLI tool):
+    Like docker but talks to CRI instead.
+    Useful for debugging container issues on nodes.
+    
+    crictl ps                     # List containers
+    crictl images                 # List images
+    crictl logs <container-id>    # Container logs
+    crictl inspect <container-id> # Container details
+    crictl pods                   # List pod sandboxes
+    
+    # Configure crictl to talk to containerd:
+    cat /etc/crictl.yaml:
+    runtime-endpoint: unix:///run/containerd/containerd.sock
+    image-endpoint: unix:///run/containerd/containerd.sock
+
+OCI (Open Container Initiative):
+  Industry standards for containers:
+  OCI Image Spec: Container image format (layers, manifests)
+  OCI Runtime Spec: How to run containers (runc, crun, gVisor, Kata)
+  
+  runc: Reference OCI runtime. Creates Linux containers using namespaces/cgroups.
+  gVisor (runsc): User-space kernel for stronger isolation (Google).
+  Kata Containers: Lightweight VMs for each container (stronger isolation).
+
+================================================================================
+5. CONTAINER NETWORK INTERFACE (CNI)
+================================================================================
+
+CNI Overview:
+  Kubernetes doesn't implement pod networking.
+  CNI plugins are responsible for:
+  - Assigning pod IP addresses
+  - Connecting pods across nodes
+  - Implementing Network Policies
+  
+  K8s networking requirements (fundamental):
+  1. Every pod gets a unique IP
+  2. Pods can communicate with each other without NAT (flat network)
+  3. Nodes can communicate with pods without NAT
+  4. IP a pod sees for itself == IP others see for that pod
+
+Major CNI Plugins:
+  
+  FLANNEL (simple overlay):
+    Simple, widely-used. Uses VXLAN tunneling.
+    Does NOT implement Network Policies.
+    Good for: simple clusters, learning.
+  
+  CALICO (popular, production-grade):
+    BGP routing (no overlay needed in same subnet).
+    OR VXLAN/IPinIP for cross-subnet.
+    Full Network Policy support (extends K8s NetworkPolicy with GlobalNetworkPolicy).
+    Good for: most production use cases.
+    eBPF dataplane available.
+  
+  CILIUM (modern, eBPF-based):
+    Uses eBPF in the Linux kernel — bypass iptables entirely.
+    Best performance at scale.
+    L7-aware Network Policies (HTTP, gRPC).
+    Built-in service mesh capabilities.
+    Hubble: built-in network observability.
+    Good for: large clusters, security-sensitive, modern setups.
+  
+  WEAVE NET:
+    Simple mesh network. Encrypted by default.
+    Less popular now but good for multi-cloud.
+  
+  AWS VPC CNI (EKS):
+    Assigns actual VPC IPs to pods. No overlay.
+    Native VPC routing for pods.
+    Security groups can be applied directly to pods.
+  
+  Azure CNI (AKS), GKE Dataplane V2 (GKE).
+
+Pod Network (how pods communicate across nodes):
+  
+  Same Node:
+  Pod A → veth pair → docker0 bridge → veth pair → Pod B
+  
+  Different Nodes (VXLAN example):
+  Pod A → veth → bridge → VXLAN tunnel → remote node bridge → veth → Pod B
+  
+  CNI sets up the veth pairs, bridge, and routes/tunnels when pods are scheduled.
+
+================================================================================
+6. CONTAINER STORAGE INTERFACE (CSI)
+================================================================================
+
+CSI Overview:
+  Standard interface for storage plugins.
+  Before CSI: volume plugins were built into Kubernetes (in-tree).
+  After CSI: storage vendors write external plugins (out-of-tree).
+  
+  Benefits: Storage plugins updated independently of K8s releases.
+
+How CSI Works:
+  CSI Driver = two components:
+  1. Controller Plugin: Handles volume provisioning, attachment (DaemonSet or Deployment)
+  2. Node Plugin: Handles volume mounting on the node (DaemonSet)
+  
+  StorageClass → dynamic provisioning → PersistentVolume → PersistentVolumeClaim → Pod
+
+Common CSI Drivers:
+  aws-ebs-csi-driver        EBS volumes on EKS
+  gce-pd-csi-driver         GCE Persistent Disk on GKE
+  azuredisk-csi-driver      Azure Disk on AKS
+  rook-ceph                 Ceph storage in-cluster
+  nfs-subdir-external-provisioner  NFS shares
+  secrets-store-csi-driver  Mount secrets from Vault/AWS SSM/etc.
+
+================================================================================
+7. ADMISSION CONTROLLERS AND WEBHOOKS
+================================================================================
+
+Admission Controllers:
+  Plugins that intercept API requests AFTER authentication/authorization
+  but BEFORE persistence to etcd.
+  
+  Can MUTATE requests (add/change fields) and/or VALIDATE them.
+  
+  Order:
+  Request → Authentication → Authorization → Mutating Admission → Validating Admission → etcd
+
+Built-in Admission Controllers (examples):
+  
+  NamespaceLifecycle:
+    Prevents creating objects in non-existent namespaces.
+    Prevents deleting system namespaces.
+  
+  LimitRanger:
+    Enforces LimitRange objects (default resource limits).
+    If pod has no CPU limit, applies the LimitRange default.
+  
+  ResourceQuota:
+    Enforces ResourceQuota objects.
+    Rejects requests that would exceed namespace quotas.
+  
+  ServiceAccount:
+    Auto-adds ServiceAccount token volume to pods.
+    Sets default ServiceAccount if not specified.
+  
+  DefaultStorageClass:
+    Auto-sets default StorageClass on PVCs without one.
+  
+  MutatingAdmissionWebhook:
+    Enables dynamic mutating webhooks (call external services).
+  
+  ValidatingAdmissionWebhook:
+    Enables dynamic validating webhooks.
+  
+  PodSecurity (K8s 1.25+):
+    Enforces Pod Security Standards (Privileged/Baseline/Restricted)
+    based on namespace labels. Replaced PodSecurityPolicy.
+
+Dynamic Admission Webhooks:
+  Allow you to add custom admission logic without modifying K8s.
+  
+  How it works:
+  1. Register WebhookConfiguration (MutatingWebhookConfiguration or ValidatingWebhookConfiguration)
+  2. API server sends AdmissionReview JSON to your webhook server
+  3. Webhook responds with allow/deny + optional patches (mutating)
+  
+  Use cases:
+  - Inject sidecar containers (Istio/Linkerd proxy injection)
+  - Enforce naming conventions
+  - Add default labels/annotations
+  - Block privileged containers
+  - Validate resource limits are set
+  
+  Tools that use webhooks:
+  - Istio: auto-injects envoy sidecar
+  - OPA Gatekeeper: policy enforcement
+  - Kyverno: K8s-native policy engine
+  - cert-manager: mutates services to add TLS
+  
+  Example: Always inject a label
+  apiVersion: admissionregistration.k8s.io/v1
+  kind: MutatingWebhookConfiguration
+  metadata:
+    name: add-team-label
+  webhooks:
+  - name: add-team-label.example.com
+    clientConfig:
+      service:
+        name: webhook-service
+        namespace: default
+        path: /mutate
+    rules:
+    - operations: ["CREATE"]
+      apiGroups: [""]
+      apiVersions: ["v1"]
+      resources: ["pods"]
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+
+================================================================================
+8. HIGH AVAILABILITY ARCHITECTURE
+================================================================================
+
+Control Plane HA:
+  
+  STACKED etcd (etcd on same nodes as control plane):
+  
+  ┌─────────────────────────────────────────────────────────┐
+  │                    Load Balancer                         │
+  │              (e.g., HAProxy, AWS NLB)                    │
+  └───────────────────────┬─────────────────────────────────┘
+          ┌───────────────┼───────────────┐
+          ↓               ↓               ↓
+  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+  │ Control Plane│ │ Control Plane│ │ Control Plane│
+  │   Node 1     │ │   Node 2     │ │   Node 3     │
+  │ apiserver    │ │ apiserver    │ │ apiserver    │
+  │ scheduler    │ │ scheduler    │ │ scheduler    │
+  │ ctrl-manager │ │ ctrl-manager │ │ ctrl-manager │
+  │ etcd         │ │ etcd         │ │ etcd         │
+  └──────────────┘ └──────────────┘ └──────────────┘
+  
+  EXTERNAL etcd (separate etcd cluster):
+  - More complex but etcd failures don't affect API server
+  - Used for very large clusters
+  
+  Key HA points:
+  - Multiple API servers behind load balancer (all active)
+  - Only ONE scheduler and controller manager are active at once (leader election)
+  - etcd requires quorum (N/2 + 1 nodes available)
+  
+  Worker node failure:
+  - Node controller marks node NotReady after ~40s
+  - Pod eviction timeout: 5 minutes (node.kubernetes.io/not-ready:NoExecute)
+  - Reduce with --default-not-ready-toleration-seconds for faster recovery
+
+================================================================================
+9. COMPONENT COMMUNICATION AND SECURITY
+================================================================================
+
+TLS Everywhere:
+  All K8s component communication is TLS-encrypted:
+  
+  COMPONENT              CONNECTS TO          CERT USED
+  ────────────────────────────────────────────────────────
+  kubectl                API Server           ~/.kube/config (client cert or token)
+  kubelet                API Server           kubelet client cert
+  kube-scheduler         API Server           scheduler service account
+  ctrl-manager           API Server           controller-manager SA
+  API Server             etcd                 apiserver-etcd-client cert
+  API Server             kubelet              apiserver-kubelet-client cert
+  kubelet                API Server (webhook) kubelet server cert
+  
+  cert paths (kubeadm): /etc/kubernetes/pki/
+
+Service Account Tokens:
+  Pods authenticate to API server via ServiceAccount tokens.
+  
+  Mounted automatically at: /var/run/secrets/kubernetes.io/serviceaccount/token
+  
+  Token projection (recommended, short-lived):
+  spec:
+    serviceAccountName: my-app
+    volumes:
+    - name: token
+      projected:
+        sources:
+        - serviceAccountToken:
+            audience: api
+            expirationSeconds: 3600   # 1 hour, auto-rotated
+            path: token
+
+Node-to-API-Server Communication:
+  All kubelets register with API server using a bootstrap token or kubelet cert.
+  API server can PUSH workloads to kubelet (via Watch/informers).
+  Kubelet opens outbound connection to API server (not inbound to kubelet).
+
+================================================================================
+10. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: Walk me through what happens when you run kubectl apply -f deployment.yaml.
+A: The full request flow:
+   
+   1. kubectl reads the YAML, serializes it to JSON, sends HTTP request
+      to API server (kube-apiserver) on port 6443 with bearer token/cert auth.
+   
+   2. API server authenticates the request (who are you?),
+      then authorizes via RBAC (can this user create deployments?).
+   
+   3. Admission controllers run:
+      - Mutating webhooks may add defaults (ServiceAccount, resource limits)
+      - Validating webhooks check policies (OPA, Kyverno)
+   
+   4. API server validates the object schema, then writes to etcd.
+      etcd Raft consensus: majority of etcd nodes acknowledge before confirming.
+   
+   5. Deployment Controller (in controller-manager) is watching etcd for
+      Deployment events. It sees the new Deployment and creates a ReplicaSet.
+   
+   6. ReplicaSet Controller sees the new ReplicaSet with desired=3, creates
+      3 Pod objects. Pods are in "Pending" state — no node assigned.
+   
+   7. Scheduler watches for unscheduled pods (nodeName == "").
+      Runs filtering (which nodes have enough resources?) then scoring
+      (which node is best?). Assigns pod.spec.nodeName = "worker-node-1".
+   
+   8. kubelet on worker-node-1 watches for pods assigned to it via
+      the API server watch. It calls the container runtime (containerd)
+      via CRI to create the pod sandbox, pull the image, start containers.
+   
+   9. containerd pulls the image from the registry, creates the container.
+      kubelet starts the health probes (liveness/readiness).
+   
+   10. Pod status changes to Running. ReplicaSet controller sees 3/3 pods
+       running. Deployment controller updates the Deployment status.
+   
+   This entire flow from kubectl apply to container running takes ~1-5 seconds
+   for simple pods. The watch mechanism makes it event-driven, not polling.
+
+Q2: How does etcd ensure data consistency and what happens if etcd fails?
+A: etcd uses the Raft consensus algorithm:
+   
+   Raft fundamentals:
+   - One node is elected "Leader" via votes
+   - Only the Leader accepts writes
+   - Leader replicates writes to Followers
+   - Write is "committed" when a majority (quorum) acknowledges it
+   - If Leader fails, a new election happens (takes ~150-300ms)
+   
+   Quorum calculation: (N/2) + 1
+   - 3 nodes → quorum = 2 → tolerate 1 failure
+   - 5 nodes → quorum = 3 → tolerate 2 failures
+   
+   Cluster is available as long as quorum is met.
+   Without quorum: etcd goes into "leader election" mode, all writes fail.
+   API server can still serve reads from cache but no writes succeed.
+   
+   If ALL etcd nodes fail → cluster is completely down. No new pods, no updates.
+   Existing containers keep running (kubelet is autonomous) but no management.
+   
+   Recovery: Restore from etcd snapshot backup.
+   This is why etcd backup is CRITICAL for production clusters.
+
+Q3: What is the difference between iptables and IPVS mode in kube-proxy?
+A: Both implement Service routing but with different mechanisms:
+   
+   iptables mode:
+   - Creates iptables DNAT rules for each Service/Endpoint
+   - Randomly selects a backend pod (stateless, no session affinity by default)
+   - Rule chain traversal is O(n) — with 10,000 Services, each packet
+     traverses up to 10,000 iptables rules
+   - Suitable for clusters with up to ~1000 Services
+   
+   IPVS mode:
+   - Uses Linux kernel's IPVS (IP Virtual Server) in-kernel load balancer
+   - Hash table lookup — O(1) regardless of number of Services
+   - Multiple load balancing algorithms:
+     rr, lc, dh, sh, sed, nq
+   - Better performance and lower latency at scale
+   - Requires IPVS kernel modules (ipset, ip_vs, ip_vs_rr, etc.)
+   - Recommended for clusters with 1000+ Services
+   
+   Modern alternative: Use Cilium CNI which replaces kube-proxy entirely
+   with eBPF programs, providing even better performance and visibility.
+
+Q4: Explain taints, tolerations, and node affinity. When would you use each?
+A: These are three different ways to control pod scheduling:
+   
+   TAINTS (on nodes) + TOLERATIONS (on pods):
+   Taints repel pods. Tolerations allow pods to override the repulsion.
+   Used for: Dedicated hardware, special-purpose nodes.
+   
+   Example: GPU node with taint dedicated=gpu:NoSchedule
+   Only pods with matching toleration will schedule there.
+   Effect options: NoSchedule (hard), PreferNoSchedule (soft), NoExecute (evict).
+   
+   NODE AFFINITY (on pods):
+   Pods express preference/requirement for certain nodes.
+   Used for: Topology-aware scheduling, compliance (run in EU region only).
+   
+   requiredDuringScheduling = hard constraint (pod won't schedule if not met)
+   preferredDuringScheduling = soft constraint (tries to match, continues if not)
+   
+   Key difference from nodeSelector: supports operators (In, NotIn, Exists, Gt)
+   
+   TOPOLOGY SPREAD CONSTRAINTS:
+   Evenly spread pods across failure domains (zones, nodes).
+   Used for: High availability, ensuring no single zone has too many pods.
+   
+   When to use:
+   - Dedicated nodes (GPU, high-memory): Taints + tolerations
+   - Compliance/locality requirements: Node affinity
+   - HA spreading: Topology spread constraints
+   - Simple environment selection: nodeSelector (quick and simple)
+
+Q5: What happens to running pods when a node fails?
+A: This is handled by multiple components working together:
+   
+   0-40 seconds: Node stops sending heartbeats (NodeLease objects in etcd).
+   
+   ~40 seconds: Node controller marks node as "NotReady".
+                Condition: node.status.conditions[type=Ready] = False
+   
+   40s-5min: Pods have built-in tolerations for NotReady/Unreachable conditions:
+             node.kubernetes.io/not-ready:NoExecute tolerationSeconds=300
+             node.kubernetes.io/unreachable:NoExecute tolerationSeconds=300
+             Pods are not evicted yet during this grace period.
+   
+   ~5 minutes: Tolerations expire. Node controller marks pods for deletion
+               by adding deletionTimestamp and setting phase to Failed.
+               
+   ReplicaSet Controller sees pods are gone → creates replacement pods
+   on healthy nodes. Scheduler places them.
+   
+   Important caveat: Pods NOT managed by ReplicaSet/Deployment/etc. (standalone pods)
+   are NOT replaced automatically. This is why you should always use Deployments.
+   
+   Optimization: Reduce toleration seconds for faster recovery:
+   spec:
+     tolerations:
+     - key: "node.kubernetes.io/not-ready"
+       operator: "Exists"
+       effect: "NoExecute"
+       tolerationSeconds: 60   # Faster eviction
+
+================================================================================
+11. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+CONTROL PLANE COMPONENTS:
+  kube-apiserver      :6443   REST API gateway, auth/authz/admission/etcd
+  etcd                :2379   Cluster state store, Raft consensus
+  kube-scheduler      :10259  Pod → Node assignment (filter+score)
+  kube-controller-mgr :10257  Reconciliation loops (Deployment, RS, Node...)
+  cloud-controller-mgr        Cloud-specific (LBs, routes, nodes)
+
+WORKER NODE COMPONENTS:
+  kubelet         CRI agent, pod lifecycle, health probes, status reporting
+  kube-proxy      Service networking (iptables/IPVS rules for ClusterIP)
+  container runtime  containerd (most common), CRI-O (OpenShift)
+
+INTERFACES:
+  CRI   Container Runtime Interface  kubelet ↔ container runtime
+  CNI   Container Network Interface  pod IP allocation, cross-node networking
+  CSI   Container Storage Interface  volume provisioning, mounting
+
+SCHEDULING MECHANISMS:
+  nodeSelector              Simple key=value node match (hard)
+  nodeAffinity              Complex expressions, soft/hard constraints
+  podAffinity/anti-affinity Co-locate or separate pods
+  taints + tolerations      Node repels pods (dedicated hardware)
+  topologySpreadConstraints Spread across zones/nodes for HA
+
+etcd QUORUM:
+  3 nodes → tolerate 1 failure
+  5 nodes → tolerate 2 failures
+  Always odd numbers
+
+ADMISSION PIPELINE:
+  Auth → AuthZ → Mutating Webhooks → Validating Webhooks → etcd
+
+SELF-HEALING TIMELINE (node failure):
+  0s     → Node stops heartbeat
+  40s    → Marked NotReady
+  5 min  → Pods evicted → ReplicaSet creates replacements
+
+================================================================================
+END OF FILE
+================================================================================

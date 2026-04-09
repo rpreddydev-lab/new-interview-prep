@@ -1,0 +1,269 @@
+================================================================================
+LOAD BALANCING IN MICROSERVICES
+================================================================================
+
+WHAT IS LOAD BALANCING?
+------------------------
+Load balancing distributes incoming network traffic across multiple service
+instances to ensure:
+  - No single instance is overwhelmed
+  - High availability (requests routed away from failed instances)
+  - Consistent response times
+  - Elastic scaling (add/remove instances without downtime)
+
+────────────────────────────────────────────────────────────────────────────────
+
+LOAD BALANCING LEVELS
+======================
+
+L4 LOAD BALANCING (Transport Layer — TCP/UDP):
+  - Routes based on IP address and TCP port only
+  - Doesn't inspect HTTP content
+  - Very fast (minimal processing)
+  - Examples: AWS NLB, Linux LVS, HAProxy in TCP mode
+  - Limitations: Can't route based on HTTP path, headers, cookies
+
+L7 LOAD BALANCING (Application Layer — HTTP):
+  - Routes based on HTTP method, path, headers, cookies, body
+  - Can implement session affinity, SSL termination, content switching
+  - Examples: Nginx, HAProxy HTTP mode, AWS ALB, Spring Cloud Gateway
+  - More features but slightly more overhead
+
+In microservices: L7 load balancing is standard at the API Gateway/service level.
+
+────────────────────────────────────────────────────────────────────────────────
+
+LOAD BALANCING ALGORITHMS
+==========================
+
+1. ROUND ROBIN (Default)
+   Requests distributed sequentially to each instance in turn.
+   Instance 1 → Instance 2 → Instance 3 → Instance 1 → ...
+
+   Pros: Simple, even distribution
+   Cons: Doesn't account for different instance capacities or response times
+   Best for: Homogeneous instances with similar capacity
+
+2. WEIGHTED ROUND ROBIN
+   Assigns weights to instances; higher weight = more requests.
+   Instance 1 (weight=3): gets 3/5 requests
+   Instance 2 (weight=2): gets 2/5 requests
+
+   Pros: Accounts for different capacities (e.g., a bigger VM gets more traffic)
+   Cons: Still doesn't respond to current load
+   Best for: Mixed instance types / canary deployments (10% traffic to new version)
+
+3. LEAST CONNECTIONS
+   Sends request to the instance with the fewest active connections.
+
+   Pros: Adapts to actual workload; won't overload slow instances
+   Cons: Slight overhead to track connection counts
+   Best for: Long-lived connections (WebSockets, gRPC streams)
+
+4. RANDOM
+   Randomly selects an instance.
+   Pros: Simple, surprisingly effective with many instances
+   Cons: No adaptation to load
+   Best for: Stateless services with many instances
+
+5. LEAST RESPONSE TIME
+   Routes to instance with lowest combination of response time + connections.
+   Pros: Best end-user experience (minimizes latency)
+   Cons: Requires latency tracking overhead
+   Best for: Latency-sensitive operations
+
+6. IP HASH (CONSISTENT HASHING)
+   Hash of client IP → always routes to same instance.
+   Pros: Session affinity without sticky cookies
+   Cons: Uneven distribution if few clients; breaks if instance added/removed
+   Best for: Stateful sessions (caching, connection pooling)
+
+7. CONSISTENT HASHING (Kafka, Caches)
+   Used in distributed caches (Redis Cluster) and Kafka partition assignment.
+   Hash ring: Keys map to "slots" on a ring; nodes own a range of slots.
+   Adding a node: only nearby keys migrate (minimal redistribution).
+   Removing a node: only that node's keys redistribute.
+
+────────────────────────────────────────────────────────────────────────────────
+
+CLIENT-SIDE LOAD BALANCING (Spring Cloud LoadBalancer)
+========================================================
+
+Spring Cloud LoadBalancer replaced deprecated Netflix Ribbon.
+Plugs into RestTemplate, WebClient, and OpenFeign automatically when
+@LoadBalanced is applied.
+
+Configuration:
+  # Default: Round Robin
+  spring:
+    cloud:
+      loadbalancer:
+        ribbon:
+          enabled: false  # Use SCG LoadBalancer, not Ribbon
+
+Custom Algorithm (Random):
+  @Configuration
+  @LoadBalancerClient(name = "order-service", configuration = RandomLBConfig.class)
+  public class OrderServiceConfig {}
+
+  public class RandomLBConfig {
+    @Bean
+    ReactorLoadBalancer<ServiceInstance> randomLoadBalancer(
+        Environment env, LoadBalancerClientFactory factory) {
+      String serviceId = env.getProperty(LoadBalancerClientFactory.PROPERTY_NAME);
+      return new RandomLoadBalancer(
+        factory.getLazyProvider(serviceId, ServiceInstanceListSupplier.class),
+        serviceId
+      );
+    }
+  }
+
+Instance Health Awareness:
+  // SCG LoadBalancer respects health status from Eureka
+  // DOWN instances are filtered out automatically
+
+────────────────────────────────────────────────────────────────────────────────
+
+SERVER-SIDE LOAD BALANCING IN KUBERNETES
+==========================================
+
+Kubernetes Service implements server-side load balancing via kube-proxy.
+
+Default: Round-Robin using iptables rules
+Advanced: IPVS mode with more algorithms
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: order-service
+  spec:
+    selector:
+      app: order-service
+    ports:
+      - protocol: TCP
+        port: 8080
+        targetPort: 8080
+
+  K8s Session Affinity (sticky sessions):
+  spec:
+    sessionAffinity: ClientIP      # Route same client IP to same pod
+    sessionAffinityConfig:
+      clientIP:
+        timeoutSeconds: 3600
+
+Advanced K8s Load Balancing with Istio:
+  apiVersion: networking.istio.io/v1alpha3
+  kind: DestinationRule
+  metadata:
+    name: order-service
+  spec:
+    host: order-service
+    trafficPolicy:
+      loadBalancer:
+        simple: LEAST_CONN         # ROUND_ROBIN | LEAST_CONN | RANDOM | PASSTHROUGH
+    # Connection pool tuning
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        http1MaxPendingRequests: 50
+        http2MaxRequests: 100
+    # Outlier detection (circuit breaking)
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 30s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50      # Eject at most 50% of instances
+
+────────────────────────────────────────────────────────────────────────────────
+
+HEALTH-AWARE LOAD BALANCING
+=============================
+
+Load balancers must route only to healthy instances.
+
+Kubernetes Readiness Probe:
+  (Pod not ready = not added to Service endpoints = no traffic)
+
+  livenessProbe:
+    httpGet:
+      path: /actuator/health/liveness
+      port: 8080
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    failureThreshold: 3
+
+  readinessProbe:
+    httpGet:
+      path: /actuator/health/readiness
+      port: 8080
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    failureThreshold: 3
+
+Spring Boot Actuator health endpoints:
+  management:
+    endpoint:
+      health:
+        probes:
+          enabled: true          # Enables /actuator/health/liveness and /readiness
+        group:
+          readiness:
+            include: db,redis    # Readiness fails if DB or Redis is down
+
+Flow:
+  1. Pod starts → readiness probe fails until app is fully initialized
+  2. App connects to DB, loads caches → readiness probe passes
+  3. K8s adds pod to Service endpoints → traffic starts flowing
+  4. On shutdown: readiness probe fails → removed from endpoints before SIGTERM
+  5. SIGTERM sent → app finishes in-flight requests → terminates
+
+────────────────────────────────────────────────────────────────────────────────
+
+GLOBAL SERVER LOAD BALANCING (GSLB)
+=====================================
+For multi-region deployments:
+  - DNS-based GSLB: Route users to nearest/healthiest region
+  - AWS Route53 with latency-based routing
+  - Cloudflare Load Balancing
+  - Azure Traffic Manager
+
+  User in EU → DNS → api.company.com → EU cluster
+  User in US → DNS → api.company.com → US cluster
+  EU cluster down → DNS → routes EU users to US cluster (failover)
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What load balancing algorithms are available and when do you use each?
+A: Round-robin (default, even distribution), Least Connections (long-running
+   connections, adapts to load), IP Hash/Consistent Hashing (session affinity),
+   Weighted Round-Robin (canary deploys, mixed capacity instances), Random
+   (simple, effective with many instances).
+
+Q: What's the difference between L4 and L7 load balancing?
+A: L4 routes based on TCP/IP (fast, minimal inspection). L7 routes based on HTTP
+   content (path, headers, cookies) enabling more intelligent routing but with
+   more processing. Microservices typically use L7 at the API gateway level.
+
+Q: How does Kubernetes handle load balancing?
+A: K8s Service maintains a list of healthy pod endpoints via readiness probes.
+   kube-proxy (iptables or IPVS mode) distributes traffic to pods. For advanced
+   algorithms, Istio's DestinationRule can configure LEAST_CONN, consistent
+   hash, and connection pool limits.
+
+Q: How does a service know when an instance is unhealthy?
+A: K8s readiness probes — if the /health/readiness endpoint fails, the pod is
+   removed from service endpoints (stops receiving traffic). In Eureka, missed
+   heartbeats cause eviction. Istio's outlier detection ejects instances with
+   consecutive 5xx errors.
+
+Q: What is a sticky session / session affinity?
+A: Routing the same client to the same server instance consistently. Achieved
+   via IP hash (client IP → same instance) or cookie-based routing. Useful for
+   stateful applications but contradicts Factor 6 (stateless). Prefer storing
+   state externally (Redis) and avoid sticky sessions.
+
+================================================================================

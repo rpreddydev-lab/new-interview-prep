@@ -1,0 +1,151 @@
+================================================================================
+REDIS DATA STRUCTURE INTERVIEW QUESTIONS
+================================================================================
+
+Q1: Why is a Redis Sorted Set implemented as both a skiplist AND a hashtable?
+───────────────────────────────────────────────────────────────────────────────
+  The two structures serve different query patterns:
+
+  Hashtable (member → score):
+    - ZSCORE: O(1) lookup of a member's score
+    - ZADD with update: O(1) to find existing member and update score
+    Without it: ZSCORE would require O(log N) skiplist traversal.
+
+  Skiplist (score → member, ordered):
+    - ZRANGE, ZRANGEBYSCORE, ZRANK: O(log N) range queries by score
+    - Sorted iteration
+    Without it: range queries would require a full scan.
+
+  Together: Sorted Set has O(1) score lookup AND O(log N) range queries.
+  Space tradeoff: roughly 2× memory vs a single structure.
+
+
+Q2: Why does Redis use a skiplist instead of a balanced BST (AVL/Red-Black tree)?
+───────────────────────────────────────────────────────────────────────────────────
+  1. Simplicity: skiplist is simpler to implement and modify.
+  2. Range queries: ZRANGE between two ranks or scores is faster on a skiplist
+     because nodes are linked in sorted order — sequential scan is cache-friendly.
+  3. Concurrency: lock-free skiplist is easier to implement for future threading.
+  4. No rebalancing: skiplist uses randomized levels (probabilistic balancing).
+  5. ZRANK: with an "forward pointer count" augmentation, skiplist gives O(log N) rank.
+
+
+Q3: What is the listpack encoding and when does Redis use it?
+──────────────────────────────────────────────────────────────
+  Listpack is a compact sequential memory layout that replaced ziplist in Redis 7.0.
+  Unlike ziplist, listpack has no back pointer → safer against cascading updates.
+
+  Format: total-bytes | num-elements | entry1 | entry2 | ... | end-byte
+  Each entry: encoding byte + data + backlen (for reverse traversal).
+
+  Redis uses listpack when a structure is "small":
+    Hash:        ≤ hash-max-listpack-entries (128) AND values ≤ hash-max-listpack-value (64B)
+    Sorted Set:  ≤ zset-max-listpack-entries (128) AND members ≤ zset-max-listpack-value (64B)
+    List:        ≤ list-max-listpack-size per node in quicklist
+    Set:         ≤ set-max-listpack-entries (128) AND members ≤ set-max-listpack-value (64B)
+
+  When thresholds exceeded: converted to hashtable/skiplist/quicklist (cannot revert).
+
+
+Q4: What's the difference between SMEMBERS and SSCAN? When would you use each?
+────────────────────────────────────────────────────────────────────────────────
+  SMEMBERS key:
+    Returns ALL members in one reply.
+    O(N) where N = set cardinality.
+    BLOCKS the server while executing.
+    Safe for small sets (< few thousand members).
+    Never use on large sets in production.
+
+  SSCAN key cursor [MATCH pattern] [COUNT count]:
+    Iterates in batches using a cursor.
+    Does NOT block for long (each call is O(count) typically ~10–100 elements).
+    Use for large sets, especially in production.
+    Multiple calls until cursor returns 0 (full scan complete).
+
+  Rule: if set size > ~1000 or you don't control cardinality → use SSCAN.
+  Same applies: KEYS→SCAN, HGETALL→HSCAN, ZRANGE (full)→ZSCAN.
+
+
+Q5: What internal encoding does a Set use and what triggers each?
+──────────────────────────────────────────────────────────────────
+  intset:      all members are integers AND count ≤ set-max-intset-entries (512)
+               Memory layout: sorted array of int16/int32/int64 (compact, binary search)
+  listpack:    non-integer members, count ≤ set-max-listpack-entries (128),
+               all values ≤ set-max-listpack-value bytes (Redis 7.2+)
+  hashtable:   any member exceeds listpack thresholds or too many members
+
+  Check encoding: OBJECT ENCODING myset
+
+
+Q6: How does INCR guarantee atomicity without locks?
+─────────────────────────────────────────────────────
+  Redis is single-threaded for command execution.
+  Only one command runs at a time in the event loop.
+  INCR internally: GET value → increment → SET value, all within one command.
+  No other command can execute between these sub-steps.
+  → Zero-lock atomicity via single-threaded model.
+
+
+Q7: What is a HyperLogLog and what's the tradeoff vs a Set?
+────────────────────────────────────────────────────────────
+  HyperLogLog: probabilistic cardinality estimator.
+    Fixed 12KB memory for up to 2^64 unique elements.
+    ±0.81% standard error.
+    Cannot retrieve individual elements.
+    Mergeable: PFMERGE combines multiple HLLs.
+
+  Set: exact cardinality, full member retrieval, arbitrary operations (SINTER/SDIFF).
+    Memory: O(N) — grows with each unique element.
+
+  Use HLL when: you need approximate count of unique items (DAU, page views) and
+  exact membership/retrieval is not needed. 12KB for billions of elements vs gigabytes for a Set.
+
+
+Q8: How do Redis Lists handle large lists internally?
+──────────────────────────────────────────────────────
+  Lists use quicklist: a doubly-linked list of listpack nodes.
+  Each node holds a compact listpack of elements.
+  Configurable: list-max-listpack-size (default: 128 elements per node)
+                list-max-ziplist-size -2 (max 8KB per ziplist node)
+
+  Operations:
+    LPUSH/RPUSH: O(1) — add to head/tail node
+    LINDEX n: O(N) — must traverse quicklist nodes
+    LINSERT: O(N) — must find the pivot element
+
+  This gives Redis Lists O(1) head/tail operations (good for queues)
+  with cache-friendly compact memory within each node (good for iteration).
+
+
+Q9: What happens to a BLPOP client if Redis restarts?
+──────────────────────────────────────────────────────
+  BLPOP blocks the client waiting for a list element to appear.
+  On Redis restart: the TCP connection is dropped.
+  Client receives a connection error → must reconnect and re-issue BLPOP.
+  Reliable queue pattern uses LMOVE to move items to a processing list atomically.
+
+
+Q10: What's the maximum size of a Redis key and value?
+───────────────────────────────────────────────────────
+  Key max: 512MB (string type)
+  Value max: 512MB per string value
+  Recommended key length: < 1KB (short keys = less memory, faster comparisons)
+
+  But in practice: avoid large keys/values.
+  Large values cause: high memory usage, slow network serialization, blocking
+  the event loop for serialization of large blobs.
+
+
+Q11: How does EXPIRE work internally in Redis?
+──────────────────────────────────────────────
+  Redis stores expiry in a global dictionary: expires = {key → expiry_timestamp}.
+  Two mechanisms to delete expired keys:
+    Lazy expiry: checked when key is accessed — if expired, deleted then.
+    Active expiry: 100ms background task samples random keys with TTL.
+                   Repeatedly samples until < 25% of sampled keys are expired.
+                   Prevents memory leak from non-accessed keys.
+  
+  Expired key notifications: fired when key is actually deleted (by either mechanism).
+
+
+================================================================================

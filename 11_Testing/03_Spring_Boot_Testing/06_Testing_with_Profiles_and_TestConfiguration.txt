@@ -1,0 +1,385 @@
+================================================================
+SPRING BOOT TESTING — TEST PROFILES AND @TestConfiguration
+Complete Interview Preparation Guide
+================================================================
+
+1. WHY TEST PROFILES AND TEST CONFIGURATION?
+================================================================
+
+Production code and test code often need DIFFERENT configurations:
+  Production:
+    - Real SMTP server for email
+    - Real payment gateway
+    - Real database (PostgreSQL)
+    - Secrets from environment variables
+
+  Tests:
+    - No-op email service
+    - Mocked payment gateway
+    - In-memory database OR Testcontainers
+    - Test-specific secrets
+
+Spring Boot handles this through:
+  1. Test profiles (@ActiveProfiles("test"))
+  2. Test-specific property files (application-test.yml)
+  3. @TestConfiguration — test-only Spring configuration classes
+  4. @TestPropertySource — inline or file-based property overrides
+
+================================================================
+2. APPLICATION TEST PROFILES
+================================================================
+
+STEP 1: Create test properties:
+  # src/test/resources/application-test.yml
+  
+  spring:
+    datasource:
+      url: jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1;MODE=PostgreSQL
+      driver-class-name: org.h2.Driver
+      username: sa
+      password:
+    
+    jpa:
+      hibernate:
+        ddl-auto: create-drop
+      show-sql: true
+    
+    mail:
+      host: localhost
+      port: 1025  # MailHog or similar for email testing
+  
+  app:
+    payment:
+      gateway-url: http://localhost:8080/mock-payment  # mock server
+      api-key: test-api-key-12345
+    
+    features:
+      new-checkout-flow: true
+      beta-search: false
+
+STEP 2: Activate in test:
+  @SpringBootTest
+  @ActiveProfiles("test")
+  class UserServiceIT { ... }
+
+PROFILE-SPECIFIC BEAN:
+  @Configuration
+  @Profile("test")
+  public class TestEmailConfig {
+      
+      @Bean
+      @Primary
+      public EmailService emailService() {
+          return new NoOpEmailService();  // does nothing — no real SMTP
+      }
+  }
+  
+  // OR in production:
+  @Configuration
+  @Profile("!test")  // NOT active in test
+  public class ProductionEmailConfig {
+      
+      @Bean
+      public EmailService emailService(SmtpProperties props) {
+          return new SmtpEmailService(props);
+      }
+  }
+
+================================================================
+3. @TestConfiguration
+================================================================
+
+@TestConfiguration is a special @Configuration that:
+  - Defines additional beans for TEST scope only
+  - Is NOT picked up by production component scan
+  - Can be used to provide replacements or additions for tests
+
+STANDALONE (imported explicitly):
+  @TestConfiguration
+  public class TestSecurityConfig {
+      
+      @Bean
+      @Primary
+      public SecurityFilterChain testSecurityFilterChain(HttpSecurity http) throws Exception {
+          // Disable security entirely for tests
+          http.authorizeHttpRequests(auth -> auth.anyRequest().permitAll())
+              .csrf(csrf -> csrf.disable());
+          return http.build();
+      }
+      
+      @Bean
+      public JwtTokenService jwtTokenService() {
+          JwtTokenService service = Mockito.mock(JwtTokenService.class);
+          when(service.validateToken(anyString())).thenReturn(true);
+          when(service.getUsernameFromToken(anyString())).thenReturn("test@example.com");
+          return service;
+      }
+  }
+  
+  // Import in test:
+  @WebMvcTest(UserController.class)
+  @Import(TestSecurityConfig.class)
+  class UserControllerTest { ... }
+
+NESTED (auto-detected in @SpringBootTest):
+  @SpringBootTest
+  class OrderServiceIT {
+      
+      @TestConfiguration
+      static class TestConfig {
+          
+          @Bean
+          @Primary  // overrides the production bean
+          public PaymentGateway testPaymentGateway() {
+              PaymentGateway mock = Mockito.mock(PaymentGateway.class);
+              when(mock.charge(any())).thenReturn(PaymentResult.success("ch_test"));
+              return mock;
+          }
+          
+          @Bean
+          public Clock fixedClock() {
+              return Clock.fixed(
+                  Instant.parse("2024-06-01T12:00:00Z"),
+                  ZoneOffset.UTC
+              );
+          }
+      }
+      
+      @Autowired OrderService orderService;  // gets real service wired with test gateway
+  }
+
+================================================================
+4. @TestPropertySource
+================================================================
+
+Override specific properties inline:
+  @SpringBootTest
+  @TestPropertySource(properties = {
+      "app.feature.new-checkout=true",
+      "app.max-retries=0",
+      "spring.datasource.url=jdbc:h2:mem:specifictest"
+  })
+  class FeatureToggleTest { ... }
+
+Override via file:
+  @SpringBootTest
+  @TestPropertySource(locations = "classpath:test-overrides.properties")
+  class CustomPropertyTest { ... }
+
+Multiple sources (later wins):
+  @TestPropertySource(
+      locations = "classpath:base-test.properties",
+      properties = "app.feature.flag=true"  // overrides file
+  )
+
+================================================================
+5. @DynamicPropertySource — FOR RUNTIME VALUES
+================================================================
+
+Used when property values are only known at runtime (Testcontainers, random ports):
+  
+  @SpringBootTest
+  @Testcontainers
+  class IntegrationTest {
+      
+      @Container
+      static PostgreSQLContainer<?> postgres = 
+          new PostgreSQLContainer<>("postgres:15")
+              .withDatabaseName("testdb");
+      
+      @Container
+      static GenericContainer<?> redis =
+          new GenericContainer<>("redis:7")
+              .withExposedPorts(6379);
+      
+      @DynamicPropertySource
+      static void dynamicProperties(DynamicPropertyRegistry registry) {
+          // Register PostgreSQL properties
+          registry.add("spring.datasource.url", postgres::getJdbcUrl);
+          registry.add("spring.datasource.username", postgres::getUsername);
+          registry.add("spring.datasource.password", postgres::getPassword);
+          
+          // Register Redis properties
+          registry.add("spring.redis.host", redis::getHost);
+          registry.add("spring.redis.port", 
+              () -> redis.getMappedPort(6379).toString());
+          
+          // Computed values
+          registry.add("app.callback-url", 
+              () -> "http://localhost:" + serverPort + "/callback");
+      }
+  }
+
+================================================================
+6. CONDITIONAL BEANS WITH @ConditionalOnProperty
+================================================================
+
+  // Production bean (only active when real mode):
+  @Bean
+  @ConditionalOnProperty(name = "app.payment.mode", havingValue = "real", 
+                          matchIfMissing = true)
+  public PaymentGateway realPaymentGateway(PaymentConfig config) {
+      return new StripePaymentGateway(config);
+  }
+  
+  // Test bean (only active in test mode):
+  @Bean
+  @ConditionalOnProperty(name = "app.payment.mode", havingValue = "mock")
+  public PaymentGateway mockPaymentGateway() {
+      return new InMemoryPaymentGateway();
+  }
+  
+  // application-test.yml:
+  # app.payment.mode=mock
+
+================================================================
+7. ABSTRACT BASE TEST CLASS PATTERN
+================================================================
+
+Best practice for sharing test infrastructure:
+  
+  @SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT)
+  @ActiveProfiles("test")
+  @Testcontainers
+  public abstract class AbstractIntegrationTest {
+      
+      @Container
+      protected static PostgreSQLContainer<?> postgres = 
+          new PostgreSQLContainer<>("postgres:15")
+              .withDatabaseName("testdb")
+              .withReuse(true);  // reuse container across test classes!
+      
+      @Container
+      protected static GenericContainer<?> redis = 
+          new GenericContainer<>("redis:7")
+              .withExposedPorts(6379)
+              .withReuse(true);
+      
+      @DynamicPropertySource
+      static void configureProperties(DynamicPropertyRegistry r) {
+          r.add("spring.datasource.url", postgres::getJdbcUrl);
+          r.add("spring.datasource.username", postgres::getUsername);
+          r.add("spring.datasource.password", postgres::getPassword);
+          r.add("spring.redis.host", redis::getHost);
+          r.add("spring.redis.port", () -> redis.getMappedPort(6379));
+      }
+      
+      // Common mocks for external services
+      @MockBean protected EmailService emailService;
+      @MockBean protected PaymentGateway paymentGateway;
+      @MockBean protected SmsService smsService;
+      
+      // Shared setup
+      @BeforeEach
+      void resetMocks() {
+          reset(emailService, paymentGateway, smsService);
+      }
+  }
+  
+  // All integration tests extend this base class:
+  class OrderServiceIT extends AbstractIntegrationTest {
+      @Autowired OrderService orderService;
+      
+      @Test
+      void shouldCreateOrder() { ... }
+  }
+  
+  class UserServiceIT extends AbstractIntegrationTest {
+      @Autowired UserService userService;
+      
+      @Test
+      void shouldRegisterUser() { ... }
+  }
+  
+  // Both classes REUSE the same context (same @MockBean, same containers)
+  // → Context is cached once for all subclasses = FAST!
+
+================================================================
+8. DISABLING SPECIFIC AUTO-CONFIGURATIONS IN TESTS
+================================================================
+
+  @SpringBootTest
+  @EnableAutoConfiguration(exclude = {
+      SecurityAutoConfiguration.class,
+      SecurityFilterAutoConfiguration.class
+  })
+  class TestWithoutSecurity { ... }
+  
+  // OR in application-test.yml:
+  # spring.autoconfigure.exclude=
+  #   org.springframework.boot.autoconfigure.security.servlet.SecurityAutoConfiguration
+
+================================================================
+9. TEST DATA MANAGEMENT
+================================================================
+
+OPTION A: @Sql scripts:
+  @Test
+  @Sql(scripts = "/sql/create-test-users.sql",
+       executionPhase = BEFORE_TEST_METHOD)
+  @Sql(scripts = "/sql/delete-test-users.sql",
+       executionPhase = AFTER_TEST_METHOD)
+  void shouldFindActiveUsers() { ... }
+
+OPTION B: @BeforeEach programmatic setup:
+  @BeforeEach
+  @Transactional
+  void setUpData() {
+      userRepository.deleteAll();
+      userRepository.saveAll(List.of(
+          new User("alice@test.com", "Alice", Role.USER),
+          new User("bob@test.com", "Bob", Role.ADMIN)
+      ));
+  }
+
+OPTION C: Test data builders:
+  static User testUser(String email) {
+      return User.builder()
+          .email(email)
+          .name("Test User")
+          .role(Role.USER)
+          .active(true)
+          .build();
+  }
+
+OPTION D: Liquibase/Flyway test profiles:
+  # application-test.yml
+  spring:
+    liquibase:
+      contexts: test  # only run test context changesets
+
+================================================================
+10. INTERVIEW QUESTIONS
+================================================================
+
+Q: What is the difference between @TestConfiguration and @Configuration?
+A: @TestConfiguration is only scanned in test scope — production component
+   scans don't pick it up. @Configuration is always picked up. Use
+   @TestConfiguration for test-only beans that would cause issues in production.
+
+Q: How do you override a Spring bean in tests?
+A: Use @MockBean to replace it with a Mockito mock.
+   Use @TestConfiguration with @Bean @Primary to provide a custom test impl.
+   Use @Profile("test") on a @Configuration class to activate a test-specific bean.
+
+Q: What is @ActiveProfiles and how is it used in tests?
+A: @ActiveProfiles("test") activates the "test" Spring profile for a test class.
+   Spring Boot loads application-test.yml in addition to application.yml,
+   and activates beans annotated with @Profile("test").
+
+Q: What is @DynamicPropertySource?
+A: A static method in a test class annotated to register dynamic properties.
+   Called before the ApplicationContext is created. Used with Testcontainers to
+   register the dynamically-assigned container connection URLs.
+
+Q: How do you share test infrastructure (Testcontainers) across multiple test classes?
+A: Create an abstract base class with @Testcontainers + @DynamicPropertySource.
+   Declare the containers as static fields with .withReuse(true).
+   All subclasses inherit the base class setup and Spring caches the shared context.
+
+Q: What is @TestPropertySource and when do you use it?
+A: Used to override Spring properties for a specific test class.
+   Via properties = {"key=value"} for inline overrides.
+   Via locations = "classpath:file.properties" for file-based overrides.
+
+================================================================

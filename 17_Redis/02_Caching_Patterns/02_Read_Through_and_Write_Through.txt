@@ -1,0 +1,253 @@
+================================================================================
+READ-THROUGH & WRITE-THROUGH CACHING — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+═══════════════════════════════════════════════════════════════════════════════
+PART 1: READ-THROUGH
+═══════════════════════════════════════════════════════════════════════════════
+
+1. WHAT IS READ-THROUGH?
+─────────────────────────
+In Read-Through, the CACHE (not the application) is responsible for loading
+data from the database on a cache miss. The application always talks to the
+cache — never directly to the DB for reads.
+
+  Application → Cache
+               Cache → DB (on miss, automatically)
+               Cache ← DB result (cached internally)
+  Application ← Cache
+
+This is different from Cache-Aside where:
+  Application → Cache (miss)
+  Application → DB (app does the DB call)
+  Application → Cache (app populates cache)
+
+
+2. FLOW DIAGRAM
+────────────────
+  Cache HIT:
+    App → GET(key) → Cache → returns value
+
+  Cache MISS:
+    App → GET(key) → Cache → [miss] → loads from DB → stores in cache
+                   ←─────────────────────────────────────────────────
+                   returns value to App
+
+  The app code is clean — it only calls cache.get(key). The cache handles DB.
+
+
+3. READ-THROUGH IMPLEMENTATION APPROACHES
+───────────────────────────────────────────
+
+3a. Custom Cache Loader:
+  class CachingProductRepository:
+      def __init__(self, redis, db):
+          self.redis = redis
+          self.db = db
+
+      def get(self, product_id):
+          key = f"product:{product_id}"
+          cached = self.redis.get(key)
+          if cached:
+              return deserialize(cached)
+          # Read-Through: load from DB automatically
+          product = self.db.query("SELECT * FROM products WHERE id=?", product_id)
+          if product:
+              self.redis.setex(key, 3600, serialize(product))
+          return product
+
+  The application only calls: repo.get(42) — doesn't know about Redis or DB details.
+
+3b. Spring Cache Abstraction:
+  @Cacheable(value = "products", key = "#id")
+  public Product findProduct(Long id) {
+      return productRepo.findById(id).orElseThrow();
+  }
+  // Spring handles: check cache → miss → call this method → populate cache
+  // This IS effectively a Read-Through pattern implemented via AOP proxy.
+
+3c. Dedicated Read-Through Cache Libraries:
+  - Caffeine (in-memory): CacheLoader for read-through
+  - Redis client libraries: Lettuce or Redisson can implement CacheLoader
+  - Redisson's RMapCache: supports read-through via MapLoader interface
+
+
+4. ADVANTAGES OF READ-THROUGH
+───────────────────────────────
+  ✓ Application code is simpler (no cache miss handling in app)
+  ✓ Cache is always the source of truth for reads
+  ✓ Consistent access pattern (always through cache)
+  ✓ Cache is always populated on first access (not bypassed)
+
+
+5. DISADVANTAGES OF READ-THROUGH
+──────────────────────────────────
+  ✗ First request always has latency (cold start)
+  ✗ Cache failure is no longer silent — app can't fall back to DB easily
+    (the cache is the only path)
+  ✗ Requires a cache loader implementation (more upfront engineering)
+  ✗ Harder to debug (indirection between app and DB)
+
+
+═══════════════════════════════════════════════════════════════════════════════
+PART 2: WRITE-THROUGH
+═══════════════════════════════════════════════════════════════════════════════
+
+6. WHAT IS WRITE-THROUGH?
+──────────────────────────
+In Write-Through, EVERY WRITE goes to BOTH the cache and the database
+synchronously. Both are updated in the same operation before returning to
+the application.
+
+  Application → WRITE(key, value)
+  Cache → writes to DB (synchronously)
+  Cache → stores in cache
+  Application ← success
+
+The database write and cache write happen together. No stale data.
+
+
+7. FLOW DIAGRAM
+────────────────
+  WRITE flow:
+    App → SET(key, value)
+           └→ Cache writes to Redis
+           └→ Cache writes to DB
+           ← both succeed → return OK to App
+
+  READ flow (combined with Read-Through):
+    App → GET(key) → Cache (always populated from prior writes)
+    → Returns value (cache hit most of the time)
+
+
+8. WRITE-THROUGH IMPLEMENTATION
+─────────────────────────────────
+  class WriteThoughCache:
+      def set(self, key, value, ttl=3600):
+          # Write to DB first (source of truth)
+          self.db.upsert(key, value)
+          # Write to cache
+          self.redis.setex(key, ttl, serialize(value))
+
+      def get(self, key):
+          cached = self.redis.get(key)
+          if cached:
+              return deserialize(cached)
+          # Fallback (should rarely happen with write-through)
+          value = self.db.get(key)
+          if value:
+              self.redis.setex(key, 3600, serialize(value))
+          return value
+
+  Spring @CachePut (write-through for Spring):
+  @CachePut(value = "products", key = "#product.id")
+  @Transactional
+  public Product saveProduct(Product product) {
+      return productRepo.save(product);  // DB write + cache update
+  }
+
+
+9. CONSISTENCY CONSIDERATIONS
+────────────────────────────────
+  What if DB write succeeds but cache write fails?
+    → Cache is stale. Next read returns stale data from cache.
+    → Fix: delete cache key on DB write failure.
+
+  What if cache write succeeds but DB write fails?
+    → Cache has data that DB doesn't.
+    → Fix: write to DB FIRST, then cache. On DB failure, don't write to cache.
+
+  Correct order for Write-Through:
+    1. Write to DB (authoritative)
+    2. On DB success, write to cache
+    3. On cache failure, delete cache key (force miss on next read)
+
+  def write_through(key, value):
+      try:
+          db.upsert(key, value)
+      except DBException:
+          raise  # DB write failed, don't touch cache
+
+      try:
+          redis.setex(key, 3600, serialize(value))
+      except RedisException:
+          redis.delete(key)  # ensure no stale data in cache
+
+
+10. ADVANTAGES OF WRITE-THROUGH
+─────────────────────────────────
+  ✓ Cache is always consistent with DB (strong consistency)
+  ✓ No stale data (every write updates both)
+  ✓ High cache hit rate (every written value is immediately cached)
+  ✓ Read performance is excellent (cache always has fresh data)
+
+
+11. DISADVANTAGES OF WRITE-THROUGH
+────────────────────────────────────
+  ✗ Write latency is higher (must write to BOTH DB and cache synchronously)
+  ✗ Write amplification: every DB write also goes to cache
+  ✗ Cache may contain data that's never read (wasted cache space)
+  ✗ Cold start: cache is empty until data is written (first reads still miss)
+  ✗ Complexity: two writes per operation; partial failure handling needed
+
+
+12. COMBINING READ-THROUGH + WRITE-THROUGH
+────────────────────────────────────────────
+  This combination gives the best consistency:
+    - Reads: always go through cache (read-through populates on miss)
+    - Writes: always update cache + DB (write-through ensures freshness)
+    - Result: cache is always synchronized with DB
+
+  Popular implementation: Redisson's RMapCache with MapLoader + MapWriter
+  @Bean
+  public RMap<String, Product> productCache(RedissonClient redisson) {
+      MapOptions<String, Product> options = MapOptions.<String, Product>defaults()
+          .loader(new ProductMapLoader(productRepo))    // read-through
+          .writer(new ProductMapWriter(productRepo))    // write-through
+          .writeMode(MapOptions.WriteMode.WRITE_THROUGH);
+      return redisson.getMapCache("products", options);
+  }
+
+
+13. COMPARISON TABLE
+─────────────────────
+  Feature                    │ Cache-Aside    │ Read-Through  │ Write-Through
+  ───────────────────────────┼────────────────┼───────────────┼───────────────
+  Who populates cache        │ Application    │ Cache         │ Cache (on write)
+  Read consistency           │ Eventual       │ Eventual      │ Strong
+  Write consistency          │ Manual evict   │ Manual evict  │ Automatic
+  First-read latency         │ High (miss)    │ High (miss)   │ Low (pre-cached)
+  Write latency              │ Low            │ Low           │ High (2 writes)
+  App complexity             │ Medium         │ Low           │ Low
+  Cache failure impact       │ Graceful fallb.│ Fatal         │ Partial
+  Wasted cache entries       │ No (lazy)      │ No (lazy)     │ Yes (all writes)
+
+
+14. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: What is the difference between Cache-Aside and Read-Through?
+  A: In Cache-Aside, the application manages cache misses — it reads from DB
+     and populates the cache. In Read-Through, the cache (or a loader) handles
+     DB reads transparently — the app only talks to the cache, and the cache
+     fetches from DB on miss. Read-Through simplifies app code but makes cache
+     a required dependency (no graceful fallback).
+
+  Q: What is Write-Through caching?
+  A: Every write goes to both the DB and the cache synchronously in the same
+     operation. Ensures the cache is always consistent with the DB. The trade-off
+     is higher write latency (must wait for both writes) and potential cache
+     pollution (caching data that may never be read).
+
+  Q: Why might you choose Write-Through over Cache-Aside for writes?
+  A: Write-Through guarantees cache freshness — no stale data window after a
+     write. With Cache-Aside + delete-on-write, there's a brief window where the
+     cache is empty (between delete and next read repopulation), causing a miss.
+     Write-Through avoids that miss at the cost of higher write latency.
+
+  Q: What happens if the DB write succeeds but the Redis write fails in
+     Write-Through?
+  A: The cache becomes stale. Best practice: write DB first. On Redis failure,
+     delete the cache key so the next read is a miss (and re-populates correctly
+     from DB). Never leave a stale value in the cache.
+
+================================================================================

@@ -1,0 +1,178 @@
+================================================================================
+REDIS CLUSTERING INTERVIEW QUESTIONS
+================================================================================
+
+Q1: How does Redis Cluster distribute keys across nodes?
+─────────────────────────────────────────────────────────
+  Redis Cluster uses 16,384 fixed hash slots.
+  Key → slot: slot = CRC16(key) % 16384
+  Each primary node owns a contiguous range of slots.
+  The cluster config file (nodes.conf) records the slot-to-node mapping.
+
+  Why 16,384:
+    Heartbeat messages contain a 16384-bit bitmap (2KB) of owned slots.
+    Using more (e.g., 65536) would waste 8KB per heartbeat — too expensive.
+    16384 supports up to ~1000 nodes with 16+ slots each.
+
+
+Q2: What is a hash tag and why is it important?
+─────────────────────────────────────────────────
+  Hash tag: if a key contains {…}, only the content inside braces is used
+  for slot calculation.
+  
+  {user:42}:session and {user:42}:profile → CRC16("user:42") → same slot → same node.
+  
+  Why important:
+    MULTI/EXEC, MSET/MGET, Lua scripts, and ZUNIONSTORE require all keys to be
+    on the same node. Without hash tags, related keys may be on different shards,
+    causing CROSSSLOT errors. Hash tags ensure co-location of related keys.
+
+  Design with care: too many keys with the same tag → hot shard.
+
+
+Q3: What's the difference between MOVED and ASK redirects?
+────────────────────────────────────────────────────────────
+  MOVED (permanent redirect):
+    The slot has been FULLY migrated to the new node.
+    Client should update its slot map and resend the command to the new node.
+    Future requests for this slot go directly to the new node.
+
+  ASK (temporary redirect during migration):
+    The slot is CURRENTLY MIGRATING to the new node.
+    Client must: (1) send ASKING to the new node, (2) resend the command.
+    Client should NOT update its slot map (migration may not be complete).
+    Once migration finishes, MOVED will be used instead.
+
+
+Q4: What happens to requests during a Redis Cluster failover?
+──────────────────────────────────────────────────────────────
+  Process:
+    1. Primary fails → other nodes detect via gossip (cluster-node-timeout).
+    2. Nodes mark primary as PFAIL (possible fail).
+    3. Majority of primaries agree → FAIL state.
+    4. One of the primary's replicas starts election:
+       Broadcasts FAILOVER_AUTH_REQUEST.
+       Receives FAILOVER_AUTH_GRANTED votes from majority of primaries.
+    5. Replica promotes itself, takes over the slots.
+
+  During failover:
+    Requests to the failed primary's slots return CLUSTERDOWN error.
+    cluster-require-full-coverage yes (default): cluster stops serving those slots.
+    cluster-require-full-coverage no: only failed shard is unavailable, others work.
+
+  Typical failover time: 1–10 seconds.
+
+
+Q5: How is Redis Sentinel different from Redis Cluster?
+─────────────────────────────────────────────────────────
+  Sentinel:
+    - HA for a SINGLE Redis dataset (no sharding)
+    - External Sentinel processes monitor and failover
+    - Multi-key commands: unrestricted (all on one node)
+    - Write scalability: single primary only
+    - Simpler operations, fewer nodes required
+
+  Cluster:
+    - HA + SHARDING across multiple nodes
+    - HA is built-in per shard (no external processes)
+    - Multi-key commands: require same hash slot
+    - Write scalability: horizontal (N primaries)
+    - More complex routing, client must be cluster-aware
+
+  Choose Sentinel: dataset fits on one node, need auto-failover only.
+  Choose Cluster: dataset exceeds one node capacity, or need write scaling.
+
+
+Q6: What is split-brain in Redis and how do you handle it?
+────────────────────────────────────────────────────────────
+  Split-brain: network partition causes two Redis nodes to both act as primary.
+  Both accept writes → data diverges.
+  When partition heals: one side's writes are rolled back (lost).
+
+  Prevention:
+    1. min-replicas-to-write + min-replicas-max-lag: primary stops writes when isolated.
+    2. Sentinel quorum (odd number): minority partition can't reach quorum → no failover.
+    3. Cluster majority vote: replica needs votes from majority of primaries → minority partition can't elect.
+
+  Detection:
+    Monitor cluster_state in INFO or CLUSTER INFO.
+    Alert on: connected_slaves < expected, master_link_status:down.
+
+  Recovery (when healed):
+    Old primary (minority side) syncs from new primary.
+    Extra writes on old primary are DISCARDED (data loss).
+
+
+Q7: Can you run KEYS * in a Redis Cluster? What's the correct alternative?
+────────────────────────────────────────────────────────────────────────────
+  KEYS * runs only on the connected node — returns keys from that shard only.
+  Not a full cluster scan.
+
+  Correct approach:
+    Use redis-cli --cluster call to run SCAN on each node:
+    redis-cli --cluster call <host>:<port> SCAN 0
+
+  Or use SCAN on each node programmatically:
+    for (String node : clusterNodes) {
+        Cursor<byte[]> cursor = connection.scan(ScanOptions.scanOptions()
+            .match("pattern:*").count(100).build());
+        while (cursor.hasNext()) {
+            // process key
+        }
+    }
+
+  Or use RedisClusterCommands.scan() in Lettuce which handles per-node scanning.
+
+
+Q8: How do you handle failover in a Spring Boot application using Redis Cluster?
+──────────────────────────────────────────────────────────────────────────────────
+  Spring Boot + Lettuce (default):
+    ClusterTopologyRefreshOptions refreshOptions =
+        ClusterTopologyRefreshOptions.builder()
+            .enablePeriodicRefresh(Duration.ofSeconds(30))
+            .enableAllAdaptiveRefreshTriggers()  // refresh on MOVED, RECONNECT, etc.
+            .build();
+
+    ClusterClientOptions clientOptions = ClusterClientOptions.builder()
+        .topologyRefreshOptions(refreshOptions)
+        .build();
+
+    LettuceClientConfiguration lettuceConfig =
+        LettuceClientConfiguration.builder()
+            .clientOptions(clientOptions)
+            .build();
+
+  With this: Lettuce auto-refreshes the cluster topology on MOVED errors
+  and reconnects after failover. Spring Boot's connection factory handles
+  retry logic transparently.
+
+
+Q9: What is the minimum cluster configuration and why?
+───────────────────────────────────────────────────────
+  Minimum for production: 6 nodes (3 primaries + 3 replicas, one replica per primary).
+
+  Why 3 primaries minimum:
+    Cluster failover requires a majority of primaries to vote.
+    With 2 primaries: if one fails → only 1 primary left → can't form majority for election.
+    With 3 primaries: if one fails → 2 remain → majority → election succeeds.
+
+  Why 1 replica minimum per primary:
+    Without replicas: primary failure = permanent slot loss until manually fixed.
+    With 1 replica: automatic failover possible.
+
+
+Q10: What happens to MULTI/EXEC transactions in a Redis Cluster?
+──────────────────────────────────────────────────────────────────
+  MULTI/EXEC transactions work ONLY if all keys are on the same shard.
+  If keys span different slots: CROSSSLOT error at EXEC time.
+
+  Fix: use hash tags to co-locate all transaction keys:
+    MULTI
+    SET {user:42}:name "Alice"
+    SET {user:42}:score 1000
+    EXEC
+    Both keys → same slot → valid transaction.
+
+  Alternative: use Lua scripting (same constraint: all KEYS[] must be same slot).
+
+================================================================================

@@ -1,0 +1,253 @@
+================================================================================
+OPENTELEMETRY
+================================================================================
+
+WHAT IS OPENTELEMETRY?
+-----------------------
+OpenTelemetry (OTel) is an open-source, vendor-neutral framework for
+collecting telemetry data: traces, metrics, and logs.
+
+Problem it solves:
+  - Every APM vendor (Datadog, New Relic, Dynatrace, Jaeger) had its own SDK
+  - Switching vendors required rewriting all instrumentation code
+  - No interoperability between tools
+
+OpenTelemetry provides:
+  - A single, standardized API for traces, metrics, and logs
+  - Auto-instrumentation agents (zero code changes needed)
+  - Exporters for 30+ backends (Jaeger, Prometheus, Tempo, Datadog, etc.)
+  - W3C TraceContext standard for context propagation
+
+Formed from: merger of OpenTracing and OpenCensus (2019), CNCF project.
+
+────────────────────────────────────────────────────────────────────────────────
+
+OPENTELEMETRY ARCHITECTURE
+============================
+
+  Application Code
+      │
+  OTel API (interface layer — application uses this)
+      │
+  OTel SDK (implementation — configurable backend)
+      │
+  ┌───┴────────────┐
+  │  Exporter      │  → OTLP / Jaeger / Zipkin / Prometheus / ...
+  └────────────────┘
+      │
+  OTel Collector (optional but recommended)
+      │
+  ┌───┴──────────────────────────────────────────────┐
+  │ Backend: Jaeger / Tempo / Grafana / Datadog / ... │
+  └──────────────────────────────────────────────────┘
+
+OTel Collector:
+  - Acts as a telemetry pipeline (receive, process, export)
+  - Decouples application from backend
+  - Batches, filters, enriches, and routes telemetry
+  - Can fan out to multiple backends
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING BOOT 3 + OPENTELEMETRY SETUP
+=======================================
+
+Option 1: OTel Java Agent (auto-instrumentation, zero code changes):
+  # Dockerfile / JVM args
+  java -javaagent:opentelemetry-javaagent.jar \
+       -Dotel.service.name=order-service \
+       -Dotel.exporter.otlp.endpoint=http://otel-collector:4317 \
+       -Dotel.exporter.otlp.protocol=grpc \
+       -Dotel.traces.sampler=traceidratio \
+       -Dotel.traces.sampler.arg=0.1 \
+       -jar order-service.jar
+
+  Auto-instruments: Spring MVC, WebClient, JDBC, Kafka, Redis, Elasticsearch, gRPC, ...
+
+Option 2: Spring Boot Micrometer Tracing (Spring-native):
+  # pom.xml
+  <dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-tracing-bridge-otel</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>io.opentelemetry.exporter</groupId>
+    <artifactId>opentelemetry-exporter-otlp</artifactId>
+  </dependency>
+
+  # application.yml
+  management:
+    tracing:
+      sampling:
+        probability: 0.1  # 10% sampling in production
+      enabled: true
+  otel:
+    exporter:
+      otlp:
+        endpoint: http://otel-collector:4317
+
+────────────────────────────────────────────────────────────────────────────────
+
+OPENTELEMETRY COLLECTOR CONFIGURATION
+========================================
+
+# otel-collector-config.yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:                    # Batch spans for efficiency
+    timeout: 1s
+    send_batch_size: 1024
+
+  memory_limiter:           # Prevent OOM
+    check_interval: 1s
+    limit_mib: 400
+
+  resource:                 # Add common attributes
+    attributes:
+    - key: environment
+      value: production
+      action: insert
+
+  filter:                   # Drop health check traces (noise)
+    traces:
+      span:
+      - 'attributes["http.target"] == "/actuator/health"'
+
+exporters:
+  # Traces → Jaeger
+  jaeger:
+    endpoint: jaeger-collector:14250
+    tls:
+      insecure: true
+
+  # Traces → Grafana Tempo
+  otlp/tempo:
+    endpoint: http://tempo:4317
+
+  # Metrics → Prometheus
+  prometheus:
+    endpoint: "0.0.0.0:9090"
+
+  # Logs → Loki
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, filter, batch, resource]
+      exporters: [jaeger, otlp/tempo]
+
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [loki]
+
+────────────────────────────────────────────────────────────────────────────────
+
+CUSTOM INSTRUMENTATION
+========================
+
+Creating custom spans:
+  @Service
+  public class OrderService {
+    @Autowired private Tracer tracer;
+
+    public Order processOrder(CreateOrderRequest request) {
+      Span span = tracer.spanBuilder("order.process")
+        .setAttribute("order.userId", request.getUserId().toString())
+        .setAttribute("order.itemCount", request.getItems().size())
+        .startSpan();
+
+      try (Scope scope = span.makeCurrent()) {
+        // All nested calls will be children of this span
+        validateInventory(request.getItems());  // Creates child span automatically
+        Order order = saveOrder(request);
+        span.setAttribute("order.id", order.getId().toString());
+        span.setStatus(StatusCode.OK);
+        return order;
+      } catch (Exception e) {
+        span.setStatus(StatusCode.ERROR, e.getMessage());
+        span.recordException(e);
+        throw e;
+      } finally {
+        span.end();
+      }
+    }
+  }
+
+Adding trace context to logs (automatic with OTel + Logback):
+  # With OTel Java agent, trace context is automatically added to MDC:
+  # traceId, spanId, traceFlags are in every log line
+
+Baggage (cross-span key-value context):
+  // Set baggage in API Gateway:
+  Baggage.current()
+    .toBuilder()
+    .put("userId", userId)
+    .put("tenantId", tenantId)
+    .build()
+    .makeCurrent();
+
+  // Available in any service down the call chain:
+  String userId = Baggage.current().getEntryValue("userId");
+
+────────────────────────────────────────────────────────────────────────────────
+
+OPENTELEMETRY vs OLDER SOLUTIONS
+===================================
+
+Aspect            │ OpenTelemetry  │ Sleuth+Zipkin │ Brave     │ Jaeger SDK
+──────────────────┼────────────────┼───────────────┼───────────┼──────────────
+Standard          │ CNCF standard  │ Spring-specific│ Twitter  │ Jaeger-specific
+Vendor neutral    │ ✓              │ ✗             │ ✗        │ ✗
+Metrics+Logs+Traces│ ✓ Unified     │ Traces only   │ Traces   │ Traces only
+Auto-instrumented │ ✓ (agent)      │ ✓             │ Manual   │ Manual
+Migration effort  │ Moderate       │ Low           │ High     │ High
+────────────────────────────────────────────────────────────────────────────────
+
+NOTE: Spring Cloud Sleuth is deprecated as of Spring Boot 3.
+Replaced by: Micrometer Tracing + OTel bridge.
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is OpenTelemetry and why was it created?
+A: A vendor-neutral, open-source framework for collecting traces, metrics, and
+   logs. Created to solve vendor lock-in — each APM vendor had its own SDK and
+   format. OTel provides a single API; exporters send to any backend (Jaeger,
+   Datadog, Prometheus). Replaces OpenTracing and OpenCensus.
+
+Q: What is the OTel Collector and what does it do?
+A: An optional telemetry pipeline component. Receives telemetry from services,
+   processes it (batching, filtering, enriching), and exports to one or more
+   backends. Decouples services from backends, enables routing to multiple
+   backends, and reduces load on services by batching.
+
+Q: What replaced Spring Cloud Sleuth in Spring Boot 3?
+A: Spring Cloud Sleuth is deprecated. The replacement is Micrometer Tracing
+   with the OpenTelemetry bridge (micrometer-tracing-bridge-otel). Provides
+   the same functionality but uses OTel under the hood for vendor neutrality.
+
+Q: What is OTel Baggage?
+A: A key-value store propagated alongside trace context across all service calls
+   in a trace. Allows passing custom context (userId, tenantId) without modifying
+   request bodies or headers explicitly. Access anywhere in the call chain via
+   Baggage.current().getEntryValue("key").
+
+================================================================================

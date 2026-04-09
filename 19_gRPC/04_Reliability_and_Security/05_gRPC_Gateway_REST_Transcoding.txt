@@ -1,0 +1,312 @@
+================================================================
+gRPC-GATEWAY — REST TRANSCODING
+================================================================
+
+----------------------------------------------------------------
+1. WHAT IS gRPC-GATEWAY?
+----------------------------------------------------------------
+
+gRPC-Gateway is a protoc plugin that generates a reverse proxy
+which translates RESTful HTTP/JSON calls into gRPC calls.
+
+The problem it solves:
+  - gRPC is not browser-friendly (browsers can't use HTTP/2 raw frames)
+  - Some clients (mobile apps, 3rd-party integrations) only speak REST
+  - You want ONE backend but support both gRPC and REST
+
+gRPC-Gateway architecture:
+  Browser/REST Client
+      │  HTTP/1.1 + JSON
+      ▼
+  gRPC-Gateway (proxy)
+      │  gRPC + HTTP/2 + Protobuf
+      ▼
+  gRPC Server (your Java service)
+
+Alternatives:
+  - gRPC-Web: compiled JavaScript client that speaks a subset of gRPC
+  - Connect Protocol: gRPC-compatible but also works with curl/fetch
+  - Manual REST layer: write a Spring MVC controller that calls gRPC stub
+
+Primary use: Go ecosystem, but the proto annotations approach works
+with any gRPC language via generated gateway code or Envoy transcoding.
+
+----------------------------------------------------------------
+2. ENVOY REST/gRPC TRANSCODING (JAVA-FRIENDLY)
+----------------------------------------------------------------
+
+For Java Spring applications, the most practical approach is using
+Envoy's gRPC-JSON transcoding filter. This is available in service
+meshes (Istio) and standalone Envoy deployments.
+
+  REST Client
+      │  HTTP/1.1 + JSON (POST /v1/orders)
+      ▼
+  Envoy with grpc-json-transcoder filter
+      │  gRPC + HTTP/2 + Protobuf
+      ▼
+  Java Spring gRPC Server
+
+The proto file defines the REST mapping via google.api.http annotations:
+
+----------------------------------------------------------------
+3. HTTP ANNOTATIONS IN PROTO
+----------------------------------------------------------------
+
+import "google/api/annotations.proto";
+
+service OrderService {
+  rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse) {
+    option (google.api.http) = {
+      post: "/v1/orders"
+      body: "*"   // map entire JSON body to proto message
+    };
+  }
+  
+  rpc GetOrder(GetOrderRequest) returns (Order) {
+    option (google.api.http) = {
+      get: "/v1/orders/{order_id}"  // order_id from path → proto field
+    };
+  }
+  
+  rpc UpdateOrder(UpdateOrderRequest) returns (Order) {
+    option (google.api.http) = {
+      patch: "/v1/orders/{order_id}"
+      body: "order"   // only "order" field from JSON body
+    };
+  }
+  
+  rpc DeleteOrder(DeleteOrderRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      delete: "/v1/orders/{order_id}"
+    };
+  }
+  
+  rpc ListOrders(ListOrdersRequest) returns (stream Order) {
+    option (google.api.http) = {
+      get: "/v1/customers/{customer_id}/orders"
+      // query params: ?page_size=20&page_token=abc
+    };
+  }
+  
+  // Additional HTTP bindings (same method, multiple URLs)
+  rpc SearchOrders(SearchOrdersRequest) returns (SearchOrdersResponse) {
+    option (google.api.http) = {
+      get: "/v1/orders:search"
+      additional_bindings {
+        post: "/v1/orders:search"
+        body: "*"
+      }
+    };
+  }
+}
+
+message GetOrderRequest    { string order_id = 1; }
+message DeleteOrderRequest { string order_id = 1; }
+message UpdateOrderRequest {
+  string order_id = 1;   // from path
+  Order order = 2;       // from body (partial update)
+}
+
+----------------------------------------------------------------
+4. JSON ↔ PROTOBUF MAPPING RULES
+----------------------------------------------------------------
+
+The grpc-gateway / Envoy transcoder follows these mapping rules:
+
+Rule 1: Field names
+  Proto snake_case field "created_at" → JSON camelCase "createdAt"
+  (configurable via json_name option in proto)
+
+Rule 2: Numeric types
+  int64, uint64, fixed64 → JSON string (to avoid precision loss)
+  int32, float, double → JSON number
+
+Rule 3: Enums
+  Enum values → JSON string by name: "SERVING" not 1
+
+Rule 4: Timestamps
+  google.protobuf.Timestamp → JSON RFC 3339 string: "2024-01-15T10:30:00Z"
+
+Rule 5: Bytes
+  bytes fields → JSON base64 string
+
+Rule 6: Empty / null
+  Unset proto3 fields → omitted from JSON (not null)
+  google.protobuf.StringValue (wrapper) allows explicit null
+
+Rule 7: Streaming
+  Server streaming: response is NDJSON (newline-delimited JSON)
+  Each message on a new line:
+    {"orderId":"o1","status":"CREATED"}
+    {"orderId":"o2","status":"PENDING"}
+
+JSON request:
+  POST /v1/orders
+  {
+    "customerId": "cust-1",
+    "productId": "prod-1",
+    "quantity": 2,
+    "priceCents": 1999
+  }
+  
+Equivalent proto (after transcoding):
+  CreateOrderRequest {
+    customer_id: "cust-1"
+    product_id: "prod-1"
+    quantity: 2
+    price_cents: 1999
+  }
+
+----------------------------------------------------------------
+5. SPRING BOOT WITH GRPC-WEB
+----------------------------------------------------------------
+
+For browser clients specifically, grpc-web is an alternative.
+It uses HTTP/1.1 with a special envelope format.
+
+grpc-spring-boot-starter supports grpc-web via configuration:
+
+grpc:
+  server:
+    port: 9090
+  
+  # Enable grpc-web support (allows browser JS clients)
+  # Requires additional dependency
+
+Maven dependency:
+  <dependency>
+    <groupId>net.devh</groupId>
+    <artifactId>grpc-server-spring-boot-autoconfigure</artifactId>
+    <!-- grpc-web support included in some versions -->
+  </dependency>
+
+JavaScript client:
+  import {OrderServiceClient} from './generated/OrderServiceClientPb';
+  import {CreateOrderRequest} from './generated/order_pb';
+  
+  const client = new OrderServiceClient('http://localhost:8080');
+  const req = new CreateOrderRequest();
+  req.setCustomerId('cust-1');
+  req.setProductId('prod-1');
+  
+  client.createOrder(req, {}, (err, response) => {
+    if (err) console.error(err);
+    else console.log(response.getOrderId());
+  });
+
+----------------------------------------------------------------
+6. ENVOY CONFIGURATION FOR TRANSCODING
+----------------------------------------------------------------
+
+envoy.yaml (simplified):
+  static_resources:
+    listeners:
+      - name: listener_0
+        address:
+          socket_address: {address: 0.0.0.0, port_value: 8080}
+        filter_chains:
+          - filters:
+              - name: envoy.filters.network.http_connection_manager
+                typed_config:
+                  "@type": type.googleapis.com/...HttpConnectionManager
+                  codec_type: AUTO
+                  http_filters:
+                    # gRPC-JSON transcoder filter
+                    - name: envoy.filters.http.grpc_json_transcoder
+                      typed_config:
+                        "@type": type.googleapis.com/...GrpcJsonTranscoder
+                        proto_descriptor: "/etc/envoy/api.pb"  # compiled proto descriptor
+                        services: ["com.example.OrderService"]
+                        print_options:
+                          add_whitespace: true
+                          always_print_primitive_fields: false
+                    - name: envoy.filters.http.router
+                  route_config:
+                    virtual_hosts:
+                      - name: backend
+                        domains: ["*"]
+                        routes:
+                          - match: {prefix: "/"}
+                            route:
+                              cluster: grpc_backend
+                              timeout: 0s  # streaming support
+    
+    clusters:
+      - name: grpc_backend
+        type: LOGICAL_DNS
+        dns_lookup_family: V4_ONLY
+        lb_policy: ROUND_ROBIN
+        http2_protocol_options: {}  # ← enables HTTP/2 to backend
+        load_assignment:
+          cluster_name: grpc_backend
+          endpoints:
+            - lb_endpoints:
+                - endpoint:
+                    address:
+                      socket_address: {address: order-service, port_value: 9090}
+
+Compiling proto descriptor for Envoy:
+  protoc --include_imports --include_source_info \
+    --descriptor_set_out=api.pb \
+    --proto_path=. \
+    --proto_path=/path/to/googleapis \
+    com/example/order/v1/order_service.proto
+
+----------------------------------------------------------------
+7. COMPARISON: gRPC-GATEWAY vs ENVOY TRANSCODING vs gRPC-WEB
+----------------------------------------------------------------
+
+┌──────────────────────┬────────────────┬────────────────┬──────────────┐
+│ Feature              │ gRPC-Gateway   │ Envoy Transcode│ gRPC-Web     │
+├──────────────────────┼────────────────┼────────────────┼──────────────┤
+│ Language             │ Go proxy       │ Sidecar proxy  │ Browser JS   │
+│ Server changes?      │ No             │ No             │ No           │
+│ Deployment           │ Separate proxy │ Envoy sidecar  │ Envoy needed │
+│ Streaming support    │ Limited        │ Yes            │ Limited      │
+│ Proto annotation     │ Required       │ Required       │ Not needed   │
+│ Performance          │ Extra hop      │ Extra hop      │ Extra hop    │
+│ Kubernetes           │ Sidecar/inline │ Best with Istio│ Envoy needed │
+└──────────────────────┴────────────────┴────────────────┴──────────────┘
+
+----------------------------------------------------------------
+8. INTERVIEW KEY POINTS
+----------------------------------------------------------------
+
+Q: Why can't browsers use gRPC natively?
+A: Standard gRPC requires HTTP/2 with full control over the framing
+   layer — specifically, it needs to read HTTP/2 DATA frames with length
+   prefix (5-byte frame header: 1-byte compression flag + 4-byte message
+   length). Web browsers' Fetch API and XMLHttpRequest do NOT expose raw
+   HTTP/2 frames — they abstract HTTP semantics. Additionally, HTTP/2
+   trailers are used for gRPC status codes, and browsers don't expose
+   HTTP/2 trailers either. This is why gRPC-Web and REST transcoding
+   exist: they translate to formats browsers can consume.
+
+Q: How does Envoy's gRPC-JSON transcoding work?
+A: You provide Envoy with a compiled proto descriptor (.pb file) and
+   configure which services to expose. Envoy's grpc_json_transcoder
+   filter reads the google.api.http annotations from the descriptor.
+   When an HTTP/1.1 JSON request arrives, Envoy maps the URL and JSON
+   body to a proto message, encodes it as binary protobuf, and forwards
+   it to your gRPC server over HTTP/2. The gRPC server's response is
+   decoded from protobuf and returned as JSON to the REST client.
+
+Q: What are the limitations of REST transcoding for streaming RPCs?
+A: Server streaming maps to NDJSON (newline-delimited JSON streamed
+   as the response body). Client streaming and bidi streaming are
+   difficult or impossible to represent over HTTP/1.1 REST — REST is
+   inherently request-response. For these patterns, gRPC-Web or a
+   WebSocket-based alternative is needed.
+
+Q: How does JSON field naming work with proto3 and transcoding?
+A: Transcoding follows the proto3 JSON mapping spec. Snake_case proto
+   field names are converted to camelCase in JSON by default.
+   For example, "created_at" becomes "createdAt". You can override
+   this per field with the json_name option in the proto file.
+   Integer types int64/uint64 are serialized as strings to avoid
+   JavaScript precision loss (JS can't represent all 64-bit integers).
+
+================================================================
+END OF FILE
+================================================================

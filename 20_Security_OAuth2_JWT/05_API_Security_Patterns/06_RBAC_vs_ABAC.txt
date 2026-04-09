@@ -1,0 +1,443 @@
+========================================================
+RBAC vs ABAC
+========================================================
+
+Authorization models define HOW access control decisions are made.
+The two dominant enterprise models are:
+  - RBAC: Role-Based Access Control
+  - ABAC: Attribute-Based Access Control
+
+They address different complexity needs and can be used together.
+
+========================================================
+1. ROLE-BASED ACCESS CONTROL (RBAC)
+========================================================
+
+RBAC grants access based on a user's ROLE within an organization.
+
+Core concepts:
+  User    → assigned one or more Roles
+  Role    → has one or more Permissions
+  Permission → defines what action is allowed on what resource
+
+RBAC Model:
+  User ─── (assigned) ───→ Role ─── (has) ───→ Permission
+  Alice                     ADMIN               DELETE:USER
+  Bob                       USER                READ:ORDER
+                            MANAGER             APPROVE:ORDER
+
+Example roles:
+  ADMIN:   Full system access
+  MANAGER: Read all + approve operations
+  USER:    CRUD on own resources only
+  VIEWER:  Read-only across all resources
+  AUDITOR: Read logs + reports (no data mutation)
+
+1.1 RBAC in Spring Security
+
+// Simple RBAC with Spring Security:
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+public class RbacSecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/admin/**").hasRole("ADMIN")
+                .requestMatchers(HttpMethod.DELETE, "/api/**").hasAnyRole("ADMIN", "MANAGER")
+                .requestMatchers(HttpMethod.POST, "/api/orders/*/approve").hasRole("MANAGER")
+                .requestMatchers("/api/**").hasRole("USER")
+                .anyRequest().authenticated()
+            );
+        return http.build();
+    }
+}
+
+// Method-level RBAC:
+@Service
+public class UserManagementService {
+
+    @PreAuthorize("hasRole('ADMIN')")
+    public void deleteUser(Long userId) { ... }
+
+    @PreAuthorize("hasAnyRole('ADMIN', 'MANAGER')")
+    public Page<User> getAllUsers(Pageable pageable) { ... }
+
+    @PreAuthorize("hasRole('USER')")
+    public User getOwnProfile(String username) { ... }
+}
+
+1.2 Hierarchical RBAC
+
+Roles can inherit from other roles:
+
+// Role hierarchy: SUPER_ADMIN > ADMIN > MANAGER > USER
+@Bean
+public RoleHierarchy roleHierarchy() {
+    return RoleHierarchyImpl.fromHierarchy("""
+        ROLE_SUPER_ADMIN > ROLE_ADMIN
+        ROLE_ADMIN > ROLE_MANAGER
+        ROLE_MANAGER > ROLE_USER
+        """);
+}
+
+@Bean
+public DefaultWebSecurityExpressionHandler expressionHandler() {
+    DefaultWebSecurityExpressionHandler handler = new DefaultWebSecurityExpressionHandler();
+    handler.setRoleHierarchy(roleHierarchy());
+    return handler;
+}
+
+// Now hasRole('USER') also matches MANAGER, ADMIN, SUPER_ADMIN!
+
+1.3 RBAC in Database
+
+CREATE TABLE roles (
+    id      BIGSERIAL PRIMARY KEY,
+    name    VARCHAR(50) NOT NULL UNIQUE  -- e.g., 'ADMIN', 'USER'
+);
+
+CREATE TABLE permissions (
+    id      BIGSERIAL PRIMARY KEY,
+    name    VARCHAR(100) NOT NULL UNIQUE  -- e.g., 'orders:delete'
+);
+
+CREATE TABLE role_permissions (
+    role_id       BIGINT REFERENCES roles(id),
+    permission_id BIGINT REFERENCES permissions(id),
+    PRIMARY KEY (role_id, permission_id)
+);
+
+CREATE TABLE user_roles (
+    user_id BIGINT REFERENCES users(id),
+    role_id BIGINT REFERENCES roles(id),
+    PRIMARY KEY (user_id, role_id)
+);
+
+1.4 RBAC Strengths and Weaknesses
+
+Strengths:
+  ✓ Simple to understand and implement
+  ✓ Easy to audit (who has what role?)
+  ✓ Works well for stable, well-defined access patterns
+  ✓ Well-supported by most frameworks
+
+Weaknesses:
+  ✗ Role explosion: Many specific roles needed for complex scenarios
+  ✗ Can't easily express context-based rules (time, location, resource state)
+  ✗ Can't express "user can only access their OWN data" without app-layer code
+  ✗ No attribute-based conditions (e.g., "only during business hours")
+
+========================================================
+2. ATTRIBUTE-BASED ACCESS CONTROL (ABAC)
+========================================================
+
+ABAC grants access based on ATTRIBUTES of:
+  - The SUBJECT (user): role, department, clearance level, location
+  - The RESOURCE: sensitivity, owner, classification, status
+  - The ACTION: read, write, delete, approve
+  - The ENVIRONMENT: time, IP address, device trust level
+
+ABAC uses POLICIES to combine these attributes into decisions.
+
+ABAC Policy example:
+  "Allow access if:
+     subject.role == 'DOCTOR'
+     AND resource.type == 'PATIENT_RECORD'
+     AND resource.assigned_doctor == subject.id
+     AND action == 'READ'
+     AND environment.time between 08:00 and 20:00"
+
+This single policy replaces dozens of RBAC roles!
+
+2.1 ABAC Implementation in Spring Security
+
+Using PermissionEvaluator for ABAC:
+
+@Component
+public class OrderPermissionEvaluator implements PermissionEvaluator {
+
+    private final OrderRepository orderRepo;
+    private final UserRepository userRepo;
+
+    @Override
+    public boolean hasPermission(Authentication auth,
+                                  Object targetDomainObject,
+                                  Object permission) {
+
+        if (!(targetDomainObject instanceof Order order)) return false;
+
+        String username = auth.getName();
+        String action = permission.toString().toUpperCase();
+
+        // Get user attributes from JWT or UserDetails
+        Map<String, Object> userAttrs = getUserAttributes(auth);
+        String department = (String) userAttrs.get("department");
+        String clearanceLevel = (String) userAttrs.get("clearance_level");
+        boolean isBusinessHours = isBusinessHours();
+
+        return switch (action) {
+            case "READ" -> {
+                // Owner OR same department manager OR admin
+                yield order.getOwnerId().equals(username)
+                    || (hasRole(auth, "MANAGER") && department.equals(order.getDepartment()))
+                    || hasRole(auth, "ADMIN");
+            }
+            case "APPROVE" -> {
+                // Manager of order's department + business hours + order is PENDING
+                yield hasRole(auth, "MANAGER")
+                    && department.equals(order.getDepartment())
+                    && order.getStatus() == OrderStatus.PENDING
+                    && isBusinessHours;
+            }
+            case "DELETE" -> {
+                // Only admin OR owner if order is DRAFT
+                yield hasRole(auth, "ADMIN")
+                    || (order.getOwnerId().equals(username)
+                        && order.getStatus() == OrderStatus.DRAFT);
+            }
+            default -> false;
+        };
+    }
+
+    @Override
+    public boolean hasPermission(Authentication auth,
+                                  Serializable targetId,
+                                  String targetType,
+                                  Object permission) {
+        if ("Order".equals(targetType)) {
+            Order order = orderRepo.findById((Long) targetId).orElse(null);
+            return order != null && hasPermission(auth, order, permission);
+        }
+        return false;
+    }
+
+    private boolean isBusinessHours() {
+        int hour = LocalTime.now().getHour();
+        return hour >= 8 && hour < 20;
+    }
+}
+
+// Usage in service:
+@Service
+public class OrderService {
+
+    @PreAuthorize("hasPermission(#order, 'READ')")
+    public Order getOrder(Order order) { return order; }
+
+    @PreAuthorize("hasPermission(#orderId, 'Order', 'APPROVE')")
+    public Order approveOrder(Long orderId) { ... }
+
+    @PreAuthorize("hasPermission(#order, 'DELETE')")
+    public void deleteOrder(Order order) { ... }
+}
+
+2.2 ABAC with JWT Attributes
+
+Enrich JWT with user attributes to support ABAC:
+
+// JWT claims for ABAC:
+{
+  "sub": "alice",
+  "roles": ["MANAGER"],
+  "department": "finance",
+  "clearance_level": "CONFIDENTIAL",
+  "cost_center": "CC-001",
+  "location": "US",
+  "employee_type": "FULL_TIME"
+}
+
+// Use in PermissionEvaluator:
+@Override
+public boolean hasPermission(...) {
+    if (auth instanceof JwtAuthenticationToken jwtAuth) {
+        Jwt jwt = jwtAuth.getToken();
+        String department = jwt.getClaimAsString("department");
+        String clearance = jwt.getClaimAsString("clearance_level");
+        // ... use in policy logic
+    }
+}
+
+2.3 XACML Standard
+
+XACML (eXtensible Access Control Markup Language) is the standard for ABAC policies.
+It defines a request/response protocol and XML-based policy language.
+
+Implemented by:
+  - Axiomatics PDP
+  - AuthZForce
+  - AWS IAM (conceptually similar)
+
+Not commonly used with Spring Boot — OPA is more developer-friendly.
+
+2.4 ABAC Strengths and Weaknesses
+
+Strengths:
+  ✓ Extremely fine-grained control
+  ✓ Handles complex, context-sensitive rules
+  ✓ Eliminates role explosion
+  ✓ Single policy can replace many RBAC roles
+  ✓ Dynamic: time, location, resource state can influence decisions
+
+Weaknesses:
+  ✗ More complex to implement
+  ✗ Policies can be hard to audit/understand
+  ✗ Performance: attribute lookup can add latency
+  ✗ Harder to debug ("why was I denied?")
+
+========================================================
+3. RBAC vs ABAC COMPARISON
+========================================================
+
+Feature              RBAC                   ABAC
+-------------------  ---------------------  ----------------------------------
+Decision basis       User role              Multiple attributes (who, what, when, where)
+Complexity           Low                    Medium to High
+Flexibility          Low (limited context)  High (any condition expressible)
+Audit clarity        High                   Medium
+Performance          High (simple check)    Lower (attribute fetching, evaluation)
+Implementation       Simple                 Complex
+Best for             Stable, known roles    Complex, dynamic access rules
+Examples             Admin/User/Viewer      Healthcare, Finance, Gov, Multi-tenant
+
+========================================================
+4. PBAC — POLICY-BASED ACCESS CONTROL
+========================================================
+
+PBAC is an extension of ABAC where authorization decisions are based on
+explicit policies (often managed externally via a policy engine like OPA).
+
+Difference from ABAC:
+  ABAC: Attributes drive decisions, logic in application code
+  PBAC: Policies defined externally, decoupled from application code
+
+Benefits:
+  - Policy updates without code deployment
+  - Centralized policy management
+  - Auditable policies
+  - Consistent enforcement across services
+
+OPA (Open Policy Agent) — Popular PBAC tool:
+
+// Policy in Rego:
+package myapp.orders
+
+import future.keywords.if
+
+default allow = false
+
+# Owners can read their own orders
+allow if {
+    input.action == "read"
+    input.subject.id == input.resource.owner_id
+}
+
+# Managers can approve orders in their department
+allow if {
+    input.action == "approve"
+    input.subject.roles[_] == "MANAGER"
+    input.subject.department == input.resource.department
+    input.resource.status == "PENDING"
+}
+
+# Admins can do anything
+allow if {
+    input.subject.roles[_] == "ADMIN"
+}
+
+========================================================
+5. PRACTICAL COMBINATION: RBAC + ABAC
+========================================================
+
+Real-world systems often combine both:
+
+  RBAC:  Coarse-grained (what features can this role access?)
+  ABAC:  Fine-grained (can THIS user access THIS specific record?)
+
+Example strategy:
+  1. RBAC check: "Does the user have the ORDERS_READER role?" (security filter)
+  2. ABAC check: "Does the user own this specific order?" (method security)
+
+// Layer 1: RBAC (HTTP level — fast, coarse)
+.authorizeHttpRequests(auth -> auth
+    .requestMatchers("/api/orders/**").hasRole("ORDERS_READER")
+)
+
+// Layer 2: ABAC (method level — fine-grained, slow but necessary)
+@PreAuthorize("hasPermission(#orderId, 'Order', 'read')")
+public Order getOrder(Long orderId) { ... }
+
+======================================================
+6. OAUTH2 SCOPES AND THEIR RELATION TO RBAC/ABAC
+========================================================
+
+OAuth2 scopes are a RESOURCE-CENTRIC authorization model:
+  - Scope: what operations are allowed on what resource
+  - Issued by Authorization Server, validated by Resource Server
+
+Mapping:
+  Scope              RBAC Equivalent            ABAC Example
+  -----------------  -------------------------  -----------------------
+  orders:read        VIEWER role                User can read own orders
+  orders:write       USER role                  User can write own orders
+  orders:admin       ADMIN role                 Admin can read all orders
+  analytics:read     ANALYST role               Read aggregated data
+
+Combining scopes + roles in Spring Security:
+
+@PreAuthorize("hasAuthority('SCOPE_orders:read') and hasRole('USER')")
+public List<Order> getOrders(@AuthenticationPrincipal Jwt jwt) {
+    // Scope ensures client requested orders:read
+    // Role ensures user is a USER (not just any service)
+    return orderService.findByUser(jwt.getSubject());
+}
+
+========================================================
+7. COMMON INTERVIEW QUESTIONS
+========================================================
+
+Q: What is the difference between RBAC and ABAC?
+A: RBAC grants access based on user roles (a fixed set of categorical permissions).
+   ABAC grants access based on attributes of the subject (user), resource, action,
+   and environment combined with policies. RBAC is simpler but less flexible.
+   ABAC handles complex, context-sensitive rules but is harder to implement and audit.
+
+Q: What is role explosion in RBAC?
+A: When you need many very specific roles to handle different combinations of access
+   requirements. Example: MANAGER_FINANCE_READ_ONLY, MANAGER_HR_READ_WRITE,
+   MANAGER_FINANCE_READ_WRITE, etc. This becomes unmanageable. ABAC solves this
+   by using attributes to express conditions without separate roles.
+
+Q: How would you implement row-level security (each user sees only their data)?
+A: RBAC alone can't do this — use ABAC or application-layer filtering:
+   1) PermissionEvaluator with @PreAuthorize("hasPermission(#id, 'Order', 'read')")
+   2) Spring Data JPA with @Query("WHERE o.userId = ?#{authentication.name}")
+   3) Hibernate Filters for automatic tenant/user filtering
+   4) PostgreSQL Row Security Policies (database-level)
+
+Q: What is hierarchical RBAC?
+A: A variation where roles can inherit permissions from other roles.
+   Example: ADMIN > MANAGER > USER means an ADMIN also has all MANAGER and USER
+   permissions. Spring Security supports this via RoleHierarchy bean.
+
+Q: What is the "principle of least privilege" and how does RBAC/ABAC support it?
+A: Least privilege means granting only the minimum permissions needed for a task.
+   RBAC supports it by defining narrow roles (e.g., ORDER_CREATOR can only create
+   orders, not read or delete). ABAC supports it by fine-grained conditions (can
+   only access PENDING orders, only during business hours, only own records).
+
+Q: How do OAuth2 scopes relate to RBAC?
+A: Scopes are a resource-server-centric authorization model. They specify what
+   operations a client application is allowed to perform on behalf of a user.
+   They complement RBAC: scopes control what the APPLICATION can do, roles control
+   what the USER can do. A request is fully authorized only if both the scope AND
+   the role/permission check pass.
+
+Q: What is PBAC (Policy-Based Access Control)?
+A: An extension of ABAC where authorization policies are externalized from application
+   code into a policy engine (like OPA). Policies are written in a high-level language
+   (Rego for OPA), deployed independently, and queried by services. Benefits: policy
+   updates without code deploys, centralized management, consistent enforcement across
+   all services.

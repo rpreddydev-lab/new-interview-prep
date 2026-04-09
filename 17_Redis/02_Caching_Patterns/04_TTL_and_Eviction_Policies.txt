@@ -1,0 +1,255 @@
+================================================================================
+TTL & EVICTION POLICIES — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. TTL (TIME TO LIVE)
+──────────────────────
+
+1a. What is TTL?
+  Every Redis key can have an optional expiry time (TTL). When TTL reaches 0,
+  Redis automatically deletes the key. This is essential for:
+  - Preventing stale data in caches
+  - Automatic cleanup (sessions, tokens, temporary data)
+  - Memory management without manual cleanup
+
+1b. Setting TTL:
+  SET key value EX 3600           → TTL = 3600 seconds (1 hour) at creation
+  SET key value PX 3600000        → TTL = 3600000 milliseconds
+  SET key value EXAT 1709000000   → TTL = Unix timestamp (absolute)
+  SET key value PXAT 1709000000000 → TTL = Unix timestamp in ms
+
+  After creation:
+  EXPIRE key 3600                 → set TTL in seconds
+  PEXPIRE key 3600000             → set TTL in milliseconds
+  EXPIREAT key 1709000000         → set TTL as absolute Unix timestamp
+  PEXPIREAT key 1709000000000
+
+  Remove TTL:
+  PERSIST key                     → remove TTL (key lives forever)
+
+  Check TTL:
+  TTL key                         → -1 = no TTL, -2 = key doesn't exist
+  PTTL key                        → milliseconds remaining
+
+1c. EXPIRETIME / PEXPIRETIME (Redis 7.0+):
+  EXPIRETIME key                  → Unix timestamp when key will expire
+  PEXPIRETIME key                 → Unix timestamp in ms
+
+1d. EXPIRE options (Redis 7.0+):
+  EXPIRE key 3600 NX              → only set if key has NO expiry
+  EXPIRE key 3600 XX              → only set if key HAS an existing expiry
+  EXPIRE key 3600 GT              → only set if new TTL > current TTL
+  EXPIRE key 3600 LT              → only set if new TTL < current TTL
+
+
+2. HOW REDIS EXPIRES KEYS
+───────────────────────────
+Redis uses TWO strategies for expiration:
+
+  a) Lazy expiration (passive):
+     When a client accesses a key, Redis checks if it's expired.
+     If expired: delete it, return nil.
+     Pros: no CPU overhead for rarely accessed keys.
+     Cons: expired keys not cleaned up until accessed → can waste memory.
+
+  b) Active expiration (background):
+     Every 100ms (hz=10 default), Redis runs a background job:
+       1. Randomly sample 20 keys from volatile-key hash (keys with TTL)
+       2. Delete expired ones
+       3. If > 25% of sampled keys were expired → repeat immediately
+       4. Stop when < 25% of sampled were expired
+     Ensures expired keys are cleaned up even if never accessed.
+     Tunable via hz=10 in redis.conf (range: 1-500; higher = more CPU usage).
+
+  Both strategies work together. Large datasets with many expiring keys may
+  still hold expired keys in memory briefly (until background sweep catches up).
+
+
+3. EVICTION POLICIES
+─────────────────────
+
+3a. What is eviction?
+  When Redis reaches maxmemory limit, it must free memory.
+  Eviction = Redis proactively deletes keys to make room for new ones.
+  
+  Configure in redis.conf:
+    maxmemory 4gb
+    maxmemory-policy allkeys-lru
+
+3b. ALL EVICTION POLICIES:
+  noeviction (default):
+    Return OOM error to client. Do NOT delete any keys.
+    Use case: Redis as a primary DB (never silently lose data).
+
+  allkeys-lru:
+    Evict the LEAST RECENTLY USED key from ALL keys.
+    Use case: General cache where all keys are candidates for eviction.
+    Most common for pure cache workloads.
+
+  volatile-lru:
+    Evict the LRU key from keys WITH TTL only.
+    Non-TTL keys are never evicted.
+    Use case: Mix of persistent keys and cache keys — protect non-TTL keys.
+
+  allkeys-lfu:
+    Evict the LEAST FREQUENTLY USED key from ALL keys.
+    Better than LRU for skewed access patterns (popular items stay in cache).
+    Tracks access frequency, not just recency.
+
+  volatile-lfu:
+    Evict the LFU key from keys WITH TTL only.
+
+  allkeys-random:
+    Evict a RANDOM key from ALL keys.
+    Simple but no intelligence about key importance.
+
+  volatile-random:
+    Evict a random key from keys WITH TTL only.
+
+  volatile-ttl:
+    Evict the key with the SHORTEST TTL (soonest to expire anyway).
+    Use case: when TTL is a proxy for importance/freshness.
+
+
+4. LRU vs LFU — WHICH TO CHOOSE?
+───────────────────────────────────
+  LRU (Least Recently Used):
+    "Evict the key that was accessed LEAST RECENTLY"
+    - Good when recent access = likely future access
+    - Classic Zipf distribution workloads
+    - "Hot" key scan: LRU may evict keys that were popular but not accessed in
+      the last hour (even if they'll be requested again)
+
+  LFU (Least Frequently Used):
+    "Evict the key that was accessed LEAST OFTEN (over time)"
+    - Good when popular keys should persist even if not recently accessed
+    - Frequency tracked with logarithmic counter (Morris counter)
+    - Configurable: lfu-log-factor 10 (higher = slower counter growth)
+                    lfu-decay-time 1  (minutes for counter to halve)
+    - Better for workloads with stable popularity (top products stay cached)
+
+  Redis LRU is approximate (not exact):
+    Redis samples N random keys (default: maxmemory-samples 5) and evicts the
+    LRU among them. Not a true LRU (no full eviction list maintained).
+    Increase samples for more accurate LRU at cost of CPU.
+
+  Redis LFU counter:
+    Uses a logarithmic "Morris counter" per key (8-bit, max ~1M accesses).
+    Counter decays over time (lfu-decay-time). Balances recency and frequency.
+
+
+5. EVICTION POLICY DECISION GUIDE
+───────────────────────────────────
+  Scenario                              → Policy
+  ──────────────────────────────────────────────────────────────────────────────
+  Pure cache (all data is expendable)   → allkeys-lru (or allkeys-lfu)
+  Cache + persistent data (no TTL)      → volatile-lru (protect non-TTL keys)
+  Workload with hotspot keys            → allkeys-lfu (popular stays longer)
+  Scheduled/TTL-based expiry only       → volatile-ttl (evict soonest-to-expire)
+  Redis as primary DB (data is critical)→ noeviction
+  Simple cache, any key is fine         → allkeys-random (rare, low overhead)
+
+
+6. MAXMEMORY CONFIGURATION
+────────────────────────────
+  maxmemory 4gb             # absolute value
+  maxmemory 75%             # Redis 7.0+ relative to total system RAM
+
+  Memory policies:
+    maxmemory-policy allkeys-lru
+    maxmemory-samples 10    # sample 10 keys for LRU approximation (default 5)
+
+  Check current memory:
+    INFO memory
+    → used_memory_human: 3.5G
+    → maxmemory_human: 4.0G
+    → maxmemory_policy: allkeys-lru
+
+  Memory breakdown:
+    used_memory:             Redis-owned data
+    used_memory_rss:         RSS (includes OS fragmentation)
+    mem_fragmentation_ratio: rss/used_memory (>1.5 = high fragmentation)
+
+  Active defrag (Redis 4.0+):
+    activedefrag yes                 # enable online defragmentation
+    active-defrag-threshold-lower 10 # start defrag when frag > 10%
+    active-defrag-threshold-upper 25 # use max CPU at 25% fragmentation
+
+
+7. MEMORY USAGE COMMANDS
+─────────────────────────
+  MEMORY USAGE key [SAMPLES n]    → memory in bytes for key (incl. metadata)
+  MEMORY DOCTOR                   → human-readable memory analysis
+  MEMORY MALLOC-STATS             → jemalloc allocator stats
+  OBJECT IDLETIME key             → seconds since last access (LRU clock)
+  OBJECT FREQ key                 → LFU access frequency counter
+
+  Monitor evictions:
+  INFO stats | grep evicted_keys   → cumulative evictions
+  # High eviction rate → consider increasing maxmemory or reducing cache size
+
+
+8. TTL BEST PRACTICES
+──────────────────────
+  ✓ ALWAYS set a TTL on cache entries — prevents memory accumulation
+  ✓ Use jitter on TTL to prevent simultaneous expiry (stampede):
+      ttl = base_ttl + random(0, base_ttl * 0.1)
+      E.g., TTL = 3600 + randint(0, 360)   # ±10% jitter
+  ✓ Short TTL for fast-changing data (prices: 30s, stock: 5s)
+  ✓ Long TTL for stable data (product descriptions: 24h, translations: 7d)
+  ✓ Sliding TTL for sessions: reset TTL on each access (GETEX key EX 1800)
+  ✓ Use EXPIREAT for time-of-day-based expiry (cache valid until midnight)
+
+  ✗ AVOID TTL = 0 (means no TTL in Redis, not "expire immediately")
+  ✗ AVOID very short TTL on expensive queries (defeats caching purpose)
+  ✗ AVOID very long TTL without any invalidation strategy
+
+
+9. EVICTION MONITORING AND ALERTING
+────────────────────────────────────
+  Key metrics to monitor:
+    evicted_keys:      If non-zero, cache is under memory pressure
+    used_memory vs maxmemory:  If > 90%, increase maxmemory or reduce data
+    mem_fragmentation_ratio:   If > 1.5, consider MEMORY PURGE or restart
+    hit_rate = keyspace_hits / (keyspace_hits + keyspace_misses): target > 90%
+
+  Alert thresholds:
+    evicted_keys > 0      → WARNING (check cache sizing)
+    used_memory > 90%     → WARNING
+    hit_rate < 80%        → WARNING (cache efficiency issue)
+    mem_fragmentation > 1.5 → INFO
+
+
+10. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: What eviction policy would you use for a Redis cache?
+  A: allkeys-lru is the most common choice for a pure cache — it evicts the
+     least recently used key from all keys when memory is full. If the workload
+     has hotspot keys (Pareto distribution, some keys much more popular),
+     allkeys-lfu is better — it keeps frequently accessed keys even if they
+     weren't accessed in the last few seconds.
+
+  Q: What is the difference between key expiration and eviction?
+  A: Expiration: a key is deleted when its TTL reaches zero (time-based, set by
+     the developer). Eviction: Redis deletes a key to free memory when maxmemory
+     is reached (policy-based, set by admin). Eviction can delete keys that
+     haven't expired yet.
+
+  Q: How does Redis implement LRU eviction?
+  A: Redis uses APPROXIMATE LRU, not exact LRU. When eviction is triggered,
+     Redis randomly samples maxmemory-samples keys (default 5) and evicts the
+     one with the oldest LRU clock timestamp. This avoids maintaining a global
+     LRU list, saving memory. Increasing maxmemory-samples improves accuracy.
+
+  Q: What happens when Redis hits maxmemory with noeviction policy?
+  A: Redis returns an OOM (Out of Memory) error to all write commands (SET,
+     LPUSH, HSET, etc.). Read commands (GET, LRANGE) still work. This prevents
+     silent data loss but means the application must handle OOM errors.
+
+  Q: How do you prevent cache stampede from simultaneous TTL expiry?
+  A: Add random jitter to TTL: ttl = base + random(0, base * 0.1).
+     This spreads out expiry times so not all keys expire simultaneously,
+     preventing a thundering herd of cache misses. Also consider probabilistic
+     early expiration (PER) — re-compute values slightly before they expire.
+
+================================================================================

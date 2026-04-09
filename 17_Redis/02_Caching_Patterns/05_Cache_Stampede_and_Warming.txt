@@ -1,0 +1,342 @@
+================================================================================
+CACHE STAMPEDE & CACHE WARMING — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+═══════════════════════════════════════════════════════════════════════════════
+PART 1: CACHE STAMPEDE (THUNDERING HERD)
+═══════════════════════════════════════════════════════════════════════════════
+
+1. WHAT IS CACHE STAMPEDE?
+───────────────────────────
+Cache Stampede (also known as Thundering Herd, Dog Pile Effect) occurs when:
+  1. A popular cache key expires (TTL reaches 0)
+  2. Many concurrent requests arrive simultaneously
+  3. ALL requests find the cache empty (miss)
+  4. ALL requests hit the database simultaneously
+  5. DB is overwhelmed → high latency → potential crash
+
+  Timeline:
+  t=0:  Key expires
+  t=0+ε: 1000 concurrent requests → 1000 cache misses → 1000 DB queries
+         DB normally handles 100 queries/sec → overload!
+
+
+2. WHY IS IT DANGEROUS?
+────────────────────────
+  Under normal load:   1000 req/sec, 1% miss rate = 10 DB queries/sec ✓
+  After cache expiry:  1000 req/sec, 100% miss rate = 1000 DB queries/sec ✗✗✗
+
+  The DB may not recover fast enough → cascading failures → cache can't be
+  repopulated → more misses → more DB load → system spiral.
+
+  Real incidents: product detail pages expiring at the same time, popular
+  endpoints with synchronized TTL, flash sales clearing cache entries.
+
+
+3. SOLUTION 1: MUTEX / DISTRIBUTED LOCK (MOST COMMON)
+───────────────────────────────────────────────────────
+  Only ONE process recomputes the value. Others wait or return stale.
+
+  def get_product(product_id):
+      key = f"product:{product_id}"
+      cached = redis.get(key)
+      if cached:
+          return deserialize(cached)
+
+      # Cache miss → try to acquire lock
+      lock_key = f"lock:{key}"
+      lock_acquired = redis.set(lock_key, "1", nx=True, ex=5)  # 5s lock
+
+      if lock_acquired:
+          # This process recomputes
+          try:
+              value = db.query(product_id)
+              redis.setex(key, 3600, serialize(value))
+              return value
+          finally:
+              redis.delete(lock_key)
+      else:
+          # Wait for lock holder to populate cache
+          time.sleep(0.05)           # 50ms backoff
+          return get_product(product_id)  # retry (recursive/loop)
+
+  Improvement: instead of waiting, return STALE data while recomputing:
+  def get_product(product_id):
+      key = f"product:{product_id}"
+      stale_key = f"stale:{key}"
+
+      cached = redis.get(key)
+      if cached:
+          return deserialize(cached)
+
+      stale = redis.get(stale_key)  # stale = old value with extended TTL
+
+      lock_key = f"lock:{key}"
+      lock_acquired = redis.set(lock_key, "1", nx=True, ex=5)
+      if lock_acquired:
+          value = db.query(product_id)
+          redis.setex(key, 3600, serialize(value))
+          redis.setex(stale_key, 7200, serialize(value))  # stale lives longer
+          redis.delete(lock_key)
+          return value
+      else:
+          return deserialize(stale) if stale else None   # return stale immediately
+
+
+4. SOLUTION 2: TTL JITTER (RANDOMIZED EXPIRY)
+───────────────────────────────────────────────
+  Spread out TTL so keys don't all expire at the same moment.
+
+  # Instead of all keys expiring at exactly 3600s:
+  base_ttl = 3600
+  jitter = random.randint(0, 600)    # ±600s jitter (±10% of 3600)
+  redis.setex(key, base_ttl + jitter, value)
+
+  This prevents synchronized expiry of multiple related keys (e.g., all
+  product pages loaded during a cache warm expiring simultaneously).
+
+  Use case: when caching many similar items (product catalog, user profiles)
+  — randomize TTL so they expire at different times.
+
+
+5. SOLUTION 3: PROBABILISTIC EARLY EXPIRY (PER)
+────────────────────────────────────────────────
+  Also known as "XFetch" algorithm (Vattani, Chierichetti, Veness, 2015).
+
+  Core idea: Instead of waiting until TTL=0 to recompute, start recomputing
+  slightly BEFORE the key expires, with probability proportional to how close
+  to expiry it is.
+
+  def get_with_per(key, recompute_fn, beta=1.0):
+      cached, expiry = redis.get_with_expiry(key)  # custom: get value + TTL
+      if cached:
+          # Probabilistic check: should we recompute early?
+          ttl_remaining = expiry - time.time()
+          recompute_cost = measure_recompute_time(recompute_fn)  # or estimate
+          early_recompute = -beta * recompute_cost * math.log(random.random())
+          if early_recompute > ttl_remaining:
+              # Probabilistically recompute before expiry
+              value = recompute_fn()
+              redis.setex(key, NEW_TTL, serialize(value))
+              return value
+          return deserialize(cached)
+      # Full miss
+      value = recompute_fn()
+      redis.setex(key, NEW_TTL, serialize(value))
+      return value
+
+  How it works:
+    - Close to expiry: high probability of early recomputation
+    - Far from expiry: very low probability
+    - beta=1 is the sweet spot; increase to recompute more aggressively early
+
+  Advantage: No lock needed. Naturally self-healing.
+
+
+6. SOLUTION 4: BACKGROUND REFRESH (STALE-WHILE-REVALIDATE)
+────────────────────────────────────────────────────────────
+  Serve stale data immediately, refresh in the background.
+
+  def get_with_background_refresh(key, recompute_fn, ttl=3600, stale_ttl=7200):
+      value = redis.get(key)
+      if value:
+          # Check if we should trigger a background refresh
+          remaining_ttl = redis.ttl(key)
+          if remaining_ttl < 300:   # last 5 minutes of TTL
+              # Trigger async refresh (don't wait for it)
+              thread = threading.Thread(target=refresh_cache,
+                                        args=(key, recompute_fn, ttl))
+              thread.daemon = True
+              thread.start()
+          return deserialize(value)
+
+      # Full miss: compute synchronously
+      result = recompute_fn()
+      redis.setex(key, ttl, serialize(result))
+      return result
+
+  def refresh_cache(key, recompute_fn, ttl):
+      lock_key = f"refresh:lock:{key}"
+      if redis.set(lock_key, "1", nx=True, ex=30):  # only one refresh at a time
+          result = recompute_fn()
+          redis.setex(key, ttl, serialize(result))
+          redis.delete(lock_key)
+
+  HTTP/CDN equivalent: Cache-Control: stale-while-revalidate=60
+
+
+7. SOLUTION 5: NEVER-EXPIRE + EXTERNAL REFRESH
+────────────────────────────────────────────────
+  Don't use TTL at all. A separate background job refreshes cache values on
+  a schedule. The cache is NEVER empty.
+
+  Background job:
+    for each key in active_keys:
+        value = db.query(key)
+        redis.set(key, serialize(value))   # no TTL, or very long TTL
+
+  Pros: No stampede possible (cache never expires mid-request)
+  Cons: Cache can become stale if refresh job fails; requires key registry;
+        harder to handle dynamic keys.
+
+  Use case: small, stable, known-ahead-of-time datasets (homepage featured
+  products, top categories, config values).
+
+
+8. COMPARISON OF STAMPEDE SOLUTIONS
+──────────────────────────────────────
+  Solution               │ Stale Data? │ Complexity │ Best For
+  ───────────────────────┼─────────────┼────────────┼──────────────────────────
+  TTL Jitter             │ No          │ Low        │ Batch-cached items
+  Mutex Lock             │ Brief       │ Medium     │ Single popular key
+  Lock + Stale Fallback  │ Briefly yes │ Medium     │ Latency-sensitive
+  Probabilistic Early    │ No          │ Medium     │ High-traffic endpoints
+  Background Refresh     │ Briefly yes │ High       │ Critical pages
+  Never Expire           │ Possible    │ High       │ Known static datasets
+
+
+═══════════════════════════════════════════════════════════════════════════════
+PART 2: CACHE WARMING
+═══════════════════════════════════════════════════════════════════════════════
+
+9. WHAT IS CACHE WARMING?
+──────────────────────────
+Cache warming (pre-warming) is the process of proactively populating the cache
+BEFORE traffic hits it.
+
+  Problem without warming:
+    - Deploy new service → cache is empty (cold)
+    - First N requests all miss → DB hit → high latency spikes
+    - Under high traffic: stampede effect from cold cache
+
+  Cache warming solves:
+    - Cold start problem after deployments
+    - Predictable traffic spikes (flash sales, scheduled events)
+    - Cache node replacement in cluster
+
+
+10. WARMING STRATEGIES
+───────────────────────
+
+10a. Replay Recent Traffic:
+    # Capture top queries from production logs
+    # Replay them against the new cache during maintenance window
+    for query in top_1000_queries:
+        result = db.execute(query)
+        cache_key = query_to_cache_key(query)
+        redis.setex(cache_key, 3600, serialize(result))
+
+10b. Warm from DB Dump:
+    # Pre-populate cache with most popular items
+    top_products = db.query("SELECT * FROM products ORDER BY views DESC LIMIT 10000")
+    pipeline = redis.pipeline()
+    for p in top_products:
+        pipeline.setex(f"product:{p.id}", 3600, serialize(p))
+    pipeline.execute()   # batch write via pipeline (single round-trip per 1000)
+
+10c. Lazy Warm-Up (Gradual):
+    # Send a small % of traffic to new cache node
+    # Let it warm up naturally over time
+    # Gradually increase traffic percentage (canary deploy)
+
+10d. Active Cache Warmer Service:
+    # Dedicated service that continuously refreshes top-N items
+    # Items ranked by access frequency (track in Sorted Set):
+    ZINCRBY access:frequency 1 "product:42"
+    # Warmer reads top 1000 keys and refreshes them
+
+10e. Cache Seeding on Startup:
+    # Application startup: pre-load known static data
+    @ApplicationStartup
+    void warmCache() {
+        List<Product> topProducts = productRepo.findTop1000ByOrderByViewsDesc();
+        for (Product p : topProducts) {
+            cache.set("product:" + p.getId(), p, Duration.ofHours(1));
+        }
+    }
+
+
+11. CACHE WARMING AFTER DEPLOYMENT
+────────────────────────────────────
+  Blue-Green Deployment:
+    1. New version (green) spins up with empty cache
+    2. Warm green cache BEFORE switching traffic
+    3. Switch DNS/LB to green
+    4. Green cache is warm → no cold start
+
+  Rolling Deployment:
+    1. Add new instances to pool gradually
+    2. Each new instance has cold cache
+    3. Load is shared with warm instances → impact is minimal
+    4. New instances warm up naturally over time
+
+  Redis Cluster node replacement:
+    1. New node joins cluster and receives its keyslots
+    2. Keys that don't exist yet cause DB misses
+    3. Solution: RDB snapshot copy from old node + RESTORE; or let it warm up
+       naturally if traffic is low enough
+
+
+12. WARMING VALIDATION
+───────────────────────
+  Monitor hit rate to confirm cache is warm:
+    INFO stats
+    keyspace_hits / (keyspace_hits + keyspace_misses) = hit rate
+
+  Acceptable warmup time depends on TTL:
+    If TTL=1hr and hit rate reaches 90% within 10 minutes → warm enough
+
+  Tools:
+    redis-cli --latency → check latency during warmup
+    MONITOR → observe cache miss patterns (dev/staging only)
+
+
+13. PREVENTING COLD CACHE RESTART
+────────────────────────────────────
+  Use Redis persistence to survive restarts:
+    - RDB snapshot: loads in seconds → cache is immediately warm
+    - AOF: replay all commands → slower but more complete
+    - Hybrid (recommended): RDB + incremental AOF
+
+  On planned restarts:
+    1. BGSAVE → dump.rdb
+    2. Restart Redis
+    3. Redis loads dump.rdb → cache warm in seconds
+
+  On crash: depends on last RDB/AOF checkpoint.
+
+
+14. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: What is cache stampede and how do you prevent it?
+  A: Cache stampede (thundering herd) occurs when a popular cache key expires
+     and many concurrent requests simultaneously miss the cache, all hitting
+     the database at once. Prevention strategies:
+     1. TTL Jitter: randomize expiry so keys don't expire simultaneously.
+     2. Mutex lock: only one process recomputes; others wait or return stale.
+     3. Probabilistic early expiration: start recomputing before TTL=0.
+     4. Background refresh with stale data: serve stale, refresh async.
+
+  Q: How would you warm a Redis cache after a deployment?
+  A: Pre-populate the cache before routing traffic:
+     1. Query DB for top-N most accessed items (by access logs or analytics).
+     2. Batch-write to Redis using PIPELINE (avoid N round-trips).
+     3. In blue-green deployment: warm the green instance before traffic switch.
+     4. For dynamic caches: use a replay of recent production traffic.
+     Enable RDB persistence to avoid cold starts on planned restarts.
+
+  Q: What is stale-while-revalidate?
+  A: A caching strategy where the current (possibly stale) cached value is
+     returned immediately to the user, while a background process refreshes
+     the cache asynchronously. The user sees fast response times; the cache
+     is updated in the background. Commonly seen in HTTP CDNs (Cache-Control:
+     stale-while-revalidate=60) and application caches.
+
+  Q: How does Probabilistic Early Expiration work?
+  A: The XFetch algorithm computes a probability of recomputing a cache value
+     BEFORE its TTL expires. The probability increases as the TTL approaches
+     zero and is proportional to the recomputation cost (beta * delta * log(rand)).
+     This ensures the cache is refreshed by one process before it expires for
+     everyone else, without any coordination or locking.
+
+================================================================================

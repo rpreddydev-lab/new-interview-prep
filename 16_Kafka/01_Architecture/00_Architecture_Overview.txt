@@ -1,0 +1,238 @@
+================================================================================
+  KAFKA ARCHITECTURE OVERVIEW
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. HIGH-LEVEL ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Kafka's architecture consists of four primary components:
+
+  ┌─────────────┐    publish     ┌────────────────────────────┐    consume   ┌─────────────────┐
+  │  PRODUCERS  │ ─────────────→ │     KAFKA CLUSTER          │ ──────────→  │   CONSUMERS     │
+  │             │                │  ┌──────┐ ┌──────┐ ┌──────┐│              │ (Consumer Group)│
+  │  App        │                │  │Broker│ │Broker│ │Broker││              │                 │
+  │  Service    │                │  │  1   │ │  2   │ │  3   ││              │  Service A      │
+  │  IoT        │                │  └──────┘ └──────┘ └──────┘│              ���  Analytics      │
+  │  CDC        │                │                            │              │  Data Pipeline  │
+  └─────────────┘                └────────────────────────────┘              └─────────────────┘
+                                              │
+                                 ┌────────────┴──────────────┐
+                                 │  Metadata & Coordination   │
+                                 │  (KRaft: built-in OR       │
+                                 │   ZooKeeper: legacy)        │
+                                 └────────────────────────────┘
+
+Components:
+  1. Producers: Publish records to Kafka topics
+  2. Brokers: Store topic partitions, serve consumers
+  3. Consumers: Subscribe and read records from topics
+  4. Metadata Store: ZooKeeper (legacy) or KRaft (modern)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. DATA FLOW — STEP BY STEP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Producer → Broker → Consumer:
+
+Step 1: Producer decides the target topic and partition
+  - Using a message key → deterministic partition (murmur2 hash % numPartitions)
+  - No key → round-robin or sticky partitioning
+
+Step 2: Producer fetches metadata
+  - Contacts any broker (bootstrap.servers) to get partition leader info
+  - Metadata is cached and refreshed periodically
+
+Step 3: Producer sends to the partition LEADER
+  - Direct connection to the leader broker
+  - Message is appended to the partition's log file
+  - Leader increments the LEO (Log End Offset)
+
+Step 4: Replication to followers
+  - Follower replicas fetch from leader continuously
+  - Once all ISR replicas have the record, HW advances
+  - Leader sends ack to producer (based on acks config)
+
+Step 5: Consumer polls from leader
+  - Consumer fetches from partition leader (default)
+  - As of Kafka 2.4+: consumers can fetch from follower replicas
+    (rack-aware fetch for lower inter-AZ costs)
+  - Consumer receives records up to the High-Watermark
+
+Step 6: Consumer commits offset
+  - Consumer commits its read position to __consumer_offsets topic
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. TOPIC AND PARTITION LAYOUT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A topic is divided into partitions. Each partition is assigned a leader and
+followers spread across brokers:
+
+  Topic: orders (3 partitions, replication factor 3, 3 brokers)
+
+  Broker 1:  orders-P0 (LEADER), orders-P1 (follower), orders-P2 (follower)
+  Broker 2:  orders-P0 (follower), orders-P1 (LEADER), orders-P2 (follower)
+  Broker 3:  orders-P0 (follower), orders-P1 (follower), orders-P2 (LEADER)
+
+  → Each partition's leader is on a different broker (even load)
+  → If Broker 1 dies: Broker 2 or 3 takes over leadership for orders-P0
+  → New leader is elected from the ISR list
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. THE CONTROLLER BROKER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+In a Kafka cluster, one broker is elected as the CONTROLLER.
+
+Controller responsibilities:
+  - Monitor all broker liveliness (via heartbeats or ZooKeeper watches)
+  - When a broker fails: elect new leaders for partitions whose leader was lost
+  - When a broker joins: redistribute partitions
+  - Create/delete topics (update partition assignments)
+  - Handle ISR changes (update ISR list when replica falls behind or catches up)
+
+Controller failure:
+  - ZooKeeper mode: a new controller is elected via ZooKeeper within ~30 seconds
+  - KRaft mode: a new active controller is elected from the quorum in < 1 second
+
+Controller bottleneck (pre-KRaft):
+  - In ZooKeeper mode, the controller must propagate metadata updates one broker
+    at a time. With 1 million partitions, controller restart could take hours.
+  - KRaft solves this: controllers share a replicated log for metadata
+    → propagation is nearly instantaneous
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. REPLICATION ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Replication ensures fault tolerance. Key concepts:
+
+ISR (In-Sync Replicas):
+  - Set of replicas that are "caught up" with the leader
+  - A follower is in ISR if it has fetched all messages up to the HW
+    within replica.lag.time.max.ms (default 30 seconds)
+  - ISR is dynamic: brokers enter/leave ISR as they catch up or fall behind
+
+High-Watermark (HW):
+  - The last offset replicated to ALL ISR replicas
+  - Consumers can only read up to the HW (ensures consumer reads committed data)
+  - Advances when all ISR replicas have fetched the record
+
+LEO (Log End Offset):
+  - The next offset to be written on a replica
+  - The leader's LEO is always >= any follower's LEO
+
+Replication protocol:
+  1. Producer writes to leader → leader appends to log → LEO advances
+  2. Follower sends FetchRequest to leader
+  3. Leader responds with records and its HW
+  4. Follower appends records to its log → Follower LEO advances
+  5. On next fetch, follower sends its LEO → leader knows follower is caught up
+  6. Leader advances HW when all ISR followers have the record
+  7. Producer receives ack when HW advances (for acks=all)
+
+Unclean Leader Election:
+  - If ALL ISR replicas die, only a replica OUTSIDE ISR (out-of-sync) is available
+  - unclean.leader.election.enable=true: allow OSR to become leader (risk DATA LOSS)
+  - unclean.leader.election.enable=false: refuse to elect → partition becomes offline
+  - Default: false (prefer availability off over data loss)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. PHYSICAL STORAGE ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Each partition stored as a directory of segment files:
+
+  /var/kafka/data/
+  └── orders-0/                    ← Partition 0 of topic "orders"
+      ├── 00000000000000000000.log  ← Segment file (records)
+      ├── 00000000000000000000.index ← Offset index (sparse, for fast seek)
+      ├── 00000000000000000000.timeindex ← Timestamp index
+      ├── 00000000000001234567.log  ← Next segment (rolled when size/time limit hit)
+      ├── 00000000000001234567.index
+      └── 00000000000001234567.timeindex
+
+Segment files:
+  - Filename = base offset of the first message in the segment
+  - .log: raw message data (binary)
+  - .index: sparse offset → byte position mapping (every Nth record)
+  - .timeindex: sparse timestamp → offset mapping
+  - Active segment: the most recent, still being written to
+  - Rolled when: segment.bytes exceeded (1GB default) or segment.ms passed
+
+Reading a message by offset:
+  1. Binary search in the segment list → find the right .log file
+  2. Binary search in the .index file → find byte position in .log
+  3. Sequential scan from byte position to find exact offset
+
+Page cache:
+  - OS page cache keeps hot data in RAM
+  - Kafka doesn't manage its own heap cache for messages
+  - This allows OS to optimize caching and sequential reads
+  - On a well-tuned broker: most reads served from page cache (RAM), not disk
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. NETWORK ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Kafka uses a custom binary protocol over TCP.
+
+Broker thread model:
+  - Acceptor thread: accepts new connections → assigns to network threads
+  - Network threads (num.network.threads, default 3): read requests from socket, 
+    put into request queue
+  - I/O threads (num.io.threads, default 8): dequeue requests, read/write disk
+  - Response queue: I/O threads put responses here
+  - Network threads pick up responses and send back to client
+
+Why custom protocol (not HTTP/REST)?
+  - Zero overhead: binary framing, no HTTP headers
+  - Batching: fetch multiple records in one request
+  - Multiplexing: pipelining requests over a single TCP connection
+  - Zero-copy support at OS level (sendfile)
+
+Listener configuration (broker side):
+  listeners=PLAINTEXT://0.0.0.0:9092
+  advertised.listeners=PLAINTEXT://broker-hostname:9092
+
+  PLAINTEXT: unencrypted
+  SSL: TLS encrypted
+  SASL_PLAINTEXT: SASL auth, no encryption
+  SASL_SSL: SASL auth + TLS
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: Describe Kafka's architecture at a high level.
+A: Kafka consists of producers that publish events, a cluster of brokers that
+   store partitioned, replicated logs, and consumers that read from partitions.
+   A metadata store (KRaft or ZooKeeper) manages cluster state. Topics are
+   divided into partitions distributed across brokers; each partition has one
+   leader and N-1 follower replicas for fault tolerance.
+
+Q: What is the role of the Kafka Controller?
+A: The Controller is one designated broker that handles cluster-level metadata:
+   it monitors broker health, elects new partition leaders when brokers fail,
+   manages partition assignment when brokers join/leave, and tracks ISR changes.
+   In KRaft mode, this role is distributed across a quorum of controller nodes.
+
+Q: Why can consumers only read up to the high-watermark?
+A: The HW ensures consumers only read data that has been fully replicated to all
+   ISR replicas. If a consumer read beyond the HW, it might read a record that
+   hasn't been replicated yet — if the leader then crashes, that record could be
+   lost and the consumer would have received a "ghost" message.
+
+Q: What is the ISR and what happens when a follower falls out of it?
+A: ISR (In-Sync Replicas) is the set of replicas caught up with the leader within
+   replica.lag.time.max.ms. If a follower falls behind (network issue, GC pause,
+   disk slow), it leaves the ISR. This reduces the "quorum" for acks=all writes.
+   If ISR drops below min.insync.replicas, writes are rejected with
+   NotEnoughReplicasException to prevent data loss.
+
+Q: How does Kafka achieve high throughput on a single broker?
+A: Sequential disk I/O (appending to log files), OS page cache exploitation
+   (no JVM heap for message data), zero-copy sendfile() for network transfers,
+   message batching and compression, and an efficient custom binary TCP protocol.

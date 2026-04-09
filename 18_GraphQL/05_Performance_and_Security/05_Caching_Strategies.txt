@@ -1,0 +1,363 @@
+================================================================
+CACHING STRATEGIES IN GRAPHQL — IN DEPTH
+================================================================
+
+1. WHY CACHING IN GRAPHQL IS DIFFERENT
+-----------------------------------------
+REST caching is straightforward: each URL is a cacheable resource.
+GET /users/1 → cache the response, invalidate when user changes.
+
+GraphQL challenges:
+  - All requests go to the same endpoint (POST /graphql)
+  - POST is not cacheable by HTTP caching infrastructure
+  - The same data might appear at multiple paths in different queries
+  - A query can return data from multiple resources (user + posts + comments)
+  - Partial updates: if one field changes, the entire response is stale
+
+Caching strategies must be more intentional in GraphQL.
+
+2. CACHING LAYERS
+------------------
+  a) HTTP/CDN caching     → Cache entire query responses (GET + persisted queries)
+  b) Application caching  → Cache resolver results (Redis, Caffeine)
+  c) DataLoader caching   → Per-request memoization (built-in to DataLoader)
+  d) Query result caching → Cache full GraphQL operation results
+  e) HTTP response caching → Cache-Control headers per type
+
+3. HTTP CACHING WITH PERSISTED QUERIES (GET)
+----------------------------------------------
+Persisted queries enable GET requests which CDNs can cache:
+
+```
+GET /graphql
+  ?operationName=GetUser
+  &variables={"id":"1"}
+  &extensions={"persistedQuery":{"version":1,"sha256Hash":"abc..."}}
+
+CDN caches response by URL (hash + variables = unique cache key)
+```
+
+For public, non-authenticated queries (product catalog, news, etc.):
+  - CDN caches the response
+  - Cache-Control: public, max-age=300 (5 minutes)
+  - All users get the cached response without hitting your server
+
+For authenticated queries:
+  - Cache-Control: private (per-user CDN caching or skip)
+  - Or use application-level caching
+
+4. APPLICATION-LEVEL CACHING WITH REDIS
+-----------------------------------------
+  4.1 Service-Layer Caching (Spring Cache)
+  -----------------------------------------
+  ```java
+  @Service
+  public class UserService {
+
+    @Cacheable(value = "users", key = "#id")
+    public User findById(Long id) {
+      return userRepository.findById(id)
+        .orElseThrow(() -> new ResourceNotFoundException("User", id));
+    }
+
+    @CacheEvict(value = "users", key = "#user.id")
+    public User update(User user) {
+      return userRepository.save(user);
+    }
+
+    @CacheEvict(value = "users", allEntries = true)
+    public void deleteAll() {
+      userRepository.deleteAll();
+    }
+  }
+  ```
+
+  ```yaml
+  # application.yml
+  spring:
+    cache:
+      type: redis
+    data:
+      redis:
+        host: localhost
+        port: 6379
+  ```
+
+  4.2 Manual Redis Caching
+  -------------------------
+  ```java
+  @Service
+  public class ProductCatalogService {
+
+    private final RedisTemplate<String, String> redis;
+    private final ObjectMapper objectMapper;
+    private final ProductRepository repository;
+    private static final Duration CACHE_TTL = Duration.ofMinutes(15);
+
+    public List<Product> getProducts(String category) {
+      String cacheKey = "products:category:" + category;
+
+      // Try cache first
+      String cached = redis.opsForValue().get(cacheKey);
+      if (cached != null) {
+        return objectMapper.readValue(cached, new TypeReference<>() {});
+      }
+
+      // Load from DB
+      List<Product> products = repository.findByCategory(category);
+
+      // Store in cache
+      redis.opsForValue().set(cacheKey, objectMapper.writeValueAsString(products), CACHE_TTL);
+      return products;
+    }
+
+    public void invalidateCategory(String category) {
+      redis.delete("products:category:" + category);
+    }
+  }
+  ```
+
+5. RESOLVER-LEVEL CACHING
+---------------------------
+Cache expensive computation at resolver level using DataLoader caching:
+
+```java
+@BatchMapping(typeName = "Post", field = "author")
+public Map<Post, User> author(List<Post> posts) {
+  // DataLoader automatically caches within a request (per-request memoization)
+  // For cross-request caching, use Redis here:
+  Set<Long> uncachedIds = new HashSet<>();
+  Map<Long, User> result = new HashMap<>();
+
+  for (Post post : posts) {
+    String cacheKey = "user:" + post.getAuthorId();
+    User cached = redisCache.get(cacheKey, User.class);
+    if (cached != null) {
+      result.put(post.getAuthorId(), cached);
+    } else {
+      uncachedIds.add(post.getAuthorId());
+    }
+  }
+
+  // Load only uncached
+  if (!uncachedIds.isEmpty()) {
+    List<User> loaded = userRepository.findAllById(uncachedIds);
+    loaded.forEach(user -> {
+      redisCache.set("user:" + user.getId(), user, Duration.ofMinutes(10));
+      result.put(user.getId(), user);
+    });
+  }
+
+  return posts.stream()
+    .collect(Collectors.toMap(Function.identity(),
+      post -> result.get(post.getAuthorId())));
+}
+```
+
+6. FULL QUERY RESULT CACHING
+------------------------------
+Cache entire GraphQL operation results for public, cacheable operations:
+
+```java
+@Component
+public class QueryResultCacheInterceptor implements WebGraphQlInterceptor {
+
+  private final RedisTemplate<String, String> redis;
+  private final ObjectMapper objectMapper;
+
+  @Override
+  public Mono<WebGraphQlResponse> intercept(WebGraphQlRequest request, Chain chain) {
+    // Only cache safe (non-mutation) public operations
+    if (!isCacheable(request)) {
+      return chain.next(request);
+    }
+
+    String cacheKey = computeCacheKey(request);
+
+    // Try cache
+    String cached = redis.opsForValue().get(cacheKey);
+    if (cached != null) {
+      return Mono.just(deserializeResponse(cached));
+    }
+
+    // Execute and cache
+    return chain.next(request).doOnNext(response -> {
+      if (response.getErrors().isEmpty()) {  // Only cache success
+        redis.opsForValue().set(
+          cacheKey,
+          serializeResponse(response),
+          getCacheDuration(request)
+        );
+      }
+    });
+  }
+
+  private String computeCacheKey(WebGraphQlRequest request) {
+    // Include operation name + variables + hash of document
+    return "graphql:result:" + hashOf(
+      request.getOperationName() + ":" + request.getVariables()
+    );
+  }
+
+  private boolean isCacheable(WebGraphQlRequest request) {
+    String doc = request.getDocument();
+    if (doc == null) return false;
+    // Check if it's a query (not mutation/subscription)
+    return doc.trim().startsWith("query") || doc.trim().startsWith("{");
+  }
+}
+```
+
+7. HTTP CACHE-CONTROL HEADERS
+--------------------------------
+Use the response extensions to hint at cache headers for the HTTP layer:
+
+```java
+@Bean
+public WebGraphQlHandlerInterceptor cacheHeaderInterceptor() {
+  return new WebGraphQlHandlerInterceptor() {
+    @Override
+    public Mono<WebGraphQlResponse> handleResponse(
+        WebGraphQlRequest request, WebGraphQlResponse response) {
+
+      // Check if response includes cache hint from resolvers
+      Object cacheHint = response.getExecutionResult().getExtensions().get("cacheControl");
+      if (cacheHint instanceof Map<?,?> hint) {
+        int maxAge = (Integer) hint.get("maxAge");
+        String scope = (String) hint.get("scope");
+        response.getHeaders().set(
+          HttpHeaders.CACHE_CONTROL,
+          scope.equals("PRIVATE")
+            ? "private, max-age=" + maxAge
+            : "public, max-age=" + maxAge
+        );
+      }
+      return Mono.just(response);
+    }
+  };
+}
+```
+
+8. CACHE INVALIDATION STRATEGIES
+-----------------------------------
+Cache invalidation is the hardest part of caching.
+
+  a) TTL-based (Time To Live):
+     → Simplest: cache expires after N seconds
+     → Stale data possible for TTL duration
+     → Good for semi-static data (product catalog, user profiles)
+
+  b) Event-driven invalidation:
+     → On mutation, publish event → cache subscriber deletes affected keys
+     → Near real-time consistency
+     → More complex to implement
+
+  c) Write-through:
+     → On mutation, update both DB and cache simultaneously
+     → Always fresh cache
+     → Complex to keep in sync
+
+  Example event-driven (using Spring Events):
+  ```java
+  @Service
+  public class UserService {
+    private final ApplicationEventPublisher events;
+
+    @Transactional
+    public User update(Long id, UpdateUserInput input) {
+      User user = findById(id);
+      // apply changes
+      user = userRepository.save(user);
+      events.publishEvent(new UserUpdatedEvent(user.getId()));
+      return user;
+    }
+  }
+
+  @Component
+  public class UserCacheListener {
+    private final RedisTemplate<String, String> redis;
+
+    @EventListener
+    public void handleUserUpdated(UserUpdatedEvent event) {
+      redis.delete("user:" + event.getUserId());
+      redis.delete("users:all");
+    }
+  }
+  ```
+
+9. APOLLO CLIENT-SIDE CACHING
+-------------------------------
+Apollo Client (JavaScript) has a normalized in-memory cache. Responses
+are split into individual objects by type + ID and stored flat:
+
+```javascript
+// Apollo Client normalizes: { user { id name } } →
+// cache: { "User:1": { __typename: "User", id: "1", name: "Alice" } }
+
+// Mutations that return updated objects auto-update the cache:
+const UPDATE_USER = gql`
+  mutation UpdateUser($id: ID!, $name: String!) {
+    updateUser(id: $id, name: $name) {
+      id name    # Return updated fields to trigger cache update
+    }
+  }
+`;
+```
+
+For mutations that create new items (not auto-cached), update cache manually:
+```javascript
+await client.mutate({
+  mutation: ADD_POST,
+  update(cache, { data: { addPost } }) {
+    const existing = cache.readQuery({ query: GET_POSTS });
+    cache.writeQuery({
+      query: GET_POSTS,
+      data: { posts: [...existing.posts, addPost] }
+    });
+  }
+});
+```
+
+10. INTERVIEW QUESTIONS & ANSWERS
+-----------------------------------
+
+Q: Why is HTTP caching hard with GraphQL?
+A: Traditional HTTP caching uses the URL as the cache key and works with
+   GET requests. GraphQL uses a single POST endpoint for all operations.
+   POST is not cacheable by CDNs or browsers. Also, one query can return
+   data from multiple resources, making granular cache invalidation difficult.
+   Solutions: Persisted Queries enable GET caching; application-level caching
+   with Redis handles server-side caching; Apollo Client normalizes client cache.
+
+Q: What is Apollo Client's normalized cache?
+A: Apollo Client decomposes GraphQL responses by type + ID into a flat
+   normalized cache. Instead of `{ user: { id: 1, name: "Alice" } }`, it
+   stores `User:1 → { id: 1, name: "Alice" }`. When a mutation returns the
+   updated user, all queries that included that user are automatically
+   refreshed. This prevents stale data in the UI without manual refetching.
+
+Q: How do you use @Cacheable with GraphQL resolvers in Spring?
+A: Apply @Cacheable (Spring Cache abstraction) to service layer methods
+   called by resolvers. Cache is populated on first call; subsequent calls
+   with the same key return cached data. Use @CacheEvict on mutating methods.
+   Configure Redis as the cache provider for distributed deployments.
+   Note: Don't cache at the resolver level for per-user data without including
+   the userId in the cache key.
+
+Q: What is the difference between DataLoader caching and application caching?
+A: DataLoader provides per-request memoization: within a single GraphQL
+   operation, loading the same key twice returns the cached value (same
+   Promise). This cache is thrown away after the request. Application-level
+   caching (Redis, Caffeine) persists across requests and users, suitable
+   for shared, public data. Both are valuable and complement each other.
+
+Q: How would you cache public product catalog data in GraphQL?
+A: Multiple layers: (1) Service layer: @Cacheable with Redis, TTL of 15 min.
+   (2) Full query result cache: intercept product queries and cache the
+   full GraphQL response in Redis. (3) CDN: Use persisted queries with GET
+   and Cache-Control: public, max-age=300 so CDN caches responses by URL.
+   Invalidate on admin mutations that update product data.
+
+================================================================
+END OF FILE
+================================================================

@@ -1,0 +1,292 @@
+================================================================================
+RETRY AND EXPONENTIAL BACKOFF
+================================================================================
+
+WHAT IS RETRY?
+--------------
+Retry is a resilience pattern where failed operations are automatically
+attempted again, on the assumption that the failure is transient (temporary).
+
+Transient failures: 
+  - Network glitches (packet loss, temporary unreachability)
+  - Service restart/rolling deployment (brief 502/503)
+  - Temporary resource contention (database connection pool full)
+  - Cloud infrastructure hiccups (AWS EC2 instance migration)
+
+Non-transient failures (don't retry!):
+  - 400 Bad Request — your request is wrong, retrying won't fix it
+  - 401 Unauthorized — your credentials are invalid
+  - 403 Forbidden — you don't have permission
+  - 404 Not Found — resource doesn't exist
+
+────────────────────────────────────────────────────────────────────────────────
+
+RETRY STRATEGIES
+=================
+
+1. FIXED DELAY RETRY
+   Wait the same amount of time between each retry.
+   
+   Attempt 1: FAIL → wait 1s
+   Attempt 2: FAIL → wait 1s
+   Attempt 3: FAIL → wait 1s
+   Attempt 4: SUCCESS ✓
+
+   Problem: Under high load, all failed clients retry simultaneously
+   → "Retry Storm" that overwhelms the recovering service
+
+2. EXPONENTIAL BACKOFF
+   Double (or multiply) the wait time after each failure.
+
+   Attempt 1: FAIL → wait 1s
+   Attempt 2: FAIL → wait 2s
+   Attempt 3: FAIL → wait 4s
+   Attempt 4: FAIL → wait 8s (or max cap)
+
+   Formula: delay = initialDelay × multiplier^(attempt-1)
+   Wait: 1s → 2s → 4s → 8s → 16s → ... (capped at max)
+
+   Benefit: Reduces load on recovering service by spreading retries
+
+3. EXPONENTIAL BACKOFF WITH JITTER (BEST PRACTICE)
+   Add randomness to avoid synchronized retries from multiple instances.
+
+   Without jitter: 100 clients all retry at exactly t=1s, t=2s, t=4s
+   → Thundering herd problem — spikes of load at each retry moment
+
+   With jitter:
+   delay = randomBetween(0, min(cap, initialDelay × multiplier^attempt))
+   
+   Each client retries at a random time within the backoff window:
+   Client A: waits 0.7s, 1.3s, 3.1s
+   Client B: waits 0.2s, 1.8s, 2.6s
+   → Smooth load distribution
+
+   AWS recommendation: Always add jitter to backoff.
+
+────────────────────────────────────────────────────────────────────────────────
+
+RESILIENCE4J RETRY CONFIGURATION
+===================================
+
+application.yml:
+  resilience4j:
+    retry:
+      instances:
+        inventoryService:
+          max-attempts: 3                        # Total attempts (including first try)
+          wait-duration: 1s                      # Initial wait between attempts
+          exponential-backoff-multiplier: 2      # Double each time
+          exponential-max-wait-duration: 10s     # Cap backoff at 10s
+          enable-exponential-backoff: true
+
+          # Retry on these exceptions
+          retry-exceptions:
+            - java.io.IOException
+            - java.net.SocketTimeoutException
+            - feign.RetryableException
+            - org.springframework.web.client.HttpServerErrorException.ServiceUnavailable
+
+          # DO NOT retry on these (client errors)
+          ignore-exceptions:
+            - feign.FeignException.BadRequest           # 400
+            - feign.FeignException.Unauthorized         # 401
+            - feign.FeignException.Forbidden            # 403
+            - feign.FeignException.NotFound             # 404
+            - com.example.BusinessException             # Business logic errors
+
+          # Retry on specific HTTP status codes
+          result-predicate: >
+            retryOnResult(result ->
+              result.getStatus() == 502 ||
+              result.getStatus() == 503 ||
+              result.getStatus() == 504
+            )
+
+Spring Boot annotation:
+  @Service
+  public class InventoryService {
+
+    @Retry(name = "inventoryService", fallbackMethod = "defaultInventory")
+    @CircuitBreaker(name = "inventoryService", fallbackMethod = "defaultInventory")
+    public InventoryDTO getInventory(Long productId) {
+      return inventoryClient.getInventory(productId);
+    }
+
+    // Called after all retries exhausted AND circuit closed
+    // OR when circuit is OPEN (circuit breaker prevents retries)
+    public InventoryDTO defaultInventory(Long productId, Exception ex) {
+      log.warn("All retries failed for inventory productId={}", productId, ex);
+      return InventoryDTO.unavailable(productId);
+    }
+  }
+
+Retry Events:
+  registry.retry("inventoryService")
+    .getEventPublisher()
+    .onRetry(event -> log.info("Retry attempt {} for {}",
+        event.getNumberOfRetryAttempts(), event.getName()))
+    .onError(event -> log.error("All retries failed"))
+    .onSuccess(event -> log.info("Retry succeeded on attempt {}",
+        event.getNumberOfRetryAttempts()));
+
+────────────────────────────────────────────────────────────────────────────────
+
+RETRY WITH SPRING RETRY
+========================
+
+Alternative: Spring Retry (can use with @Retryable annotation)
+
+  <dependency>
+    <groupId>org.springframework.retry</groupId>
+    <artifactId>spring-retry</artifactId>
+  </dependency>
+
+  @EnableRetry  // on @SpringBootApplication class
+
+  @Service
+  public class PaymentService {
+
+    @Retryable(
+      retryFor = {HttpServerErrorException.class, ResourceAccessException.class},
+      noRetryFor = {HttpClientErrorException.class},
+      maxAttempts = 3,
+      backoff = @Backoff(delay = 1000, multiplier = 2, maxDelay = 10000, random = true)
+    )
+    public PaymentDTO processPayment(PaymentRequest request) {
+      return paymentClient.process(request);
+    }
+
+    @Recover  // Called after all @Retryable attempts fail
+    public PaymentDTO recoverPayment(Exception ex, PaymentRequest request) {
+      log.error("Payment processing failed after retries: {}", ex.getMessage());
+      return PaymentDTO.pending(request.getOrderId());  // Queue for manual processing
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+IDEMPOTENCY — CRITICAL FOR RETRY SAFETY
+=========================================
+
+PROBLEM: Retrying non-idempotent operations can cause duplicate actions.
+
+Example: Payment API
+  Client sends "charge $100" → times out (no response received)
+  Did the charge happen? Unknown.
+  Client retries "charge $100"
+  If original succeeded: now charged $200! (DUPLICATE!)
+
+SOLUTION: Idempotency keys
+
+  How it works:
+  1. Client generates a unique idempotency key (UUID) per logical operation
+  2. Includes it in the request: Idempotency-Key: "uuid-abc-123"
+  3. Server stores (idempotency-key, result) in DB with TTL (24h)
+  4. On retry: server finds key → returns original result (no duplicate action)
+  5. If first request is still processing → returns 409 Conflict (client waits)
+
+  Implementation:
+    @RestController
+    @RequestMapping("/api/v1/payments")
+    public class PaymentController {
+
+      @PostMapping
+      public ResponseEntity<PaymentDTO> process(
+          @RequestHeader("Idempotency-Key") String idempotencyKey,
+          @RequestBody PaymentRequest request) {
+
+        // Check if already processed
+        Optional<PaymentDTO> cached = idempotencyStore.get(idempotencyKey);
+        if (cached.isPresent()) {
+          return ResponseEntity.ok(cached.get());  // Return original response
+        }
+
+        // Process payment
+        PaymentDTO payment = paymentService.processPayment(request);
+
+        // Store result for future retries
+        idempotencyStore.store(idempotencyKey, payment, Duration.ofHours(24));
+
+        return ResponseEntity.ok(payment);
+      }
+    }
+
+Operations that are naturally idempotent (safe to retry):
+  ✓ GET requests (reads don't change state)
+  ✓ PUT requests (set a resource to a specific state)
+  ✓ DELETE (deleting already-deleted resource → 404, acceptable)
+
+Operations requiring idempotency keys:
+  ✗ POST (create) — payment processing, order creation
+  ✗ POST (trigger action) — send email, charge card
+
+────────────────────────────────────────────────────────────────────────────────
+
+RETRY BUDGET — PREVENTING RETRY STORMS
+========================================
+
+Retry storms: Multiple services retry simultaneously → amplified load on recovering service
+
+Example: 
+  1000 clients retry every 1s to a service that's recovering
+  = 1000 requests/second hitting the service while it's trying to recover
+  = service can't recover because of retry traffic
+
+Solutions:
+  1. Exponential backoff with jitter (spread retries over time)
+  2. Retry budget: Maximum N retries system-wide per time window
+  3. Circuit Breaker: After threshold reached, stop retrying entirely
+
+Retry budget in Linkerd/Istio:
+  retryBudget:
+    retryRatio: 0.2     # Allow at most 20% of requests to be retries
+    minRetriesPerSecond: 10  # Minimum retries even under low traffic
+    ttl: 10s            # Budget window
+
+────────────────────────────────────────────────────────────────────────────────
+
+BEST PRACTICES
+===============
+
+1. Always set a MAX retry limit (don't retry indefinitely)
+2. Use exponential backoff with jitter
+3. Only retry on transient errors (5xx, timeout) — never 4xx client errors
+4. Make operations idempotent to safely retry
+5. Use Circuit Breaker alongside Retry — Retry for transient; CB for persistent
+6. Log retry attempts with context (attempt number, exception, service name)
+7. Define clear fallbacks when all retries fail
+8. Monitor retry rates — high retry rates signal a persistent issue
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is exponential backoff and why is it used?
+A: Exponential backoff doubles the wait time between each retry attempt
+   (e.g., 1s, 2s, 4s, 8s). This prevents retry storms — without backoff, all
+   failed clients retry simultaneously, overwhelming a recovering service.
+
+Q: What's the "thundering herd" problem with retries?
+A: When many clients all fail at once and retry at the same intervals, they
+   create synchronized spikes of load on the recovering service. Adding random
+   jitter to the backoff spreads retries over time, preventing these spikes.
+
+Q: Why must you make operations idempotent for retries to be safe?
+A: If an operation (like payment processing) is retried after a timeout, the
+   first call may have succeeded. Without idempotency, you'd process it twice.
+   With idempotency keys, the server returns the original result on retry.
+
+Q: What's the difference between Retry and Circuit Breaker?
+A: Retry handles transient failures by trying again (3 times with backoff).
+   Circuit Breaker handles persistent failures by stopping calls entirely.
+   Use both together: Retry for quick recovery, Circuit Breaker for prolonged
+   outages to prevent resource exhaustion.
+
+Q: Which HTTP status codes should NOT be retried?
+A: 4xx client errors (400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not
+   Found). These indicate a problem with the REQUEST, not the server — retrying
+   won't fix them. Only retry 5xx server errors and network-level failures.
+
+================================================================================

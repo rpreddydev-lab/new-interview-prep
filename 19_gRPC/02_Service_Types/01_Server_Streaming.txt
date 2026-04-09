@@ -1,0 +1,544 @@
+================================================================
+SERVER STREAMING RPC - COMPLETE GUIDE
+================================================================
+
+----------------------------------------------------------------
+1. WHAT IS SERVER STREAMING RPC?
+----------------------------------------------------------------
+
+Server streaming RPC:
+  - Client sends ONE request
+  - Server sends a STREAM of responses (zero or more messages)
+  - Client reads from the stream until server signals completion
+  - Server calls onCompleted() or onError() to end the stream
+
+Proto definition:
+  rpc MethodName (RequestMessage) returns (stream ResponseMessage);
+                                          ^^^^^^^
+                                    "stream" keyword before return type
+
+HTTP/2 behavior:
+  - Single HTTP/2 stream
+  - Client: HEADERS + DATA [END_STREAM]  (single request, ends immediately)
+  - Server: HEADERS + DATA + DATA + ... + DATA + TRAILERS [END_STREAM]
+  
+  Client END_STREAM is sent with the request, meaning the client will
+  not send more data on that stream. The server stream remains open.
+
+Common use cases:
+  ✅ Stock price or market data feeds (subscribe once, receive updates)
+  ✅ File download (server streams file chunks)
+  ✅ Large result sets (stream database query results)
+  ✅ Real-time event subscriptions (system events, notifications)
+  ✅ Progress updates for long-running operations
+
+----------------------------------------------------------------
+2. PROTO DEFINITION
+----------------------------------------------------------------
+
+syntax = "proto3";
+package com.example.stock.v1;
+
+option java_package = "com.example.stock.v1";
+option java_multiple_files = true;
+
+import "google/protobuf/timestamp.proto";
+
+message StockSubscribeRequest {
+  repeated string symbols = 1;  // e.g., ["AAPL", "GOOGL", "MSFT"]
+  int32 interval_ms = 2;        // update interval in milliseconds
+}
+
+message StockPrice {
+  string symbol = 1;
+  double price  = 2;
+  int64  volume = 3;
+  google.protobuf.Timestamp timestamp = 4;
+}
+
+message FileDownloadRequest {
+  string file_id = 1;
+  int32  chunk_size_bytes = 2;  // preferred chunk size
+}
+
+message FileChunk {
+  bytes  data         = 1;
+  int64  offset       = 2;  // byte offset in file
+  int64  total_size   = 3;  // total file size
+  string filename     = 4;  // only in first chunk
+  bool   is_last      = 5;  // true for last chunk
+}
+
+message SearchOrdersRequest {
+  string customer_id = 1;
+  string status      = 2;
+}
+
+message Order {
+  string order_id    = 1;
+  string customer_id = 2;
+  string status      = 3;
+  int64  amount_cents = 4;
+}
+
+service StockService {
+  // Subscribe to real-time stock prices
+  rpc StreamStockPrices(StockSubscribeRequest) returns (stream StockPrice);
+}
+
+service FileService {
+  // Download large file in chunks
+  rpc DownloadFile(FileDownloadRequest) returns (stream FileChunk);
+}
+
+service OrderService {
+  // Stream all orders for a customer
+  rpc ListOrders(SearchOrdersRequest) returns (stream Order);
+}
+
+----------------------------------------------------------------
+3. SERVER IMPLEMENTATION (JAVA)
+----------------------------------------------------------------
+
+import io.grpc.stub.StreamObserver;
+import io.grpc.Status;
+import io.grpc.Context;
+
+// ── STOCK PRICE STREAMING SERVER ─────────────────────────────
+
+@GrpcService
+public class StockServiceImpl extends StockServiceGrpc.StockServiceImplBase {
+  
+  private final StockDataFeed stockFeed;
+  
+  @Override
+  public void streamStockPrices(StockSubscribeRequest request,
+                                  StreamObserver<StockPrice> responseObserver) {
+    
+    List<String> symbols = request.getSymbolsList();
+    int intervalMs = request.getIntervalMs() > 0 ? request.getIntervalMs() : 1000;
+    
+    // Keep streaming until:
+    // 1. Client cancels (Context.current().isCancelled())
+    // 2. Error occurs
+    // 3. We decide to stop (e.g., subscription expires)
+    
+    try {
+      while (!Context.current().isCancelled()) {  // ← KEY: check for client cancellation
+        for (String symbol : symbols) {
+          // Check cancellation before each send to avoid sending to disconnected client
+          if (Context.current().isCancelled()) {
+            break;
+          }
+          
+          StockPrice price = stockFeed.getLatestPrice(symbol);
+          
+          // onNext() can be called many times for server streaming
+          responseObserver.onNext(price);
+        }
+        
+        Thread.sleep(intervalMs);
+      }
+      
+      // Clean up and complete normally
+      responseObserver.onCompleted();
+      
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      responseObserver.onError(
+          Status.CANCELLED.withDescription("Server interrupted").asException());
+    } catch (Exception e) {
+      responseObserver.onError(
+          Status.INTERNAL.withDescription("Failed to stream prices").withCause(e).asException());
+    }
+  }
+}
+
+// ── FILE DOWNLOAD SERVER ──────────────────────────────────────
+
+@GrpcService
+public class FileServiceImpl extends FileServiceGrpc.FileServiceImplBase {
+  
+  private final FileStorage fileStorage;
+  
+  @Override
+  public void downloadFile(FileDownloadRequest request,
+                            StreamObserver<FileChunk> responseObserver) {
+    
+    String fileId = request.getFileId();
+    int chunkSize = request.getChunkSizeBytes() > 0
+        ? request.getChunkSizeBytes()
+        : 64 * 1024;  // default 64KB chunks
+    
+    try {
+      FileMetadata metadata = fileStorage.getMetadata(fileId);
+      if (metadata == null) {
+        responseObserver.onError(
+            Status.NOT_FOUND.withDescription("File not found: " + fileId).asException());
+        return;
+      }
+      
+      long totalSize = metadata.getSizeBytes();
+      long offset = 0;
+      boolean first = true;
+      
+      try (InputStream inputStream = fileStorage.openStream(fileId)) {
+        byte[] buffer = new byte[chunkSize];
+        int bytesRead;
+        
+        while ((bytesRead = inputStream.read(buffer)) != -1) {
+          if (Context.current().isCancelled()) {
+            // Client cancelled download
+            responseObserver.onError(Status.CANCELLED.asException());
+            return;
+          }
+          
+          byte[] chunkData = bytesRead < buffer.length
+              ? Arrays.copyOf(buffer, bytesRead)
+              : buffer;
+          
+          boolean isLast = (offset + bytesRead >= totalSize);
+          
+          FileChunk.Builder chunkBuilder = FileChunk.newBuilder()
+              .setData(ByteString.copyFrom(chunkData))
+              .setOffset(offset)
+              .setTotalSize(totalSize)
+              .setIsLast(isLast);
+          
+          // Include filename only in first chunk
+          if (first) {
+            chunkBuilder.setFilename(metadata.getFilename());
+            first = false;
+          }
+          
+          responseObserver.onNext(chunkBuilder.build());
+          offset += bytesRead;
+        }
+      }
+      
+      responseObserver.onCompleted();
+      
+    } catch (IOException e) {
+      responseObserver.onError(
+          Status.INTERNAL.withDescription("File read error").withCause(e).asException());
+    }
+  }
+}
+
+// ── ORDER LIST STREAMING SERVER ───────────────────────────────
+
+@GrpcService
+public class OrderServiceImpl extends OrderServiceGrpc.OrderServiceImplBase {
+  
+  private final OrderRepository orderRepository;
+  
+  @Override
+  public void listOrders(SearchOrdersRequest request,
+                          StreamObserver<Order> responseObserver) {
+    
+    // Stream orders from database using cursor to avoid loading all into memory
+    try (Stream<Order> orderStream = orderRepository.streamByCustomer(
+            request.getCustomerId(), request.getStatus())) {
+      
+      orderStream.forEach(order -> {
+        if (Context.current().isCancelled()) {
+          return;  // stop streaming if client cancelled
+        }
+        responseObserver.onNext(order);
+      });
+      
+      responseObserver.onCompleted();
+      
+    } catch (Exception e) {
+      responseObserver.onError(
+          Status.INTERNAL.withDescription("Database error").asException());
+    }
+  }
+}
+
+----------------------------------------------------------------
+4. CLIENT IMPLEMENTATION - BLOCKING STUB (ITERATOR)
+----------------------------------------------------------------
+
+// BlockingStub returns an Iterator<T> for server streaming
+@Component
+public class StockServiceClient {
+  
+  private final StockServiceGrpc.StockServiceBlockingStub blockingStub;
+  
+  public StockServiceClient(ManagedChannel channel) {
+    this.blockingStub = StockServiceGrpc.newBlockingStub(channel);
+  }
+  
+  public void consumeStockPrices() {
+    StockSubscribeRequest request = StockSubscribeRequest.newBuilder()
+        .addSymbols("AAPL")
+        .addSymbols("GOOGL")
+        .setIntervalMs(500)
+        .build();
+    
+    // Returns Iterator — calling .hasNext() and .next() are blocking calls
+    Iterator<StockPrice> priceIterator = blockingStub.streamStockPrices(request);
+    
+    while (priceIterator.hasNext()) {
+      StockPrice price = priceIterator.next();
+      System.out.printf("%s: $%.2f%n", price.getSymbol(), price.getPrice());
+    }
+    // Loop ends when server calls onCompleted() or onError()
+  }
+  
+  // File download example
+  public void downloadFile(String fileId, Path destination) throws IOException {
+    FileDownloadRequest request = FileDownloadRequest.newBuilder()
+        .setFileId(fileId)
+        .setChunkSizeBytes(65536)  // 64KB chunks
+        .build();
+    
+    Iterator<FileChunk> chunks = blockingStub.downloadFile(request);
+    
+    try (FileOutputStream fos = new FileOutputStream(destination.toFile())) {
+      while (chunks.hasNext()) {
+        FileChunk chunk = chunks.next();
+        fos.write(chunk.getData().toByteArray());
+        
+        double progress = (double) (chunk.getOffset() + chunk.getData().size())
+                          / chunk.getTotalSize() * 100;
+        System.out.printf("Download progress: %.1f%%%n", progress);
+      }
+    }
+  }
+}
+
+----------------------------------------------------------------
+5. CLIENT IMPLEMENTATION - ASYNC STUB (STREAMOBSERVER)
+----------------------------------------------------------------
+
+@Component
+public class AsyncStockServiceClient {
+  
+  private final StockServiceGrpc.StockServiceStub asyncStub;
+  
+  public AsyncStockServiceClient(ManagedChannel channel) {
+    this.asyncStub = StockServiceGrpc.newStub(channel);
+  }
+  
+  public void streamPricesAsync(List<String> symbols, PriceHandler handler) {
+    
+    StockSubscribeRequest request = StockSubscribeRequest.newBuilder()
+        .addAllSymbols(symbols)
+        .setIntervalMs(1000)
+        .build();
+    
+    asyncStub.streamStockPrices(request, new StreamObserver<StockPrice>() {
+      
+      @Override
+      public void onNext(StockPrice price) {
+        // Called for EACH response message (called many times)
+        handler.onPrice(price);
+      }
+      
+      @Override
+      public void onError(Throwable t) {
+        // Stream terminated with error
+        Status status = Status.fromThrowable(t);
+        if (status.getCode() == Status.Code.CANCELLED) {
+          log.info("Subscription cancelled");
+        } else {
+          log.error("Stream error: {}", status, t);
+          handler.onError(t);
+        }
+      }
+      
+      @Override
+      public void onCompleted() {
+        // Server called onCompleted() — stream ended normally
+        log.info("Price stream completed");
+        handler.onComplete();
+      }
+    });
+    // Returns immediately — responses arrive asynchronously
+  }
+  
+  // Cancel a stream early by using ClientCall or Context cancellation
+  public void streamWithCancellation(List<String> symbols) {
+    Context.CancellableContext ctx = Context.current().withCancellation();
+    
+    ctx.run(() -> {
+      asyncStub.streamStockPrices(
+          StockSubscribeRequest.newBuilder().addAllSymbols(symbols).build(),
+          new StreamObserver<StockPrice>() {
+            @Override
+            public void onNext(StockPrice price) {
+              process(price);
+              if (shouldStop()) {
+                ctx.cancel(null);  // cancel the stream from client side
+              }
+            }
+            @Override public void onError(Throwable t) { }
+            @Override public void onCompleted() { }
+          });
+    });
+  }
+}
+
+----------------------------------------------------------------
+6. FLOW CONTROL AND BACK-PRESSURE
+----------------------------------------------------------------
+
+Problem: Server sends faster than client can process.
+
+HTTP/2 automatic flow control:
+  - HTTP/2 has built-in flow control via WINDOW_UPDATE frames
+  - If client's receive buffer fills up, HTTP/2 signals server to pause
+  - Server blocks on onNext() when client window is full
+  - This is AUTOMATIC — you don't need to implement it
+
+Manual flow control (advanced — using ServerCallStreamObserver):
+  @Override
+  public void streamStockPrices(StockSubscribeRequest request,
+                                  StreamObserver<StockPrice> rawObserver) {
+    
+    // Cast to ServerCallStreamObserver for manual flow control
+    ServerCallStreamObserver<StockPrice> observer =
+        (ServerCallStreamObserver<StockPrice>) rawObserver;
+    
+    // Check if client is ready to receive before sending
+    if (observer.isReady()) {
+      observer.onNext(price);
+    }
+    
+    // Register callback for when client becomes ready again
+    observer.setOnReadyHandler(() -> {
+      // This is called when client is ready to receive more
+      // Resume sending data
+      resumeStreaming();
+    });
+    
+    // Detect client cancellation
+    observer.setOnCancelHandler(() -> {
+      // Client cancelled the stream
+      log.info("Client cancelled the stream");
+      cancelDataSource();
+    });
+  }
+
+----------------------------------------------------------------
+7. CANCELLATION HANDLING
+----------------------------------------------------------------
+
+Client-side cancellation:
+  // Using Context.CancellableContext
+  Context.CancellableContext ctx = Context.current().withCancellation();
+  
+  ctx.run(() -> {
+    asyncStub.streamStockPrices(request, responseObserver);
+  });
+  
+  // Later, cancel:
+  ctx.cancel(null);  // null means no specific cause
+
+  // OR: cancel after timeout
+  Context.CancellableContext ctx2 = Context.current().withDeadlineAfter(30, TimeUnit.SECONDS, executor);
+
+Server-side: Detecting cancellation:
+  @Override
+  public void streamStockPrices(StockSubscribeRequest request,
+                                  StreamObserver<StockPrice> responseObserver) {
+    // Register a listener for cancellation
+    Context.current().addListener(ctx -> {
+      log.info("Client cancelled: {}", ctx.cancellationCause());
+      // Clean up resources (stop database cursor, close connections, etc.)
+      cleanupResources();
+    }, MoreExecutors.directExecutor());
+    
+    // Also check in the loop
+    while (!Context.current().isCancelled()) {
+      // ... stream data
+    }
+  }
+
+What happens on cancellation:
+  - Client sends HTTP/2 RST_STREAM frame
+  - Server's Context becomes cancelled
+  - Context.current().isCancelled() returns true
+  - Server's next call to onNext() throws StatusRuntimeException(CANCELLED)
+  - Server should stop and clean up resources
+
+----------------------------------------------------------------
+8. COMMON PATTERNS AND ANTI-PATTERNS
+----------------------------------------------------------------
+
+PATTERN 1: Streaming Database Results
+  // BAD: Load all into memory then stream (defeats the purpose!)
+  List<Order> allOrders = orderRepo.findAll();  // millions of orders!
+  allOrders.forEach(responseObserver::onNext);
+  
+  // GOOD: Use cursor/stream to iterate lazily
+  orderRepo.streamAll().forEach(order -> {
+    if (!Context.current().isCancelled()) {
+      responseObserver.onNext(order);
+    }
+  });
+
+PATTERN 2: Throttled Streaming
+  while (!Context.current().isCancelled()) {
+    StockPrice price = fetchLatestPrice();
+    responseObserver.onNext(price);
+    
+    // Don't spam; rate limit to avoid overwhelming network
+    Thread.sleep(intervalMs);
+  }
+
+PATTERN 3: Checkpoint/Resume (for large transfers)
+  message FileDownloadRequest {
+    string file_id       = 1;
+    int64  resume_offset = 2;  // 0 to start from beginning
+  }
+
+ANTI-PATTERN 1: Not checking cancellation
+  // Server keeps processing after client cancelled → wastes resources
+  while (true) {
+    responseObserver.onNext(fetchData());  // this throws if cancelled, but better to check first
+  }
+
+ANTI-PATTERN 2: Not handling onCompleted on client
+  asyncStub.listOrders(request, new StreamObserver<Order>() {
+    @Override public void onNext(Order o) { process(o); }
+    @Override public void onError(Throwable t) { handle(t); }
+    @Override public void onCompleted() { /* DO SOMETHING! Signal that work is done. */ }
+  });
+
+----------------------------------------------------------------
+9. INTERVIEW KEY POINTS
+----------------------------------------------------------------
+
+Q: How do you prevent a server streaming RPC from overwhelming a slow client?
+A: HTTP/2 provides automatic flow control. When a client's receive window
+   is full (it can't process fast enough), HTTP/2 signals the server to
+   pause sending. The server's call to onNext() will block until the
+   client is ready. For more explicit control, cast the StreamObserver to
+   ServerCallStreamObserver and use isReady() / setOnReadyHandler().
+
+Q: How does a client cancel a server streaming RPC?
+A: The client cancels by cancelling the Context used for the call.
+   This sends an HTTP/2 RST_STREAM frame to the server. On the server,
+   Context.current().isCancelled() returns true, and subsequent calls
+   to onNext() throw a StatusRuntimeException with CANCELLED status.
+   The server should clean up resources in a CancellationListener.
+
+Q: What is the difference between server streaming RPC and Server-Sent Events (SSE)?
+A: Both are server-to-client push patterns. SSE is HTTP/1.1 based, text-only,
+   and only works in browsers natively. gRPC server streaming uses HTTP/2,
+   binary protobuf, has back-pressure via HTTP/2 flow control, and supports
+   cancellation via RST_STREAM. gRPC server streaming is more efficient for
+   high-frequency data; SSE is simpler for browser-based use cases.
+
+Q: Can you have a server streaming RPC time out?
+A: Yes. If the client sets a deadline (withDeadlineAfter), the entire
+   streaming RPC must complete before the deadline. If not, the client
+   receives DEADLINE_EXCEEDED and the server's Context becomes cancelled.
+   For long-lived subscriptions, use no deadline or very long deadlines.
+
+================================================================
+END OF FILE
+================================================================

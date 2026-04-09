@@ -1,0 +1,275 @@
+================================================================================
+RATE LIMITING WITH REDIS — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. WHY RATE LIMITING?
+──────────────────────
+  Protects backend services from:
+    - Abuse / DoS attacks
+    - API quota enforcement (per client/user/IP)
+    - Cost control (downstream API calls, DB queries)
+    - Fair use enforcement in multi-tenant systems
+
+  Redis is ideal for distributed rate limiting:
+    - Sub-millisecond latency for check + increment
+    - Atomic operations via Lua scripting
+    - TTL-based automatic window reset
+    - Shared state across all service instances
+
+
+2. ALGORITHM 1: FIXED WINDOW COUNTER
+──────────────────────────────────────
+  Concept: count requests per fixed time window (e.g., per minute).
+
+  Key: rate:<userId>:<window>   where window = timestamp / windowSize
+
+  INCR rate:user:42:1705363200   → increment for this minute
+  EXPIRE rate:user:42:1705363200 60  → auto-expire after window
+
+  Problem: INCR and EXPIRE are two separate commands (not atomic).
+  Fix: Lua script for atomicity.
+
+  Lua implementation:
+    local current = redis.call('INCR', KEYS[1])
+    if current == 1 then
+      redis.call('EXPIRE', KEYS[1], ARGV[1])
+    end
+    if current > tonumber(ARGV[2]) then
+      return 0   -- rate limited
+    end
+    return 1     -- allowed
+
+  Key: "rate:user:42:1705363200" (window = epoch_seconds / 60)
+  ARGV: window_seconds=60, limit=100
+
+  Limitation:
+    Burst at window boundary: 100 requests at 11:59:59 + 100 requests at 12:00:00
+    → 200 requests in 2 seconds. Allowed because they're in different windows.
+
+
+3. ALGORITHM 2: SLIDING WINDOW LOG
+────────────────────────────────────
+  Concept: track exact timestamps of all requests.
+  Allow if fewer than limit requests in the last windowSize seconds.
+
+  Key: rate:user:42  (Sorted Set: member=UUID, score=timestamp_ms)
+
+  Redis operations (NOT atomic — need Lua):
+    ZREMRANGEBYSCORE rate:user:42 0 (now_ms - window_ms)  → remove old entries
+    ZADD rate:user:42 now_ms <unique_request_id>           → add current request
+    ZCARD rate:user:42                                     → current count
+    EXPIRE rate:user:42 window_seconds                    → auto cleanup
+
+  Lua script (atomic):
+    local now = tonumber(ARGV[1])
+    local window = tonumber(ARGV[2])
+    local limit = tonumber(ARGV[3])
+    local key = KEYS[1]
+
+    redis.call('ZREMRANGEBYSCORE', key, 0, now - window)
+    local count = redis.call('ZCARD', key)
+    if count < limit then
+      redis.call('ZADD', key, now, now .. math.random())
+      redis.call('EXPIRE', key, math.ceil(window / 1000))
+      return 1  -- allowed
+    end
+    return 0    -- rate limited
+
+  Advantage: no boundary burst problem.
+  Disadvantage: O(log N) per request (sorted set operations), memory grows with request count.
+
+
+4. ALGORITHM 3: SLIDING WINDOW COUNTER (HYBRID) ← RECOMMENDED
+────────────────────────────────────────────────────────────────
+  Compromise between fixed window (fast) and sliding window log (accurate).
+
+  Use two adjacent fixed-window counters + interpolation:
+    current_window_count = INCR rate:<userId>:<current_window>
+    previous_window_count = GET rate:<userId>:<previous_window>
+    elapsed = (now % window_size) / window_size   (0.0 to 1.0)
+    estimated_count = previous_window_count * (1 - elapsed) + current_window_count
+
+  Result: approximation of sliding window. Effective at scale.
+  Error rate < 0.1% for most workloads.
+  Memory: O(1) per user (just two counters).
+
+
+5. ALGORITHM 4: TOKEN BUCKET
+──────────────────────────────
+  Concept:
+    Each user has a "bucket" with capacity N tokens.
+    Tokens fill at a rate of R tokens/second.
+    Each request consumes 1 token. No token = rejected.
+
+  Properties:
+    - Allows bursts (up to bucket capacity)
+    - Smooths out traffic over time
+    - More complex to implement correctly
+
+  Key fields (stored as Hash):
+    tokens: current token count
+    last_refill: timestamp of last refill
+
+  Lua implementation:
+    local tokens_key = KEYS[1]
+    local last_refill_key = KEYS[2]
+    local rate = tonumber(ARGV[1])       -- tokens per second
+    local capacity = tonumber(ARGV[2])   -- max bucket size
+    local now = tonumber(ARGV[3])        -- current time (ms)
+    local tokens_requested = tonumber(ARGV[4])
+
+    local last_refill = tonumber(redis.call('GET', last_refill_key) or now)
+    local current_tokens = tonumber(redis.call('GET', tokens_key) or capacity)
+
+    local elapsed = (now - last_refill) / 1000  -- seconds
+    local new_tokens = math.min(capacity, current_tokens + elapsed * rate)
+
+    if new_tokens >= tokens_requested then
+      redis.call('SET', tokens_key, new_tokens - tokens_requested)
+      redis.call('SET', last_refill_key, now)
+      redis.call('EXPIRE', tokens_key, math.ceil(capacity / rate) + 1)
+      redis.call('EXPIRE', last_refill_key, math.ceil(capacity / rate) + 1)
+      return 1
+    end
+    return 0
+
+
+6. SPRING BOOT IMPLEMENTATION (FIXED WINDOW, PRODUCTION)
+──────────────────────────────────────────────────────────
+  @Component
+  public class RedisRateLimiter {
+
+      @Autowired StringRedisTemplate redisTemplate;
+
+      private static final DefaultRedisScript<Long> RATE_LIMIT_SCRIPT;
+      static {
+          RATE_LIMIT_SCRIPT = new DefaultRedisScript<>();
+          RATE_LIMIT_SCRIPT.setScriptText(
+              "local current = redis.call('INCR', KEYS[1])\n" +
+              "if current == 1 then\n" +
+              "  redis.call('EXPIRE', KEYS[1], ARGV[1])\n" +
+              "end\n" +
+              "return current"
+          );
+          RATE_LIMIT_SCRIPT.setResultType(Long.class);
+      }
+
+      public boolean isAllowed(String userId, int limit, int windowSeconds) {
+          long window = Instant.now().getEpochSecond() / windowSeconds;
+          String key = "rate:" + userId + ":" + window;
+          Long count = redisTemplate.execute(
+              RATE_LIMIT_SCRIPT,
+              Collections.singletonList(key),
+              String.valueOf(windowSeconds)
+          );
+          return count != null && count <= limit;
+      }
+  }
+
+  // Filter or interceptor:
+  @Component
+  public class RateLimitFilter extends OncePerRequestFilter {
+      @Autowired RedisRateLimiter rateLimiter;
+
+      @Override
+      protected void doFilterInternal(HttpServletRequest req,
+              HttpServletResponse res, FilterChain chain)
+              throws ServletException, IOException {
+          String userId = req.getHeader("X-User-Id");
+          if (userId == null) userId = req.getRemoteAddr();  // fallback to IP
+
+          if (!rateLimiter.isAllowed(userId, 100, 60)) {
+              res.setStatus(429);
+              res.setHeader("Retry-After", "60");
+              res.getWriter().write("{\"error\":\"Rate limit exceeded\"}");
+              return;
+          }
+          chain.doFilter(req, res);
+      }
+  }
+
+
+7. RETURNING RATE LIMIT HEADERS
+─────────────────────────────────
+  Standard headers (RFC 6585):
+    X-RateLimit-Limit: 100
+    X-RateLimit-Remaining: 43
+    X-RateLimit-Reset: 1705363260    (Unix timestamp when window resets)
+    Retry-After: 17                  (seconds until allowed again; 429 only)
+
+  Extended script to return all info:
+    local current = redis.call('INCR', KEYS[1])
+    if current == 1 then
+      redis.call('EXPIRE', KEYS[1], ARGV[1])
+    end
+    local ttl = redis.call('TTL', KEYS[1])
+    return {current, ttl}   -- count, seconds_remaining
+
+  Parse response:
+    List<Object> result = execute(script, ...);
+    long count = (Long) result.get(0);
+    long ttl   = (Long) result.get(1);
+    long remaining = Math.max(0, limit - count);
+
+
+8. COMPARISON TABLE
+─────────────────────
+  Algorithm           │ Accuracy  │ Memory  │ Burst  │ Complexity
+  ────────────────────┼───────────┼─────────┼────────┼───────────
+  Fixed Window        │ Low (edge)│ O(1)    │ 2x max │ Simple
+  Sliding Window Log  │ Exact     │ O(N req)│ None   │ Medium
+  Sliding Window Cnt  │ ~99.9%    │ O(1)    │ None   │ Medium
+  Token Bucket        │ Exact     │ O(1)    │ Yes    │ Complex
+  Leaky Bucket        │ Exact     │ O(1)    │ None   │ Complex
+
+  Recommendation:
+    Most use cases: Sliding Window Counter (hybrid) — accurate + O(1)
+    Bursty workloads: Token Bucket
+    Simplest: Fixed Window Counter
+
+
+9. DISTRIBUTED RATE LIMIT: MULTI-KEY DESIGN
+─────────────────────────────────────────────
+  Rate limit by different dimensions:
+    rate:user:<userId>          → per-user limit
+    rate:ip:<ip>                → per-IP limit
+    rate:api-key:<key>          → per-API-key limit
+    rate:endpoint:<method:path> → per-endpoint limit
+
+  Check multiple limits:
+    if (rateLimiter.isAllowed("user:" + userId, 1000, 3600)
+        && rateLimiter.isAllowed("ip:" + ip, 100, 60)) {
+        // process request
+    }
+
+
+10. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: How do you implement rate limiting in Redis?
+  A: The most common approach is the Fixed Window Counter: increment a key
+     (rate:userId:window) with INCR, set TTL on first increment. If count > limit,
+     reject with 429. Use Lua script to make INCR+EXPIRE atomic. For better
+     accuracy, use the Sliding Window Counter: two fixed windows + interpolation
+     for O(1) memory with ~99.9% accuracy.
+
+  Q: What's the race condition in a naive rate limiter and how do you fix it?
+  A: INCR and EXPIRE are two separate commands. Between them, another request
+     could INCR, pushing count above limit before EXPIRE is set. Worse, if the
+     process crashes after INCR but before EXPIRE, the key never expires.
+     Fix: Lua script executes both atomically:
+     "if redis.call('INCR', KEYS[1]) == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end"
+
+  Q: What's the "burst problem" with fixed window rate limiting?
+  A: A user can make limit requests at 11:59:59 (end of window) and another
+     limit requests at 12:00:00 (start of new window), effectively making 2×limit
+     requests in 2 seconds while technically not violating the per-minute rule.
+     Solution: sliding window log or sliding window counter hybrid.
+
+  Q: How would you implement rate limiting in a Redis Cluster?
+  A: Rate limiting keys must be on the same shard for atomic Lua scripts.
+     Use hash tags: {rate:user:42} — keys with the same hash tag go to the
+     same slot. All related rate limit keys for user 42 will be on the same
+     shard, allowing atomic Lua execution. Alternatively, use a consistent
+     key naming scheme and ensure Lua keys are always on the same shard.
+
+================================================================================

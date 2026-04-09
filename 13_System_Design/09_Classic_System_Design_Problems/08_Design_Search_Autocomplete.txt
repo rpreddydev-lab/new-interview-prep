@@ -1,0 +1,247 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DESIGN: SEARCH AUTOCOMPLETE / TYPEAHEAD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FUNCTIONAL:
+  - As user types, return top 5-10 completions in real-time
+  - Results ordered by: search frequency × recency × personalization
+  - Support prefix matching ("ap" → ["apple", "app store", "apple music"])
+  - Support typo tolerance (bonus)
+  - Handle millions of different prefixes efficiently
+  - Update suggestions based on real-time search trends (near real-time, within minutes)
+
+NON-FUNCTIONAL:
+  - 10M DAU, each user types 5 searches/day
+  - 10 keystrokes per search → 500M autocomplete requests/day
+  - Query latency: < 100ms p99 (user perceives slow autocomplete)
+  - Write throughput: 10M × 5 searches = 50M search events/day
+    (need to update frequency data from these searches)
+  - Scale: Support 1B total unique search terms (vocabulary)
+
+SCALE:
+  500M requests/day / 86,400 = 5,800 requests/second average
+  Peak (morning rush): ~20,000 requests/second
+
+
+2. CORE DATA STRUCTURE: TRIE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TRIE (PREFIX TREE):
+  - Tree where each path from root to leaf represents a word
+  - Shared prefixes share nodes
+  - Lookup: O(L) where L = prefix length
+  
+  Example: ["apple", "app", "application", "apply", "banana"]
+  
+        (root)
+          |
+          a ─────────── b
+          |             |
+          p             a
+          |             |
+          p             n
+         / \            |
+        (app)  l        a
+               |        |
+               e  i    n
+               |  |    |
+              (apple) c  a
+                    | |
+                   a apply→ top-k: [apple, app]
+                   |
+                  tion→ top-k: [application]
+
+AUGMENTED TRIE (for autocomplete):
+  Each node stores: top-K search queries for that prefix
+  - Not just the words, but the most POPULAR completions
+  
+  Node for prefix "ap":
+    top5 = ["apple", "app store", "apple music", "apply job", "app download"]
+  
+  Query "ap": return node["ap"].top5 immediately
+  O(L) lookup — just traverse the prefix path and return pre-computed list
+
+BUILDING TRIE:
+  1. Collect all search queries from logs (past 7 days)
+  2. Count frequency of each query
+  3. Build trie from scratch with top-K at each node
+  4. Replace live trie (atomic snapshot swap) periodically (hourly)
+
+TRIE SIZE:
+  1B unique queries × 50 chars avg × ~20 nodes per query = ~1TB
+  → Cannot fit in a single machine! Need distributed trie.
+
+
+3. DISTRIBUTED TRIE ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+APPROACH 1: Shard by prefix range
+  Shard 1: a-f
+  Shard 2: g-m
+  Shard 3: n-r
+  Shard 4: s-z
+  
+  Problems:
+    - "s" prefix has way more queries than "x" prefix → uneven load
+    - Range-based sharding creates hot shards
+  
+  FIX: Consistent hashing of prefix → shard
+
+APPROACH 2: Cache hot prefixes (RECOMMENDED)
+  Most autocomplete queries hit a small set of popular prefixes.
+  Top 1,000 prefixes cover 80% of all traffic (power law distribution).
+  
+  Architecture:
+    L1 Cache: In-process cache per autocomplete server
+              Hot 1,000 prefixes cached for instant response (< 1ms)
+    L2 Cache: Redis cluster (all servers share this)
+              Hot 100,000 prefixes
+    L3: Distributed Trie servers (sharded by prefix hash)
+        Handles the long tail of less common prefixes
+
+ACTUAL GOOGLE/BING APPROACH:
+  Build prefix → suggestions mapping table (not trie directly)
+  Key-Value store: {prefix: [suggestion1, suggestion2, ...]}
+  
+  "ap"    → ["apple", "app store", "apple music", ...]
+  "app"   → ["app store", "app download", "apple", ...]
+  "appl"  → ["apple", "apple music", "apple tv", ...]
+  
+  Store in Cassandra (prefix as partition key):
+  SELECT suggestions FROM autocomplete WHERE prefix = 'ap' LIMIT 10;
+
+
+4. DATA COLLECTION PIPELINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+COLLECTING SEARCH FREQUENCY:
+  Event: user submits search query
+  → Log search event: { "query": "apple iphone", "userId": "123", "timestamp": ... }
+  → Kafka topic "search-events"
+  
+BATCH AGGREGATION (hourly/daily):
+  Spark batch job runs hourly:
+    1. Read search events from Kafka (last 7 days, rolling window)
+    2. Count by (query, day) — frequency
+    3. Decay older data: frequency = sum(count_day_i × decay_factor^i)
+       Recent searches weighted higher (decay_factor = 0.9)
+    4. Filter: only keep queries with count > 5 (remove noise/PII)
+    5. Write to Cassandra: (prefix, suggestions_json)
+  
+  For each accepted query "apple iphone", update ALL its prefixes:
+    "a" → add "apple iphone" to candidates
+    "ap" → add "apple iphone"
+    "app" → add "apple iphone"
+    ... up to full query
+  
+  Then sort each prefix's candidates by frequency → keep top 10
+
+REAL-TIME UPDATE (STREAMING):
+  For trending queries (breaking news, viral events):
+  Flink streaming job:
+    - Sliding 1-hour window: count queries
+    - If sudden spike (10× normal frequency): trigger cache invalidation
+    - Update Redis L2 cache directly for hot prefixes
+    - Lag: ~5 minutes to reflect trending queries in autocomplete
+
+
+5. RANKING SIGNALS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BASE RANKING: Search frequency (how many times was this exact query searched)
+
+RECENCY WEIGHT: Recent searches count more
+  score = frequency × (0.9 ^ days_since_searched)
+  Trending queries: "World Cup 2024" spikes during tournament
+
+PERSONALIZATION (optional):
+  If user has search history: boost completions matching past behavior
+  "ap" for user who frequently searches Apple products:
+    Boost: "apple watch", "apple iphone"
+    Normal: "app development", "apply for jobs"
+  
+  Stored in per-user suggestion bias table (Redis, small footprint)
+
+GEOGRAPHIC RELEVANCE:
+  "coffee" for users in Seattle → "coffee near me", "starbucks reserve"
+  "coffee" for users in NYC → "coffee shops manhattan", "la colombe"
+  
+  Maintain per-city prefix tables for popular local queries (top 50 cities)
+
+
+6. TYPO TOLERANCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+USER TYPE: "iphoen" → should show "iphone"
+
+APPROACH 1: BK-Tree (edit distance tree)
+  Build tree where nodes are at Levenshtein distance from each other
+  Query "iphoen" with max edit distance 2 → find "iphone"
+
+APPROACH 2: N-gram indexing
+  Break query into character n-grams: "iphoen" → "ip", "ph", "ho", "oe", "en"
+  Match against indexed terms: "iphone" → "ip", "ph", "ho", "on", "ne"
+  Overlap score high → likely typo
+
+APPROACH 3: DL Automaton (Elasticsearch approach)
+  Fuzzy query with edit distance parameter:
+    GET _search { "suggest": { "query": { "text": "iphoen",
+                  "phrase": { "field": "title", "size": 5 } } } }
+  Elasticsearch builds Levenshtein automaton at query time.
+
+PRACTICAL APPROACH: Only do typo correction if no results found for exact prefix.
+  First: exact prefix lookup (fast)
+  If 0 results: trigger typo correction pass (slower, ~50ms budget)
+
+
+7. API DESIGN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+GET /api/v1/autocomplete?q=ap&limit=10&context=search&lang=en
+  Response (< 100ms):
+  {
+    "query": "ap",
+    "suggestions": [
+      { "text": "apple", "score": 9850000, "type": "query" },
+      { "text": "app store", "score": 7200000, "type": "query" },
+      { "text": "apple music", "score": 6100000, "type": "query" },
+      ...
+    ]
+  }
+
+CLIENT-SIDE OPTIMIZATIONS:
+  - Debounce: Only fire request after 200ms of no typing
+  - Deduplication: Cancel pending request if user types more
+  - Cache on client: Cache recently queried prefixes (in-memory)
+  - Prefetch: On "ap", also prefetch "app" and "appl" in background
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWER — "Design Google Search autocomplete"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"The core idea is pre-computation. At 20K RPS, we can't compute completions
+on-the-fly — we need pre-built prefix mappings.
+
+The data structure: a prefix-to-top-N-completions mapping stored in
+Cassandra, keyed by prefix. Every prefix 'a', 'ap', 'app', 'appl', 'apple'
+maps to the top 10 ranked completions. Reads are O(1) key lookups.
+
+Building this mapping: a Spark batch job runs hourly over 7 days of search
+logs. It counts query frequencies, applies a time-decay factor (recent
+searches weighted higher), filters rare queries, and writes the top-10
+completions for each prefix.
+
+The serving layer has three cache tiers: L1 in-process cache (top 1,000
+prefixes, sub-millisecond), L2 Redis (top 100,000 prefixes, ~2ms),
+L3 Cassandra for the long tail. The top 1,000 prefixes cover ~80% of
+all traffic due to the power law distribution of search queries.
+
+For trending queries (breaking news): a Flink streaming job detects
+frequency spikes within 5-minute windows and updates Redis directly,
+bypassing the hourly batch cycle.
+
+Client-side: debounce to 200ms, cancel inflight requests on new keystrokes,
+cache recent prefix results locally. This reduces actual server QPS by ~60%."

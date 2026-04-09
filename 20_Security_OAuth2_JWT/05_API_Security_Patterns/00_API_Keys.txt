@@ -1,0 +1,352 @@
+========================================================
+API KEYS
+========================================================
+
+API Keys are a simple authentication mechanism where a client includes a
+secret string (the API key) in each request to identify itself. Unlike OAuth2,
+API keys are typically used for server-to-server communication and don't
+represent a specific user.
+
+========================================================
+1. WHAT ARE API KEYS?
+========================================================
+
+An API key is:
+  - A long, randomly generated string (typically 32+ characters)
+  - Tied to an application or service (not a user)
+  - Sent with every API request (in header, query param, or body)
+  - Validated server-side to authenticate the client
+
+When to use API Keys:
+  ✓ Simple, trusted integrations (B2B)
+  ✓ Read-only public data APIs
+  ✓ Internal microservice communication (simple scenarios)
+  ✓ Developer tools, SDKs, CI/CD pipelines
+  ✓ Low-risk, low-sensitivity data
+
+When NOT to use API Keys:
+  ✗ User authentication (use OAuth2/OIDC instead)
+  ✗ High-sensitivity operations (use mTLS or OAuth2)
+  ✗ When fine-grained authorization is needed
+  ✗ When you need token expiry/refresh
+
+========================================================
+2. API KEY TRANSMISSION
+========================================================
+
+Best Practice: Use a custom request header.
+
+Option 1: Custom header (RECOMMENDED)
+  Request: GET /api/data
+  Header: X-API-Key: ak_prod_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6
+
+Option 2: Authorization header (Bearer-style)
+  Header: Authorization: ApiKey ak_prod_a1b2c3d4e5f6...
+
+Option 3: Query parameter (NOT RECOMMENDED — keys appear in logs/URLs)
+  GET /api/data?api_key=ak_prod_a1b2c3d4e5f6
+
+Option 4: Request body (Not RESTful — parameters in body for GET)
+  POST /api/data
+  Body: { "api_key": "ak_prod_..." }
+
+========================================================
+3. API KEY DESIGN
+========================================================
+
+Good API key design:
+  Format:  PREFIX_ENVIRONMENT_RANDOM_PART
+  Example: ak_prod_A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6
+
+  Prefix (ak_):      Identifies this string as an API key
+  Environment (prod): Hints at environment to developers
+  Random part:        256-bit random value (base62 encoded)
+
+Generation:
+  - Use cryptographically secure random number generator (SecureRandom)
+  - Minimum 256 bits of entropy (32+ bytes → 43+ base64 chars)
+  - URL-safe characters only
+
+Storage:
+  - NEVER store plaintext API keys in the database!
+  - Store a HASH of the key (SHA-256 or bcrypt)
+  - The client keeps the plaintext key (shown only at creation)
+  - Analogy: Same as password hashing
+
+// API Key generation:
+public class ApiKeyGenerator {
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+    private static final Base64.Encoder ENCODER = Base64.getUrlEncoder().withoutPadding();
+
+    public static String generate(String prefix) {
+        byte[] randomBytes = new byte[32];  // 256 bits
+        SECURE_RANDOM.nextBytes(randomBytes);
+        return prefix + "_" + ENCODER.encodeToString(randomBytes);
+    }
+}
+
+// Usage:
+String apiKey = ApiKeyGenerator.generate("ak_prod");
+
+// Hashing for storage:
+String hashedKey = DigestUtils.sha256Hex(apiKey);
+// Store hashedKey in DB, show apiKey once to user
+
+========================================================
+4. SPRING SECURITY API KEY FILTER
+========================================================
+
+Implementing API key authentication in Spring Security:
+
+// 1. API Key Authentication Token
+public class ApiKeyAuthenticationToken extends AbstractAuthenticationToken {
+
+    private final String apiKey;
+    private final Object principal;
+
+    // Unauthenticated version (before validation)
+    public ApiKeyAuthenticationToken(String apiKey) {
+        super(null);
+        this.apiKey = apiKey;
+        this.principal = apiKey;
+        setAuthenticated(false);
+    }
+
+    // Authenticated version (after validation)
+    public ApiKeyAuthenticationToken(String apiKey,
+                                      ApiKeyPrincipal principal,
+                                      Collection<? extends GrantedAuthority> authorities) {
+        super(authorities);
+        this.apiKey = apiKey;
+        this.principal = principal;
+        setAuthenticated(true);
+    }
+
+    @Override
+    public Object getCredentials() { return apiKey; }
+
+    @Override
+    public Object getPrincipal() { return principal; }
+}
+
+// 2. API Key principal (holds client info)
+@Value
+public class ApiKeyPrincipal {
+    String clientId;
+    String clientName;
+    String environment;
+    Set<String> permissions;
+}
+
+// 3. API Key filter
+@Component
+public class ApiKeyAuthenticationFilter extends OncePerRequestFilter {
+
+    private final AuthenticationManager authenticationManager;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                     HttpServletResponse response,
+                                     FilterChain filterChain)
+            throws ServletException, IOException {
+
+        String apiKey = extractApiKey(request);
+
+        if (apiKey != null) {
+            ApiKeyAuthenticationToken authToken = new ApiKeyAuthenticationToken(apiKey);
+            try {
+                Authentication authenticated = authenticationManager.authenticate(authToken);
+                SecurityContextHolder.getContext().setAuthentication(authenticated);
+            } catch (AuthenticationException ex) {
+                SecurityContextHolder.clearContext();
+                response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+                response.setContentType("application/json");
+                response.getWriter().write("{\"error\": \"Invalid API key\"}");
+                return;
+            }
+        }
+
+        filterChain.doFilter(request, response);
+    }
+
+    private String extractApiKey(HttpServletRequest request) {
+        String header = request.getHeader("X-API-Key");
+        if (header != null && !header.isBlank()) return header;
+
+        // Fallback: Authorization: ApiKey <key>
+        String auth = request.getHeader("Authorization");
+        if (auth != null && auth.startsWith("ApiKey ")) {
+            return auth.substring(7);
+        }
+        return null;
+    }
+}
+
+// 4. API Key Authentication Provider
+@Component
+public class ApiKeyAuthenticationProvider implements AuthenticationProvider {
+
+    private final ApiKeyRepository apiKeyRepository;
+
+    @Override
+    public Authentication authenticate(Authentication authentication)
+            throws AuthenticationException {
+
+        String rawKey = (String) authentication.getCredentials();
+
+        // Hash the incoming key and look up in DB
+        String hashedKey = DigestUtils.sha256Hex(rawKey);
+        ApiKeyRecord record = apiKeyRepository.findByHashedKey(hashedKey)
+            .orElseThrow(() -> new BadCredentialsException("Invalid API key"));
+
+        // Check if key is active/not revoked
+        if (!record.isActive()) {
+            throw new DisabledException("API key is revoked");
+        }
+
+        // Check expiry
+        if (record.getExpiresAt() != null &&
+                record.getExpiresAt().isBefore(Instant.now())) {
+            throw new CredentialsExpiredException("API key has expired");
+        }
+
+        // Build principal with permissions
+        ApiKeyPrincipal principal = new ApiKeyPrincipal(
+            record.getClientId(),
+            record.getClientName(),
+            record.getEnvironment(),
+            record.getPermissions()
+        );
+
+        List<GrantedAuthority> authorities = record.getPermissions().stream()
+            .map(SimpleGrantedAuthority::new)
+            .collect(Collectors.toList());
+
+        // Update last used timestamp
+        apiKeyRepository.updateLastUsed(record.getId(), Instant.now());
+
+        return new ApiKeyAuthenticationToken(rawKey, principal, authorities);
+    }
+
+    @Override
+    public boolean supports(Class<?> authentication) {
+        return ApiKeyAuthenticationToken.class.isAssignableFrom(authentication);
+    }
+}
+
+// 5. Security Config
+@Configuration
+@EnableWebSecurity
+public class ApiKeySecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http,
+                                            ApiKeyAuthenticationFilter apiKeyFilter)
+            throws Exception {
+        http
+            .addFilterBefore(apiKeyFilter, UsernamePasswordAuthenticationFilter.class)
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/public/**").permitAll()
+                .anyRequest().authenticated()
+            )
+            .csrf(csrf -> csrf.disable())
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS));
+
+        return http.build();
+    }
+}
+
+========================================================
+5. API KEY DATABASE SCHEMA
+========================================================
+
+CREATE TABLE api_keys (
+    id           BIGSERIAL PRIMARY KEY,
+    client_id    VARCHAR(100) NOT NULL,
+    client_name  VARCHAR(200) NOT NULL,
+    key_prefix   VARCHAR(20) NOT NULL,      -- First 8 chars shown in UI
+    hashed_key   VARCHAR(64) NOT NULL UNIQUE, -- SHA-256 hex
+    environment  VARCHAR(20) NOT NULL,       -- prod, dev, staging
+    permissions  TEXT[],                     -- Array of permission strings
+    is_active    BOOLEAN DEFAULT TRUE,
+    created_at   TIMESTAMP NOT NULL DEFAULT NOW(),
+    expires_at   TIMESTAMP,
+    last_used_at TIMESTAMP,
+    created_by   VARCHAR(100) NOT NULL
+);
+
+CREATE INDEX idx_api_keys_hashed ON api_keys(hashed_key);
+CREATE INDEX idx_api_keys_client ON api_keys(client_id);
+
+========================================================
+6. API KEY MANAGEMENT
+========================================================
+
+Key lifecycle management:
+  - Creation: Generate key, show to user ONCE, store hash
+  - Listing: Show key_prefix (e.g., "ak_prod_A1B2C3...") + metadata
+  - Revocation: Set is_active = false
+  - Rotation: Generate new key, old key has grace period before revocation
+  - Expiry: Optional TTL (e.g., 1 year for prod keys)
+
+Key rotation best practices:
+  1. Generate new key, send to client
+  2. Both old and new keys work during grace period (e.g., 7 days)
+  3. After grace period, old key auto-revoked
+  4. Client confirms new key works before grace period ends
+
+========================================================
+7. API KEY SECURITY CONSIDERATIONS
+========================================================
+
+Transport Security:
+  - ALWAYS use HTTPS. Never send API keys over HTTP.
+  - Keys in HTTP log files (NGINX, App logs) — be careful!
+
+Logging:
+  - NEVER log the full API key
+  - Log only the prefix: "API key ak_prod_A1B2C3..." (first 12 chars)
+
+Scoping:
+  - Give each key minimum required permissions
+  - Separate keys for read-only vs read-write
+  - Separate keys per environment (dev, staging, prod)
+
+Rate Limiting:
+  - Always combine API keys with rate limiting (see Rate Limiting notes)
+  - Different limits per key tier (free/basic/premium)
+
+Key Compromise:
+  - Immediate revocation endpoint
+  - Alert on unusual usage patterns (anomaly detection)
+  - Log all API key usage with timestamp, IP, endpoint
+
+========================================================
+8. COMMON INTERVIEW QUESTIONS
+========================================================
+
+Q: What is the main security risk with API keys?
+A: Plaintext transmission (accidentally logged or exposed), no built-in expiry,
+   no user context, and if compromised, the attacker has full access until
+   manually revoked. Keys can also appear in URLs, version control, or logs.
+
+Q: How do you securely store API keys in the database?
+A: Store only a one-way hash of the key (SHA-256). On the client side, the
+   key is shown once on creation and never again. At validation time, hash
+   the incoming key and compare with the stored hash.
+
+Q: What's the difference between API keys and OAuth2 access tokens?
+A: API keys are long-lived, static credentials tied to an application.
+   OAuth2 access tokens are short-lived (15 min), can be user-specific,
+   carry claims/scopes, can be revoked centrally, and support refresh.
+   OAuth2 is more secure for user-facing applications.
+
+Q: Why shouldn't API keys be passed as URL query parameters?
+A: They appear in: server access logs, browser history, Referer headers,
+   proxy logs, and URL bookmarks — making accidental exposure much more likely.
+   Headers are not stored in these places.
+
+Q: How do you handle API key rotation without downtime?
+A: Issue the new key while keeping the old key active for a grace period.
+   Both keys work simultaneously. The client updates their configuration and
+   confirms the new key works. After the grace period, the old key is revoked.

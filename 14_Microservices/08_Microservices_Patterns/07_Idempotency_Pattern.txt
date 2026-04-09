@@ -1,0 +1,235 @@
+================================================================================
+IDEMPOTENCY PATTERN
+================================================================================
+
+WHAT IS IDEMPOTENCY?
+---------------------
+An operation is idempotent if performing it multiple times has the same effect
+as performing it once.
+
+  Mathematical definition: f(f(x)) = f(x)
+
+  HTTP examples:
+  - GET /orders/123 — idempotent (reading doesn't change state)
+  - DELETE /orders/123 — idempotent (second delete = already deleted = same result)
+  - PUT /orders/123 {status: "SHIPPED"} — idempotent (setting to same value)
+  - POST /orders (create new order) — NOT idempotent (each call creates new order)
+  - POST /payments/charge — NOT idempotent (each call charges the card)
+
+Why it matters in microservices:
+  - Networks fail. Clients RETRY requests.
+  - Load balancers RETRY requests.
+  - Message brokers deliver messages AT LEAST ONCE.
+  - Any of these can cause duplicate processing.
+  - Without idempotency: double charges, duplicate orders, double inventory deductions.
+
+────────────────────────────────────────────────────────────────────────────────
+
+IDEMPOTENCY KEY PATTERN
+========================
+
+For non-idempotent operations, the client provides an Idempotency-Key header.
+The server records processed keys. If the same key is received, return cached response.
+
+  Client → POST /payments { amount: 100 }
+           Header: Idempotency-Key: order-123-payment-v1
+
+  Server:
+    1. Check if Idempotency-Key "order-123-payment-v1" is in processed_requests table
+    2. If NOT found: process payment, store result, return 200
+    3. If FOUND: return the stored response from the first processing
+
+  Client retries (network timeout):
+    POST /payments { amount: 100 }
+    Header: Idempotency-Key: order-123-payment-v1
+    → Server finds key in processed_requests → returns cached 200 response
+    → No double charge!
+
+This is exactly how Stripe, PayPal, and Twilio handle retries.
+
+────────────────────────────────────────────────────────────────────────────────
+
+FULL IMPLEMENTATION
+====================
+
+Database table:
+  CREATE TABLE idempotency_keys (
+    id              BIGSERIAL PRIMARY KEY,
+    idempotency_key VARCHAR(255) UNIQUE NOT NULL,
+    service         VARCHAR(100) NOT NULL,        -- "payment-service"
+    operation       VARCHAR(100) NOT NULL,         -- "charge"
+    request_hash    VARCHAR(64),                   -- Hash of request body
+    response_status INT NOT NULL,
+    response_body   JSONB NOT NULL,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ NOT NULL           -- Auto-cleanup after 24h
+  );
+
+  CREATE UNIQUE INDEX idx_idempotency_key ON idempotency_keys(idempotency_key);
+
+Idempotency filter / interceptor:
+  @Component
+  @Order(1)
+  public class IdempotencyFilter implements Filter {
+
+    @Autowired private IdempotencyKeyRepository repository;
+    @Autowired private ObjectMapper objectMapper;
+
+    private static final Set<String> IDEMPOTENT_METHODS = Set.of("GET", "PUT", "DELETE");
+
+    @Override
+    public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+        throws IOException, ServletException {
+
+      HttpServletRequest request = (HttpServletRequest) req;
+      HttpServletResponse response = (HttpServletResponse) res;
+
+      // Only check non-idempotent methods (POST, PATCH)
+      if (IDEMPOTENT_METHODS.contains(request.getMethod())) {
+        chain.doFilter(req, res);
+        return;
+      }
+
+      String idempotencyKey = request.getHeader("Idempotency-Key");
+      if (idempotencyKey == null || idempotencyKey.isBlank()) {
+        chain.doFilter(req, res);  // No key = proceed normally
+        return;
+      }
+
+      // Check for existing response
+      Optional<IdempotencyRecord> existing = repository.findByKey(idempotencyKey);
+      if (existing.isPresent()) {
+        // Return cached response
+        IdempotencyRecord record = existing.get();
+        response.setStatus(record.getResponseStatus());
+        response.setContentType("application/json");
+        response.getWriter().write(record.getResponseBody().toString());
+        log.debug("Idempotency hit: key={}, status={}", idempotencyKey, record.getResponseStatus());
+        return;
+      }
+
+      // First time: capture response
+      ContentCachingResponseWrapper wrappedResponse =
+        new ContentCachingResponseWrapper(response);
+
+      chain.doFilter(req, wrappedResponse);
+
+      // Store response for future duplicates
+      byte[] responseBody = wrappedResponse.getContentAsByteArray();
+      String responseBodyStr = new String(responseBody, StandardCharsets.UTF_8);
+
+      try {
+        repository.save(IdempotencyRecord.builder()
+          .idempotencyKey(idempotencyKey)
+          .service("payment-service")
+          .responseStatus(wrappedResponse.getStatus())
+          .responseBody(objectMapper.readTree(responseBodyStr))
+          .expiresAt(Instant.now().plus(24, ChronoUnit.HOURS))
+          .build()
+        );
+      } catch (DataIntegrityViolationException e) {
+        // Race condition: another request with same key just stored a response
+        // Return that response
+        existing = repository.findByKey(idempotencyKey);
+        existing.ifPresent(record -> {
+          response.setStatus(record.getResponseStatus());
+        });
+      }
+
+      wrappedResponse.copyBodyToResponse();
+    }
+  }
+
+Payment service using idempotency:
+  @RestController
+  @RequestMapping("/payments")
+  public class PaymentController {
+
+    @PostMapping("/charge")
+    public ResponseEntity<ChargeResponse> charge(
+        @RequestBody ChargeRequest request,
+        @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
+
+      // The idempotency filter has already handled deduplication.
+      // If we get here, it's the first processing.
+
+      PaymentResult result = paymentService.processCharge(request);
+
+      return ResponseEntity.ok(ChargeResponse.from(result));
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+IDEMPOTENCY IN KAFKA CONSUMERS
+================================
+
+For Kafka consumers, idempotency key = messageId (from Kafka record key or payload).
+See 06_Inbox_and_Outbox_Pattern.txt for the Inbox implementation.
+
+Additional approach — Natural idempotency with conditional updates:
+  // Instead of INSERT (not idempotent):
+  inventoryRepository.save(new ReservationEntry(orderId, productId, quantity));
+
+  // Use upsert / conditional INSERT (idempotent):
+  // INSERT ... ON CONFLICT (order_id, product_id) DO NOTHING
+  @Modifying
+  @Query("""
+    INSERT INTO inventory_reservations (order_id, product_id, quantity, reserved_at)
+    VALUES (:orderId, :productId, :quantity, NOW())
+    ON CONFLICT (order_id, product_id) DO NOTHING
+    """)
+  int reserveIfNotExists(@Param("orderId") Long orderId,
+                          @Param("productId") Long productId,
+                          @Param("quantity") int quantity);
+
+  // Always safe to call multiple times — second call does nothing
+
+────────────────────────────────────────────────────────────────────────────────
+
+DESIGNING IDEMPOTENT APIs
+===========================
+
+Rules:
+  1. GET / HEAD — always make read-only
+  2. PUT — always replace full resource (idempotent by design)
+  3. DELETE — return 404 or 200 both acceptable (not an error)
+  4. POST — require Idempotency-Key header for state-changing operations
+  5. PATCH — provide Idempotency-Key for partial updates
+
+  // Idempotent order creation:
+  POST /orders
+  Idempotency-Key: user-42-cart-session-9bce3f
+
+  // Same request retried 10 times → same order created once
+  // 10 responses → all identical (first = 201 Created, rest = 200 from cache)
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is idempotency and why is it important in microservices?
+A: An operation is idempotent if calling it multiple times has the same effect
+   as calling it once. Critical in microservices because networks fail, causing
+   clients and load balancers to retry requests. Without idempotency: duplicate
+   orders, double charges, double inventory reservations.
+
+Q: How do you implement idempotency for a payment API?
+A: Client sends a unique Idempotency-Key header with each request. Server stores
+   the key and response in a database (with unique constraint on key). On
+   subsequent requests with the same key, return the stored response without
+   reprocessing. This is how Stripe/PayPal handle retries.
+
+Q: What HTTP methods are idempotent by design?
+A: GET, HEAD, OPTIONS (safe and idempotent). PUT (replaces full resource,
+   idempotent). DELETE (idempotent — deleting an already-deleted resource
+   is a no-op). POST and PATCH are NOT inherently idempotent.
+
+Q: How do you make a Kafka consumer idempotent?
+A: Use the Inbox pattern: before processing, INSERT the message ID into an
+   inbox_events table with a unique constraint. If INSERT succeeds = first time,
+   process. If unique constraint violation = duplicate, skip. Both inbox insert
+   and processing should be in the same DB transaction.
+
+================================================================================

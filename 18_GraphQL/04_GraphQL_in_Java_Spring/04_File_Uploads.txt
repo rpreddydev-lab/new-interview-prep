@@ -1,0 +1,354 @@
+================================================================
+FILE UPLOADS IN GRAPHQL — IN DEPTH
+================================================================
+
+1. THE CHALLENGE: FILE UPLOADS IN GRAPHQL
+------------------------------------------
+GraphQL is built around JSON. JSON cannot directly carry binary file data.
+Several approaches exist, each with trade-offs:
+
+  a) Multipart Request (graphql-multipart-request-spec) — most common
+  b) Base64-encode file and send as String scalar
+  c) Pre-signed URL pattern (upload to S3/Azure directly) — recommended at scale
+  d) Upload files via REST, then pass the URL to GraphQL mutation
+
+2. THE GRAPHQL MULTIPART SPEC
+-------------------------------
+The graphql-multipart-request-spec defines how to send file uploads
+over HTTP as multipart/form-data:
+
+  Spec: https://github.com/jaydenseric/graphql-multipart-request-spec
+
+  Request format:
+  - Part "operations" (JSON): the GraphQL query + variables (file fields = null)
+  - Part "map" (JSON): mapping from multipart part name → variable path
+  - File parts: the actual files
+
+  Example raw multipart request:
+  ```
+  POST /graphql
+  Content-Type: multipart/form-data; boundary=----boundary
+
+  ----boundary
+  Content-Disposition: form-data; name="operations"
+  {"query":"mutation Upload($file: Upload!){uploadFile(file:$file){url}}",
+   "variables":{"file":null}}
+
+  ----boundary
+  Content-Disposition: form-data; name="map"
+  {"0":["variables.file"]}
+
+  ----boundary
+  Content-Disposition: form-data; name="0"; filename="photo.jpg"
+  Content-Type: image/jpeg
+  <binary data>
+  ----boundary--
+  ```
+
+3. SPRING FOR GRAPHQL — FILE UPLOAD SETUP
+------------------------------------------
+Spring for GraphQL supports the Upload scalar via Spring's MultipartFile.
+
+  3.1 Add Upload Scalar to Schema
+  --------------------------------
+  ```graphql
+  # schema.graphqls
+  scalar Upload
+
+  type Mutation {
+    uploadAvatar(userId: ID!, file: Upload!): String!
+    uploadDocuments(files: [Upload!]!): [String!]!
+  }
+  ```
+
+  3.2 Register Upload Scalar
+  ---------------------------
+  ```java
+  @Configuration
+  public class UploadScalarConfig {
+
+    @Bean
+    public RuntimeWiringConfigurer uploadScalarWiring() {
+      return builder -> builder.scalar(
+        GraphQLScalarType.newScalar()
+          .name("Upload")
+          .description("A file upload")
+          .coercing(new UploadCoercing())
+          .build()
+      );
+    }
+  }
+
+  // Coercing implementation for Upload scalar
+  public class UploadCoercing implements Coercing<MultipartFile, Void> {
+
+    @Override
+    public Void serialize(Object dataFetcherResult) {
+      throw new CoercingSerializeException("Upload scalar cannot be serialized");
+    }
+
+    @Override
+    public MultipartFile parseValue(Object input) {
+      if (input instanceof MultipartFile) {
+        return (MultipartFile) input;
+      }
+      throw new CoercingParseValueException("Expected MultipartFile, got: " + input.getClass());
+    }
+
+    @Override
+    public MultipartFile parseLiteral(Object ast) {
+      throw new CoercingParseLiteralException("Upload cannot be used as a literal");
+    }
+  }
+  ```
+
+  3.3 Mutation Resolver
+  ----------------------
+  ```java
+  @Controller
+  public class FileUploadController {
+
+    private final StorageService storageService;
+
+    @MutationMapping
+    public String uploadAvatar(
+      @Argument String userId,
+      @Argument(name = "file") MultipartFile file
+    ) throws IOException {
+      // Validate file
+      if (file.isEmpty()) throw new IllegalArgumentException("File is empty");
+      validateFileType(file);
+      validateFileSize(file, 5 * 1024 * 1024); // 5MB max
+
+      // Store file and return URL
+      String url = storageService.store(userId + "/avatar", file);
+      return url;
+    }
+
+    @MutationMapping
+    public List<String> uploadDocuments(
+      @Argument List<MultipartFile> files
+    ) {
+      return files.stream()
+        .map(file -> {
+          try {
+            return storageService.store("documents/" + file.getOriginalFilename(), file);
+          } catch (IOException e) {
+            throw new RuntimeException("Failed to store file: " + file.getOriginalFilename(), e);
+          }
+        })
+        .collect(Collectors.toList());
+    }
+
+    private void validateFileType(MultipartFile file) {
+      String contentType = file.getContentType();
+      List<String> allowed = List.of("image/jpeg", "image/png", "image/gif", "image/webp");
+      if (!allowed.contains(contentType)) {
+        throw new IllegalArgumentException("Unsupported file type: " + contentType);
+      }
+    }
+
+    private void validateFileSize(MultipartFile file, long maxBytes) {
+      if (file.getSize() > maxBytes) {
+        throw new IllegalArgumentException(
+          "File too large: " + file.getSize() + " bytes (max " + maxBytes + ")");
+      }
+    }
+  }
+  ```
+
+  3.4 Configuration (application.yml)
+  -------------------------------------
+  ```yaml
+  spring:
+    servlet:
+      multipart:
+        enabled: true
+        max-file-size: 10MB
+        max-request-size: 50MB
+    graphql:
+      path: /graphql
+  ```
+
+4. STORAGE SERVICE EXAMPLE
+----------------------------
+```java
+@Service
+public class StorageService {
+
+  @Value("${storage.upload-dir}")
+  private String uploadDir;
+
+  public String store(String path, MultipartFile file) throws IOException {
+    Path fullPath = Paths.get(uploadDir).resolve(path).normalize();
+    Files.createDirectories(fullPath.getParent());
+    try (InputStream inputStream = file.getInputStream()) {
+      Files.copy(inputStream, fullPath, StandardCopyOption.REPLACE_EXISTING);
+    }
+    return "/files/" + path;
+  }
+}
+```
+
+5. UPLOADING TO S3 (COMMON PRODUCTION PATTERN)
+-------------------------------------------------
+```java
+@Service
+public class S3StorageService {
+
+  private final S3Client s3Client;
+
+  @Value("${aws.s3.bucket}")
+  private String bucket;
+
+  public String store(String key, MultipartFile file) throws IOException {
+    PutObjectRequest request = PutObjectRequest.builder()
+      .bucket(bucket)
+      .key(key)
+      .contentType(file.getContentType())
+      .contentLength(file.getSize())
+      .build();
+
+    s3Client.putObject(request,
+      RequestBody.fromInputStream(file.getInputStream(), file.getSize()));
+
+    return "https://" + bucket + ".s3.amazonaws.com/" + key;
+  }
+}
+```
+
+6. PRE-SIGNED URL PATTERN (BETTER FOR LARGE FILES)
+----------------------------------------------------
+Instead of uploading through GraphQL server, have the client upload directly
+to cloud storage. The server just generates a pre-signed URL.
+
+```graphql
+type Mutation {
+  getUploadUrl(filename: String!, contentType: String!): UploadUrlPayload!
+  confirmUpload(uploadKey: String!, filename: String!): Document!
+}
+type UploadUrlPayload {
+  uploadUrl: String!    # Pre-signed URL to PUT to
+  uploadKey: String!    # Key to reference the uploaded file
+}
+```
+
+```java
+@MutationMapping
+public UploadUrlPayload getUploadUrl(@Argument String filename,
+                                     @Argument String contentType) {
+  String key = "uploads/" + UUID.randomUUID() + "/" + filename;
+  URL presignedUrl = s3Presigner.presignPutObject(r -> r
+    .signatureDuration(Duration.ofMinutes(15))
+    .putObjectRequest(put -> put
+      .bucket(bucket)
+      .key(key)
+      .contentType(contentType)));
+
+  return UploadUrlPayload.builder()
+    .uploadUrl(presignedUrl.toString())
+    .uploadKey(key)
+    .build();
+}
+```
+
+Client flow:
+  1. Call `getUploadUrl` mutation → get presigned URL
+  2. PUT file directly to presigned URL (bypasses GraphQL server)
+  3. Call `confirmUpload` with the key → create DB record
+
+Advantages:
+  - GraphQL server doesn't handle binary data at all
+  - Files go directly to cloud storage (faster, more scalable)
+  - No memory/disk pressure on application server
+
+7. CLIENT-SIDE UPLOAD (JavaScript with Apollo)
+------------------------------------------------
+```javascript
+import { useMutation, gql } from '@apollo/client';
+
+const UPLOAD_FILE = gql`
+  mutation UploadAvatar($userId: ID!, $file: Upload!) {
+    uploadAvatar(userId: $userId, file: $file)
+  }
+`;
+
+function AvatarUpload({ userId }) {
+  const [uploadAvatar] = useMutation(UPLOAD_FILE);
+
+  const handleChange = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    const result = await uploadAvatar({
+      variables: { userId, file },
+      context: {
+        useMultipart: true  // Apollo Client: use multipart form data
+      }
+    });
+    console.log('Uploaded to:', result.data.uploadAvatar);
+  };
+
+  return <input type="file" accept="image/*" onChange={handleChange} />;
+}
+```
+
+Apollo Client uses apollo-upload-client for multipart support:
+```bash
+npm install apollo-upload-client
+```
+```javascript
+import { createUploadLink } from 'apollo-upload-client';
+const link = createUploadLink({ uri: '/graphql' });
+```
+
+8. SECURITY CONSIDERATIONS
+----------------------------
+  - Validate file type by content sniffing (MIME type), not just extension
+  - Scan for viruses using ClamAV or cloud service before storing
+  - Limit file size (configure multipart.max-file-size)
+  - Store files outside web root (prevent direct execution)
+  - Use random UUIDs for file storage keys (prevent path traversal)
+  - Restrict upload to authenticated users only
+  - Rate limit upload mutations
+
+9. INTERVIEW QUESTIONS & ANSWERS
+----------------------------------
+
+Q: Why can't you include file data directly in a GraphQL JSON body?
+A: GraphQL operations are transmitted as JSON, which is text-based and
+   cannot directly represent binary data. You'd have to base64-encode
+   the file (inflating size by ~33%) and transmit as a String. The
+   graphql-multipart-request-spec solves this properly using multipart
+   HTTP requests where the file is a separate binary part.
+
+Q: What is the graphql-multipart-request-spec?
+A: A specification for sending file uploads over HTTP with GraphQL. The
+   request is multipart/form-data with: (1) an "operations" part containing
+   the GraphQL query with null for file variables, (2) a "map" part
+   describing which file part maps to which variable, and (3) the actual
+   file parts. Libraries on both client and server implement this spec.
+
+Q: What is the pre-signed URL pattern for file uploads?
+A: Instead of uploading through the GraphQL server, the client asks the
+   server for a pre-signed URL (a temporary URL that allows PUT access to
+   cloud storage like S3). The client uploads directly to that URL, then
+   notifies the server with a confirmation mutation. This avoids binary
+   data passing through the application server and scales better.
+
+Q: How do you validate file uploads in a GraphQL resolver?
+A: Check file type (by content-type header and/or magic bytes), file size,
+   filename sanitization, and file count limits. Throw exceptions for
+   invalid uploads; Spring for GraphQL's exception resolvers will convert
+   them to structured GraphQL errors. For security, validate content type
+   by inspecting file headers (magic bytes), not just the extension.
+
+Q: What Spring configuration is needed to support file uploads?
+A: Enable multipart support in application.yml (`spring.servlet.multipart.enabled=true`),
+   set size limits, register the Upload scalar with a custom Coercing
+   implementation, and declare Upload scalar in the schema. The resolver
+   receives the file as a MultipartFile parameter.
+
+================================================================
+END OF FILE
+================================================================

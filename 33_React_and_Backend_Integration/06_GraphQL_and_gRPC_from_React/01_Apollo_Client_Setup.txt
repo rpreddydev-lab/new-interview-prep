@@ -1,0 +1,353 @@
+================================================================
+APOLLO CLIENT SETUP AND CONFIGURATION
+================================================================
+
+Apollo Client is the most popular GraphQL client for React.
+This file covers complete setup, configuration, and advanced patterns.
+
+================================================================
+1. INSTALLATION
+================================================================
+
+  npm install @apollo/client graphql
+
+  # For WebSocket subscriptions:
+  npm install graphql-ws
+
+  # For legacy subscriptions (older servers):
+  npm install subscriptions-transport-ws
+
+================================================================
+2. BASIC SETUP
+================================================================
+
+  // src/apollo/client.ts
+  import { ApolloClient, InMemoryCache, createHttpLink } from '@apollo/client';
+
+  export const client = new ApolloClient({
+    link: createHttpLink({ uri: import.meta.env.VITE_GRAPHQL_URL }),
+    cache: new InMemoryCache(),
+  });
+
+  // main.tsx
+  import { ApolloProvider } from '@apollo/client';
+  import { client } from './apollo/client';
+
+  ReactDOM.createRoot(document.getElementById('root')!).render(
+    <ApolloProvider client={client}>
+      <App />
+    </ApolloProvider>
+  );
+
+================================================================
+3. AUTHENTICATION LINK
+================================================================
+
+Apollo uses a "link chain" pattern (like middleware).
+Each link processes the request/response before passing to the next.
+
+  import { setContext } from '@apollo/client/link/context';
+
+  // Inject auth token into every request
+  const authLink = setContext((_, { headers }) => {
+    const token = getAccessToken(); // from memory store
+    return {
+      headers: {
+        ...headers,
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+      },
+    };
+  });
+
+  export const client = new ApolloClient({
+    link: authLink.concat(httpLink), // authLink runs first
+    cache: new InMemoryCache(),
+  });
+
+================================================================
+4. ERROR LINK
+================================================================
+
+  import { onError } from '@apollo/client/link/error';
+
+  const errorLink = onError(({ graphQLErrors, networkError, operation, forward }) => {
+    if (graphQLErrors) {
+      for (const { message, locations, path, extensions } of graphQLErrors) {
+        console.error(`[GraphQL error] ${message} | path: ${path}`);
+
+        if (extensions?.code === 'UNAUTHENTICATED') {
+          // Return an Observable to retry after refresh
+          return new Observable((observer) => {
+            refreshToken()
+              .then((newToken) => {
+                setAccessToken(newToken);
+                const oldHeaders = operation.getContext().headers;
+                operation.setContext({
+                  headers: { ...oldHeaders, authorization: `Bearer ${newToken}` },
+                });
+                forward(operation).subscribe(observer);
+              })
+              .catch((err) => {
+                observer.error(err);
+                logout();
+              });
+          });
+        }
+
+        if (extensions?.code === 'FORBIDDEN') {
+          toast.error('You do not have permission to perform this action');
+        }
+      }
+    }
+
+    if (networkError) {
+      console.error(`[Network error]: ${networkError}`);
+      if ('statusCode' in networkError && networkError.statusCode === 503) {
+        toast.error('Service temporarily unavailable');
+      }
+    }
+  });
+
+================================================================
+5. COMPLETE LINK CHAIN WITH SUBSCRIPTIONS
+================================================================
+
+  import {
+    ApolloClient, InMemoryCache, from,
+    HttpLink, split
+  } from '@apollo/client';
+  import { GraphQLWsLink } from '@apollo/client/link/subscriptions';
+  import { createClient } from 'graphql-ws';
+  import { getMainDefinition } from '@apollo/client/utilities';
+  import { RetryLink } from '@apollo/client/link/retry';
+
+  const httpLink = new HttpLink({
+    uri: import.meta.env.VITE_GRAPHQL_URL,
+  });
+
+  const wsLink = new GraphQLWsLink(
+    createClient({
+      url: import.meta.env.VITE_GRAPHQL_WS_URL,
+      connectionParams: () => ({
+        authToken: getAccessToken(),
+      }),
+      retryAttempts: 5,
+    })
+  );
+
+  const retryLink = new RetryLink({
+    attempts: {
+      max: 3,
+      retryIf: (error) => error && error.statusCode >= 500,
+    },
+    delay: { initial: 1000, jitter: true },
+  });
+
+  // Send subscriptions over WebSocket, everything else over HTTP
+  const splitLink = split(
+    ({ query }) => {
+      const def = getMainDefinition(query);
+      return def.kind === 'OperationDefinition' && def.operation === 'subscription';
+    },
+    wsLink,
+    httpLink
+  );
+
+  export const apolloClient = new ApolloClient({
+    link: from([errorLink, authLink, retryLink, splitLink]),
+    cache: new InMemoryCache({
+      typePolicies: {
+        Query: {
+          fields: {
+            users: {
+              keyArgs: false, // for pagination
+              merge(existing = [], incoming) {
+                return [...existing, ...incoming];
+              },
+            },
+          },
+        },
+      },
+    }),
+    defaultOptions: {
+      watchQuery: {
+        fetchPolicy: 'cache-and-network',
+        errorPolicy: 'all', // return partial data even with errors
+      },
+      mutate: {
+        errorPolicy: 'all',
+      },
+    },
+  });
+
+================================================================
+6. INMEMORY CACHE CONFIGURATION
+================================================================
+
+  new InMemoryCache({
+    // Custom key fields (default: id, __typename)
+    typePolicies: {
+      User: {
+        keyFields: ['id'], // use 'id' as cache key
+      },
+      Product: {
+        keyFields: ['sku'], // use 'sku' instead of 'id'
+      },
+      // Non-normalized object (no cache key — always embedded)
+      Address: {
+        keyFields: false,
+      },
+    },
+  })
+
+================================================================
+7. PAGINATION WITH fetchMore
+================================================================
+
+  const GET_POSTS = gql`
+    query GetPosts($cursor: String, $limit: Int!) {
+      posts(cursor: $cursor, limit: $limit) {
+        edges { node { id title } cursor }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  `;
+
+  function PostsList() {
+    const { data, loading, fetchMore } = useQuery(GET_POSTS, {
+      variables: { limit: 10 },
+    });
+
+    const loadMore = () => {
+      fetchMore({
+        variables: { cursor: data.posts.pageInfo.endCursor },
+        updateQuery: (prev, { fetchMoreResult }) => {
+          if (!fetchMoreResult) return prev;
+          return {
+            posts: {
+              ...fetchMoreResult.posts,
+              edges: [
+                ...prev.posts.edges,
+                ...fetchMoreResult.posts.edges,
+              ],
+            },
+          };
+        },
+      });
+    };
+
+    return (
+      <div>
+        {data?.posts.edges.map(({ node }) => (
+          <PostCard key={node.id} post={node} />
+        ))}
+        {data?.posts.pageInfo.hasNextPage && (
+          <button onClick={loadMore} disabled={loading}>
+            {loading ? 'Loading...' : 'Load more'}
+          </button>
+        )}
+      </div>
+    );
+  }
+
+================================================================
+8. DIRECT CACHE MANIPULATION
+================================================================
+
+  const client = useApolloClient();
+
+  // Read from cache without network
+  const user = client.readQuery({
+    query: GET_USER,
+    variables: { id: '123' },
+  });
+
+  // Write to cache directly (optimistic or after side-channel update)
+  client.writeQuery({
+    query: GET_USER,
+    variables: { id: '123' },
+    data: { user: { ...user, name: 'Updated Name' } },
+  });
+
+  // Update a specific field in a cached object
+  client.cache.modify({
+    id: client.cache.identify({ __typename: 'Post', id: '42' }),
+    fields: {
+      likeCount: (existing) => existing + 1,
+      likedByMe: () => true,
+    },
+  });
+
+  // Evict (remove) from cache
+  client.cache.evict({ id: client.cache.identify({ __typename: 'Post', id: '99' }) });
+  client.cache.gc(); // garbage collect orphaned refs
+
+================================================================
+9. LOCAL STATE WITH REACTIVE VARIABLES
+================================================================
+
+Apollo can manage local state alongside server state:
+
+  import { makeVar, useReactiveVar } from '@apollo/client';
+
+  // Create reactive variables
+  export const themeVar = makeVar<'light' | 'dark'>('light');
+  export const cartVar = makeVar<CartItem[]>([]);
+
+  // Use in a component (re-renders on change)
+  function ThemeToggle() {
+    const theme = useReactiveVar(themeVar);
+
+    return (
+      <button onClick={() => themeVar(theme === 'light' ? 'dark' : 'light')}>
+        Switch to {theme === 'light' ? 'dark' : 'light'} mode
+      </button>
+    );
+  }
+
+  // Combine with GraphQL query using @client directive
+  const GET_PROFILE = gql`
+    query GetProfile($id: ID!) {
+      user(id: $id) { id name email }
+      theme @client  # resolved locally, not from server
+    }
+  `;
+
+================================================================
+10. INTERVIEW QUESTIONS
+================================================================
+
+Q: What is the Apollo Client link chain?
+A: It's a middleware pipeline for requests and responses. Links are
+   composed with .concat() or from([...]). Each link processes the
+   request (outgoing) or response (incoming) and passes to the next.
+   Common links: HttpLink (executes the HTTP request), authLink (injects
+   token), errorLink (global error handling), retryLink (auto-retry).
+   Order matters: errorLink should come before authLink, before HttpLink.
+
+Q: How does Apollo's normalized cache prevent duplicate data?
+A: Every object is stored once, keyed by __typename + id. Multiple
+   queries returning the same user (by ID) share one cache entry.
+   When a mutation returns the updated user object, Apollo updates
+   the cache entry, and ALL queries referencing that user re-render
+   automatically. No manual cache sync needed.
+
+Q: How do you handle token refresh with Apollo Client?
+A: Use the errorLink from @apollo/client/link/error. On UNAUTHENTICATED
+   error code, return an Observable that: refreshes the token, updates
+   the operation headers, and calls forward(operation) to retry the
+   original operation. This mirrors the Axios 401 interceptor pattern.
+
+Q: What is the difference between readQuery and writeQuery?
+A: readQuery reads data from the Apollo cache synchronously — returns
+   null if not in cache. writeQuery writes to the cache directly,
+   triggering re-renders for any component watching that query.
+   Both are done without network requests — useful for optimistic UI
+   and local state management.
+
+Q: How does Apollo handle pagination with fetchMore?
+A: fetchMore executes the query again with new variables (e.g., next
+   cursor). The updateQuery callback merges the new page with the
+   existing cache. Modern Apollo uses TypePolicies with a merge function
+   to handle this automatically. useQuery returns the merged data as
+   if it were one continuous list.

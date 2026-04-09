@@ -1,0 +1,263 @@
+================================================================
+QUERY COMPLEXITY IN GRAPHQL — IN DEPTH
+================================================================
+
+1. THE PROBLEM: EXPENSIVE QUERIES
+-----------------------------------
+GraphQL's flexible nature allows clients to construct deeply nested,
+expensive queries that can overwhelm servers:
+
+```graphql
+# A malicious or poorly designed query
+{
+  users {          # 1000 users
+    posts {        # × 100 posts each = 100,000 posts
+      comments {   # × 50 comments each = 5,000,000 comments
+        replies {  # × 20 replies each = 100,000,000 replies
+          author { name }
+        }
+      }
+    }
+  }
+}
+```
+
+Without protection, a single query can:
+  - Exhaust database connections
+  - Cause out-of-memory errors
+  - DDoS the service for all other users
+
+Query complexity analysis assigns a numeric cost to a query and rejects
+queries that exceed a threshold.
+
+2. COMPLEXITY CALCULATION
+--------------------------
+Each field is assigned a complexity value. The total complexity is summed
+across all selected fields. List fields multiply by an estimated element count.
+
+Simple model:
+  - Each scalar field: 1
+  - Each object field: 1 + complexity of sub-fields
+  - List field with N elements: N × complexity of sub-fields
+
+Example:
+```graphql
+{
+  user(id: "1") {    # cost: 1 (returns single object)
+    name             # cost: 1
+    email            # cost: 1
+    posts {          # cost: 10 (list multiplier) × (1 + 1 + 1) = 30
+      title
+      content
+    }
+  }
+}
+# Total: 1 + 1 + 1 + 30 = 33
+```
+
+3. IMPLEMENTING COMPLEXITY IN GRAPHQL-JAVA
+--------------------------------------------
+graphql-java has built-in complexity analysis via ComplexityCalculator.
+
+  3.1 Basic Complexity Limit
+  ---------------------------
+  ```java
+  @Configuration
+  public class GraphQLComplexityConfig {
+
+    private static final int MAX_QUERY_COMPLEXITY = 100;
+
+    @Bean
+    public Instrumentation complexityInstrumentation() {
+      return new MaxQueryComplexityInstrumentation(MAX_QUERY_COMPLEXITY);
+    }
+  }
+  ```
+
+  This sets a flat limit. If total complexity > 100, the query is rejected
+  with a validation error before execution.
+
+  3.2 Field Complexity Customization
+  ------------------------------------
+  ```java
+  @Bean
+  public Instrumentation complexityInstrumentation() {
+    FieldComplexityCalculator calculator = (env, childComplexity) -> {
+      String fieldName = env.getField().getName();
+      FieldDefinition fieldDef = env.getFieldDefinition();
+
+      // Check @complexity directive on schema field
+      Directive directive = fieldDef.getDirective("complexity");
+      if (directive != null) {
+        int value = (int) directive.getArgument("value").getValue();
+        return value + childComplexity;
+      }
+
+      // Default: 1 + child complexity (tree cost)
+      return 1 + childComplexity;
+    };
+
+    return new MaxQueryComplexityInstrumentation(100, calculator);
+  }
+  ```
+
+  3.3 Custom @Complexity Directive
+  ----------------------------------
+  ```graphql
+  directive @complexity(value: Int!) on FIELD_DEFINITION
+
+  type Query {
+    users: [User!]!  @complexity(value: 10)
+    user(id: ID!): User
+    search(query: String!): [SearchResult!]! @complexity(value: 20)
+  }
+  ```
+
+  ```java
+  // Register directive
+  @Bean
+  public RuntimeWiringConfigurer runtimeWiringConfigurer() {
+    return builder -> builder
+      .directive("complexity", new ComplexityDirectiveWiring());
+  }
+
+  // Directive wiring (marks fields with their complexity)
+  public class ComplexityDirectiveWiring implements SchemaDirectiveWiring {
+    @Override
+    public GraphQLFieldDefinition onField(
+        SchemaDirectiveWiringEnvironment<GraphQLFieldDefinition> env) {
+      // Store complexity value in field's description or extension
+      // (actual cost is computed in MaxQueryComplexityInstrumentation)
+      return env.getElement();
+    }
+  }
+  ```
+
+4. RETURNING COMPLEXITY INFO TO THE CLIENT
+--------------------------------------------
+Expose query cost in the response extensions:
+
+```java
+@Component
+public class QueryComplexityInstrumentation extends MaxQueryComplexityInstrumentation {
+
+  public QueryComplexityInstrumentation() {
+    super(100);
+  }
+
+  @Override
+  public InstrumentationContext<ExecutionResult> beginExecution(
+      InstrumentationExecutionParameters params, InstrumentationState state) {
+
+    return new InstrumentationContext<>() {
+      @Override
+      public void onCompleted(ExecutionResult result, Throwable t) {
+        // Add complexity cost to response extensions
+        int complexity = ... ; // calculated cost
+        result = result.transform(r -> r.addExtension("queryComplexity", complexity));
+      }
+    };
+  }
+}
+```
+
+5. COMPLEXITY STRATEGIES
+--------------------------
+  5.1 Static Analysis (pre-execution)
+  -------------------------------------
+  Analyze query before executing. Reject expensive queries immediately.
+  PRO: Fast, no wasted work
+  CON: Estimating costs without actual data can be inaccurate
+
+  5.2 Runtime Cost Analysis
+  --------------------------
+  Instrument actual execution and track costs as resolvers run.
+  Stop execution when limit exceeded.
+  PRO: Accurate costs
+  CON: Some work already done before rejection
+
+  5.3 Token Bucket (Rate Limiting by Complexity Points)
+  ------------------------------------------------------
+  Each user has a "complexity budget" per time window (e.g., 1000 points/min).
+  Each query consumes some of that budget.
+  PRO: Flexible, rewards cheap queries
+  CON: More complex to implement
+
+  5.4 Persisted Queries (Best Performance)
+  -----------------------------------------
+  Only allow pre-registered queries. Ad-hoc queries are blocked.
+  PRO: Maximum control
+  CON: Limits client flexibility (see 02_Persisted_Queries.txt)
+
+6. RESPONSE STRUCTURE FOR REJECTED QUERIES
+--------------------------------------------
+When complexity limit is exceeded:
+```json
+{
+  "errors": [{
+    "message": "maximum query complexity exceeded 100 with actual value 245",
+    "locations": [],
+    "extensions": {
+      "classification": "ValidationError",
+      "code": "COMPLEXITY_LIMIT_EXCEEDED",
+      "max": 100,
+      "actual": 245
+    }
+  }],
+  "data": null
+}
+```
+
+7. RECOMMENDED LIMITS
+-----------------------
+These are common starting points; tune for your actual schema and load:
+  - Development: no limit (debugging ease)
+  - Staging: 500 (can test large queries)
+  - Production: 100–200 (conservative)
+  - Per-user tier:
+    * Anonymous: 50
+    * Free tier: 100
+    * Pro tier: 500
+    * Internal/admin: 2000
+
+8. INTERVIEW QUESTIONS & ANSWERS
+----------------------------------
+
+Q: Why is query complexity important in GraphQL?
+A: GraphQL's flexible querying allows clients to construct deeply nested
+   or wide queries that can exponentially grow the number of DB calls and
+   memory usage. A single malicious or poorly designed query can overwhelm
+   the server. Complexity analysis assigns a cost to queries and rejects
+   those exceeding a threshold, preventing abuse and ensuring fair resource
+   sharing.
+
+Q: How does graphql-java implement query complexity?
+A: Through MaxQueryComplexityInstrumentation. At validation time, it
+   traverses the query AST, assigns costs to each field (default: 1 per field,
+   child costs aggregated), sums the total, and rejects with a validation
+   error if the total exceeds the configured maximum. Custom
+   FieldComplexityCalculator can override cost per field.
+
+Q: What is the difference between depth limiting and complexity limiting?
+A: Depth limiting rejects queries deeper than N levels (e.g., max 5 nesting
+   levels). It's simple but crude — a very wide (but not deep) query can
+   still be expensive. Complexity limiting assigns a numeric cost to each
+   field and rejects based on total cost — more accurate but requires
+   careful cost calibration. Both should typically be used together.
+
+Q: How would you assign different complexity costs to different fields?
+A: Several approaches: (1) Custom FieldComplexityCalculator that checks
+   the field name or type and assigns different costs. (2) Custom @complexity
+   schema directive whose value is read in the complexity calculator.
+   (3) Multiplier fields (list types) get cost × estimated element count.
+
+Q: What is complexity-based rate limiting?
+A: Instead of a per-request limit, give each client a "complexity budget"
+   per time window (e.g., 1000 complexity points per minute). Cheap queries
+   (cost 10) use up less budget; expensive queries (cost 100) use more.
+   This rewards well-written queries and prevents abuse more fairly than
+   a simple per-request count limit.
+
+================================================================
+END OF FILE
+================================================================

@@ -1,0 +1,244 @@
+================================================================================
+  SPRING KAFKA — KafkaTemplate
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. OVERVIEW AND SEND OVERLOADS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+KafkaTemplate<K, V> is the central class for sending messages in Spring Kafka.
+It wraps the native Producer, handles serialization, and integrates with Spring's
+transaction management.
+
+  @Service
+  public class OrderProducerService {
+
+    @Autowired
+    private KafkaTemplate<String, Order> kafkaTemplate;
+
+    // Send to topic (broker assigns partition by key hash or round-robin)
+    public void send(Order order) {
+      kafkaTemplate.send("orders", order);
+    }
+
+    // With key
+    public void send(String key, Order order) {
+      kafkaTemplate.send("orders", key, order);
+    }
+
+    // With explicit partition
+    public void send(Order order, int partition) {
+      kafkaTemplate.send("orders", partition, null, order);
+    }
+
+    // With key + partition
+    public void send(String key, Order order, int partition) {
+      kafkaTemplate.send("orders", partition, key, order);
+    }
+
+    // With timestamp
+    public void send(String key, Order order, long timestamp) {
+      kafkaTemplate.send("orders", null, timestamp, key, order);
+    }
+
+    // Using ProducerRecord directly (full control)
+    public void sendFull(Order order) {
+      ProducerRecord<String, Order> record = new ProducerRecord<>(
+        "orders", 0, System.currentTimeMillis(), order.getId(), order
+      );
+      // Add custom headers:
+      record.headers().add("source-service", "order-api".getBytes());
+      kafkaTemplate.send(record);
+    }
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. ASYNC CALLBACK (CompletableFuture — Spring Kafka 3.0+)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Spring Kafka 3.0+ changed ListenableFuture → CompletableFuture.
+
+  // Async send with callback
+  public void sendAsync(Order order) {
+    CompletableFuture<SendResult<String, Order>> future =
+      kafkaTemplate.send("orders", order.getId(), order);
+
+    future.whenComplete((result, ex) -> {
+      if (ex == null) {
+        RecordMetadata meta = result.getRecordMetadata();
+        log.info("Sent to topic={} partition={} offset={}",
+          meta.topic(), meta.partition(), meta.offset());
+      } else {
+        log.error("Failed to send order {}: {}", order.getId(), ex.getMessage());
+        // alerting, dead-letter, retry...
+      }
+    });
+  }
+
+  // Pre-Spring Kafka 3.0 (ListenableFuture):
+  ListenableFuture<SendResult<String, Order>> future = kafkaTemplate.send("orders", order);
+  future.addCallback(
+    result -> log.info("Sent offset={}", result.getRecordMetadata().offset()),
+    ex -> log.error("Send failed", ex)
+  );
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. SYNCHRONOUS SEND (FIRE AND WAIT)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  // Block until broker acknowledges (or timeout)
+  public void sendSync(Order order) throws ExecutionException, InterruptedException {
+    SendResult<String, Order> result =
+      kafkaTemplate.send("orders", order.getId(), order).get();
+      // or: .get(5, TimeUnit.SECONDS) to cap the wait
+    log.info("Offset: {}", result.getRecordMetadata().offset());
+  }
+
+WARNING: Synchronous sends serialize produce throughput.
+  - Use for: audit events, critical financial records
+  - Avoid for: high-throughput pipelines (1000s msg/sec)
+  - Better alternative: async + retry on failure
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. DEFAULT TOPIC (sendDefault)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  // Configure default topic in YAML:
+  spring:
+    kafka:
+      template:
+        default-topic: orders
+
+  // OR in ProducerFactory:
+  KafkaTemplate<String, Order> template = new KafkaTemplate<>(producerFactory);
+  template.setDefaultTopic("orders");
+
+  // Then use sendDefault():
+  kafkaTemplate.sendDefault(order.getId(), order);           // key + value
+  kafkaTemplate.sendDefault(order);                          // value only
+  kafkaTemplate.sendDefault(0, order.getId(), order);        // partition + key + value
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. PRODUCER INTERCEPTORS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  // Custom interceptor — add tracing headers, logging, metrics
+  public class TracingInterceptor implements ProducerInterceptor<String, Object> {
+
+    @Override
+    public ProducerRecord<String, Object> onSend(ProducerRecord<String, Object> record) {
+      // Mutate record before it's sent — add headers
+      record.headers().add("trace-id", UUID.randomUUID().toString().getBytes());
+      return record;
+    }
+
+    @Override
+    public void onAcknowledgement(RecordMetadata metadata, Exception exception) {
+      if (exception != null) {
+        Metrics.counter("kafka.producer.errors",
+          "topic", metadata != null ? metadata.topic() : "unknown").increment();
+      }
+    }
+
+    @Override
+    public void close() { }
+
+    @Override
+    public void configure(Map<String, ?> configs) { }
+  }
+
+  // Register in ProducerConfig:
+  props.put(ProducerConfig.INTERCEPTOR_CLASSES_CONFIG, TracingInterceptor.class.getName());
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. ReplyingKafkaTemplate (REQUEST-REPLY PATTERN)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A synchronous request-reply pattern over Kafka:
+  - Producer sends request to a topic
+  - Attaches a reply-to header with a unique correlation ID
+  - Waits for the response on a reply topic
+  - Matches response by correlation ID
+
+  ┌──────────────────┐  send(request-topic)    ┌──────────────────┐
+  │  ReplyingKafka   │ ──────────────────────► │  Service B       │
+  │  Template        │                          │  @KafkaListener  │
+  │                  │ ◄────────────────────── │  (sends reply)   │
+  └──────────────────┘  reply-topic             └──────────────────┘
+
+  // Configuration:
+  @Bean
+  public ReplyingKafkaTemplate<String, Request, Response> replyingTemplate(
+      ProducerFactory<String, Request> pf,
+      ConcurrentMessageListenerContainer<String, Response> replyContainer) {
+    ReplyingKafkaTemplate<String, Request, Response> template =
+      new ReplyingKafkaTemplate<>(pf, replyContainer);
+    template.setDefaultReplyTimeout(Duration.ofSeconds(10));
+    return template;
+  }
+
+  @Bean
+  public ConcurrentMessageListenerContainer<String, Response> replyContainer(
+      ConcurrentKafkaListenerContainerFactory<String, Response> factory) {
+    ConcurrentMessageListenerContainer<String, Response> container =
+      factory.createContainer("replies");
+    container.getContainerProperties().setGroupId("replying-group");
+    return container;
+  }
+
+  // Sending a request:
+  RequestReplyFuture<String, Request, Response> future =
+    replyingTemplate.sendAndReceive(
+      new ProducerRecord<>("requests", request)
+    );
+  ConsumerRecord<String, Response> reply = future.get(10, TimeUnit.SECONDS);
+
+  // Replier side:
+  @KafkaListener(topics = "requests")
+  @SendTo  // sends return value to the KafkaHeaders.REPLY_TOPIC header
+  public Response handleRequest(Request request) {
+    return processRequest(request);
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What does KafkaTemplate.send() return and how do you use it?
+A: In Spring Kafka 3.0+, send() returns CompletableFuture<SendResult<K,V>>.
+   SendResult wraps RecordMetadata (topic, partition, offset, timestamp) and the
+   original ProducerRecord. Use .whenComplete((result, ex) -> ...) for async handling.
+   For synchronous behavior, call .get() or .get(timeout, unit) which blocks until
+   the broker ack arrives. Pre-3.0, it returned ListenableFuture with .addCallback().
+
+Q: How do you add custom headers to a Kafka message in Spring Kafka?
+A: Use ProducerRecord with headers.add(): create a ProducerRecord manually,
+   then call record.headers().add("header-name", value.getBytes()) before passing
+   it to kafkaTemplate.send(record). Alternatively, use a ProducerInterceptor that
+   injects headers in onSend(), or use kafkaTemplate.send(new Message<>() with
+   Spring Messaging headers (which map to Kafka headers transparently).
+
+Q: When should you use synchronous vs asynchronous sends?
+A: Async (CompletableFuture + whenComplete callback) is preferred for high-throughput
+   scenarios — the producer doesn't block the calling thread waiting for ack. Use
+   sync (.get()) when you need guaranteed per-message delivery confirmation before
+   proceeding (e.g., financial ledger entries, audit logs) or in tests for predictable
+   ordering. The cost: sync sends limit throughput because each send blocks until the
+   broker responds (no batching benefit).
+
+Q: What is ReplyingKafkaTemplate and when would you use it?
+A: It enables synchronous request-reply semantics over Kafka — the caller sends a
+   request to a request topic and blocks (up to a configurable timeout) waiting for
+   a response on a reply topic. It uses a correlation ID header to match replies.
+   Use it when you need a synchronous API contract but want Kafka as the transport
+   (e.g., microservice orchestration, async RPC). The replier uses @KafkaListener +
+   @SendTo and Spring auto-routes the reply to the correct correlation.
+
+Q: How do ProducerInterceptors work in Spring Kafka?
+A: ProducerInterceptor<K,V> is a native kafka-clients interface (not Spring-specific).
+   Implement onSend() to mutate the ProducerRecord before it's serialized and sent
+   — ideal for injecting tracing headers, adding audit fields, or logging. Implement
+   onAcknowledgement() to react after broker ack (or failure) for metrics, alerting.
+   Register via ProducerConfig.INTERCEPTOR_CLASSES_CONFIG. Multiple interceptors
+   chain in order. They run on the producer I/O thread, so avoid blocking operations.

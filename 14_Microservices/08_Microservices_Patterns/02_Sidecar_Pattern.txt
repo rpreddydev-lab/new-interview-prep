@@ -1,0 +1,239 @@
+================================================================================
+SIDECAR AND AMBASSADOR PATTERNS
+================================================================================
+
+SIDECAR PATTERN
+================
+
+The Problem:
+  Every microservice needs: TLS termination, metrics collection, distributed
+  tracing, access logging, circuit breaking, service discovery.
+  Implementing this in every service (in every language!) is duplicated effort.
+  And it couples infrastructure concerns to business logic.
+
+The Solution — Sidecar:
+  Deploy a helper container in the SAME POD as the service.
+  The sidecar handles all infrastructure concerns. Service just does business logic.
+
+  ┌─────────────────── Pod ──────────────────────┐
+  │                                              │
+  │  ┌──────────────────┐  ┌──────────────────┐ │
+  │  │  Order Service   │  │     SIDECAR      │ │
+  │  │  (business logic)│  │  (Envoy Proxy /  │ │
+  │  │                  │◄─┤   Istio Agent)   │ │
+  │  │  localhost:8080  │  │                  │ │
+  │  └──────────────────┘  │  - mTLS          │ │
+  │                        │  - Circuit break │ │
+  │                        │  - Retry         │ │
+  │                        │  - Tracing       │ │
+  │                        │  - Access logs   │ │
+  │                        │  - Load balance  │ │
+  │                        └──────────────────┘ │
+  └──────────────────────────────────────────────┘
+
+  Incoming traffic goes through the sidecar (Envoy proxy).
+  Outgoing traffic goes through the sidecar.
+  Service doesn't know about mTLS, retry, tracing.
+
+────────────────────────────────────────────────────────────────────────────────
+
+ISTIO SERVICE MESH AS SIDECAR
+================================
+
+Istio is the most popular service mesh. It auto-injects Envoy sidecar proxies.
+
+# Enable sidecar injection for a namespace:
+kubectl label namespace production istio-injection=enabled
+
+# Istio auto-injects Envoy into every pod in the namespace.
+# No changes to your application manifests needed.
+
+What the Istio sidecar provides automatically:
+  - mTLS between all services (zero-code change)
+  - Distributed tracing (trace ID propagation)
+  - Access logs (HTTP request/response logs)
+  - Metrics (latency, error rate per service pair)
+  - Traffic management (retries, timeouts, circuit breaking)
+  - Traffic splitting (canary deployments)
+
+Istio traffic management (declarative, no code changes):
+  # VirtualService: control routing/retries/timeouts
+  apiVersion: networking.istio.io/v1beta1
+  kind: VirtualService
+  metadata:
+    name: order-service
+  spec:
+    hosts:
+    - order-service
+    http:
+    - timeout: 5s
+      retries:
+        attempts: 3
+        perTryTimeout: 2s
+        retryOn: "5xx,connect-failure"
+      route:
+      - destination:
+          host: order-service
+          port:
+            number: 8080
+
+  # DestinationRule: load balancing, connection pool, circuit breaker
+  apiVersion: networking.istio.io/v1beta1
+  kind: DestinationRule
+  metadata:
+    name: order-service
+  spec:
+    host: order-service
+    trafficPolicy:
+      connectionPool:
+        tcp:
+          maxConnections: 100
+        http:
+          h2UpgradePolicy: UPGRADE
+          http1MaxPendingRequests: 100
+      outlierDetection:          # Circuit breaker
+        consecutive5xxErrors: 5
+        interval: 30s
+        baseEjectionTime: 30s
+
+────────────────────────────────────────────────────────────────────────────────
+
+CUSTOM SIDECAR EXAMPLE (WITHOUT SERVICE MESH)
+===============================================
+
+Sometimes you want a specific sidecar without a full service mesh.
+
+Example: Log rotation / forwarding sidecar:
+  apiVersion: apps/v1
+  kind: Deployment
+  spec:
+    template:
+      spec:
+        volumes:
+        - name: shared-logs
+          emptyDir: {}
+
+        containers:
+        # Main service
+        - name: order-service
+          image: order-service:latest
+          volumeMounts:
+          - name: shared-logs
+            mountPath: /var/log/app
+
+        # Sidecar: Filebeat ships logs from shared volume to Elasticsearch
+        - name: filebeat-sidecar
+          image: docker.elastic.co/beats/filebeat:8.11.0
+          volumeMounts:
+          - name: shared-logs
+            mountPath: /var/log/app
+            readOnly: true
+          args: ["-c", "/etc/filebeat/filebeat.yml"]
+
+────────────────────────────────────────────────────────────────────────────────
+
+AMBASSADOR PATTERN
+===================
+
+The Ambassador is a specific type of sidecar acting as a PROXY for outgoing
+requests — handling: retries, circuit breaking, timeouts, protocol translation,
+authentication for external calls.
+
+While the sidecar is general (handles all traffic), the Ambassador focuses
+specifically on the network communication proxy role.
+
+Use cases:
+  - Retry logic for outgoing HTTP calls
+  - Circuit breaker for downstream services
+  - Protocol translation (service uses HTTP/1.1, downstream requires HTTP/2)
+  - mTLS for outgoing calls
+  - Add authentication headers to every outgoing request
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Pod                                                                │
+  │                                                                     │
+  │  ┌──────────────────┐              ┌──────────────────┐            │
+  │  │  Order Service   │  localhost   │   Ambassador     │            │
+  │  │                  │─────────────►│   Proxy          │────────►   │ External
+  │  │  (makes requests │  :3000       │                  │            │ Services
+  │  │  to localhost)   │              │  - retry         │            │
+  │  │                  │              │  - circuit break │            │
+  │  │                  │              │  - auth headers  │            │
+  │  └──────────────────┘              └──────────────────┘            │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  The service always calls localhost:3000 (ambassador).
+  Ambassador handles all the complexity of calling external services.
+
+Example: Envoy as Ambassador for adding auth headers:
+  # envoy-config.yaml
+  static_resources:
+    listeners:
+    - name: listener_0
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 3000     # Service calls this
+      filter_chains:
+      - filters:
+        - name: envoy.filters.network.http_connection_manager
+          typed_config:
+            route_config:
+              virtual_hosts:
+              - name: downstream
+                domains: ["*"]
+                routes:
+                - match:
+                    prefix: "/"
+                  route:
+                    cluster: payment_service
+                  request_headers_to_add:
+                  - header:
+                      key: Authorization
+                      value: "Bearer %REQ(X-Internal-Token)%"
+
+────────────────────────────────────────────────────────────────────────────────
+
+SIDECAR vs AMBASSADOR vs LIBRARY
+==================================
+
+Approach     │ Coupling │ Language │ Overhead     │ Use When
+─────────────┼──────────┼──────────┼──────────────┼───────────────────
+Library      │ Tight    │ Same     │ None         │ Single language shop
+(Resilience4j│          │ only     │              │ Want full control
+ Spring)     │          │          │              │
+─────────────┼──────────┼──────────┼──────────────┼───────────────────
+Sidecar      │ Loose    │ Any      │ ~5ms latency │ Polyglot, service mesh
+(Istio/Envoy)│          │          │ per hop      │ Need mTLS, observability
+─────────────┼──────────┼──────────┼──────────────┼───────────────────
+Ambassador   │ Moderate │ Any      │ ~1-2ms       │ Complex outbound networking
+(proxy only) │          │          │              │ Protocol translation
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is the Sidecar pattern?
+A: Deploy a helper container in the same Kubernetes pod alongside the main
+   service container. They share the same network and storage. The sidecar
+   handles cross-cutting infrastructure concerns (mTLS, tracing, metrics,
+   retries) without changing the service code. Istio's Envoy proxy sidecar
+   is the most common example.
+
+Q: What is the difference between Sidecar and Ambassador patterns?
+A: Sidecar is the general concept of a helper container in the pod for any
+   purpose (log shipping, secret refresh, metrics). Ambassador is a specific
+   pattern where the sidecar acts as an OUTBOUND PROXY — service sends all
+   external requests to localhost (ambassador), which handles retry, circuit
+   breaking, protocol translation. The ambassador is a sidecar specialized for
+   network communication.
+
+Q: What does Istio inject and what does it do automatically?
+A: Istio injects an Envoy proxy as a sidecar into every pod in labeled namespaces.
+   Automatically: enforces mTLS between services, collects metrics per service
+   pair (latency, error rate), propagates trace headers, applies traffic
+   management policies (retry, timeout, circuit breaking) declared in
+   VirtualService and DestinationRule without code changes.
+
+================================================================================

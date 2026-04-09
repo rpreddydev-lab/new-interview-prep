@@ -1,0 +1,437 @@
+================================================================
+ERROR HANDLING IN GRAPHQL — IN DEPTH
+================================================================
+
+1. THE GRAPHQL ERROR MODEL
+---------------------------
+GraphQL has a unique error model: a response can be partially successful.
+Unlike REST (which returns 4xx/5xx for errors), GraphQL always returns
+HTTP 200 with the errors field populated alongside data.
+
+Standard response structure:
+```json
+{
+  "data": {
+    "user": null,
+    "posts": [{ "id": "1", "title": "Hello" }]
+  },
+  "errors": [
+    {
+      "message": "User not found",
+      "locations": [{ "line": 2, "column": 3 }],
+      "path": ["user"],
+      "extensions": {
+        "code": "USER_NOT_FOUND",
+        "classification": "NOT_FOUND"
+      }
+    }
+  ]
+}
+```
+
+Key insight: `data.user` is null AND `errors` has an entry for that path.
+`data.posts` still contains valid data — partial response.
+
+2. ERROR TYPES
+---------------
+  2.1 Request Errors (pre-execution)
+  -----------------------------------
+  Happen before resolvers run. data is null.
+    - Syntax error: malformed query string
+    - Validation error: field doesn't exist, wrong argument type
+    - Too complex / too deep query (if configured)
+  
+  ```json
+  {
+    "errors": [{
+      "message": "Field 'foo' doesn't exist on type 'Query'",
+      "locations": [{ "line": 1, "column": 3 }],
+      "extensions": { "classification": "ValidationError" }
+    }],
+    "data": null
+  }
+  ```
+
+  2.2 Field Errors (during execution)
+  -------------------------------------
+  Happen inside a resolver. data is partially populated.
+    - Null field errors (non-null field returns null)
+    - Resolver throws an exception
+    - Data fetching error
+
+  ```json
+  {
+    "data": { "user": null },
+    "errors": [{
+      "message": "User not found",
+      "path": ["user"],
+      "locations": [...],
+      "extensions": { "code": "NOT_FOUND" }
+    }]
+  }
+  ```
+
+3. NULL PROPAGATION AND NON-NULL ERRORS
+-----------------------------------------
+Non-null (`!`) fields propagate errors upward to the nearest nullable parent.
+
+```graphql
+type Query {
+  user: User!          # non-null — errors bubble up to root
+}
+type User {
+  id: ID!
+  name: String!        # non-null — if null, User becomes null
+  email: String        # nullable — can be null without error
+}
+```
+
+If `name` resolver returns null for a non-null field:
+  - `User.name` error → `User` becomes null (nearest nullable parent)
+  - `Query.user` is non-null → error propagates to root → entire data becomes null!
+
+Be careful with `!` — aggressive non-null can cause full data loss on single field error.
+
+Design recommendation: Use non-null conservatively. Make fields nullable
+unless you are 100% certain they will never be null.
+
+4. EXCEPTIONS IN RESOLVERS
+-----------------------------
+When a resolver throws an exception, graphql-java catches it and adds
+it to the errors list.
+
+  4.1 Default Exception Mapping
+  --------------------------------
+  Any uncaught exception becomes a generic error:
+  ```json
+  { "message": "Internal Server Error(s) while executing query" }
+  ```
+  Details are hidden to prevent internal information leakage.
+
+  4.2 GraphQLException (graphql-java)
+  ------------------------------------
+  For custom errors with full control:
+  ```java
+  throw new GraphQLException("User not found");
+  // Produces: { "message": "User not found" }
+  ```
+
+  4.3 DataFetchingException
+  --------------------------
+  ```java
+  // Wraps a cause; treated as system error
+  throw new DataFetchingException("Database error");
+  ```
+
+5. CUSTOM EXCEPTION HANDLING IN SPRING FOR GRAPHQL
+----------------------------------------------------
+Spring for GraphQL uses `DataFetcherExceptionResolver` to map exceptions
+to GraphQL errors.
+
+  5.1 Implementing DataFetcherExceptionResolver
+  ----------------------------------------------
+  ```java
+  @Component
+  public class CustomExceptionResolver implements DataFetcherExceptionResolver {
+
+    @Override
+    public Mono<List<GraphQLError>> resolveException(Throwable exception,
+                                                     DataFetchingEnvironment env) {
+      if (exception instanceof ResourceNotFoundException ex) {
+        return Mono.just(List.of(
+          GraphqlErrorBuilder.newError(env)
+            .message(ex.getMessage())
+            .errorType(ErrorType.NOT_FOUND)
+            .extensions(Map.of(
+              "code", "RESOURCE_NOT_FOUND",
+              "resourceType", ex.getResourceType(),
+              "resourceId", ex.getResourceId()
+            ))
+            .build()
+        ));
+      }
+      return Mono.empty(); // Return empty to use default handling
+    }
+  }
+  ```
+
+  5.2 Using DataFetcherExceptionResolverAdapter (simpler)
+  ---------------------------------------------------------
+  ```java
+  @Component
+  public class CustomExceptionResolver extends DataFetcherExceptionResolverAdapter {
+
+    @Override
+    protected GraphQLError resolveToSingleError(Throwable ex,
+                                                DataFetchingEnvironment env) {
+      if (ex instanceof NotFoundException notFound) {
+        return GraphqlErrorBuilder.newError(env)
+          .message("Resource not found: " + notFound.getMessage())
+          .errorType(ErrorType.NOT_FOUND)
+          .build();
+      }
+      if (ex instanceof UnauthorizedException) {
+        return GraphqlErrorBuilder.newError(env)
+          .message("Access denied")
+          .errorType(ErrorType.UNAUTHORIZED)
+          .build();
+      }
+      return null; // Use default handling
+    }
+  }
+  ```
+
+  5.3 Spring Boot Custom Exception Classes
+  -----------------------------------------
+  ```java
+  // Domain exceptions
+  public class ResourceNotFoundException extends RuntimeException {
+    private final String resourceType;
+    private final String resourceId;
+
+    public ResourceNotFoundException(String resourceType, String resourceId) {
+      super(String.format("%s with id %s not found", resourceType, resourceId));
+      this.resourceType = resourceType;
+      this.resourceId = resourceId;
+    }
+    // getters...
+  }
+
+  public class UnauthorizedException extends RuntimeException {
+    public UnauthorizedException(String message) { super(message); }
+  }
+
+  public class ValidationException extends RuntimeException {
+    private final Map<String, String> fieldErrors;
+    public ValidationException(Map<String, String> fieldErrors) {
+      super("Validation failed");
+      this.fieldErrors = fieldErrors;
+    }
+    // getter...
+  }
+  ```
+
+6. GRAPHQL ERROR TYPES (ErrorType)
+------------------------------------
+Spring for GraphQL provides standard error classification via `ErrorType`:
+
+  ErrorType.NOT_FOUND          → Resource not found
+  ErrorType.UNAUTHORIZED       → Not authenticated
+  ErrorType.FORBIDDEN          → Authenticated but not permitted
+  ErrorType.BAD_REQUEST        → Invalid input / validation failure
+  ErrorType.INTERNAL_ERROR     → Unexpected server error (default)
+  ErrorType.SERVICE_UNAVAILABLE → Downstream service unavailable
+
+These map to the `extensions.classification` field in the response.
+
+7. THE USERRORS PATTERN (Business Errors as Data)
+---------------------------------------------------
+For expected business rule violations (not system errors), model errors as
+data in the schema. This gives type safety and better client handling.
+
+```graphql
+# Schema
+type RegisterUserPayload {
+  user: User                   # null if registration failed
+  userErrors: [UserError!]!    # empty if success
+}
+
+type UserError {
+  message: String!
+  field: [String!]             # which field caused the error
+  code: UserErrorCode!
+}
+
+enum UserErrorCode {
+  EMAIL_TAKEN
+  INVALID_PASSWORD
+  USERNAME_TOO_LONG
+}
+
+type Mutation {
+  registerUser(input: RegisterUserInput!): RegisterUserPayload!
+}
+```
+
+```java
+// Java implementation
+@MutationMapping
+public RegisterUserPayload registerUser(@Argument RegisterUserInput input) {
+  // Check if email taken
+  if (userRepository.existsByEmail(input.email())) {
+    return RegisterUserPayload.builder()
+      .user(null)
+      .userErrors(List.of(UserError.builder()
+        .message("Email is already registered")
+        .field(List.of("email"))
+        .code(UserErrorCode.EMAIL_TAKEN)
+        .build()))
+      .build();
+  }
+
+  User user = userService.register(input);
+  return RegisterUserPayload.builder()
+    .user(user)
+    .userErrors(List.of())
+    .build();
+}
+```
+
+Client-side handling:
+```graphql
+mutation {
+  registerUser(input: { email: "x@x.com", password: "pw" }) {
+    user { id email }
+    userErrors { message field code }
+  }
+}
+```
+
+When to use userErrors vs GraphQL errors?
+  - userErrors: business logic failures (email taken, out of stock, expired coupon)
+  - GraphQL errors: unexpected failures, auth failures, system errors
+
+8. ERROR MASKING (SECURITY)
+------------------------------
+Never expose internal exception details to clients in production!
+
+```yaml
+# application.yml
+spring:
+  graphql:
+    schema:
+      introspection:
+        enabled: false  # Disable in production
+```
+
+```java
+@Component
+public class SafeExceptionResolver extends DataFetcherExceptionResolverAdapter {
+
+  @Override
+  protected GraphQLError resolveToSingleError(Throwable ex, DataFetchingEnvironment env) {
+    // Log the real exception
+    log.error("Resolver error at path {}", env.getExecutionStepInfo().getPath(), ex);
+
+    // Return safe error to client
+    if (ex instanceof BusinessException) {
+      return GraphqlErrorBuilder.newError(env)
+        .message(ex.getMessage())   // Business messages are safe
+        .build();
+    }
+
+    // Hide all technical details
+    return GraphqlErrorBuilder.newError(env)
+      .message("An unexpected error occurred")
+      .errorType(ErrorType.INTERNAL_ERROR)
+      .extensions(Map.of("code", "INTERNAL_SERVER_ERROR"))
+      .build();
+  }
+}
+```
+
+9. ERROR EXTENSIONS
+---------------------
+Use extensions to add structured data to errors:
+
+```json
+{
+  "errors": [{
+    "message": "Validation failed",
+    "extensions": {
+      "code": "VALIDATION_ERROR",
+      "validationErrors": {
+        "email": "must be a valid email",
+        "age": "must be 18 or older"
+      },
+      "requestId": "req-abc-123",
+      "timestamp": "2024-01-15T10:30:00Z"
+    }
+  }]
+}
+```
+
+```java
+return GraphqlErrorBuilder.newError(env)
+  .message("Validation failed")
+  .extensions(Map.of(
+    "code", "VALIDATION_ERROR",
+    "validationErrors", fieldErrorMap,
+    "requestId", MDC.get("requestId"),
+    "timestamp", Instant.now().toString()
+  ))
+  .build();
+```
+
+10. HANDLING ERRORS ON THE CLIENT
+------------------------------------
+```javascript
+// Apollo Client (JavaScript) — check both data and errors
+const { data, errors } = await client.mutate({ mutation: REGISTER_USER });
+
+if (errors && errors.length > 0) {
+  // System/network errors
+  console.error("GraphQL system error:", errors[0].message);
+}
+
+if (data.registerUser.userErrors.length > 0) {
+  // Business logic errors
+  data.registerUser.userErrors.forEach(e => {
+    showFieldError(e.field[0], e.message);
+  });
+}
+
+if (data.registerUser.user) {
+  // Success path
+}
+```
+
+11. INTERVIEW QUESTIONS & ANSWERS
+------------------------------------
+
+Q: What HTTP status code does GraphQL return for errors?
+A: Always 200 OK, even for errors. GraphQL errors are part of the response
+   body in the `errors` array, not the HTTP status. An exception is
+   request-level errors (malformed request) which may return 400.
+   Some servers return 200 for field errors and 400 for request errors.
+
+Q: Can GraphQL return both data and errors at the same time?
+A: Yes! That's GraphQL's partial result model. If one field's resolver fails,
+   it becomes null with an entry in `errors`, while other fields return
+   normally. This is more informative than REST which would return an error
+   response losing all partial data.
+
+Q: What is null propagation in GraphQL errors?
+A: When a non-null (!) field resolver returns null or throws, GraphQL
+   propagates the null to the nearest nullable parent. If that parent is
+   also non-null, it continues bubbling up. This can cause the entire
+   `data` to be null if non-null fields are used aggressively.
+
+Q: What is the userErrors pattern and why use it?
+A: UserErrors models expected business failures as part of the schema's
+   return type (e.g., `userErrors: [UserError!]!` on a mutation payload).
+   Unlike GraphQL errors (which are untyped), userErrors are typed, can
+   have field-level attribution, and error codes. Clients can handle them
+   specifically. Use for: validation failures, business rule violations.
+   Use GraphQL errors for: auth failures, unexpected server errors.
+
+Q: How do you prevent leaking internal error details in production?
+A: Implement DataFetcherExceptionResolver to catch all exceptions, log
+   them internally, and return safe error messages to clients. Business
+   exceptions can expose their message; unexpected exceptions should only
+   say "An unexpected error occurred" with a reference code for debugging.
+
+Q: How do you add custom fields to GraphQL errors?
+A: Use the `extensions` map on the GraphQL error object. Extensions is a
+   free-form Map<String, Object> that gets serialized as part of the error.
+   Common extensions: error code, validation details, request ID, timestamp.
+
+Q: What is DataFetcherExceptionResolver in Spring for GraphQL?
+A: An interface (or its adapter `DataFetcherExceptionResolverAdapter`) that
+   maps thrown exceptions to GraphQL error objects. Implement it as a bean
+   to intercept resolver exceptions and convert them to structured,
+   client-friendly error responses instead of generic internal errors.
+
+================================================================
+END OF FILE
+================================================================

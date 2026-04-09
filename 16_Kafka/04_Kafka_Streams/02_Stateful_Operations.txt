@@ -1,0 +1,234 @@
+================================================================================
+  KAFKA STREAMS — STATEFUL OPERATIONS
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. STATELESS vs STATEFUL OPERATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STATELESS: each record is processed independently
+  - filter, map, mapValues, flatMap, flatMapValues, peek, branch, merge
+  - No state store required
+  - Fully parallelizable, fast, no recovery overhead
+
+STATEFUL: processing depends on accumulated history of records
+  - groupByKey().count()
+  - groupByKey().aggregate()
+  - groupByKey().reduce()
+  - join operations (KStream-KStream, KStream-KTable, KTable-KTable)
+  - windowed operations
+  - State stored in local RocksDB + Kafka changelog topic for fault tolerance
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. GROUPING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Before aggregating, you must GROUP the stream by a key.
+
+  KGroupedStream<String, Order> byCustomer =
+    orders.groupBy((key, order) -> order.getCustomerId()); // re-key by customer ID
+    // Triggers repartition since key changed
+
+  KGroupedStream<String, Order> byCurrentKey =
+    orders.groupByKey(); // no repartition needed — key unchanged
+
+  KGroupedTable<String, Long> tableGroup =
+    myTable.groupBy((key, value) -> KeyValue.pair(newKey, newValue));
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. COUNT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Count the number of records per key across the entire history (unbounded).
+
+  KTable<String, Long> orderCountByCustomer =
+    orders
+      .groupBy((key, order) -> order.getCustomerId())
+      .count(Materialized.as("customer-order-counts")); // named state store
+
+  // Result: for each customerId, total number of orders seen so far
+  // Output type: KTable<String, Long> — running total per key
+
+  orderCountByCustomer
+    .toStream()
+    .to("customer-order-count-output",
+      Produced.with(Serdes.String(), Serdes.Long()));
+
+  // Query the store interactively:
+  ReadOnlyKeyValueStore<String, Long> countStore =
+    streams.store(StoreQueryParameters.fromNameAndType(
+      "customer-order-counts", QueryableStoreTypes.keyValueStore()));
+  Long count = countStore.get("customer-42");
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. AGGREGATE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Aggregate is the general-purpose accumulator: define initial value + how to add
+each new record + (for KGroupedTable) how to subtract removed records.
+
+  // Running sum of order amounts per customer
+  KTable<String, Double> totalSpent =
+    orders
+      .groupBy((k, order) -> order.getCustomerId())
+      .aggregate(
+        () -> 0.0,                                      // initializer
+        (customerId, order, runningTotal) ->            // adder
+          runningTotal + order.getAmount(),
+        Materialized.<String, Double, KeyValueStore<Bytes, byte[]>>as("total-spent")
+          .withValueSerde(Serdes.Double())
+      );
+
+  // Track unique event types per user (Set<String> aggregation)
+  KTable<String, Set<String>> eventTypes =
+    events
+      .groupByKey()
+      .aggregate(
+        () -> new HashSet<String>(),
+        (userId, event, set) -> { set.add(event.getType()); return set; },
+        Materialized.<String, Set<String>, KeyValueStore<Bytes, byte[]>>as("event-types")
+          .withValueSerde(new SetSerde())
+      );
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. REDUCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Reduce combines values of the same type: (previousValue, newValue) → newValue
+The output has the SAME type as the input.
+
+  // Keep the max order amount seen per customer
+  KTable<String, Order> maxOrderPerCustomer =
+    orders
+      .groupBy((k, order) -> order.getCustomerId())
+      .reduce((existing, newOrder) ->
+        newOrder.getAmount() > existing.getAmount() ? newOrder : existing
+      );
+
+  // Running sum (simpler than aggregate when types match)
+  KTable<String, Long> totalClicks =
+    clickEvents
+      .mapValues(e -> 1L)
+      .groupByKey()
+      .reduce(Long::sum);
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. STATE STORE INTERNALS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Local RocksDB store:
+  - Embedded key-value store; runs in the same JVM process
+  - Data stored on local disk (state.dir, default /tmp/kafka-streams)
+  - Supports: put(), get(), range(), all(), delete()
+  - RocksDB compaction runs in the background (CPU/disk overhead to monitor)
+
+Changelog topic:
+  - Every write to the state store is ALSO written to:
+    <application-id>-<storeName>-changelog
+  - This is a compacted topic (keeps only latest per key)
+  - Enables recovery: if the instance dies, a new one replays the changelog
+
+Standby replicas (num.standby.replicas):
+  - Kafka Streams maintains N "shadow" instances of each state store
+  - Standby instances replay the changelog in real-time
+  - When an active task migrates (instance dies/scales), the standby is promoted
+  - Reduces recovery time from minutes (full changelog replay) to seconds (diff only)
+
+Custom state stores:
+  - You can define custom state stores (in-memory, different persistence, etc.)
+  - Implement: StateStore, KeyValueStore, or register via StoreBuilder
+  - Access in a processor: context.getStateStore("my-store")
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. PROCESSOR API (LOW-LEVEL)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For complex custom logic, use the Processor API directly:
+
+  public class OrderAggregateProcessor
+      implements Processor<String, Order, String, Long> {
+    
+    private KeyValueStore<String, Long> stateStore;
+    private ProcessorContext<String, Long> context;
+    
+    @Override
+    public void init(ProcessorContext<String, Long> context) {
+      this.context = context;
+      this.stateStore = context.getStateStore("order-count-store");
+    }
+    
+    @Override
+    public void process(Record<String, Order> record) {
+      String customerId = record.key();
+      Long count = stateStore.get(customerId);
+      if (count == null) count = 0L;
+      count++;
+      stateStore.put(customerId, count);
+      // Forward downstream
+      context.forward(record.withValue(count));
+    }
+    
+    @Override
+    public void close() {}
+  }
+
+  // Register in topology:
+  Topology topology = new Topology();
+  topology.addSource("source", "orders")
+    .addProcessor("aggregate", OrderAggregateProcessor::new, "source")
+    .addStateStore(
+      Stores.keyValueStoreBuilder(
+        Stores.persistentKeyValueStore("order-count-store"),
+        Serdes.String(), Serdes.Long()),
+      "aggregate")
+    .addSink("sink", "order-counts", "aggregate");
+
+Punctuation (scheduled callbacks):
+  // Inside init():
+  context.schedule(Duration.ofSeconds(10), PunctuationType.WALL_CLOCK_TIME, timestamp -> {
+    // Emit periodic summaries, flush state, etc.
+    stateStore.all().forEachRemaining(entry ->
+      context.forward(new Record<>(entry.key, entry.value, timestamp)));
+  });
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: How does Kafka Streams provide fault tolerance for stateful operations?
+A: Every write to a local RocksDB state store is also written to a Kafka changelog
+   topic. If an instance fails, another instance takes over its tasks and restores
+   state by replaying the changelog. With standby replicas (num.standby.replicas > 0),
+   shadow copies of state stores are maintained in parallel, enabling near-instant
+   failover (promote standby instead of full replay).
+
+Q: What is the difference between aggregate and reduce in Kafka Streams?
+A: reduce() combines two values of the SAME type into one using a binary function
+   (like fold-left). It's simpler but the output type must match the input type.
+   aggregate() is more flexible: it takes an initializer and an adder function,
+   and the accumulator can be of a DIFFERENT type than the input. Use aggregate()
+   when the result type differs (e.g., Set or custom object) and reduce() when
+   combining values of the same type (e.g., summing Longs).
+
+Q: What triggers repartitioning in a Kafka Streams topology?
+A: When you change the key of a record (map(), selectKey(), groupBy() with a new
+   key extractor), Kafka Streams automatically creates an internal repartition topic.
+   Records are written to this topic and re-consumed, ensuring all records with the
+   same new key arrive at the same task (since tasks are partition-bound). Repartition
+   is NOT triggered by groupByKey() when the key hasn't changed.
+
+Q: When would you use the low-level Processor API instead of the DSL?
+A: Use the Processor API when: you need fine-grained control over state store access
+   (custom eviction logic), you need scheduled punctuations (e.g., periodic flushes),
+   your logic requires complex branching or multiple state store interactions, or
+   the DSL doesn't express the operation you need (e.g., custom windowing, deferred
+   forwarding). The DSL compiles down to the Processor API internally.
+
+Q: What is the role of the Materialized parameter in aggregations?
+A: Materialized configures the state store for an aggregation: its name (used for
+   interactive queries), the key and value Serdes (used for serialization to the
+   changelog topic), and store type (persistent RocksDB vs in-memory). Without it,
+   Kafka Streams creates an anonymous store with auto-generated name and inferred
+   Serdes. Always name state stores when you need interactive queries or want
+   predictable changelog topic names.

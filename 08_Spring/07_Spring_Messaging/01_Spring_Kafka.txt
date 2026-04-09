@@ -1,0 +1,319 @@
+================================================================
+  SPRING KAFKA
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. KAFKA FUNDAMENTALS RECAP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Topic     → Named, ordered, append-only log (like a table in streaming)
+Partition → Topic split into ordered segments; parallelism unit
+Offset    → Sequential ID of a message within a partition
+Producer  → Writes messages to a topic
+Consumer  → Reads messages from a topic
+Group ID  → Consumer group: partitions split among group members
+Broker    → Kafka server; a cluster has multiple brokers
+Zookeeper / KRaft → Cluster coordination (KRaft replaces ZooKeeper in Kafka 3.x)
+
+Key delivery guarantees:
+  At most once  → acks=0, no retries (possible loss)
+  At least once → acks=all, retries enabled (possible duplicates)
+  Exactly once  → idempotent + transactional producer (no loss, no dups)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. DEPENDENCY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<!-- pom.xml -->
+<dependency>
+    <groupId>org.springframework.kafka</groupId>
+    <artifactId>spring-kafka</artifactId>
+</dependency>
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# application.yml
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      retries: 3
+      enable-idempotence: true
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      group-id: my-consumer-group
+      auto-offset-reset: earliest
+      properties:
+        spring.json.trusted.packages: "com.example.dto"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. PRODUCER — KafkaTemplate
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Service
+public class OrderProducer {
+
+    private static final String TOPIC = "orders";
+    private final KafkaTemplate<String, OrderEvent> kafkaTemplate;
+
+    public OrderProducer(KafkaTemplate<String, OrderEvent> kafkaTemplate) {
+        this.kafkaTemplate = kafkaTemplate;
+    }
+
+    // Fire-and-forget (async)
+    public void sendOrder(OrderEvent event) {
+        kafkaTemplate.send(TOPIC, event.getOrderId(), event);
+    }
+
+    // With callback for success/failure
+    public void sendOrderWithCallback(OrderEvent event) {
+        CompletableFuture<SendResult<String, OrderEvent>> future =
+            kafkaTemplate.send(TOPIC, event.getOrderId(), event);
+
+        future.whenComplete((result, ex) -> {
+            if (ex != null) {
+                log.error("Failed to send: {}", ex.getMessage());
+            } else {
+                RecordMetadata meta = result.getRecordMetadata();
+                log.info("Sent to topic={} partition={} offset={}",
+                    meta.topic(), meta.partition(), meta.offset());
+            }
+        });
+    }
+
+    // To specific partition
+    public void sendToPartition(OrderEvent event, int partition) {
+        kafkaTemplate.send(TOPIC, partition, event.getOrderId(), event);
+    }
+
+    // With headers
+    public void sendWithHeaders(OrderEvent event) {
+        ProducerRecord<String, OrderEvent> record =
+            new ProducerRecord<>(TOPIC, null, event.getOrderId(), event,
+                new RecordHeaders()
+                    .add("event-type", "ORDER_CREATED".getBytes())
+                    .add("version", "1".getBytes()));
+
+        kafkaTemplate.send(new ProducerRecord<>(record));
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. CONSUMER — @KafkaListener
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Component
+public class OrderConsumer {
+
+    // Basic listener
+    @KafkaListener(topics = "orders", groupId = "order-service")
+    public void handleOrder(OrderEvent event) {
+        log.info("Received order: {}", event.getOrderId());
+    }
+
+    // With ConsumerRecord for full metadata access
+    @KafkaListener(topics = "orders", groupId = "order-service")
+    public void handleWithRecord(ConsumerRecord<String, OrderEvent> record) {
+        log.info("key={} partition={} offset={} value={}",
+            record.key(), record.partition(), record.offset(), record.value());
+    }
+
+    // With @Header for individual headers
+    @KafkaListener(topics = "orders")
+    public void handleWithHeaders(
+        @Payload OrderEvent event,
+        @Header(KafkaHeaders.RECEIVED_TOPIC) String topic,
+        @Header(KafkaHeaders.RECEIVED_PARTITION) int partition,
+        @Header(KafkaHeaders.OFFSET) long offset,
+        @Header(value = "event-type", required = false) String eventType) {
+        // process
+    }
+
+    // Batch listener (process multiple records at once)
+    @KafkaListener(topics = "orders", containerFactory = "batchKafkaListenerContainerFactory")
+    public void handleBatch(List<OrderEvent> events) {
+        log.info("Received batch of {} events", events.size());
+        events.forEach(this::processOrder);
+    }
+
+    // Multiple topics
+    @KafkaListener(topics = {"orders", "order-updates"})
+    public void handleMultipleTopics(OrderEvent event,
+                                     @Header(KafkaHeaders.RECEIVED_TOPIC) String topic) {
+        if ("orders".equals(topic)) {
+            // handle new order
+        } else {
+            // handle update
+        }
+    }
+
+    private void processOrder(OrderEvent event) { ... }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. CONSUMER CONTAINER FACTORY — CUSTOM CONFIG
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Configuration
+public class KafkaConsumerConfig {
+
+    @Bean
+    public ConsumerFactory<String, OrderEvent> orderConsumerFactory() {
+        Map<String, Object> props = new HashMap<>();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "order-service");
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
+        props.put(JsonDeserializer.TRUSTED_PACKAGES, "com.example.dto");
+        return new DefaultKafkaConsumerFactory<>(props,
+            new StringDeserializer(),
+            new JsonDeserializer<>(OrderEvent.class));
+    }
+
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, OrderEvent>
+            kafkaListenerContainerFactory() {
+        var factory = new ConcurrentKafkaListenerContainerFactory<String, OrderEvent>();
+        factory.setConsumerFactory(orderConsumerFactory());
+        factory.setConcurrency(3);  // 3 threads per container
+        factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL);
+        return factory;
+    }
+
+    // Batch factory
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, OrderEvent>
+            batchKafkaListenerContainerFactory() {
+        var factory = new ConcurrentKafkaListenerContainerFactory<String, OrderEvent>();
+        factory.setConsumerFactory(orderConsumerFactory());
+        factory.setBatchListener(true);
+        factory.getContainerProperties().setPollTimeout(3000);
+        return factory;
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. MANUAL ACKNOWLEDGMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Manual ack gives you control over when offsets are committed,
+preventing message loss on processing failures.
+
+@KafkaListener(topics = "orders", containerFactory = "kafkaListenerContainerFactory")
+public void handleManualAck(OrderEvent event, Acknowledgment ack) {
+    try {
+        processOrder(event);
+        ack.acknowledge();   // commit offset only on success
+    } catch (RecoverableException ex) {
+        log.warn("Recoverable error, will retry: {}", ex.getMessage());
+        // don't ack — message will be re-delivered
+    } catch (NonRecoverableException ex) {
+        log.error("Fatal error, skipping: {}", ex.getMessage());
+        ack.acknowledge();   // skip the bad message to avoid stuck consumer
+    }
+}
+
+AckMode options (ContainerProperties.AckMode):
+  RECORD       → ack after each record is processed
+  BATCH        → ack after each batch (default)
+  TIME         → ack at regular intervals
+  COUNT        → ack after N records
+  MANUAL       → listener calls ack.acknowledge()
+  MANUAL_IMMEDIATE → commits immediately, not after poll loop
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. DEAD LETTER TOPIC (DLT)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Failed messages after retries are published to a dead letter topic.
+
+@Bean
+public DeadLetterPublishingRecoverer deadLetterRecoverer(
+        KafkaTemplate<Object, Object> template) {
+    return new DeadLetterPublishingRecoverer(template,
+        (record, ex) -> new TopicPartition(record.topic() + ".DLT", record.partition()));
+}
+
+@Bean
+public DefaultErrorHandler errorHandler(
+        DeadLetterPublishingRecoverer recoverer) {
+    // Retry 3 times with 1s backoff, then publish to DLT
+    return new DefaultErrorHandler(recoverer,
+        new FixedBackOff(1000L, 3L));
+}
+
+// Wire the error handler into container factory:
+factory.setCommonErrorHandler(errorHandler(recoverer));
+
+// Consumer for the DLT:
+@KafkaListener(topics = "orders.DLT")
+public void handleDlt(ConsumerRecord<String, OrderEvent> record,
+                       @Header(KafkaHeaders.DLT_EXCEPTION_MESSAGE) String errorMsg) {
+    log.error("DLT: key={}, error={}", record.key(), errorMsg);
+    // alert, store to DB for manual review
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  9. TOPIC CREATION WITH NewTopic
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Configuration
+public class KafkaTopicConfig {
+
+    @Bean
+    public NewTopic ordersTopic() {
+        return TopicBuilder.name("orders")
+            .partitions(6)
+            .replicas(3)
+            .config(TopicConfig.RETENTION_MS_CONFIG, "604800000") // 7 days
+            .build();
+    }
+
+    @Bean
+    public NewTopic ordersDltTopic() {
+        return TopicBuilder.name("orders.DLT")
+            .partitions(1)
+            .replicas(1)
+            .build();
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  10. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: How does @KafkaListener achieve parallelism?
+A: Set concurrency on ConcurrentKafkaListenerContainerFactory. Each
+   thread is assigned a subset of the topic's partitions. Parallelism
+   is bounded by the number of partitions — if you have 6 partitions,
+   max 6 threads are useful. Additional threads will be idle.
+
+Q: What is the difference between acks=1 and acks=all?
+A: acks=1 means the leader broker acknowledges the write (leader durability).
+   acks=all means all in-sync replicas acknowledge (strongest durability).
+   acks=all + min.insync.replicas=2 guarantees no data loss even if one
+   broker dies. acks=0 means no acknowledgment (fastest but unreliable).
+
+Q: How do you prevent duplicate processing in Kafka consumers?
+A: Idempotent consumers: check if event ID has been processed before
+   acting (persist processed IDs in DB/Redis). Or use Kafka transactions
+   (exactly-once processing). Commit offsets AFTER processing (not before).
+
+Q: What is consumer group rebalancing and when does it happen?
+A: Rebalancing is when Kafka reassigns partitions among group members.
+   Triggered by: new consumer joins/leaves, consumer heartbeat timeout,
+   topic partition change. During rebalance, processing pauses. To reduce
+   rebalancing: set session.timeout.ms and heartbeat.interval.ms carefully;
+   use static group membership (group.instance.id).
+
+Q: How would you implement ordered processing in Kafka?
+A: Messages in the same partition are ordered. To guarantee order for
+   a domain entity (e.g., all events for order-123), always produce with
+   the same key (e.g., orderId). Kafka routes same-key messages to the
+   same partition, and a consumer processes a partition sequentially.

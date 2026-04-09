@@ -1,0 +1,296 @@
+================================================================
+PKCE — Proof Key for Code Exchange (RFC 7636)
+================================================================
+
+WHAT IS PKCE?
+--------------
+PKCE (pronounced "pixy") is a security extension to the OAuth2
+Authorization Code flow designed to protect public clients from
+authorization code interception attacks.
+
+Public clients cannot keep a client_secret (browser JS apps, mobile apps)
+because anything stored in the app is accessible to users/attackers.
+PKCE replaces the client_secret for code exchange verification.
+
+RFC 7636 — originally for mobile apps, now RECOMMENDED for ALL clients
+(OAuth 2.1 requires PKCE for all authorization code flows).
+
+================================================================
+THE PROBLEM PKCE SOLVES
+================================================================
+
+WITHOUT PKCE (Authorization Code vulnerability for public clients):
+
+1. SPA requests authorization code
+2. Code returned in redirect URL
+3. Malicious app on same device/network intercepts the redirect
+4. Malicious app exchanges code for tokens at token endpoint
+   (No client_secret check for public clients!)
+5. Attacker has valid tokens!
+
+This attack is feasible on:
+  - Mobile: another app registers same custom URL scheme
+  - Browser: browser extensions, malicious browser plugins
+  - Network: man-in-the-middle on redirect
+
+WITH PKCE:
+  Even if code is intercepted, it cannot be exchanged without
+  the code_verifier that only the legitimate client knows.
+
+================================================================
+PKCE MECHANICS
+================================================================
+
+STEP 1: Generate Code Verifier
+---------------------------------
+The client generates a cryptographically random string:
+  code_verifier = random(43-128 characters)
+  Allowed chars: A-Z, a-z, 0-9, '-', '.', '_', '~'
+  
+  Example:
+  code_verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+
+This is stored in the client's session/memory and NEVER transmitted
+until the token exchange step.
+
+STEP 2: Compute Code Challenge
+---------------------------------
+code_challenge = BASE64URL(SHA256(ASCII(code_verifier)))
+
+  SHA256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")
+  = <32 bytes>
+  BASE64URL encode
+  = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+
+Note: BASE64URL uses URL-safe base64 (+ → -, / → _, no = padding)
+
+code_challenge_method = S256 (SHA-256)
+  Alternative: "plain" (not recommended — sends verifier directly as challenge)
+
+STEP 3: Authorization Request (includes code_challenge)
+---------------------------------------------------------
+GET /oauth2/authorize
+  ?response_type=code
+  &client_id=my-spa
+  &redirect_uri=https://app.com/callback
+  &scope=openid email
+  &state=random-csrf-value
+  &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+  &code_challenge_method=S256
+
+AS stores: (code → code_challenge, code_challenge_method)
+
+STEP 4: Receive Authorization Code
+-------------------------------------
+AS redirects back:
+  GET /callback?code=AUTH_CODE_HERE&state=random-csrf-value
+
+STEP 5: Token Request (includes code_verifier)
+------------------------------------------------
+POST /oauth2/token
+  grant_type=authorization_code
+  &code=AUTH_CODE_HERE
+  &redirect_uri=https://app.com/callback
+  &client_id=my-spa
+  &code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+
+  ← No client_secret (public client)
+
+STEP 6: AS Verifies PKCE
+---------------------------
+AS looks up stored code_challenge for this authorization code.
+AS computes: SHA256(received code_verifier)
+AS compares: SHA256(code_verifier) == stored code_challenge
+
+  If match → issue tokens
+  If no match → reject (code was stolen!)
+
+================================================================
+PKCE VERIFICATION LOGIC (PSEUDOCODE)
+================================================================
+
+On Token Request:
+  1. Look up authorization code in database
+  2. Retrieve stored code_challenge and code_challenge_method
+  3. If code_challenge_method == "S256":
+       computed = BASE64URL(SHA256(code_verifier_from_request))
+       if computed != stored code_challenge: REJECT
+  4. Issue tokens
+
+SECURITY GUARANTEE:
+  Attacker intercepts code → tries to exchange without code_verifier
+  → Fails because code_challenge validation fails
+
+  Attacker also intercepts code_challenge (it's in the URL):
+  → Cannot reverse SHA256 to get code_verifier
+  → SHA256 is a one-way function
+
+================================================================
+PKCE IN PRACTICE — JAVASCRIPT SPA
+================================================================
+
+// Generate PKCE values
+async function generatePKCE() {
+    // Generate random code verifier
+    const array = new Uint8Array(32);
+    window.crypto.getRandomValues(array);
+    const codeVerifier = btoa(String.fromCharCode(...array))
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+
+    // Compute code challenge
+    const encoder = new TextEncoder();
+    const data = encoder.encode(codeVerifier);
+    const digest = await window.crypto.subtle.digest('SHA-256', data);
+    const codeChallenge = btoa(String.fromCharCode(...new Uint8Array(digest)))
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+
+    // Store verifier in session (not accessible after page nav)
+    sessionStorage.setItem('code_verifier', codeVerifier);
+
+    return codeChallenge;
+}
+
+// Build authorization URL
+async function login() {
+    const codeChallenge = await generatePKCE();
+    const state = generateRandomString(16);
+    sessionStorage.setItem('state', state);
+
+    const params = new URLSearchParams({
+        response_type: 'code',
+        client_id: 'my-spa',
+        redirect_uri: 'https://app.com/callback',
+        scope: 'openid email',
+        state: state,
+        code_challenge: codeChallenge,
+        code_challenge_method: 'S256'
+    });
+
+    window.location.href = `https://auth-server.com/authorize?${params}`;
+}
+
+// Handle callback
+async function handleCallback() {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code');
+    const state = params.get('state');
+
+    // Verify state
+    if (state !== sessionStorage.getItem('state')) {
+        throw new Error('State mismatch - CSRF attack!');
+    }
+
+    const codeVerifier = sessionStorage.getItem('code_verifier');
+
+    // Exchange code for tokens
+    const response = await fetch('https://auth-server.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+            grant_type: 'authorization_code',
+            code: code,
+            redirect_uri: 'https://app.com/callback',
+            client_id: 'my-spa',
+            code_verifier: codeVerifier
+        })
+    });
+
+    const tokens = await response.json();
+    // Store access token in memory, refresh token in HttpOnly cookie via BFF
+}
+
+================================================================
+PKCE IN SPRING AUTHORIZATION SERVER (SERVER-SIDE)
+================================================================
+
+// Spring Authorization Server automatically supports PKCE
+// for registered clients configured as public clients:
+
+@Bean
+public RegisteredClientRepository registeredClientRepository() {
+    RegisteredClient spaClient = RegisteredClient.withId(UUID.randomUUID().toString())
+        .clientId("my-spa")
+        // NO client_secret for public client
+        .clientAuthenticationMethod(ClientAuthenticationMethod.NONE)  ← public client
+        .authorizationGrantType(AuthorizationGrantType.AUTHORIZATION_CODE)
+        .redirectUri("https://app.com/callback")
+        .scope(OidcScopes.OPENID)
+        .scope("email")
+        .clientSettings(ClientSettings.builder()
+            .requireProofKey(true)       ← REQUIRE PKCE
+            .requireAuthorizationConsent(true)
+            .build())
+        .build();
+
+    return new InMemoryRegisteredClientRepository(spaClient);
+}
+
+================================================================
+PKCE SECURITY ANALYSIS
+================================================================
+
+WHAT PKCE PROTECTS AGAINST:
+  ✓ Authorization code interception by malicious native app
+  ✓ Authorization code in browser history being stolen
+  ✓ CSRF attacks on token exchange
+
+WHAT PKCE DOES NOT PROTECT AGAINST:
+  ✗ XSS (JavaScript execution in the SPA can read anything)
+  ✗ Compromised browser extensions
+  ✗ Physical access to device
+
+COMPLEMENT PKCE WITH:
+  - Store tokens in memory (not localStorage)
+  - Use HttpOnly cookies for refresh tokens
+  - Short access token lifetime (15 min)
+  - Content Security Policy (CSP) to prevent XSS
+
+================================================================
+PKCE vs CLIENT SECRET
+================================================================
+
+                    Client Secret       PKCE
+------------------------------------------------
+For                 Confidential        Public clients
+                    clients
+Stored where        Server-side         Never stored (fresh per request)
+Transmitted         Yes, in POST        Only verifier in token request,
+                                        challenge in auth request
+Can be stolen?      If server           Verifier: No (one-time, in memory)
+                    is breached         Challenge: Yes, but useless alone
+Security model      Shared secret       Dynamic proof of possession
+
+================================================================
+COMMON INTERVIEW QUESTIONS
+================================================================
+
+Q: What is PKCE and why was it introduced?
+A: PKCE (Proof Key for Code Exchange) is a security extension to OAuth2's
+   Authorization Code flow. It was introduced to protect public clients
+   (mobile, SPA) from authorization code interception attacks. Since public
+   clients can't keep a client_secret, PKCE provides an alternative
+   verification mechanism.
+
+Q: Walk me through how PKCE works.
+A: (1) Client generates a random code_verifier. (2) Client computes
+   code_challenge = BASE64URL(SHA256(code_verifier)). (3) Auth request
+   includes code_challenge. (4) AS stores it with the auth code. (5) Token
+   request includes code_verifier. (6) AS verifies SHA256(code_verifier)
+   matches stored code_challenge. Only the legitimate client knows the
+   code_verifier, so stolen codes are useless.
+
+Q: Should confidential clients (with client_secret) use PKCE?
+A: Yes! OAuth 2.1 recommends PKCE for ALL clients, even confidential ones.
+   PKCE adds an additional layer of security. Spring Authorization Server
+   can require it.
+
+Q: Why is S256 preferred over "plain" for code_challenge_method?
+A: With "plain", the code_challenge equals the code_verifier. If an attacker
+   intercepts the auth request URL (which contains code_challenge), they have
+   the code_verifier too. With S256 (SHA-256), the challenge is a hash —
+   an attacker can't reverse it to get the verifier.
+
+Q: Where should you store the code_verifier in a SPA?
+A: In memory (JavaScript variable) or sessionStorage for the brief duration
+   of the authorization flow. It's discarded after the token exchange.
+   Never in localStorage (persists across sessions, XSS risk).

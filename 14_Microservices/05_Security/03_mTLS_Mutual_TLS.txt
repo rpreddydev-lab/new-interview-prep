@@ -1,0 +1,242 @@
+================================================================================
+mTLS — MUTUAL TLS
+================================================================================
+
+WHAT IS mTLS?
+--------------
+Regular TLS (one-way): Server presents certificate; client verifies server identity.
+  - Client: "I need to connect to bank.com"
+  - Server: "Here's my certificate signed by DigiCert"
+  - Client: "Verified. I trust you." → encrypted connection
+
+mTLS (Mutual TLS / two-way TLS): BOTH sides present and verify certificates.
+  - Client: "Here's MY certificate" → Server verifies client identity
+  - Server: "Here's my certificate" → Client verifies server identity
+  - Both: verified. → encrypted connection
+
+mTLS provides:
+  - AUTHENTICATION: "This is definitely Order Service, not a rogue service"
+  - ENCRYPTION: All traffic encrypted in transit
+  - INTEGRITY: Data cannot be tampered with
+
+────────────────────────────────────────────────────────────────────────────────
+
+HOW mTLS WORKS — HANDSHAKE
+============================
+
+  Client (Order Service)              Server (Inventory Service)
+        │                                      │
+        │ ─── ClientHello (TLS version, ciphers) ──→ │
+        │ ←── ServerHello + Server Certificate ─── │
+        │ ←── CertificateRequest (please send yours) │
+        │ ─── Client Certificate + CertificateVerify → │
+        │                                      │ (Server verifies client cert)
+        │ ─── Finished ──────────────────────→ │
+        │ ←── Finished ─────────────────────── │
+        │                                      │
+        │ ══════ Encrypted Communication ════════ │
+
+Key verification steps:
+  1. Is the certificate signed by a trusted CA?
+  2. Is the certificate currently valid (not expired)?
+  3. Has the certificate been revoked (CRL/OCSP)?
+  4. Does the identity in the certificate match expected identity?
+     (SPIFFE ID or service name)
+
+────────────────────────────────────────────────────────────────────────────────
+
+mTLS IN SERVICE MESH (ISTIO) — AUTOMATIC
+==========================================
+
+Istio handles mTLS automatically via the sidecar proxy (Envoy).
+Applications don't need to change — Envoy intercepts all traffic.
+
+Enable strict mTLS for all services in a namespace:
+  apiVersion: security.istio.io/v1beta1
+  kind: PeerAuthentication
+  metadata:
+    name: default
+    namespace: production
+  spec:
+    mtls:
+      mode: STRICT   # All traffic MUST use mTLS
+                     # PERMISSIVE: both mTLS and plain text allowed (migration)
+                     # DISABLE: plain text only
+
+Enable mTLS for a specific service:
+  apiVersion: security.istio.io/v1beta1
+  kind: PeerAuthentication
+  metadata:
+    name: payment-service-mtls
+    namespace: production
+  spec:
+    selector:
+      matchLabels:
+        app: payment-service
+    mtls:
+      mode: STRICT
+
+Verify mTLS is working:
+  # Check if traffic is encrypted
+  kubectl exec -n production deployment/order-service \
+    -c istio-proxy -- pilot-agent request GET /stats | grep ssl
+
+How Istio manages certificates:
+  - Each pod gets a SPIFFE certificate via Citadel (Istio's CA)
+  - Format: spiffe://cluster.local/ns/production/sa/order-service
+  - Certificates auto-rotated (default: 24 hours)
+  - Zero downtime rotation via PERMISSIVE mode during transition
+
+────────────────────────────────────────────────────────────────────────────────
+
+mTLS WITHOUT SERVICE MESH (Spring Boot)
+=========================================
+
+If you don't have a service mesh, configure mTLS manually.
+
+Generate certificates (for testing — use proper CA in production):
+  # Certificate Authority
+  openssl genrsa -out ca-key.pem 4096
+  openssl req -new -x509 -key ca-key.pem -out ca-cert.pem -days 3650
+
+  # Order Service certificate
+  openssl genrsa -out order-service-key.pem 2048
+  openssl req -new -key order-service-key.pem -out order-service.csr \
+    -subj "/CN=order-service"
+  openssl x509 -req -in order-service.csr -CA ca-cert.pem -CAkey ca-key.pem \
+    -out order-service-cert.pem -days 365
+
+  # Inventory Service certificate
+  # ... similar ...
+
+Spring Boot Server (Inventory Service — requires client cert):
+  # application.yml
+  server:
+    port: 8443
+    ssl:
+      enabled: true
+      key-store: classpath:inventory-service-keystore.p12
+      key-store-password: ${SSL_KEYSTORE_PASSWORD}
+      key-store-type: PKCS12
+      trust-store: classpath:truststore.p12       # CA certificate
+      trust-store-password: ${SSL_TRUSTSTORE_PASSWORD}
+      client-auth: NEED  # NEED = require client cert; WANT = optional; NONE = disable
+
+Spring Boot Client (Order Service — sends its cert):
+  @Bean
+  public SSLContext sslContext() throws Exception {
+    KeyStore keyStore = KeyStore.getInstance("PKCS12");
+    keyStore.load(resourceLoader.getResource("classpath:order-service-keystore.p12")
+      .getInputStream(), keystorePassword.toCharArray());
+
+    KeyStore trustStore = KeyStore.getInstance("PKCS12");
+    trustStore.load(resourceLoader.getResource("classpath:truststore.p12")
+      .getInputStream(), truststorePassword.toCharArray());
+
+    return SSLContexts.custom()
+      .loadKeyMaterial(keyStore, keystorePassword.toCharArray())  // Client cert
+      .loadTrustMaterial(trustStore, null)  // Trust the server cert
+      .build();
+  }
+
+  @Bean
+  public WebClient mtlsWebClient(SSLContext sslContext) {
+    SslContext nettySslContext = SslContextBuilder.forClient()
+      .keyManager(/* key manager from sslContext */)
+      .trustManager(/* trust manager from sslContext */)
+      .build();
+
+    HttpClient httpClient = HttpClient.create()
+      .secure(spec -> spec.sslContext(nettySslContext));
+
+    return WebClient.builder()
+      .baseUrl("https://inventory-service:8443")
+      .clientConnector(new ReactorClientHttpConnector(httpClient))
+      .build();
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+CERTIFICATE MANAGEMENT IN PRODUCTION
+=======================================
+
+Challenges:
+  - Certificates expire → need rotation without downtime
+  - Distributing certs to many services → automation needed
+  - Revocation → CRL or OCSP
+
+Solutions:
+  1. cert-manager (Kubernetes)
+     - Automatically issues and renews certificates
+     - Integrates with Let's Encrypt, Vault, private CAs
+     - Auto-rotates before expiry
+
+     # cert-manager Certificate resource
+     apiVersion: cert-manager.io/v1
+     kind: Certificate
+     metadata:
+       name: order-service-cert
+     spec:
+       secretName: order-service-tls
+       issuerRef:
+         name: internal-ca
+         kind: ClusterIssuer
+       dnsNames:
+       - order-service.production.svc.cluster.local
+       duration: 24h          # Short-lived
+       renewBefore: 1h        # Renew 1h before expiry
+
+  2. HashiCorp Vault PKI
+     - Full internal CA management
+     - Issues certs via API
+     - Automated rotation via Vault Agent
+
+  3. Service Mesh (Istio/Linkerd)
+     - Built-in cert management (Citadel, Linkerd identity)
+     - No manual cert management needed
+
+────────────────────────────────────────────────────────────────────────────────
+
+mTLS vs JWT COMPARISON
+========================
+
+Aspect             │ mTLS                            │ JWT
+───────────────────┼─────────────────────────────────┼──────────────────────
+Authentication     │ Cryptographic cert (strong)     │ Signed token (strong)
+Identity           │ Service certificate              │ Token claims (sub, etc.)
+Authorization      │ Not included (cert proves identity│ Claims include roles/scopes
+Rotation           │ Certificate rotation (cert-mgr)  │ Token expiry (short TTL)
+Performance        │ TLS handshake overhead (once)    │ Token validation (fast)
+Setup complexity   │ Certificate infrastructure       │ Auth server + key management
+Service mesh       │ Automatic (Istio/Linkerd)        │ Manual interceptors
+Best for           │ Service identity (east-west)     │ User identity, authorization
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is mTLS and how does it differ from regular TLS?
+A: Regular TLS authenticates the SERVER to the client. mTLS (Mutual TLS) requires
+   BOTH parties to present and verify certificates. In microservices, this means
+   both the calling service AND the receiving service prove their identity,
+   preventing any rogue service from calling other services.
+
+Q: How does Istio implement mTLS automatically?
+A: Istio's sidecar proxy (Envoy) intercepts all inter-service traffic. Each pod
+   gets a SPIFFE certificate from Istio's CA (Citadel). The sidecar proxies
+   handle the TLS handshake transparently — applications don't need to change.
+   PeerAuthentication policy with mode: STRICT enforces mTLS for a namespace.
+
+Q: How do you rotate certificates without downtime?
+A: Use cert-manager or service mesh for automatic rotation. During rotation,
+   use PERMISSIVE mode (accepts both mTLS and plain text). Cert-manager renews
+   before expiry (configurable renewBefore). After all services have new certs,
+   switch back to STRICT mode.
+
+Q: Why are short-lived certificates (e.g., 24 hours) better than long-lived?
+A: If a certificate is compromised, it's only valid for a short time.
+   Reduces the window of exposure. Auto-rotation ensures certificates are
+   always fresh. Modern tools (Istio, cert-manager) make short-lived
+   certificates practical with automated renewal.
+
+================================================================================

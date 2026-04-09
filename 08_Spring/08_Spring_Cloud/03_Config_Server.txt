@@ -1,0 +1,225 @@
+================================================================
+  SPRING CLOUD CONFIG SERVER
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. WHY CENTRALIZED CONFIG?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+In a microservices system with 20+ services, each with dev/staging/prod
+environments, managing config files per-service becomes a maintenance
+nightmare.
+
+Problems without centralized config:
+  - Config changes require a new deploy
+  - Same secret (DB password) duplicated across many services
+  - Hard to audit which config changed when
+  - Sensitive values (API keys) committed to source code
+
+Spring Cloud Config Server solves this:
+  - Single source of truth for all service configurations
+  - Backed by Git, filesystem, Vault, JDBC, etc.
+  - Services fetch their config at startup (and refresh without restart)
+  - Environment-specific config (dev, staging, prod) in one place
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. CONFIG SERVER SETUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<!-- pom.xml -->
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-config-server</artifactId>
+</dependency>
+
+@SpringBootApplication
+@EnableConfigServer
+public class ConfigServerApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ConfigServerApplication.class, args);
+    }
+}
+
+# application.yml (Config Server)
+server:
+  port: 8888
+
+spring:
+  application:
+    name: config-server
+
+  cloud:
+    config:
+      server:
+        git:
+          uri: https://github.com/myorg/config-repo  # Git repository
+          default-label: main                          # branch
+          search-paths: configs/{application}          # subfolder per service
+          clone-on-start: true                         # clone at startup, fail fast
+          username: ${GIT_USERNAME}
+          password: ${GIT_TOKEN}
+          # For SSH:
+          # uri: git@github.com:myorg/config-repo.git
+          # private-key: ${GIT_PRIVATE_KEY}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. GIT REPOSITORY FILE NAMING CONVENTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Config Server resolves files based on: /{application}/{profile}/{label}
+
+File naming in Git repo:
+  application.yml                 → shared by ALL services
+  order-service.yml               → specific to order-service (all profiles)
+  order-service-dev.yml           → order-service in dev profile
+  order-service-prod.yml          → order-service in prod profile
+  application-dev.yml             → shared by ALL services in dev profile
+
+Priority (highest to lowest):
+  1. {application}-{profile}.yml
+  2. {application}.yml
+  3. application-{profile}.yml
+  4. application.yml
+
+Property resolution is merged — specific files override shared ones.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. CONFIG CLIENT SETUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<!-- pom.xml — each microservice -->
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-config</artifactId>
+</dependency>
+
+# application.yml (client service)
+spring:
+  application:
+    name: order-service       # ← must match config repo file names
+  profiles:
+    active: dev
+  config:
+    import: optional:configserver:http://localhost:8888
+    # optional: = don't fail if config server is unavailable (use local defaults)
+
+# OR bootstrap.yml (legacy approach, still works):
+spring:
+  cloud:
+    config:
+      uri: http://localhost:8888
+      fail-fast: true          # fail at startup if config server unreachable
+      retry:
+        max-attempts: 6
+        initial-interval: 1000
+        multiplier: 1.5
+        max-interval: 2000
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. DYNAMIC CONFIG REFRESH — @RefreshScope
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Without restart, push a config change to Git, then trigger refresh:
+
+@RestController
+@RefreshScope   // ← re-creates the bean on /actuator/refresh
+public class FeatureFlagController {
+
+    @Value("${feature.payment.enabled:false}")
+    private boolean paymentEnabled;
+
+    @GetMapping("/feature-flags")
+    public Map<String, Boolean> getFlags() {
+        return Map.of("paymentEnabled", paymentEnabled);
+    }
+}
+
+Trigger refresh via Actuator:
+  POST http://localhost:8080/actuator/refresh
+
+Must expose the refresh endpoint:
+  management.endpoints.web.exposure.include: refresh, health, info
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. BROADCAST REFRESH WITH SPRING CLOUD BUS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Problem: calling /actuator/refresh on 20 service instances is tedious.
+
+Spring Cloud Bus uses a message broker (Kafka or RabbitMQ) to broadcast
+refresh events to ALL instances at once.
+
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-bus-kafka</artifactId>
+    <!-- or spring-cloud-starter-bus-amqp for RabbitMQ -->
+</dependency>
+
+// Call refresh on ONE instance:
+POST http://any-instance:8080/actuator/busrefresh
+// Spring Cloud Bus broadcasts RefreshEvent to all instances via Kafka/RabbitMQ
+// Each instance refreshes its @RefreshScope beans
+
+// Scoped refresh (only order-service instances):
+POST /actuator/busrefresh/order-service:**
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. ENCRYPTING SECRETS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Config Server can store and decrypt encrypted values.
+
+# Generate key
+curl http://config-server:8888/encrypt -d 'mySecretPassword'
+→ {cipher}AQAxjk1...
+
+# In config file (Git repo):
+spring:
+  datasource:
+    password: '{cipher}AQAxjk1...'   # Config Server decrypts before serving
+
+# Config server key (symmetric):
+encrypt:
+  key: my-encryption-key  # or key-store for asymmetric
+
+# For production secrets: use HashiCorp Vault backend instead:
+spring.cloud.config.server.vault:
+  host: vault-server
+  port: 8200
+  scheme: https
+  authentication: TOKEN
+  token: ${VAULT_TOKEN}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the purpose of Spring Cloud Config Server?
+A: Centralized configuration management for all microservices. Services
+   fetch their config from a Git-backed Config Server at startup. Config
+   changes can be refreshed without redeployment. Supports environment-
+   specific (dev/staging/prod) configuration and encrypted secrets.
+
+Q: What is @RefreshScope and when is it needed?
+A: @RefreshScope creates a bean proxy that re-creates the actual bean
+   when a /actuator/refresh is triggered. This allows @Value fields to
+   pick up updated config from the Config Server without a full restart.
+   Required for any bean that uses externalized config values you want
+   to refresh dynamically.
+
+Q: What is the file naming convention in the Config Server Git repo?
+A: {appName}.yml (all profiles), {appName}-{profile}.yml (specific
+   profile), application.yml (shared all), application-{profile}.yml
+   (shared for a profile). More specific files override more general ones.
+   All matching files are merged before returning to the client.
+
+Q: How do you scale config refresh across many instances?
+A: Use Spring Cloud Bus with Kafka or RabbitMQ. A single POST to
+   /actuator/busrefresh publishes a RefreshEvent that all instances
+   consume and use to refresh their @RefreshScope beans.
+
+Q: How should you handle secrets in Config Server?
+A: For simple cases, use Config Server's built-in encryption (symmetric
+   or asymmetric key, {cipher} prefix). For production, use HashiCorp
+   Vault as a backend. Spring Cloud Config Server has a VaultEnvironmentRepository.
+   Never store plain-text secrets in Git repositories.

@@ -1,0 +1,333 @@
+================================================================
+JWT BEST PRACTICES
+================================================================
+
+JWT is powerful but commonly misused. Following these best practices
+is critical to building secure systems.
+
+================================================================
+1. KEEP TOKENS SHORT-LIVED
+================================================================
+
+ACCESS TOKEN TTL: 5-15 minutes (MAXIMUM 1 hour)
+REFRESH TOKEN TTL: Hours to days (based on security requirements)
+ID TOKEN TTL: Same as access token (10-15 minutes)
+
+WHY?
+  JWT can't be revoked before expiry. Short TTL limits the window
+  of exposure if a token is stolen.
+
+ROTATION STRATEGY:
+  - Use refresh tokens to get new access tokens silently
+  - Implement refresh token rotation (invalidate old refresh token)
+  - Absolute refresh token lifetime: 24 hours to 30 days (session length)
+
+// Spring Authorization Server token settings
+TokenSettings tokenSettings = TokenSettings.builder()
+    .accessTokenTimeToLive(Duration.ofMinutes(15))    ← short!
+    .refreshTokenTimeToLive(Duration.ofDays(7))
+    .reuseRefreshTokens(false)                        ← rotation!
+    .build();
+
+================================================================
+2. ALWAYS VALIDATE ALL CRITICAL CLAIMS
+================================================================
+
+CHECKLIST — validate ALL of these:
+  ✓ Signature      — verify cryptographic signature
+  ✓ alg            — must match expected algorithm (never trust header blindly)
+  ✓ exp            — must not be expired (with small clock skew tolerance)
+  ✓ iss            — must match your Authorization Server's URL
+  ✓ aud            — your service's URL must be in the audience list
+  ✓ nbf            — current time must be after "not before" time
+  ✓ alg ≠ "none"   — NEVER accept unsigned tokens
+
+OPTIONAL BUT RECOMMENDED:
+  ✓ jti            — unique token ID (prevents replay attacks with a denylist)
+  ✓ azp            — authorized party (client that requested the token)
+
+// Spring Security custom validator example
+OAuth2TokenValidator<Jwt> audienceValidator = jwt -> {
+    List<String> audiences = jwt.getAudience();
+    if (!audiences.contains("https://api.myapp.com")) {
+        OAuth2Error error = new OAuth2Error("invalid_token",
+            "The required audience is missing", null);
+        return OAuth2TokenValidatorResult.failure(error);
+    }
+    return OAuth2TokenValidatorResult.success();
+};
+
+@Bean
+public JwtDecoder jwtDecoder() {
+    NimbusJwtDecoder decoder = NimbusJwtDecoder
+        .withJwkSetUri(jwksUri)
+        .build();
+    decoder.setJwtValidator(new DelegatingOAuth2TokenValidator<>(
+        JwtValidators.createDefault(),  // validates exp, iss
+        audienceValidator
+    ));
+    return decoder;
+}
+
+================================================================
+3. USE ASYMMETRIC SIGNING (RS256 / ES256) FOR DISTRIBUTED SYSTEMS
+================================================================
+
+  ✓ Use RS256 or ES256 for production APIs
+  ✓ Private key stays ONLY on the Authorization Server
+  ✓ Public key published via JWKS endpoint (anyone can verify)
+  ✓ Resource servers need NO secrets to validate tokens
+  ✓ Enables key rotation without coordinating with resource servers
+
+  HS256 is acceptable ONLY when:
+    - Same team owns AS and ALL resource servers
+    - Secret distribution and rotation is tightly controlled
+    - Performance requirements demand it
+
+================================================================
+4. NEVER PUT SENSITIVE DATA IN JWT PAYLOAD
+================================================================
+
+THE PAYLOAD IS NOT ENCRYPTED — it's just Base64URL encoded.
+Anyone who gets the token can decode and read the payload.
+
+DO NOT include in JWT:
+  ✗ Passwords
+  ✗ Credit card numbers
+  ✗ Social Security Numbers
+  ✗ Private keys or secrets
+  ✗ Detailed PII (full address, etc.)
+  ✗ Internal system details
+
+SAFE to include:
+  ✓ User ID (sub)
+  ✓ Roles/permissions
+  ✓ Email (if user has consented and it's necessary)
+  ✓ OAuth scopes
+  ✓ Tenant/org ID
+
+IF YOU MUST ENCRYPT PAYLOAD → use JWE (JSON Web Encryption):
+  5 parts: header.encrypted_key.iv.ciphertext.auth_tag
+
+================================================================
+5. SECURE TOKEN STORAGE ON CLIENT SIDE
+================================================================
+
+ATTACK VECTORS:
+  - localStorage: accessible by JavaScript → XSS can steal tokens
+  - sessionStorage: same XSS risk
+  - URL parameters: in browser history, server logs, referrer headers
+  - Non-HttpOnly cookies: accessible by JavaScript → XSS risk
+
+RECOMMENDED STORAGE:
+  Web App (SSR with backend):
+    ✓ Access token: server-side memory or encrypted session
+    ✓ Refresh token: HttpOnly, Secure, SameSite=Strict cookie
+
+  SPA (React/Angular/Vue):
+    ✓ Access token: JavaScript memory ONLY (lost on page refresh)
+    ✓ Refresh token: HttpOnly cookie (handled by BFF pattern)
+    ✓ BFF (Backend for Frontend): SPA → BFF → API, BFF handles tokens
+
+  Mobile App:
+    ✓ Access token + refresh token: platform Keychain (iOS) / Keystore (Android)
+    ✓ Secure Enclave for highly sensitive tokens
+
+NEVER store tokens in:
+  ✗ localStorage (XSS accessible)
+  ✗ sessionStorage (XSS accessible)
+  ✗ URL (logs, history)
+  ✗ Non-HttpOnly cookie (XSS accessible)
+
+================================================================
+6. IMPLEMENT TOKEN REFRESH CORRECTLY
+================================================================
+
+// Silent refresh — use refresh token to get new access token
+// before the access token expires
+function scheduleTokenRefresh(expiresIn) {
+    // Refresh 1 minute before expiry
+    const refreshIn = (expiresIn - 60) * 1000;
+    setTimeout(() => refreshTokens(), refreshIn);
+}
+
+// Handle 401 in API calls
+async function callApi(endpoint) {
+    try {
+        return await fetch(endpoint, {
+            headers: { 'Authorization': `Bearer ${getAccessToken()}` }
+        });
+    } catch (e) {
+        if (e.status === 401) {
+            // Token expired — refresh and retry
+            await refreshTokens();
+            return fetch(endpoint, {
+                headers: { 'Authorization': `Bearer ${getAccessToken()}` }
+            });
+        }
+    }
+}
+
+================================================================
+7. IMPLEMENT REFRESH TOKEN ROTATION
+================================================================
+
+PROBLEM: Refresh tokens are long-lived → high value target.
+         If stolen, attacker can continuously get new access tokens.
+
+SOLUTION: Refresh Token Rotation
+  - Issue a NEW refresh token with every access token refresh
+  - Invalidate the OLD refresh token
+  - If someone tries to use an already-rotated refresh token → 
+    DETECT THEFT → invalidate entire session
+
+// Spring Authorization Server
+TokenSettings tokenSettings = TokenSettings.builder()
+    .reuseRefreshTokens(false)  ← rotation enabled
+    .build();
+
+ROTATION FLOW:
+  1. Client sends refresh_token=RT1 to get new access token
+  2. AS validates RT1, issues AT2 + RT2, invalidates RT1
+  3. Client stores RT2, discards RT1
+  4. If attacker also had RT1 and tries to use it → AS sees RT1 was
+     already used → ANOMALY → invalidate RT2 and all related tokens
+  5. Legitimate user's next request fails → forced to re-login
+
+================================================================
+8. PROTECT AGAINST JWT VULNERABILITIES
+================================================================
+
+VULNERABILITY                MITIGATION
+----------------------------------------------------------------------
+alg:none attack              Hardcode expected algorithm, never accept "none"
+Algorithm confusion          Never use header's alg to choose verify method
+Weak HMAC secrets            Use cryptographic random keys, min 256 bits
+Brute-forceable HS256        Use long random secrets (not passwords)
+Token replay                 Use jti claim + short expiry + optional denylist
+Stolen tokens                Short TTL, HTTPS, secure storage, revocation
+
+// Prevent algorithm confusion — always explicit
+@Bean
+public JwtDecoder jwtDecoder() {
+    return NimbusJwtDecoder.withJwkSetUri(jwksUri)
+        .jwsAlgorithm(SignatureAlgorithm.RS256)  ← explicit!
+        .build();
+}
+
+================================================================
+9. USE jti FOR REPLAY ATTACK PREVENTION (HIGH SECURITY)
+================================================================
+
+WHEN NEEDED:
+  - Financial transactions
+  - One-time actions
+  - When statelessness can be partially sacrificed for security
+
+IMPLEMENTATION:
+@Service
+public class JtiValidator {
+    private final RedisTemplate<String, String> redis;
+
+    public boolean isValidAndNotUsed(String jti, Instant exp) {
+        String key = "used_jti:" + jti;
+
+        // SET key "1" NX (set if not exists) with TTL
+        Boolean isNew = redis.opsForValue()
+            .setIfAbsent(key, "1",
+                Duration.between(Instant.now(), exp).plusSeconds(60));
+
+        return Boolean.TRUE.equals(isNew);  // false = already used (replay!)
+    }
+}
+
+================================================================
+10. HANDLE TOKEN EXPIRY GRACEFULLY
+================================================================
+
+CLIENT BEST PRACTICES:
+  ✓ Proactively refresh before expiry (don't wait for 401)
+  ✓ Handle 401 by refreshing and retrying (exactly once)
+  ✓ If refresh fails → redirect to login (session expired)
+  ✓ Show clear "session expired" message to user
+
+SERVER BEST PRACTICES:
+  ✓ Return 401 with WWW-Authenticate header
+  ✓ Return informative error code (token_expired vs invalid_token)
+  ✓ Include clock skew tolerance (±30 seconds for exp)
+
+@ExceptionHandler(JwtValidationException.class)
+public ResponseEntity<ErrorResponse> handleJwtError(JwtValidationException e) {
+    if (e.getMessage().contains("expired")) {
+        return ResponseEntity.status(401)
+            .header("WWW-Authenticate", "Bearer error=\"invalid_token\", " +
+                    "error_description=\"Token has expired\"")
+            .body(new ErrorResponse("token_expired", "Your session has expired"));
+    }
+    return ResponseEntity.status(401).body(new ErrorResponse("invalid_token"));
+}
+
+================================================================
+JWT BEST PRACTICES SUMMARY CHECKLIST
+================================================================
+
+TOKEN DESIGN:
+  [ ] Access token TTL ≤ 15 minutes
+  [ ] Refresh token rotation enabled
+  [ ] No sensitive data in payload
+  [ ] Audience (aud) claim set correctly
+  [ ] Issuer (iss) claim set to AS URL
+
+VALIDATION:
+  [ ] Signature verified with correct algorithm
+  [ ] Algorithm hardcoded (not from header)
+  [ ] exp, iss, aud validated
+  [ ] "alg: none" never accepted
+
+STORAGE:
+  [ ] No tokens in localStorage
+  [ ] Refresh tokens in HttpOnly cookies or Keychain
+  [ ] Access tokens in memory (SPA) or server-side (web app)
+
+TRANSPORT:
+  [ ] HTTPS only
+  [ ] Authorization header (not URL params)
+  [ ] CORS properly configured
+
+OPERATIONS:
+  [ ] Key rotation plan in place
+  [ ] JWKS endpoint publicly accessible and cached
+  [ ] Token revocation strategy (short TTL or denylist)
+  [ ] Audit logging of token issuance
+
+================================================================
+COMMON INTERVIEW QUESTIONS
+================================================================
+
+Q: What are the most important JWT best practices?
+A: Short access token TTL (15 min), validate all claims (sig, exp, iss, aud),
+   use asymmetric signing (RS256/ES256), never store in localStorage, use
+   refresh token rotation, never put sensitive data in payload.
+
+Q: How do you handle JWT revocation?
+A: JWT can't be truly revoked, so: (1) Use short TTL to limit exposure.
+   (2) Implement a token denylist/blacklist in Redis for immediate revocation.
+   (3) Use refresh token rotation — AS detects if a refresh token is used
+   twice (theft indicator) and invalidates the session.
+
+Q: What is refresh token rotation and why is it important?
+A: On every refresh, issue a new refresh token and invalidate the old one.
+   If an attacker steals a refresh token and uses it after the legitimate
+   client, the AS detects the reuse of an already-rotated token — an anomaly
+   indicating theft — and can revoke the entire session.
+
+Q: Where should a SPA store JWT tokens?
+A: Access token in JavaScript memory (not localStorage). Refresh token in
+   an HttpOnly, Secure, SameSite cookie managed by a BFF (Backend for
+   Frontend) server. This prevents XSS from reading either token.
+
+Q: What is the difference between signed (JWS) and encrypted (JWE) JWT?
+A: JWS (standard JWT) is signed — the payload is readable but tamper-proof.
+   JWE is encrypted — the payload is unreadable without the decryption key.
+   Use JWE when payload contains sensitive data that must be hidden from
+   the token bearer or intermediaries.

@@ -1,0 +1,660 @@
+================================================================================
+CONTAINER IMAGE SCANNING — DEEP DIVE
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1.  Container Image Anatomy & Vulnerability Surface
+2.  Distroless and Minimal Base Images
+3.  Trivy (Advanced Usage)
+4.  Grype
+5.  Image Signing with Cosign (Sigstore)
+6.  Admission Controllers for Image Security
+7.  Runtime Container Security (securityContext & Pod Security Standards)
+8.  Falco (Runtime Threat Detection)
+9.  Supply Chain Security (SLSA & SBOM)
+10. ECR Scanning & Lifecycle Policies
+11. Common Interview Questions & Answers
+12. Quick Reference Cheat Sheet
+
+================================================================================
+NOTE: 03_Dependency_Scanning.txt covers: Trivy basics (image/fs/config scans,
+GitHub Action, .trivyignore), container security best practices (minimal images,
+non-root, multi-stage, distroless), SBOM basics (CycloneDX/SPDX, trivy + syft).
+This file goes deeper on image signing, admission controllers, runtime security,
+Falco, and supply chain security.
+================================================================================
+
+1. CONTAINER IMAGE ANATOMY & VULNERABILITY SURFACE
+================================================================================
+
+Image Layer Model:
+  Docker images are stacked, copy-on-write layers.
+  Each RUN/COPY/ADD instruction creates a new layer.
+  Vulnerabilities live in the files added by each layer.
+  
+  ┌─────────────────────────────────┐
+  │  Layer 5: App code (COPY . .)  │ ← App vulnerabilities
+  │  Layer 4: pip install deps     │ ← Python package CVEs
+  │  Layer 3: apt-get install curl │ ← OS package CVEs
+  │  Layer 2: Python 3.11          │ ← Python runtime CVEs
+  │  Layer 1: debian:bookworm-slim │ ← OS base image CVEs
+  └─────────────────────────────────┘
+  
+  Key insight: Even if you delete a file in a later layer, it still exists
+  in the previous layer's snapshot — scanners WILL find it.
+
+Vulnerability Sources:
+  1. OS packages (apt, apk, yum): glibc, openssl, curl, libc6
+  2. Language runtime: Python 3.x, Node.js, JDK
+  3. Application dependencies: packages from pip/npm/Maven
+  4. Application code: custom CVEs in your own code (SAST covers this)
+
+CVSS Scoring and Prioritization:
+  CVSS v3.1 scale: 0.0 (None) → 10.0 (Critical)
+  
+  Score Range  Severity   Action
+  9.0–10.0     Critical   Fix immediately (same sprint)
+  7.0–8.9      High       Fix within 1 sprint
+  4.0–6.9      Medium     Fix in next 2-4 sprints
+  0.1–3.9      Low        Best effort
+  
+  Context matters: A critical CVE in curl may not be exploitable if
+  your app never uses curl's network stack. Use reachability analysis tools.
+
+================================================================================
+2. DISTROLESS AND MINIMAL BASE IMAGES
+================================================================================
+
+What Are Distroless Images?
+  Images with NO shell, package manager, or utilities.
+  Only the application runtime and its dependencies.
+  Developed and maintained by Google (gcr.io/distroless).
+  
+  Available images:
+  gcr.io/distroless/static-debian12    Static binaries only (Go, Rust)
+  gcr.io/distroless/base-debian12      libc + OpenSSL (C/C++)
+  gcr.io/distroless/java21-debian12    JRE 21 only
+  gcr.io/distroless/python3-debian12   Python 3 only
+  gcr.io/distroless/nodejs20-debian12  Node.js 20 only
+
+Distroless Dockerfile Example (Python):
+  # Build stage: full Python image to install dependencies
+  FROM python:3.11-slim AS builder
+  WORKDIR /app
+  COPY requirements.txt .
+  RUN pip install --user --no-cache-dir -r requirements.txt
+  COPY . .
+  
+  # Final stage: distroless, no shell, no package manager
+  FROM gcr.io/distroless/python3-debian12
+  WORKDIR /app
+  COPY --from=builder /root/.local/lib/python3.11 /root/.local/lib/python3.11
+  COPY --from=builder /app .
+  CMD ["app.py"]
+  
+  # Result: dramatically smaller attack surface
+  # Regular python:3.11: ~1000+ packages, hundreds of CVEs
+  # Distroless python3: ~50 packages, handful of CVEs
+
+Debugging Distroless:
+  No shell = can't exec into container for debugging.
+  
+  Options:
+  1. Debug variant (has busybox shell):
+     FROM gcr.io/distroless/python3-debian12:debug
+     # Use for development/debugging only, not production
+  
+  2. kubectl debug (K8s 1.23+):
+     kubectl debug -it my-pod --image=busybox --target=app
+     # Attaches a debug container to the running pod
+
+================================================================================
+3. TRIVY (ADVANCED USAGE)
+================================================================================
+
+Trivy Scan Types:
+  # Vulnerabilities only:
+  trivy image --vuln-type os,library myapp:latest
+  
+  # Secrets in image:
+  trivy image --scanners secret myapp:latest
+  
+  # Misconfigurations only:
+  trivy image --scanners misconfig myapp:latest
+  
+  # All scanners:
+  trivy image --scanners vuln,secret,misconfig myapp:latest
+  
+  # Only critical+high, fail on critical:
+  trivy image --severity CRITICAL,HIGH --exit-code 1 myapp:latest
+  
+  # Output SARIF for GitHub Advanced Security:
+  trivy image -f sarif -o trivy-results.sarif myapp:latest
+
+Continuous Registry Scanning:
+  Scan on push to registry AND periodically re-scan old images
+  (new CVEs are published daily — an image clean today may be vulnerable tomorrow)
+  
+  # GitHub Actions — scan on push:
+  - name: Build and push image
+    uses: docker/build-push-action@v5
+    with:
+      push: true
+      tags: myrepo/myapp:${{ github.sha }}
+  
+  - name: Trivy scan
+    uses: aquasecurity/trivy-action@master
+    with:
+      image-ref: myrepo/myapp:${{ github.sha }}
+      format: sarif
+      output: trivy-results.sarif
+      severity: CRITICAL,HIGH
+      exit-code: 1
+
+================================================================================
+4. GRYPE
+================================================================================
+
+What is Grype?
+  Open-source vulnerability scanner by Anchore.
+  Fast, focused on container image and filesystem scanning.
+  Works well with its companion tool Syft (SBOM generator).
+
+Grype vs Trivy Comparison:
+  Feature                 Grype                    Trivy
+  ─────────────────────────────────────────────────────────
+  Vulnerability scanning  ✅ Excellent              ✅ Excellent
+  Misconfiguration scan   ❌ No                     ✅ Yes (Dockerfile, K8s, Terraform)
+  Secret scanning         ❌ No                     ✅ Yes
+  IaC scanning            ❌ No                     ✅ Yes (Terraform, CloudFormation)
+  SBOM input/output       ✅ Syft integration       ✅ Native
+  Speed                   ✅ Very fast               ✅ Fast
+  CI/CD integration       ✅ GitHub Actions          ✅ GitHub Actions
+  Formats                 SARIF, JSON, table        SARIF, JSON, table, HTML
+  
+  Choose Grype: When you want a focused, lightweight vulnerability scanner
+                integrated with Syft for SBOM-driven scanning.
+  Choose Trivy: When you want one tool for vuln + misconfig + secrets + IaC.
+
+Grype Usage:
+  # Scan image:
+  grype myapp:latest
+  
+  # Scan with SBOM (faster re-scanning):
+  syft myapp:latest -o json > sbom.json
+  grype sbom:./sbom.json
+  
+  # Only HIGH and CRITICAL, fail on HIGH+:
+  grype myapp:latest --fail-on high
+  
+  # Ignore known false positives (.grype.yaml):
+  ignore:
+  - vulnerability: CVE-2022-1234
+    reason: "Not exploitable — we don't use this codepath"
+  - fix-state: not-fixed   # Ignore unfixed CVEs (can't do anything about them)
+  
+  # GitHub Actions:
+  - name: Grype scan
+    uses: anchore/scan-action@v3
+    with:
+      image: myapp:latest
+      fail-build: true
+      severity-cutoff: high
+
+================================================================================
+5. IMAGE SIGNING WITH COSIGN (SIGSTORE)
+================================================================================
+
+Why Sign Container Images?
+  Verify images come from your trusted build pipeline.
+  Prevents image substitution attacks (supply chain attacks).
+  "Is this image really the one I built and tested?"
+
+Sigstore and Cosign:
+  Sigstore: Public goods infrastructure for signing, verification, and transparency.
+  Cosign: CLI tool for signing/verifying container images.
+  Rekor: Tamper-proof, append-only transparency log (records all signatures).
+  Fulcio: Certificate authority that issues signing certs tied to identity (OIDC).
+
+Keyless Signing (Recommended — no key management):
+  Cosign + Fulcio + OIDC — signing cert issued based on GitHub Actions identity.
+  
+  # In GitHub Actions (no key storage needed):
+  - name: Sign image with Cosign
+    uses: sigstore/cosign-installer@v3
+  
+  - name: Sign
+    run: |
+      cosign sign --yes \
+        myrepo/myapp@${{ steps.build.outputs.digest }}
+    env:
+      COSIGN_EXPERIMENTAL: 1
+  # Signature stored in registry (OCI artifact next to image)
+  # Signing certificate tied to the GitHub Actions OIDC identity
+
+Verifying an Image Signature:
+  # Verify before deploying:
+  cosign verify \
+    --certificate-identity-regexp "https://github.com/myorg/myrepo/.github/workflows/" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    myrepo/myapp:latest
+  
+  # If verification fails → image was not built by your CI, DO NOT deploy
+
+Attaching SBOM as Attestation:
+  # Generate SBOM with Syft:
+  syft myrepo/myapp:latest -o cyclonedx-json > sbom.json
+  
+  # Attach SBOM as attestation (cryptographically linked to image):
+  cosign attest --predicate sbom.json --type cyclonedx \
+    myrepo/myapp@${{ digest }}
+  
+  # Retrieve SBOM later for audit:
+  cosign download attestation myrepo/myapp:latest | \
+    jq -r '.payload' | base64 -d | jq .predicate
+
+================================================================================
+6. ADMISSION CONTROLLERS FOR IMAGE SECURITY
+================================================================================
+
+What Are Admission Controllers?
+  K8s webhook-based gatekeepers that intercept resource creation.
+  Can VALIDATE (allow/deny) or MUTATE (modify) requests to the API server.
+  Run BEFORE a pod is created — prevents insecure deployments.
+
+Kyverno Policies for Image Security:
+  # Policy: Block :latest tag (force digest or version tags):
+  apiVersion: kyverno.io/v1
+  kind: ClusterPolicy
+  metadata:
+    name: disallow-latest-tag
+  spec:
+    validationFailureAction: Enforce
+    rules:
+    - name: check-image-tag
+      match:
+        resources:
+          kinds: [Pod]
+      validate:
+        message: "Image tag ':latest' is not allowed. Use a specific version or digest."
+        pattern:
+          spec:
+            containers:
+            - image: "!*:latest"
+  
+  ---
+  # Policy: Only allow images from approved registries:
+  apiVersion: kyverno.io/v1
+  kind: ClusterPolicy
+  metadata:
+    name: restrict-image-registries
+  spec:
+    validationFailureAction: Enforce
+    rules:
+    - name: validate-registries
+      match:
+        resources:
+          kinds: [Pod]
+      validate:
+        message: "Images must come from 123456789.dkr.ecr.us-east-1.amazonaws.com or gcr.io/distroless"
+        pattern:
+          spec:
+            containers:
+            - image: "123456789.dkr.ecr.us-east-1.amazonaws.com/* | gcr.io/distroless/*"
+  
+  ---
+  # Policy: Require images to be signed with Cosign:
+  apiVersion: kyverno.io/v1
+  kind: ClusterPolicy
+  metadata:
+    name: require-signed-images
+  spec:
+    validationFailureAction: Enforce
+    rules:
+    - name: check-image-signature
+      match:
+        resources:
+          kinds: [Pod]
+      verifyImages:
+      - image: "123456789.dkr.ecr.us-east-1.amazonaws.com/*"
+        attestors:
+        - entries:
+          - keyless:
+              issuer: https://token.actions.githubusercontent.com
+              subject: https://github.com/myorg/myrepo/.github/workflows/build.yml@refs/heads/main
+
+================================================================================
+7. RUNTIME CONTAINER SECURITY
+================================================================================
+
+Pod Security Context (Best Practices):
+  # Fully hardened pod spec:
+  apiVersion: v1
+  kind: Pod
+  spec:
+    securityContext:
+      runAsNonRoot: true          # Fail if container runs as root
+      runAsUser: 10001            # Specific non-root UID
+      runAsGroup: 10001
+      fsGroup: 10001              # Ownership of mounted volumes
+      seccompProfile:
+        type: RuntimeDefault      # Apply default seccomp filtering
+    
+    containers:
+    - name: app
+      image: myapp:1.2.3
+      securityContext:
+        allowPrivilegeEscalation: false   # Can't sudo or setuid
+        readOnlyRootFilesystem: true      # No writes to container FS
+        capabilities:
+          drop: ["ALL"]                  # Remove all Linux capabilities
+          add: ["NET_BIND_SERVICE"]       # Only add what you need (e.g., port <1024)
+      
+      resources:
+        requests:
+          memory: "128Mi"
+          cpu: "100m"
+        limits:
+          memory: "256Mi"
+          cpu: "500m"
+      
+      volumeMounts:
+      - name: tmp
+        mountPath: /tmp              # writable /tmp since rootfs is read-only
+    
+    volumes:
+    - name: tmp
+      emptyDir: {}
+
+Pod Security Standards (K8s 1.25+ — replaces PSP):
+  Three levels, enforced via namespace labels:
+  
+  Privileged:  No restrictions (legacy workloads, node agents)
+  Baseline:    Prevents known privilege escalation
+               Blocks: hostNetwork, hostPID, privileged containers, hostPath
+  Restricted:  Follows hardening best practices (securityContext required)
+               Requires: runAsNonRoot, drop ALL capabilities, no privilege escalation
+  
+  # Label namespace to enforce Restricted:
+  kubectl label namespace production \
+    pod-security.kubernetes.io/enforce=restricted \
+    pod-security.kubernetes.io/enforce-version=v1.28
+  
+  # Label namespace to warn on Baseline violations (audit mode):
+  kubectl label namespace staging \
+    pod-security.kubernetes.io/warn=baseline
+
+================================================================================
+8. FALCO (RUNTIME THREAT DETECTION)
+================================================================================
+
+What is Falco?
+  Open-source CNCF runtime security tool.
+  Monitors kernel syscalls using eBPF.
+  Detects suspicious behavior at runtime EVEN if an attacker bypasses image scanning.
+  "SIEM for containers."
+
+Falco Default Rules (Examples):
+  # Shell spawned in container (attack indicator):
+  - rule: Terminal shell in container
+    desc: Detect a shell opened in a running container
+    condition: >
+      spawned_process and container and shell_procs and proc.tty != 0
+    output: >
+      Shell opened in container (user=%user.name %container.info
+      shell=%proc.name parent=%proc.pname cmdline=%proc.cmdline)
+    priority: WARNING
+    tags: [container, shell, mitre_execution]
+  
+  # Package installed in running container:
+  - rule: Package management launched in container
+    desc: Package manager (apt/yum/pip) run inside container
+    condition: >
+      spawned_process and container and
+      (proc.name in (package_mgmt_binaries) or
+       proc.pname in (package_mgmt_binaries))
+    output: >
+      Package management tool launched in container
+      (user=%user.name %container.info tool=%proc.name)
+    priority: ERROR
+  
+  # Write to /etc (shouldn't happen in running container):
+  - rule: Write below etc
+    desc: Detect writes to /etc
+    condition: >
+      open_write and container and fd.directory = /etc
+    output: >
+      File opened for writing under /etc
+      (user=%user.name %container.info command=%proc.cmdline file=%fd.name)
+    priority: WARNING
+
+Falco Sidekick (Alert Routing):
+  Falco Sidekick receives Falco alerts → routes to multiple outputs.
+  
+  Supported outputs: Slack, PagerDuty, AWS Lambda, Elasticsearch, Loki,
+                     Teams, OpsGenie, Prometheus AlertManager
+  
+  # Falco Sidekick config:
+  alertmanager:
+    hostport: "http://alertmanager:9093"
+  
+  slack:
+    webhookurl: "https://hooks.slack.com/services/xxx"
+    minimumpriority: "warning"
+  
+  # Install with Helm:
+  helm install falco falcosecurity/falco \
+    --set falco.jsonOutput=true \
+    --set falcowebhook.enabled=true \
+    --set falcosidekick.enabled=true
+
+================================================================================
+9. SUPPLY CHAIN SECURITY (SLSA & SBOM)
+================================================================================
+
+SLSA Framework (Supply-chain Levels for Software Artifacts):
+  Graduated levels of supply chain security assurance.
+  
+  Level   Requirements
+  ─────────────────────────────────────────────────────────────────
+  SLSA 0  No guarantees
+  SLSA 1  Build process is scripted/automated; provenance exists
+  SLSA 2  Hosted source and build, provenance is signed
+  SLSA 3  Hardened build platform; build is isolated (no network)
+  SLSA 4  Two-person review; hermetic, reproducible build
+  
+  Provenance: Metadata document describing HOW an artifact was built.
+  (Which source repo? Which commit? Which builder? What dependencies?)
+
+GitHub Actions + SLSA (Level 3):
+  # Using slsa-github-generator:
+  jobs:
+    build:
+      outputs:
+        digest: ${{ steps.build.outputs.digest }}
+      steps:
+      - name: Build image
+        id: build
+        run: |
+          docker build -t myapp:latest .
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' myapp:latest | cut -d@ -f2)
+          echo "digest=$digest" >> $GITHUB_OUTPUT
+    
+    provenance:
+      needs: [build]
+      uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v1.10.0
+      with:
+        image: myrepo/myapp
+        digest: ${{ needs.build.outputs.digest }}
+      secrets:
+        registry-username: ${{ github.actor }}
+        registry-password: ${{ secrets.GITHUB_TOKEN }}
+  
+  # Result: SLSA provenance attestation stored in registry alongside image
+
+SBOM (Software Bill of Materials):
+  # Generate with Syft:
+  syft myapp:latest -o cyclonedx-json > sbom.cyclonedx.json
+  syft myapp:latest -o spdx-json > sbom.spdx.json
+  
+  # Vulnerability scan USING SBOM (faster, cached):
+  grype sbom:./sbom.cyclonedx.json
+  
+  # What's in an SBOM:
+  - Component name, version, type (library, framework, OS)
+  - Package URL (PURL) — unique identifier
+  - License (GPL, MIT, Apache 2.0)
+  - Hash (SHA-256) — integrity check
+
+================================================================================
+10. ECR SCANNING & LIFECYCLE POLICIES
+================================================================================
+
+AWS ECR Enhanced Scanning (Amazon Inspector):
+  # Enable enhanced scanning:
+  aws ecr put-registry-scanning-configuration \
+    --scan-type ENHANCED \
+    --rules '[{
+      "repositoryFilters": [{"filter": "*", "filterType": "WILDCARD"}],
+      "scanFrequency": "CONTINUOUS_SCAN"
+    }]'
+  
+  # Enhanced scanning:
+  # - Powered by Amazon Inspector
+  # - Scans OS + language packages
+  # - Continuous (re-scans as new CVEs published)
+  # - Results in ECR console + EventBridge events → Lambda/SNS
+
+ECR Lifecycle Policy (Auto-cleanup old images):
+  # Keep only last 10 production images, delete older untagged:
+  {
+    "rules": [
+      {
+        "rulePriority": 1,
+        "description": "Keep last 10 prod images",
+        "selection": {
+          "tagStatus": "tagged",
+          "tagPrefixList": ["prod-"],
+          "countType": "imageCountMoreThan",
+          "countNumber": 10
+        },
+        "action": { "type": "expire" }
+      },
+      {
+        "rulePriority": 2,
+        "description": "Delete untagged images older than 7 days",
+        "selection": {
+          "tagStatus": "untagged",
+          "countType": "sinceImagePushed",
+          "countUnit": "days",
+          "countNumber": 7
+        },
+        "action": { "type": "expire" }
+      }
+    ]
+  }
+
+================================================================================
+11. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: What is your container image security strategy from build to runtime?
+A: Defense in depth across the full lifecycle:
+   
+   Build stage (Dockerfile):
+   - Use specific digest-pinned base images (FROM debian@sha256:abc123...)
+   - Multi-stage builds — only production artifacts in final image
+   - Distroless or slim base images
+   - Run as non-root user (USER 10001)
+   - No secrets in Docker build args (use --secret flag or runtime injection)
+   
+   CI/CD:
+   - Trivy scan on every build — block on CRITICAL, warn on HIGH
+   - Fail build if Dockerfile has critical misconfigurations (Trivy misconfig scan)
+   - Sign image with Cosign (keyless, OIDC-based)
+   - Generate and attach SBOM attestation
+   
+   Registry:
+   - ECR enhanced scanning (continuous CVE monitoring)
+   - Lifecycle policies to clean up old/untagged images
+   - Tag policy: no :latest — always tag with git SHA or version
+   
+   Deployment:
+   - Kyverno admission controller:
+     * Require signed images
+     * Block images from unapproved registries
+     * Block :latest tag
+   - Pod security context: non-root, readOnlyRootFilesystem, drop ALL capabilities
+   - Pod Security Standard: Restricted namespace label
+   
+   Runtime:
+   - Falco for syscall-level threat detection
+   - Network policies to limit pod communication
+   - Regular re-scan old images for new CVEs
+
+Q2: Explain image signing with Cosign and why it matters.
+A: Image signing is part of supply chain security — verifying that:
+   1. The image was built by YOUR CI/CD pipeline (not by an attacker)
+   2. The image has not been tampered with since it was built
+   
+   Without signing, an attacker who gets write access to your registry could:
+   - Push a backdoored image with the same tag
+   - Your deployment pulls it — silent supply chain attack
+   
+   Cosign + Sigstore (keyless signing):
+   - When GitHub Actions builds the image, cosign sign is run
+   - Cosign contacts Fulcio (Sigstore's CA) with the GitHub OIDC token
+   - Fulcio issues a short-lived certificate tied to the workflow identity
+   - Cosign creates a signature and stores it in the registry (OCI artifact)
+   - Signature record is also written to Rekor (public transparency log)
+   
+   Verification:
+   - cosign verify checks: signature is valid, cert was issued for the expected identity
+   - If image was tampered with → signature fails → deployment blocked
+   
+   With Kyverno's verifyImages policy:
+   - Every pod creation is checked: does this image have a valid Cosign signature?
+   - If not signed → pod rejected → can't run unsigned images in cluster
+
+================================================================================
+12. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+SCANNING TOOLS:
+  Trivy:  vuln + misconfig + secret + IaC  (one tool for everything)
+  Grype:  vuln scanning, SBOM-native
+  Syft:   SBOM generation (CycloneDX, SPDX)
+  Cosign: Image signing and verification
+
+BASE IMAGE SECURITY (best → worst):
+  gcr.io/distroless/*     No shell, minimal packages ← BEST
+  *:*-slim / *:*-alpine   Minimal but has shell
+  *:latest                Full OS, most CVEs       ← AVOID
+
+POD SECURITY CONTEXT ESSENTIALS:
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities: drop: ["ALL"]
+  seccompProfile: type: RuntimeDefault
+
+KYVERNO IMAGE POLICIES:
+  disallow-latest-tag          Require version/digest tags
+  restrict-image-registries    Only approved registries
+  require-signed-images        Cosign signature required
+
+SUPPLY CHAIN MATURITY:
+  SLSA 1: Scripted build, provenance exists
+  SLSA 2: Signed provenance (GitHub Actions + Cosign)
+  SLSA 3: Isolated build environment (no network access)
+
+FALCO KEY RULE TYPES:
+  Terminal shell in container    Attacker opened shell
+  Package management in container  Attacker installing tools
+  Write below /etc               Config tampering
+  Outbound network from container  Data exfiltration
+
+================================================================================
+END OF FILE
+================================================================================

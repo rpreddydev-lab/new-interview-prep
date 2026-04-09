@@ -1,0 +1,236 @@
+================================================================================
+  SPRING KAFKA — ERROR HANDLING AND RETRY
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. THE PROBLEM: WHAT HAPPENS WHEN A LISTENER THROWS?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Without any error handler:
+  - Spring Kafka logs the error and seeks the offset back to the failed record
+  - Next poll returns the same record → infinite retry loop
+  - Partition is effectively stuck (poison pill)
+
+With DefaultErrorHandler (Spring Kafka 2.8+, replaced SeekToCurrentErrorHandler):
+  - Configurable retry count + backoff
+  - After exhausted retries → send to Dead Letter Topic or discard
+  - Optionally skip non-retriable exceptions immediately
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. DefaultErrorHandler WITH FIXED BACKOFF
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  @Bean
+  public ConcurrentKafkaListenerContainerFactory<String, Order> factory(
+      ConsumerFactory<String, Order> cf) {
+
+    // Retry 3 times, wait 2 seconds between each attempt
+    FixedBackOff backOff = new FixedBackOff(2000L, 3L); // interval=2s, maxAttempts=3
+
+    DefaultErrorHandler errorHandler = new DefaultErrorHandler(backOff);
+
+    // Non-retriable exceptions: skip retries, go straight to recovery
+    errorHandler.addNotRetryableExceptions(
+      ValidationException.class,
+      DeserializationException.class
+    );
+
+    ConcurrentKafkaListenerContainerFactory<String, Order> factory =
+      new ConcurrentKafkaListenerContainerFactory<>();
+    factory.setConsumerFactory(cf);
+    factory.setCommonErrorHandler(errorHandler);
+    return factory;
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. DefaultErrorHandler WITH EXPONENTIAL BACKOFF + DLQ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  @Bean
+  public DefaultErrorHandler errorHandler(KafkaTemplate<Object, Object> template) {
+
+    // Publish failed records to <original-topic>.DLT
+    DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(template,
+      (record, ex) -> new TopicPartition(
+        record.topic() + ".DLT",
+        record.partition() // preserve partition affinity
+      )
+    );
+
+    ExponentialBackOffWithMaxRetries backOff = new ExponentialBackOffWithMaxRetries(5);
+    backOff.setInitialInterval(1000L);   // 1s first retry
+    backOff.setMultiplier(2.0);          // doubles each time: 1s, 2s, 4s, 8s, 16s
+    backOff.setMaxInterval(30_000L);     // cap at 30s
+
+    DefaultErrorHandler handler = new DefaultErrorHandler(recoverer, backOff);
+
+    // Non-retriable: go straight to DLT without any backoff
+    handler.addNotRetryableExceptions(
+      JsonProcessingException.class,
+      ClassCastException.class
+    );
+
+    return handler;
+  }
+
+  // Register with factory:
+  factory.setCommonErrorHandler(errorHandler(kafkaTemplate));
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  RETRY FLOW:                                                             │
+  │                                                                         │
+  │  msg received → listener throws → retry 1 (wait 1s) → listener throws  │
+  │  → retry 2 (wait 2s) → ... → retry 5 (wait 16s)                        │
+  │  → all retries exhausted → DeadLetterPublishingRecoverer → DLT topic    │
+  │  → offset committed (partition unblocked, consumer moves on)            │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. @RetryableTopic — RETRY TOPICS PATTERN (Spring Kafka 2.7+)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Instead of blocking the main consumer thread with sleep-based retries, each retry
+is a new Kafka message sent to a separate retry topic. Retry topics are consumed
+after a delay using a dedicated consumer.
+
+  ┌──────────┐  fail  ┌─────────────────────┐  fail  ┌──────────────────────┐
+  │  orders  │ ──────► │ orders-retry-0 (2s) │ ──────► │ orders-retry-1 (4s) │
+  └──────────┘        └─────────────────────┘        └──────────────────────┘
+                                                                │ fail
+                                                                ▼
+                                                        ┌─────────────┐
+                                                        │ orders-dlt  │
+                                                        └─────────────┘
+
+  @Component
+  public class OrderListener {
+
+    @RetryableTopic(
+      attempts = "4",                           // 1 main + 3 retries
+      backoff = @Backoff(delay = 2000, multiplier = 2),
+      // Creates: orders-retry-0, orders-retry-1, orders-retry-2, orders-dlt
+      dltStrategy = DltStrategy.FAIL_ON_ERROR,  // or ALWAYS_RETRY_ON_ERROR
+      include = {TransientException.class},      // only retry these
+      exclude = {ValidationException.class},     // skip retry for these
+      autoCreateTopics = "true",
+      numPartitions = "3",
+      replicationFactor = "3"
+    )
+    @KafkaListener(topics = "orders")
+    public void handleOrder(Order order) {
+      orderService.process(order);
+    }
+
+    // DLT handler
+    @DltHandler
+    public void handleDlt(Order order,
+        @Header(KafkaHeaders.RECEIVED_TOPIC) String topic,
+        @Header(KafkaHeaders.EXCEPTION_CAUSE_FQCN) String exceptionFqcn) {
+      log.error("Message sent to DLT. topic={}, exception={}", topic, exceptionFqcn);
+      alertingService.sendAlert(order, exceptionFqcn);
+    }
+  }
+
+  // Enable in main config:
+  @EnableRetryTopic
+  @Configuration
+  public class KafkaConfig { }
+
+  // OR via application.yml:
+  spring:
+    kafka:
+      retry:
+        topic:
+          enabled: true
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. KafkaListenerErrorHandler (INLINE ERROR HANDLING)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A lightweight alternative: define a per-listener error handler inline.
+
+  @Bean
+  public KafkaListenerErrorHandler myErrorHandler() {
+    return (message, exception) -> {
+      log.error("Error processing message: {}", message.getPayload(), exception);
+      // Can return a value (sent to @SendTo destination) or null
+      return null;
+    };
+  }
+
+  @KafkaListener(topics = "orders", errorHandler = "myErrorHandler")
+  public void handleOrder(Order order) {
+    processOrder(order);
+  }
+
+Note: KafkaListenerErrorHandler is invoked BEFORE the container-level
+DefaultErrorHandler. If it swallows the exception (returns non-null or doesn't
+re-throw), no retry occurs.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. DESERIALIZATION ERRORS (ErrorHandlingDeserializer)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Deserialization exceptions happen before the listener is invoked, so
+DefaultErrorHandler can't catch them directly. Use ErrorHandlingDeserializer:
+
+  spring:
+    kafka:
+      consumer:
+        value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+        properties:
+          spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
+          spring.json.trusted.packages: "com.example.model"
+
+  # ErrorHandlingDeserializer catches DeserializationException and places it in
+  # the record header as DESERIALIZATION_EXCEPTION_HEADER — the listener container
+  # then routes it to the error handler for DLT handling.
+
+  // Add to non-retriable exceptions in DefaultErrorHandler:
+  handler.addNotRetryableExceptions(DeserializationException.class);
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What replaced SeekToCurrentErrorHandler in Spring Kafka 2.8?
+A: DefaultErrorHandler replaced both SeekToCurrentErrorHandler and
+   RecoveringBatchErrorHandler in Spring Kafka 2.8. It unified error handling for
+   both individual and batch listeners. It uses a BackOff (FixedBackOff or
+   ExponentialBackOffWithMaxRetries) to control retry intervals, supports a
+   ConsumerRecordRecoverer (e.g., DeadLetterPublishingRecoverer) for records that
+   exhaust retries, and allows classifying exceptions as non-retriable for
+   immediate routing to the recoverer.
+
+Q: What is the difference between DefaultErrorHandler retries and @RetryableTopic retries?
+A: DefaultErrorHandler retries are blocking — the consumer thread sleeps between
+   attempts. The partition is effectively paused while waiting. @RetryableTopic retries
+   are non-blocking — the failed record is published to a retry topic, the main consumer
+   moves on, and a separate consumer processes the retry topic after a delay. @RetryableTopic
+   is preferred for high-throughput scenarios (main consumer keeps processing) and when
+   retry delays are long (seconds-minutes). DefaultErrorHandler is simpler for
+   short-duration, low-frequency retries.
+
+Q: How do you handle deserialization failures in Spring Kafka?
+A: Wrap your actual deserializer in ErrorHandlingDeserializer. It catches
+   DeserializationException and embeds it in the record header instead of propagating
+   it to the producer client (which would kill the poll loop). The container's error
+   handler can then receive the record with the embedded exception header and route it
+   to a DLT. Add DeserializationException to DefaultErrorHandler.addNotRetryableExceptions()
+   so it skips retries and goes straight to the recoverer.
+
+Q: How do you skip retries for certain exception types?
+A: Call errorHandler.addNotRetryableExceptions(MyException.class, ...) on your
+   DefaultErrorHandler. When a non-retriable exception is thrown, the handler skips
+   the BackOff entirely and calls the recoverer (e.g., DeadLetterPublishingRecoverer)
+   immediately, then commits the offset. Useful for validation failures, data format
+   errors, and other permanent failures where retrying would never succeed.
+
+Q: How does @DltHandler work with @RetryableTopic?
+A: When all retry attempts for @RetryableTopic are exhausted, the record is sent to
+   the Dead Letter Topic (by default: <original-topic>-dlt). If a method in the same
+   @Component is annotated with @DltHandler, Spring Kafka wires it as the consumer
+   for the DLT and invokes it for each DLT record. Inside @DltHandler you can alert,
+   log to a database, or schedule a replay. Without @DltHandler, DLT records are
+   consumed by a default handler that simply logs them.

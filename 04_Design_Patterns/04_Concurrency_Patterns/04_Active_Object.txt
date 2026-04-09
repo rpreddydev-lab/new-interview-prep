@@ -1,0 +1,262 @@
+================================================================
+  ACTIVE OBJECT PATTERN
+================================================================
+
+  Category:   Concurrency
+  Intent:     Decouple method execution from method invocation for objects
+              that each reside in their own thread of control. The pattern
+              provides method execution as an asynchronous operation using
+              a message-passing mechanism.
+  Also known: Concurrent Object, Actor model element
+
+----------------------------------------------------------------
+PROBLEM SOLVED
+----------------------------------------------------------------
+
+  You want to invoke a method on an object asynchronously.
+  The caller should not block waiting for the result.
+  The object processes requests sequentially in its own thread.
+  Clients interact through a proxy (synchronous interface) without knowing
+  about threads.
+
+  Traditional approach: new Thread(() -> object.doWork()).start();
+  Problem: no ordering guarantee, no result return, no backpressure.
+
+  Active Object solves:
+    - Method call → asynchronous; returns a Future/CompletableFuture.
+    - Object has its own dispatcher thread processing one request at a time.
+    - Queue provides backpressure and ordering.
+
+----------------------------------------------------------------
+PARTICIPANTS
+----------------------------------------------------------------
+
+  Proxy          -- Client-facing interface. Converts calls to MethodRequest objects.
+                    Returns Futures for async results. Submits to Activation Queue.
+
+  MethodRequest  -- Represents a pending method call.
+                    Implements a call() that executes the actual logic.
+                    Holds all parameters needed for execution.
+
+  Activation Queue (Scheduler): BlockingQueue<MethodRequest>
+
+  Servant        -- The actual object that does the real work.
+                    Runs in the Dispatcher's thread.
+
+  Dispatcher     -- Runs the Servant's thread.
+                    Continuously takes MethodRequests from the queue and executes them.
+
+  Future (Result): CompletableFuture<T> — returned to caller immediately.
+                   Completed by Dispatcher after execution.
+
+----------------------------------------------------------------
+IMPLEMENTATION — ASYNC PRINTER EXAMPLE
+----------------------------------------------------------------
+
+  // Method request abstraction
+  @FunctionalInterface
+  public interface MethodRequest {
+      void execute();
+  }
+
+  // Servant — the real work object
+  public class Printer {
+      public void print(String message) {
+          System.out.println(Thread.currentThread().getName() + ": " + message);
+      }
+
+      public String format(String message) {
+          return "[" + System.currentTimeMillis() + "] " + message;
+      }
+  }
+
+  // Active Object — wraps Servant with its own thread + queue
+  public class ActivePrinter {
+      private final BlockingQueue<MethodRequest> queue      = new LinkedBlockingQueue<>();
+      private final Printer                      servant    = new Printer();
+      private final Thread                       dispatcher;
+
+      public ActivePrinter() {
+          this.dispatcher = new Thread(this::dispatchLoop, "active-printer");
+          this.dispatcher.setDaemon(true);
+          this.dispatcher.start();
+      }
+
+      // Dispatch loop — runs in dedicated thread
+      private void dispatchLoop() {
+          while (!Thread.currentThread().isInterrupted()) {
+              try {
+                  MethodRequest request = queue.take();  // blocks until work arrives
+                  request.execute();
+              } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+              }
+          }
+      }
+
+      // Async method: print (fire-and-forget)
+      public void print(String message) {
+          queue.offer(() -> servant.print(message));
+      }
+
+      // Async method with result: format (returns CompletableFuture)
+      public CompletableFuture<String> format(String message) {
+          CompletableFuture<String> future = new CompletableFuture<>();
+          queue.offer(() -> {
+              try {
+                  String result = servant.format(message);
+                  future.complete(result);
+              } catch (Exception e) {
+                  future.completeExceptionally(e);
+              }
+          });
+          return future;
+      }
+
+      public void shutdown() {
+          dispatcher.interrupt();
+      }
+  }
+
+  // Usage
+  ActivePrinter printer = new ActivePrinter();
+
+  // Fire-and-forget async calls (non-blocking)
+  printer.print("Hello");
+  printer.print("World");
+
+  // Async with result
+  CompletableFuture<String> formatted = printer.format("test message");
+  formatted.thenAccept(System.out::println);
+
+  // Caller thread never blocked by printing
+
+----------------------------------------------------------------
+ACTIVE OBJECT WITH PRIORITIZED QUEUE
+----------------------------------------------------------------
+
+  // Use PriorityBlockingQueue for priority-based dispatch
+  public class PriorityTask implements Comparable<PriorityTask> {
+      private final Runnable action;
+      private final int      priority;
+
+      public PriorityTask(Runnable action, int priority) {
+          this.action   = action;
+          this.priority = priority;
+      }
+
+      public void execute()     { action.run(); }
+
+      @Override
+      public int compareTo(PriorityTask other) {
+          return Integer.compare(other.priority, this.priority); // higher = first
+      }
+  }
+
+  PriorityBlockingQueue<PriorityTask> priorityQueue = new PriorityBlockingQueue<>();
+  // Dispatcher takes highest-priority task first.
+
+----------------------------------------------------------------
+ACTOR MODEL (MODERN EQUIVALENT)
+----------------------------------------------------------------
+
+  Active Object is a lightweight version of the Actor model.
+
+  Actor Model (Akka, Java Virtual Thread actors):
+    - Each Actor has a mailbox (queue) and processes messages sequentially.
+    - Actors communicate only through messages (no shared state).
+    - Actors can create child actors.
+    - Location transparent: actors can be local or remote.
+
+  Active Object vs Actor:
+    - Active Object: method-based interface, returns Future.
+    - Actor: message-passing (tell/ask), no direct method calls.
+    - Actor: full framework (Akka) needed; Active Object: simple to implement.
+
+  Modern Java: Virtual Threads (Java 21) make Active Object simpler.
+    - One virtual thread per active object.
+    - Minimal overhead — millions of virtual threads possible.
+    - Use BlockingQueue inside virtual thread's run loop.
+
+----------------------------------------------------------------
+JAVA CONCURRENCY TOOLS AS ACTIVE OBJECT
+----------------------------------------------------------------
+
+  SingleThreadExecutor IS an Active Object dispatcher:
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    Future<String> f = executor.submit(() -> servant.format(message));
+    // One thread, queued execution, Future for result.
+
+  All ExecutorService variants are specializations of Active Object with thread pool.
+  Spring @Async with single-thread pool is an Active Object.
+
+----------------------------------------------------------------
+COMPARISON WITH RELATED PATTERNS
+----------------------------------------------------------------
+
+  Active Object vs Command:
+    Command: encapsulates a request; execution timing is caller-controlled.
+    Active Object: encapsulates request AND dispatch to object's own thread.
+    Active Object uses Command internally (MethodRequest IS a Command).
+
+  Active Object vs Thread Pool:
+    Thread Pool: any available worker executes tasks.
+    Active Object: ONE dedicated thread per active object; preserves ordering.
+    Use Thread Pool for parallel work; Active Object for stateful sequential work.
+
+  Active Object vs Reactor:
+    Reactor: event loop dispatches to handlers (single thread, many events).
+    Active Object: each object has own thread.
+    Reactor (Netty, Vert.x) for I/O event handling.
+    Active Object for business logic objects needing sequential processing.
+
+----------------------------------------------------------------
+COMPLEXITY
+----------------------------------------------------------------
+
+  Space: O(n) — n pending method requests in queue.
+  Time:  O(1) per enqueue; task processed in queue order (O(n) wait if n ahead).
+
+  Active Object is effective when:
+    - Caller should not block.
+    - Object state requires sequential access.
+    - Tasks arrive faster than processed (queue absorbs bursts).
+
+----------------------------------------------------------------
+INTERVIEW Q&A
+----------------------------------------------------------------
+
+  Q: What is the Active Object pattern?
+  A: Separates method invocation from execution. The object has its own thread
+     (dispatcher) and a method request queue. Callers submit requests and get
+     back a Future. The dispatcher processes requests sequentially. Provides
+     asynchrony without caller blocking or concurrent state access.
+
+  Q: How does it differ from just using ExecutorService?
+  A: ExecutorService distributes tasks to multiple workers (no ordering).
+     Active Object: ONE dedicated dispatcher thread per object.
+     Ensures all requests to this object are serialized — no concurrency
+     between requests, making internal state management safe.
+
+  Q: How is Active Object related to the Actor model?
+  A: Both objects have a mailbox (queue) and process messages sequentially.
+     Actor model (Akka) is a full framework with location transparency.
+     Active Object is a simpler pattern: same JVM, method-based interface,
+     returns CompletableFuture. Actor uses tell() / ask() messages.
+
+  Q: What ensures thread safety in Active Object?
+  A: The Servant runs only in the Dispatcher thread. All access to Servant's
+     state goes through the queue. No concurrent access to Servant → no
+     synchronization needed inside Servant.
+
+----------------------------------------------------------------
+INTERVIEW TIPS
+----------------------------------------------------------------
+
+  - SingleThreadExecutor + submit() = Active Object in Java.
+  - Emphasize the key benefit: Servant state is NEVER accessed concurrently.
+  - Mention Actor model (Akka) as the framework evolution of this pattern.
+  - CompletableFuture as the return mechanism is the modern Java approach.
+  - Virtual Threads (Java 21) make implementing Active Objects very cheap.
+
+================================================================

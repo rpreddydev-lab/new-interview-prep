@@ -1,0 +1,827 @@
+================================================================================
+KUBERNETES PROBES — LIVENESS, READINESS, AND STARTUP
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Why Probes Matter
+2. Probe Types: Liveness, Readiness, Startup
+3. Probe Mechanisms (How Probes Check Health)
+4. Probe Configuration Parameters
+5. Complete Probe Examples
+6. Probe Interactions with Kubernetes
+7. Common Patterns and Anti-Patterns
+8. terminationGracePeriodSeconds and preStop
+9. Debugging Probes
+10. Common Interview Questions & Answers
+11. Quick Reference Cheat Sheet
+
+================================================================================
+1. WHY PROBES MATTER
+================================================================================
+
+The Problem Without Probes:
+  
+  WITHOUT probes:
+  ─────────────────
+  1. Pod starts → kubelet starts container → K8s immediately sends traffic
+     (even though app is still initializing)
+     → Users get connection errors during startup
+  
+  2. App enters deadlock / infinite loop → process still running, looks healthy
+     → K8s never knows to restart it
+     → Pod stuck forever, serving errors
+  
+  3. Pod depends on DB connection that dropped → app unhealthy
+     → K8s keeps sending traffic → all requests fail
+  
+  WITH probes:
+  ─────────────
+  1. Readiness probe: Traffic only when app is truly ready ✓
+  2. Liveness probe: Auto-restart deadlocked/stuck containers ✓
+  3. Startup probe: Protects slow-starting apps ✓
+
+Three Probe Types:
+  
+  ┌───────────────────┬───────────────────────────────────────────────┐
+  │ Liveness          │ Is the app alive? Should K8s restart it?      │
+  │                   │ FAILS → Container RESTARTED                   │
+  ├───────────────────┼───────────────────────────────────────────────┤
+  │ Readiness         │ Is the app ready for traffic?                 │
+  │                   │ FAILS → Pod REMOVED from Service endpoints    │
+  │                   │ (pod stays running, just gets no traffic)     │
+  ├───────────────────┼───────────────────────────────────────────────┤
+  │ Startup           │ Is the app done starting up?                  │
+  │                   │ Until PASSES → liveness probe is DISABLED     │
+  │                   │ FAILS after maxFailures → Container RESTARTED │
+  └───────────────────┴───────────────────────────────────────────────┘
+
+================================================================================
+2. PROBE TYPES: LIVENESS, READINESS, STARTUP
+================================================================================
+
+LIVENESS PROBE
+──────────────
+Purpose: Detect stuck/deadlocked processes that should be restarted.
+
+When it fails:
+  Container is RESTARTED (using restartPolicy: Always/OnFailure).
+  Back-off delay: 10s, 20s, 40s, 80s... up to 5 minutes between restarts.
+  kubectl get pods shows RESTARTS count incrementing.
+
+What to check:
+  Simple "is the app process responsive?" endpoint.
+  NOT external dependencies (database, external APIs).
+  Checking external deps in liveness = cascading failures if DB is slow.
+
+Example /healthz endpoint:
+  Returns 200 → app is alive (even if not fully functional)
+  Returns 500 or doesn't respond → restart the container
+
+READINESS PROBE
+───────────────
+Purpose: Control when pod receives traffic from Services.
+
+When it fails:
+  Pod is REMOVED from Service Endpoints (no traffic sent to it).
+  Pod remains running. Not restarted.
+  When probe recovers → pod added back to Endpoints automatically.
+
+Use cases:
+  - App initialization: loading caches, initializing connection pools
+  - Temporary overload: pod can signal "I'm busy, don't send more traffic"
+  - Dependency health: app not ready if DB connection is down
+  - Graceful shutdown: mark not-ready before accepting SIGTERM
+
+What to check:
+  CAN check dependencies (DB connectivity, upstream services).
+  /ready or /health/ready endpoint.
+
+STARTUP PROBE
+─────────────
+Purpose: Protect slow-starting containers from being killed by liveness probe.
+
+When it's active:
+  From container start until first SUCCESS.
+  While startup probe is checking → LIVENESS probe is DISABLED.
+  
+When it fails (exceeds failureThreshold):
+  Container is RESTARTED.
+  Combined timeout = initialDelaySeconds + (failureThreshold * periodSeconds)
+
+Use cases:
+  - Legacy apps with long initialization (loading data, compiling, DB migration)
+  - JVM apps that take 30-120s to start
+  - Apps that run database migrations on startup
+
+Example timeline:
+  t=0s    Container starts
+  t=0s    Startup probe begins checking (every 10s)
+  t=10s   Check 1: fail (app still starting)
+  t=20s   Check 2: fail
+  t=50s   Check 5: SUCCESS → startup probe done
+  t=51s   Liveness probe NOW activates (hadn't been checking)
+  t=51s   Readiness probe already running (independent from startup)
+
+================================================================================
+3. PROBE MECHANISMS (HOW PROBES CHECK HEALTH)
+================================================================================
+
+1. httpGet — HTTP GET Request:
+  
+  livenessProbe:
+    httpGet:
+      path: /healthz           # Path to probe
+      port: 8080               # Port (or named port)
+      scheme: HTTP             # HTTP (default) or HTTPS
+      httpHeaders:             # Optional: add request headers
+      - name: X-Health-Check
+        value: "true"
+  
+  Success: HTTP status code 200-399
+  Failure: HTTP status code >= 400, connection refused, timeout
+
+2. tcpSocket — TCP Connection:
+  
+  livenessProbe:
+    tcpSocket:
+      port: 3306    # Just try to open a TCP connection
+  
+  Success: TCP connection established
+  Failure: Connection refused or timeout
+  
+  Use when: No HTTP endpoint (databases, Redis, message brokers).
+
+3. exec — Execute Command in Container:
+  
+  livenessProbe:
+    exec:
+      command:
+      - /bin/sh
+      - -c
+      - "pg_isready -U postgres"    # Or any shell command
+  
+  Success: Exit code 0
+  Failure: Non-zero exit code
+  
+  Use when: Custom health check script, database-specific tools.
+  Warning: exec probes start a new process each time → CPU/memory overhead.
+
+4. grpc — gRPC Health Check Protocol:
+  
+  livenessProbe:
+    grpc:
+      port: 9090
+      service: ""    # Empty = overall server health
+                     # Or specify service name for specific gRPC service
+  
+  Requires: App implements gRPC Health Checking Protocol.
+  Uses: grpc.health.v1.Health/Check method.
+  Available since K8s 1.24 (GA in 1.27).
+
+================================================================================
+4. PROBE CONFIGURATION PARAMETERS
+================================================================================
+
+All Probe Configuration Options:
+  
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: 8080
+    
+    initialDelaySeconds: 15    # Wait before first probe (default: 0)
+    periodSeconds: 10          # How often to probe (default: 10)
+    timeoutSeconds: 5          # Timeout for each probe (default: 1)
+    successThreshold: 1        # Successes to consider healthy (default: 1)
+                               # NOTE: liveness must be 1
+    failureThreshold: 3        # Failures before action (default: 3)
+                               # default: restart after 3 failures
+
+Parameter Descriptions:
+  
+  initialDelaySeconds (default: 0):
+    Seconds to wait after container starts before first probe.
+    Use when you KNOW the app needs time to start but DON'T have a startup probe.
+    Better alternative: use startupProbe.
+    
+    WARNING: Too high = real crashes go undetected.
+    Too low = probe fires before app ready.
+  
+  periodSeconds (default: 10):
+    How often (in seconds) to perform the probe.
+    Lower = faster detection but more API calls.
+    Typical: 10-30s.
+  
+  timeoutSeconds (default: 1):
+    Seconds after which the probe times out.
+    Must be < periodSeconds.
+    Default of 1s is often too low for real apps. Use 5-10s.
+  
+  successThreshold (default: 1):
+    Minimum consecutive successes for the probe to be considered successful.
+    For liveness: MUST be 1.
+    For readiness: Can be > 1 (require multiple successes before routing traffic).
+  
+  failureThreshold (default: 3):
+    Consecutive failures before action.
+    Liveness: restart container after N failures.
+    Readiness: remove from endpoints after N failures.
+    Time before action = failureThreshold × periodSeconds
+
+Example: Total allowed startup time for startup probe:
+  
+  startupProbe:
+    httpGet:
+      path: /healthz
+      port: 8080
+    initialDelaySeconds: 10    # Start checking at 10s
+    periodSeconds: 10          # Check every 10s
+    failureThreshold: 30       # Allow 30 failures = 300s
+  
+  Total allowed startup time = 10 + (30 * 10) = 310 seconds
+  App has up to 310 seconds to start.
+
+================================================================================
+5. COMPLETE PROBE EXAMPLES
+================================================================================
+
+Simple Web Application:
+  
+  spec:
+    containers:
+    - name: web-app
+      image: myapp:v1
+      ports:
+      - containerPort: 8080
+      
+      # Startup probe: protects slow JVM startup
+      startupProbe:
+        httpGet:
+          path: /actuator/health    # Spring Boot health
+          port: 8080
+        initialDelaySeconds: 10
+        periodSeconds: 10
+        failureThreshold: 30        # 10 + 30*10 = 310s max startup
+        timeoutSeconds: 5
+      
+      # Liveness probe: restart if deadlocked
+      livenessProbe:
+        httpGet:
+          path: /actuator/health/liveness    # Spring Boot liveness group
+          port: 8080
+        initialDelaySeconds: 0     # startup probe handles initial delay
+        periodSeconds: 15
+        timeoutSeconds: 5
+        failureThreshold: 3
+      
+      # Readiness probe: only route traffic when ready
+      readinessProbe:
+        httpGet:
+          path: /actuator/health/readiness    # Spring Boot readiness group
+          port: 8080
+        initialDelaySeconds: 0
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 3
+        successThreshold: 1
+
+Spring Boot Health Groups (best practice):
+  # application.properties:
+  management.health.readinessstate.enabled=true
+  management.health.livenessstate.enabled=true
+  management.endpoint.health.probes.enabled=true
+  
+  # Liveness group: only local health (not DB)
+  # GET /actuator/health/liveness → {"status": "UP"}
+  
+  # Readiness group: includes DB, cache, messaging
+  # GET /actuator/health/readiness → {"status": "UP", "components": {...}}
+
+PostgreSQL Database:
+  
+  livenessProbe:
+    exec:
+      command:
+      - /bin/sh
+      - -c
+      - exec pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" -h localhost
+    initialDelaySeconds: 30
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 6
+  
+  readinessProbe:
+    exec:
+      command:
+      - /bin/sh
+      - -c
+      - exec pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" -h localhost
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+Redis:
+  
+  livenessProbe:
+    exec:
+      command:
+      - redis-cli
+      - ping
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  
+  readinessProbe:
+    exec:
+      command:
+      - redis-cli
+      - ping
+    initialDelaySeconds: 5
+    periodSeconds: 10
+
+Nginx (TCP probe):
+  
+  readinessProbe:
+    tcpSocket:
+      port: 80
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  
+  livenessProbe:
+    httpGet:
+      path: /nginx-health
+      port: 80
+    periodSeconds: 20
+
+gRPC Service:
+  
+  livenessProbe:
+    grpc:
+      port: 9090
+    periodSeconds: 10
+  
+  readinessProbe:
+    grpc:
+      port: 9090
+      service: "mypackage.MyService"
+    periodSeconds: 5
+
+================================================================================
+6. PROBE INTERACTIONS WITH KUBERNETES
+================================================================================
+
+Probe → Service Endpoints:
+  
+  All probes passing:
+    Pod STATUS: Running (condition Ready=True)
+    In Service Endpoints: YES (receives traffic)
+  
+  Readiness probe failing:
+    Pod STATUS: Running (condition Ready=False)
+    In Service Endpoints: NO (removed, no traffic)
+    Liveness/Startup: still checking
+  
+  Liveness probe failing (failureThreshold times):
+    Container: RESTARTED by kubelet
+    Pod STATUS: Running → shows RESTARTS count
+    Back-off delay: 10s, 20s, 40s... up to 5min (CrashLoopBackOff)
+  
+  Startup probe failing (failureThreshold times):
+    Container: RESTARTED (same as liveness failure)
+
+CrashLoopBackOff:
+  Happens when container repeatedly fails and restarts.
+  Back-off doubles: 10s, 20s, 40s, 80s, 160s, 300s (max).
+  Causes:
+  - Liveness probe too aggressive (firing too early)
+  - App actually crashing (exit code != 0)
+  - OOM killed (memory limits too low)
+  
+  Debugging:
+  kubectl describe pod my-pod    # Check Events section
+  kubectl logs my-pod --previous  # Logs from previous (crashed) container
+  kubectl get events -n namespace
+
+Probe Interaction with Rolling Deployments:
+  New pods MUST pass readiness probe before old pods are removed.
+  K8s rolling update strategy (maxUnavailable/maxSurge) waits for readiness.
+  
+  If new pod's readiness probe never passes:
+  - Rolling update STALLS (doesn't progress)
+  - Old pods remain (traffic goes to them)
+  - New pods in Running state but not Ready
+  - This is actually SAFE behavior (bad deploy doesn't affect users)
+
+Probe and PodDisruptionBudget:
+  During kubectl drain, K8s evicts pods.
+  If readiness probe was already failing → pod was already out of endpoints.
+  Eviction is safe since pod wasn't serving traffic.
+  PDB checks READY pods count against minAvailable.
+
+================================================================================
+7. COMMON PATTERNS AND ANTI-PATTERNS
+================================================================================
+
+GOOD PATTERNS:
+  
+  1. Use startup probe for slow-starting apps:
+     ✓ Don't fight JVM startup with aggressively-configured liveness
+     ✓ startupProbe protects startup phase; liveness checks steady-state
+  
+  2. Separate liveness and readiness checks:
+     ✓ /healthz (liveness): Just "is the process responding?"
+     ✓ /ready (readiness): "Am I ready to serve traffic?"
+       (checks DB connection, upstream dependencies)
+  
+  3. Liveness checks ONLY local state:
+     ✓ Is the server responding?
+     ✓ Is there a deadlock?
+     ✗ Don't check external services in liveness
+  
+  4. Readiness CAN check dependencies:
+     ✓ DB connection up
+     ✓ Cache warmed
+     ✓ External API accessible
+     If dependencies fail → pod removes itself from traffic (not restarted)
+
+ANTI-PATTERNS:
+  
+  1. Liveness checks external dependencies:
+     ✗ livenessProbe checking database connection
+     Problem: If DB is down, ALL pods restart simultaneously = cascading failure
+     Liveness restart doesn't fix DB issues; it makes everything worse.
+     Solution: Put DB check in readinessProbe only.
+  
+  2. Too-low timeoutSeconds:
+     ✗ timeoutSeconds: 1 (default) for real apps
+     Problem: Temporary slowness causes unnecessary restarts
+     Solution: timeoutSeconds: 5 or 10, especially for DB queries
+  
+  3. No startup probe for slow apps:
+     ✗ initialDelaySeconds: 120 without startup probe
+     Problem: If app crashes at t=30s, won't restart for 120s
+     Startup probe is more responsive.
+  
+  4. successThreshold > 1 for liveness:
+     ✗ Invalid: liveness successThreshold MUST be 1
+     K8s enforces this; validation error if > 1
+  
+  5. Probing too aggressively:
+     ✗ periodSeconds: 1 with timeoutSeconds: 1
+     Problem: Constant probe overhead, transient issues cause restarts
+     Solution: periodSeconds: 10-30, with reasonable failureThreshold
+
+Graceful Shutdown Pattern:
+  When pod receives SIGTERM:
+  1. Pod should mark itself not-ready FIRST (stop taking new traffic)
+  2. Finish in-flight requests
+  3. Exit cleanly
+  
+  Using preStop hook + readiness signal:
+  
+  lifecycle:
+    preStop:
+      exec:
+        command: ["sleep", "5"]   # Give endpoints time to propagate
+  
+  terminationGracePeriodSeconds: 60   # Total time before SIGKILL
+  
+  readinessProbe:
+    httpGet:
+      path: /ready
+      port: 8080
+    failureThreshold: 1        # One failure → immediately remove from LB
+    periodSeconds: 2
+
+================================================================================
+8. TERMINATIONGRACEPERIODECONDS AND PRESTOP
+================================================================================
+
+Pod Termination Timeline:
+  
+  t=0s   kubectl delete pod / Deployment rolling update
+  t=0s   Pod status: Terminating
+  t=0s   Endpoints controller removes pod from Service endpoints (async!)
+         This takes 1-5s for kube-proxy to update iptables
+  t=0s   preStop hook executes (if defined)
+  t=?s   preStop completes
+  t=?s   SIGTERM sent to all containers (main process, PID 1)
+  t=30s  terminationGracePeriodSeconds expires
+  t=30s  SIGKILL sent (force kill)
+  
+  PROBLEM: Requests may still arrive after SIGTERM because kube-proxy
+  iptables update is ASYNC — takes 1-5 seconds to propagate.
+  
+  If app exits immediately on SIGTERM → gets connection errors for those 1-5s.
+
+preStop Hook (solve the async endpoint problem):
+  
+  lifecycle:
+    preStop:
+      exec:
+        command: ["/bin/sh", "-c", "sleep 5"]
+  
+  The sleep 5 gives kube-proxy time to remove the pod from load balancer.
+  After 5s, no new traffic arrives. Then SIGTERM is sent (app finishes in-flight).
+  
+  OR for NGINX:
+  lifecycle:
+    preStop:
+      exec:
+        command: ["/usr/sbin/nginx", "-s", "quit"]  # Graceful shutdown
+
+terminationGracePeriodSeconds:
+  Default: 30 seconds
+  
+  spec:
+    terminationGracePeriodSeconds: 60   # Give 60s to shut down
+  
+  Total time before SIGKILL:
+  = preStop hook time + time for app to handle SIGTERM
+  
+  If preStop sleeps 5s, app drains 10s:
+  terminationGracePeriodSeconds: 20 is sufficient (with margin)
+  
+  For long-running batch jobs: may need 300s or more.
+
+Hook Types:
+  lifecycle:
+    postStart:          # Runs after container starts (async with container)
+      exec:             # NOTE: Container can fail if postStart fails
+        command: ["/bin/init.sh"]
+    preStop:            # Runs before SIGTERM (synchronous — SIGTERM waits)
+      httpGet:
+        path: /shutdown
+        port: 8080
+
+================================================================================
+9. DEBUGGING PROBES
+================================================================================
+
+Commands:
+  # Check probe configuration:
+  kubectl describe pod my-pod   # Shows probe config + Events
+  
+  # Events to look for:
+  # "Liveness probe failed: HTTP probe failed with statuscode: 500"
+  # "Readiness probe failed: Get http://10.0.0.1:8080/ready: connection refused"
+  # "Startup probe failed: ..."
+  
+  # Check pod conditions:
+  kubectl get pod my-pod -o json | jq '.status.conditions'
+  # ContainersReady: False → readiness probe failing
+  
+  # Check restart count:
+  kubectl get pod my-pod       # RESTARTS column
+  
+  # Logs from previous container (after restart):
+  kubectl logs my-pod --previous
+  kubectl logs my-pod -c container-name --previous
+  
+  # Check endpoints (is pod in Service):
+  kubectl get endpoints my-service
+  # If pod not in addresses, readiness probe failing
+  
+  # Test probe manually from inside pod:
+  kubectl exec my-pod -- wget -qO- http://localhost:8080/healthz
+  kubectl exec my-pod -- curl -v http://localhost:8080/ready
+
+Common Issues and Fixes:
+  
+  ISSUE: "connection refused" in probe
+  FIX: App not listening on expected port. Check containerPort and probe port match.
+  
+  ISSUE: "timeout" in probe  
+  FIX: timeoutSeconds too low. App responding slowly. Increase timeoutSeconds.
+  
+  ISSUE: Probe fires before app ready (no startup probe)
+  FIX: Add startupProbe, or increase initialDelaySeconds
+  
+  ISSUE: CrashLoopBackOff with 0 restarts on liveness
+  FIX: Container crashing (OOMKilled, process error), not probe issue
+  
+  ISSUE: Pod never becomes Ready
+  FIX: Readiness probe path wrong, or app not returning 200
+       Check: kubectl exec pod -- curl -v http://localhost:PORT/PATH
+  
+  ISSUE: Pod Ready but not receiving traffic
+  FIX: Check Service selector matches pod labels
+       kubectl get endpoints my-service
+
+================================================================================
+10. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: Explain the difference between liveness, readiness, and startup probes.
+A: Three distinct health mechanisms:
+   
+   Liveness probe: "Is the container alive?"
+   Action when fails: RESTART the container.
+   Use case: Detect deadlocks, infinite loops, corrupted state that
+   the app can't recover from without a restart.
+   Rule: Check LOCAL state only. Never check external services.
+   
+   Readiness probe: "Is the container ready for traffic?"
+   Action when fails: Remove from Service Endpoints (no traffic).
+   Container stays running. Reinserted when probe recovers.
+   Use case: Control when traffic flows to a pod.
+   During startup: don't send traffic until caches loaded, DB connected.
+   During operation: temporarily overloaded → stop taking new requests.
+   Rule: CAN check dependencies (DB, upstream services).
+   
+   Startup probe: "Has the container finished starting up?"
+   Action when fails (failureThreshold reached): RESTART container.
+   While checking: DISABLES the liveness probe.
+   Use case: Protect slow-starting apps from liveness killing them.
+   Without startup probe: a JVM needing 60s to start would be killed
+   by liveness failureThreshold * periodSeconds (e.g., 3*10=30s).
+   With startup probe: give up to 300s for startup, THEN enable liveness.
+
+Q2: Why is it bad to check external dependencies in a liveness probe?
+A: Liveness probe failure causes container RESTART.
+   
+   Scenario without this rule:
+   - All your pods have liveness probes checking DB connectivity
+   - DB goes down for maintenance (5 minutes)
+   - All pods' liveness probes start failing
+   - Kubernetes restarts ALL pods simultaneously
+   - Now: DB is back up but ALL pods are restarting → downtime window
+   - Pods restart, check DB again → DB fine, pods recover
+   
+   The restart doesn't fix the DB problem.
+   It creates unnecessary churn and can cause cascading failures.
+   
+   Better design:
+   - Liveness: Only local health ("is my HTTP server responding?")
+   - Readiness: Check DB connectivity
+   
+   Result with same DB outage:
+   - All pods' READINESS probes fail → removed from Service endpoints
+   - No traffic reaches pods (they'd all fail anyway)
+   - But pods are NOT restarted (liveness only checks local health)
+   - DB comes back → readiness probes pass → pods get traffic again
+   - Zero unnecessary restarts, graceful degradation
+
+Q3: What happens to a pod during a rolling deployment with respect to probes?
+A: Probes are central to safe rolling deployments:
+   
+   1. New pod starts.
+   2. If startupProbe defined: K8s waits for startup probe to pass.
+      Liveness is disabled during this period.
+   3. readinessProbe starts immediately (even during startup probe).
+   4. Pod only gets traffic when readiness probe PASSES.
+   5. K8s only removes an OLD pod when the new pod is READY.
+   
+   This means:
+   - If new pod's readiness probe never passes → rollout STALLS.
+   - Old pods continue running, traffic goes to them.
+   - Users see no disruption from bad deployments.
+   
+   kubectl rollout status: stuck waiting if readiness probe fails
+   kubectl rollout undo: to revert to previous version
+   
+   maxSurge + maxUnavailable with readiness:
+   K8s uses readiness to determine "available" replicas.
+   maxUnavailable limits how many READY pods can be missing.
+   
+   Example: 4 replicas, maxUnavailable=1
+   K8s will NOT remove a second old pod until first new pod is Ready.
+   At all times: >= 3 Ready pods. No disruption.
+
+Q4: What is terminationGracePeriodSeconds and how does it interact with preStop?
+A: terminationGracePeriodSeconds is the total time K8s gives a pod to shut down
+   before sending SIGKILL.
+   Default: 30 seconds.
+   
+   Shutdown sequence:
+   1. K8s sends delete request.
+   2. Endpoints controller removes pod from Service (ASYNC, takes 1-5s).
+   3. preStop hook runs (SYNCHRONOUSLY — blocks SIGTERM).
+   4. After preStop completes: SIGTERM sent to PID 1 in container.
+   5. App handles SIGTERM (drain connections, complete requests, close DB).
+   6. terminationGracePeriodSeconds countdown started at step 1.
+   7. When countdown expires: SIGKILL (force kill).
+   
+   Interaction:
+   preStop time + app shutdown time must fit within terminationGracePeriodSeconds.
+   
+   If preStop sleeps 5s and app needs 10s to drain:
+   terminationGracePeriodSeconds: 20 (with 5s margin)
+   
+   Why preStop sleep is needed:
+   Endpoints update (step 2) is ASYNC. Pod may still receive traffic for 1-5s
+   after SIGTERM. If app exits immediately on SIGTERM → connection errors.
+   preStop sleep gives the endpoints time to propagate before SIGTERM.
+   
+   Pattern:
+   lifecycle:
+     preStop:
+       exec:
+         command: ["sleep", "5"]   # Wait for endpoints propagation
+   terminationGracePeriodSeconds: 60
+
+Q5: How do you configure probes for a Java Spring Boot application?
+A: Spring Boot Actuator provides built-in probe endpoints via "health groups":
+   
+   1. Add Actuator dependency and configure:
+      management.health.readinessstate.enabled=true
+      management.health.livenessstate.enabled=true
+      management.endpoint.health.probes.enabled=true
+      management.endpoints.web.exposure.include=health
+   
+   This provides:
+   /actuator/health/liveness  → only local state (always UP if JVM is running)
+   /actuator/health/readiness → includes all health indicators (DB, cache, etc.)
+   
+   2. Kubernetes probe configuration:
+   
+   startupProbe:
+     httpGet:
+       path: /actuator/health/liveness
+       port: 8080
+     failureThreshold: 30
+     periodSeconds: 10    # Allow 300s for JVM startup
+   
+   livenessProbe:
+     httpGet:
+       path: /actuator/health/liveness
+       port: 8080
+     periodSeconds: 15
+     timeoutSeconds: 5
+     failureThreshold: 3
+   
+   readinessProbe:
+     httpGet:
+       path: /actuator/health/readiness
+       port: 8080
+     periodSeconds: 10
+     timeoutSeconds: 5
+     failureThreshold: 3
+   
+   3. Custom health checks:
+      Implement HealthIndicator for specific dependencies.
+      Assign to appropriate group (readiness only, not liveness).
+   
+   @Component
+   public class DatabaseHealthIndicator implements HealthIndicator {
+     // ... custom DB check
+   }
+   
+   management.endpoint.health.group.readiness.include=readinessState,db,redis
+
+================================================================================
+11. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+PROBE TYPES:
+  livenessProbe    FAILS → Container RESTARTED
+  readinessProbe   FAILS → Pod REMOVED from Service endpoints
+  startupProbe     FAILS (at threshold) → Container RESTARTED
+                   While active → liveness DISABLED
+
+PROBE MECHANISMS:
+  httpGet         HTTP GET → success if 200-399
+  tcpSocket       TCP connection → success if connects
+  exec            Shell command → success if exit code 0
+  grpc            gRPC health protocol → success if SERVING
+
+KEY PARAMETERS:
+  initialDelaySeconds  (default: 0)   Wait before first probe
+  periodSeconds        (default: 10)  Probe interval
+  timeoutSeconds       (default: 1)   Probe timeout (increase to 5-10!)
+  failureThreshold     (default: 3)   Failures before action
+  successThreshold     (default: 1)   Successes to consider healthy
+                                      (liveness MUST be 1)
+
+STARTUP PROBE MAX TIME:
+  initialDelaySeconds + (failureThreshold × periodSeconds)
+
+SHUTDOWN SEQUENCE:
+  Delete → preStop hook → SIGTERM → [wait] → SIGKILL
+  terminationGracePeriodSeconds = total from delete to SIGKILL
+
+BEST PRACTICES:
+  ✓ startupProbe for slow-starting apps (JVM, apps with migrations)
+  ✓ livenessProbe = LOCAL health only (not DB, not external services)
+  ✓ readinessProbe = CAN check dependencies
+  ✓ Increase timeoutSeconds to 5-10 (default 1s is too low)
+  ✓ preStop: sleep 5 for graceful shutdown (endpoints propagation delay)
+  ✗ DON'T check external services in liveness (cascading failures)
+  ✗ DON'T set liveness successThreshold > 1
+
+SPRING BOOT:
+  /actuator/health/liveness   → liveness probe (local state)
+  /actuator/health/readiness  → readiness probe (dependencies)
+
+DEBUGGING:
+  kubectl describe pod → Events section shows probe failures
+  kubectl get endpoints → check if pod is in Service
+  kubectl logs --previous → logs from crashed container
+  kubectl exec pod -- curl localhost:PORT/PATH → test probe manually
+
+================================================================================
+END OF FILE
+================================================================================

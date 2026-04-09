@@ -1,0 +1,404 @@
+================================================================
+GRAPHQL MUTATIONS — IN DEPTH
+================================================================
+
+1. WHAT IS A MUTATION?
+-----------------------
+A Mutation is the write operation in GraphQL. It creates, updates, or deletes
+data — any operation with side effects. Mutations map to the `Mutation` root type.
+
+Key difference from Queries:
+  - Queries: can execute in parallel (read-only, safe)
+  - Mutations: TOP-LEVEL fields execute SERIALLY (one at a time, ordered)
+
+Why serial? To ensure predictable ordering of side effects:
+  `mutation { createOrder { ... }  processPayment { ... } }` 
+  → createOrder MUST complete before processPayment starts.
+
+2. MUTATION SYNTAX
+-------------------
+```graphql
+mutation CreateUser {
+  createUser(input: { name: "Alice", email: "alice@example.com" }) {
+    id
+    name
+    email
+    createdAt
+  }
+}
+
+# With variables (preferred):
+mutation CreateUser($input: CreateUserInput!) {
+  createUser(input: $input) {
+    id
+    name
+    email
+    createdAt
+  }
+}
+```
+
+Variables JSON: `{ "input": { "name": "Alice", "email": "alice@example.com" } }`
+
+3. MUTATION RETURN VALUES
+--------------------------
+Mutations SHOULD return data. This allows the client to update its local
+cache with the server's canonical state after the operation.
+
+```graphql
+mutation UpdateProduct($id: ID!, $input: UpdateProductInput!) {
+  updateProduct(id: $id, input: $input) {
+    # Return the updated product — client updates cache immediately
+    id
+    name
+    price
+    updatedAt
+  }
+}
+```
+
+If you return the updated entity, Apollo Client automatically updates its
+normalized cache entry without needing a follow-up query.
+
+4. MUTATION PAYLOAD PATTERN (BEST PRACTICE)
+--------------------------------------------
+Instead of returning the entity directly, return a "payload" type:
+
+```graphql
+# Schema definition:
+type Mutation {
+  createUser(input: CreateUserInput!): CreateUserPayload!
+  updateUser(id: ID!, input: UpdateUserInput!): UpdateUserPayload!
+  deleteUser(id: ID!): DeleteUserPayload!
+}
+
+type CreateUserPayload {
+  user: User                    # The created user (null on error)
+  userErrors: [UserError!]!     # Validation/business errors (empty on success)
+  clientMutationId: String      # Echo back for idempotency tracking
+}
+
+type UpdateUserPayload {
+  user: User
+  userErrors: [UserError!]!
+}
+
+type DeleteUserPayload {
+  deletedUserId: ID             # ID of the deleted user
+  success: Boolean!
+  userErrors: [UserError!]!
+}
+
+type UserError {
+  field: [String!]              # Which field caused the error
+  message: String!
+  code: UserErrorCode!
+}
+
+enum UserErrorCode {
+  EMAIL_TAKEN
+  INVALID_EMAIL
+  WEAK_PASSWORD
+  USER_NOT_FOUND
+  UNAUTHORIZED
+  VALIDATION_ERROR
+}
+```
+
+Client handles success + validation errors:
+```graphql
+mutation CreateUser($input: CreateUserInput!) {
+  createUser(input: $input) {
+    user {
+      id
+      name
+      email
+    }
+    userErrors {
+      field
+      message
+      code
+    }
+  }
+}
+```
+
+```javascript
+// Client-side handling:
+const { data } = await createUser({ variables: { input } });
+if (data.createUser.userErrors.length > 0) {
+  // Handle validation errors
+  data.createUser.userErrors.forEach(error => {
+    setFieldError(error.field[0], error.message);
+  });
+} else {
+  // Success
+  navigate(`/users/${data.createUser.user.id}`);
+}
+```
+
+5. CRUD MUTATIONS
+-----------------
+```graphql
+type Mutation {
+  # CREATE
+  createProduct(input: CreateProductInput!): CreateProductPayload!
+
+  # UPDATE (full replacement)
+  updateProduct(id: ID!, input: UpdateProductInput!): UpdateProductPayload!
+
+  # PARTIAL UPDATE (patch)
+  patchProduct(id: ID!, patch: ProductPatch!): UpdateProductPayload!
+
+  # DELETE
+  deleteProduct(id: ID!): DeleteProductPayload!
+
+  # SOFT DELETE
+  archiveProduct(id: ID!): UpdateProductPayload!
+
+  # RESTORE
+  restoreProduct(id: ID!): UpdateProductPayload!
+
+  # BULK OPERATIONS
+  bulkDeleteProducts(ids: [ID!]!): BulkDeletePayload!
+  bulkUpdateStatus(ids: [ID!]!, status: ProductStatus!): BulkUpdatePayload!
+}
+```
+
+6. MULTIPLE MUTATIONS IN ONE REQUEST
+--------------------------------------
+Top-level mutation fields execute SERIALLY:
+
+```graphql
+mutation CompleteOrder {
+  updateOrder(id: "1", input: { status: CONFIRMED }) {
+    id status
+  }
+  sendNotification(userId: "user-1", message: "Your order is confirmed") {
+    success
+  }
+  createInvoice(orderId: "1") {
+    id downloadUrl
+  }
+}
+```
+
+Execution order: updateOrder → sendNotification → createInvoice (guaranteed).
+
+7. IDEMPOTENCY
+--------------
+Mutations should be idempotent where possible — retrying the same mutation
+should have the same effect as running it once.
+
+Technique: use `clientMutationId` or idempotency key:
+
+```graphql
+input PlaceOrderInput {
+  items: [OrderItemInput!]!
+  shippingAddressId: ID!
+  paymentMethodId: ID!
+  idempotencyKey: String!   # UUID generated by client; server deduplicates
+}
+
+type Mutation {
+  placeOrder(input: PlaceOrderInput!): PlaceOrderPayload!
+}
+```
+
+Server logic:
+```java
+@MutationMapping
+public PlaceOrderPayload placeOrder(@Argument PlaceOrderInput input) {
+  // Check if order with this idempotency key was already processed
+  Optional<Order> existing = orderRepository.findByIdempotencyKey(input.idempotencyKey());
+  if (existing.isPresent()) {
+    return new PlaceOrderPayload(existing.get(), List.of()); // Return cached result
+  }
+  // Process new order
+  Order order = orderService.place(input);
+  return new PlaceOrderPayload(order, List.of());
+}
+```
+
+8. MUTATION IMPLEMENTATION (SPRING FOR GRAPHQL — JAVA)
+-------------------------------------------------------
+```java
+@Controller
+public class UserMutations {
+
+  private final UserService userService;
+  private final UserRepository userRepository;
+
+  // CREATE
+  @MutationMapping
+  public CreateUserPayload createUser(@Argument CreateUserInput input) {
+    // Validate
+    if (userRepository.existsByEmail(input.email())) {
+      return new CreateUserPayload(null, List.of(
+        new UserError(List.of("email"), "Email is already taken", UserErrorCode.EMAIL_TAKEN)
+      ));
+    }
+    // Create
+    User user = userService.create(input);
+    return new CreateUserPayload(user, List.of());
+  }
+
+  // UPDATE
+  @MutationMapping
+  public UpdateUserPayload updateUser(@Argument String id, @Argument UpdateUserInput input) {
+    User user = userRepository.findById(id)
+      .orElseThrow(() -> new GraphQLException("User not found"));
+    User updated = userService.update(user, input);
+    return new UpdateUserPayload(updated, List.of());
+  }
+
+  // DELETE
+  @MutationMapping
+  public DeleteUserPayload deleteUser(@Argument String id) {
+    boolean deleted = userService.delete(id);
+    return new DeleteUserPayload(deleted ? id : null, deleted, List.of());
+  }
+}
+
+// Input records
+public record CreateUserInput(
+  @NotBlank String name,
+  @Email String email,
+  @Size(min = 8) String password,
+  String roleId
+) {}
+
+// Payload records
+public record CreateUserPayload(User user, List<UserError> userErrors) {}
+public record UserError(List<String> field, String message, UserErrorCode code) {}
+```
+
+9. OPTIMISTIC UPDATES (CLIENT SIDE)
+-------------------------------------
+Apollo Client supports optimistic UI: update the cache immediately with an
+expected response before the server responds.
+
+```javascript
+const [updateProduct] = useMutation(UPDATE_PRODUCT, {
+  optimisticResponse: {
+    updateProduct: {
+      __typename: 'UpdateProductPayload',
+      product: {
+        __typename: 'Product',
+        id: productId,
+        name: newName,          // Assume success immediately
+        price: newPrice,
+        updatedAt: new Date().toISOString(),
+      },
+      userErrors: []
+    }
+  }
+});
+```
+
+If the server returns a different value, Apollo replaces the optimistic
+response with the real one.
+
+10. MUTATIONS WITH FILE UPLOADS
+---------------------------------
+Using the GraphQL multipart request spec:
+
+```graphql
+scalar Upload
+
+type Mutation {
+  uploadProductImage(productId: ID!, image: Upload!): Product!
+  uploadDocuments(files: [Upload!]!): [Document!]!
+}
+```
+
+Spring for GraphQL:
+```java
+@MutationMapping
+public Product uploadProductImage(
+  @Argument String productId,
+  @Argument MultipartFile image
+) {
+  String url = storageService.upload(image);
+  return productService.updateImageUrl(productId, url);
+}
+```
+
+11. NESTING MUTATIONS (ANTI-PATTERN)
+--------------------------------------
+Don't nest mutations under object types — this creates implicit execution
+ordering issues. Keep all mutations at the root Mutation type level.
+
+```graphql
+# ANTI-PATTERN: Don't do this
+type UserMutation {
+  create(input: CreateUserInput!): User!
+  update(id: ID!, input: UpdateUserInput!): User!
+  delete(id: ID!): Boolean!
+}
+
+type Mutation {
+  user: UserMutation!   # Nested mutation namespace
+}
+
+# Issue: Nested mutations execute in PARALLEL (like queries), not serially!
+# This breaks the serial execution guarantee.
+```
+
+```graphql
+# CORRECT PATTERN: Flat mutations with naming convention
+type Mutation {
+  userCreate(input: CreateUserInput!): CreateUserPayload!
+  userUpdate(id: ID!, input: UpdateUserInput!): UpdateUserPayload!
+  userDelete(id: ID!): DeleteUserPayload!
+
+  productCreate(input: CreateProductInput!): CreateProductPayload!
+  productUpdate(id: ID!, input: UpdateProductInput!): UpdateProductPayload!
+}
+```
+
+12. INTERVIEW QUESTIONS & ANSWERS
+-----------------------------------
+
+Q: Why do mutations execute serially while queries can be parallel?
+A: Queries are side-effect free (read-only), so running them in parallel is
+   safe. Mutations have side effects (writes, external calls). If two mutations
+   ran in parallel, you couldn't reason about their order or dependencies.
+   For example, if you have `createOrder` followed by `processPayment`, the
+   serial guarantee ensures the order exists before payment is attempted.
+
+Q: Should mutations return data? Why?
+A: Yes. Returning the mutated entity allows clients (especially Apollo Client)
+   to update their local cache without a subsequent query. It also confirms
+   what the server actually stored (server-generated fields like `id`,
+   `createdAt`, `updatedAt`). Mutations that return nothing force clients to
+   refetch everything.
+
+Q: What is the Payload pattern for mutations?
+A: Instead of returning the entity directly, return a payload type containing
+   the entity (nullable, null on error) and a userErrors array (empty on
+   success). This supports structured field-level validation errors without
+   relying on the top-level errors array. Pioneered by Shopify, adopted widely.
+
+Q: How do you handle mutation errors in GraphQL?
+A: Two approaches: (1) Payload pattern — return structured errors in the
+   payload's userErrors field alongside the data. (2) Top-level errors —
+   throw exceptions in resolvers that appear in the top-level `errors` array.
+   Best practice: use the payload pattern for expected/business errors,
+   and let the top-level errors handle unexpected/system errors.
+
+Q: What is an idempotency key in mutations?
+A: A client-generated unique key (typically UUID) included in the mutation
+   input. The server stores processed keys and returns the cached result for
+   duplicate requests. This prevents double-processing if the client retries
+   due to network failures (common in payment/order systems).
+
+Q: Can you run multiple mutations in a single request?
+A: Yes. List multiple root mutation fields in a single mutation operation.
+   They execute SERIALLY in order. However, this is only recommended when
+   the mutations are logically related and need to execute as a unit. For
+   unrelated mutations, use separate requests for better error isolation.
+
+================================================================
+END OF FILE
+================================================================

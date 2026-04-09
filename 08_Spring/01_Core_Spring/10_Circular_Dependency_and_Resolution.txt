@@ -1,0 +1,268 @@
+================================================================
+  CIRCULAR DEPENDENCY AND RESOLUTION — IN DEPTH
+================================================================
+
+================================================================
+WHAT IS A CIRCULAR DEPENDENCY?
+================================================================
+
+  A circular dependency occurs when Bean A depends on Bean B
+  and Bean B depends on Bean A (directly or indirectly).
+
+  Direct cycle:
+    A → B → A
+
+  Indirect cycle:
+    A → B → C → A
+
+================================================================
+WHY CIRCULAR DEPENDENCIES ARE PROBLEMATIC
+================================================================
+
+  For CONSTRUCTOR INJECTION (recommended approach):
+    Spring detects the cycle at startup and throws:
+      BeanCurrentlyInCreationException
+
+  For SETTER / FIELD INJECTION:
+    Spring CAN resolve the cycle by:
+      1. Create A (instantiated but not fully initialized)
+      2. Create B (using the early-stage reference of A)
+      3. Finish wiring A (now B is ready)
+
+    This works via the THREE-LEVEL CACHE in DefaultSingletonBeanRegistry:
+      singletonObjects           -- fully initialized beans
+      earlySingletonObjects      -- early references (initialized after init)
+      singletonFactories         -- factories to produce early references
+
+  As of Spring Boot 2.6+ / Spring Framework 5.3.x:
+    Circular dependencies for setter/field injection are PROHIBITED
+    by default. You must opt in:
+      spring.main.allow-circular-references=true
+
+================================================================
+COMMON CAUSES OF CIRCULAR DEPENDENCIES
+================================================================
+
+  1. Service classes calling each other:
+     OrderService → PaymentService → OrderService
+
+  2. @Configuration classes with inter-referencing @Bean methods
+     across classes loaded in wrong order
+
+  3. A single "god class" that does too much (violates SRP)
+
+================================================================
+HOW TO DETECT CIRCULAR DEPENDENCIES
+================================================================
+
+  With Constructor Injection (best detector):
+    Spring immediately throws at startup:
+      The dependencies of some of the beans in the application context
+      form a cycle:
+      orderService → paymentService → orderService
+
+  With field/setter injection (silent cycle):
+    Enable spring.main.allow-circular-references=true and observe
+    that the app starts but the design is flawed.
+
+  Tools:
+    • Spring Boot actuator /actuator/beans shows bean graph
+    • IDE plugins (IntelliJ Ultimate) detect circular references
+    • ArchUnit tests can enforce no circular dependencies
+
+================================================================
+RESOLUTION STRATEGY 1: REFACTOR — EXTRACT COMMON SERVICE
+================================================================
+
+  PROBLEM:
+    @Service
+    public class OrderService {
+        @Autowired PaymentService paymentService;  // → circular
+    }
+    @Service
+    public class PaymentService {
+        @Autowired OrderService orderService;       // → circular
+    }
+
+  SOLUTION: Extract shared logic into a third service:
+    @Service
+    public class TransactionService {
+        // The shared logic that both need
+        public void recordTransaction(Transaction t) { ... }
+    }
+
+    @Service
+    public class OrderService {
+        @Autowired TransactionService transactionService;
+        // No longer depends on PaymentService directly
+    }
+
+    @Service
+    public class PaymentService {
+        @Autowired TransactionService transactionService;
+    }
+
+================================================================
+RESOLUTION STRATEGY 2: USE AN EVENT
+================================================================
+
+  Instead of A calling B directly, A publishes an event.
+  B listens for it. No direct dependency in either direction.
+
+  @Service
+  public class OrderService {
+      @Autowired ApplicationEventPublisher publisher;
+
+      public void completeOrder(Order order) {
+          orderRepository.save(order);
+          publisher.publishEvent(new OrderCompletedEvent(order)); // fire and forget
+      }
+  }
+
+  @Service
+  public class PaymentService {
+      @EventListener
+      public void onOrderCompleted(OrderCompletedEvent event) {
+          processPayment(event.getOrder());
+      }
+  }
+
+================================================================
+RESOLUTION STRATEGY 3: @Lazy — DEFER INITIALIZATION
+================================================================
+
+  Mark one of the dependencies as @Lazy.
+  Spring creates a proxy at injection time; real bean created on
+  first use.
+
+  @Service
+  public class OrderService {
+      private final PaymentService paymentService;
+
+      public OrderService(@Lazy PaymentService paymentService) {
+          this.paymentService = paymentService;
+      }
+  }
+
+  Caveat: The proxy adds indirection. Use only as a last resort
+          for genuine cases where refactoring isn't feasible.
+
+================================================================
+RESOLUTION STRATEGY 4: SETTER INJECTION FOR ONE DIRECTION
+================================================================
+
+  Break the constructor cycle by making one dependency setter-injected.
+  Spring can handle this with its early-reference mechanism.
+
+  @Service
+  public class OrderService {
+      private final PaymentService paymentService;  // constructor
+
+      public OrderService(PaymentService paymentService) {
+          this.paymentService = paymentService;
+      }
+  }
+
+  @Service
+  public class PaymentService {
+      private OrderService orderService;   // setter (optional dep)
+
+      @Autowired
+      public void setOrderService(OrderService orderService) {
+          this.orderService = orderService;
+      }
+  }
+
+  Still a code smell — prefer refactoring.
+
+================================================================
+RESOLUTION STRATEGY 5: @DependsOn AND ORDERING
+================================================================
+
+  Sometimes cycles exist in @Configuration @Bean methods:
+
+  @Configuration
+  public class InfraConfig {
+
+      @Bean
+      @DependsOn("schemaInitializer")
+      public DataSource dataSource() { ... }
+
+      @Bean
+      public SchemaInitializer schemaInitializer(DataSource ds) { ... }
+  }
+
+  @DependsOn ensures one bean is fully initialized before another.
+
+================================================================
+SPRING'S THREE-LEVEL CACHE (INTERNALS)
+================================================================
+
+  DefaultSingletonBeanRegistry maintains 3 maps:
+
+  Level 1: singletonObjects (Map<String, Object>)
+    Fully initialized, production-ready beans.
+
+  Level 2: earlySingletonObjects (Map<String, Object>)
+    Early references: bean instantiated, AOP proxy created, but
+    not yet fully initialized (setters not called yet).
+
+  Level 3: singletonFactories (Map<String, ObjectFactory<?>>)
+    ObjectFactory that produces the early reference for a bean
+    currently being created.
+
+  Circular resolution flow for A ↔ B (setter injection):
+    1. Start creating A → add A's factory to L3
+    2. A needs B → start creating B → add B's factory to L3
+    3. B needs A → check L1 (no) → L2 (no) → L3 (yes! get early A)
+    4. B finishes → move B from L3 → L1
+    5. A's setter filled with fully-initialized B → A finishes → L1
+
+  NOTE: This three-level cache works ONLY for singleton beans.
+        Prototype circular deps always throw.
+
+================================================================
+ALLOW-CIRCULAR-REFERENCES SETTING
+================================================================
+
+  # application.properties (opt-in for setter/field circular deps)
+  spring.main.allow-circular-references=true
+
+  This was introduced in Spring Boot 2.6 as a breaking change.
+  If upgrading from 2.5 and seeing BeanCurrentlyInCreationException,
+  this flag can temporarily unblock you while you refactor.
+
+================================================================
+INTERVIEW QUESTIONS — CIRCULAR DEPENDENCIES
+================================================================
+
+  Q: What is a circular dependency in Spring?
+  A: When two or more beans depend on each other directly or
+     indirectly, creating a cycle that Spring cannot resolve
+     without special handling.
+
+  Q: How does Spring detect circular dependencies?
+  A: With constructor injection, Spring detects cycles at startup
+     and throws BeanCurrentlyInCreationException. With setter/field
+     injection, Spring uses a three-level cache to resolve cycles
+     (though they still represent a design problem).
+
+  Q: What is the recommended fix for circular dependencies?
+  A: Refactor — extract the shared logic into a new service that
+     both depend on. This follows Single Responsibility Principle.
+
+  Q: What does @Lazy do to resolve a circular dependency?
+  A: It makes Spring inject a proxy instead of the real bean.
+     The real bean is created on first method call, breaking
+     the initialization cycle.
+
+  Q: Why is circular dependency support disabled by default in
+     Spring Boot 2.6+?
+  A: Circular dependencies indicate design issues (often violations
+     of SRP or improper architecture). Making them fail fast
+     encourages proper design rather than hiding the problem.
+
+  Q: Can prototype-scoped beans have circular dependencies?
+  A: No. Spring never resolves circular dependencies for prototype
+     beans — it always throws BeanCurrentlyInCreationException.
+

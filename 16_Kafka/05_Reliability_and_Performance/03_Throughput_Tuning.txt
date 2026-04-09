@@ -1,0 +1,216 @@
+================================================================================
+  KAFKA THROUGHPUT TUNING
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. KAFKA PERFORMANCE ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Kafka achieves high throughput through:
+
+  1. SEQUENTIAL I/O:
+     - All writes are appends to the end of log segments (sequential on disk)
+     - Sequential I/O is 100-1000x faster than random I/O
+     - HDDs: ~100MB/s sequential vs ~0.1ms seek + 6MB/s random
+     - SSDs: even more dramatic improvement for sequential
+
+  2. ZERO-COPY (sendfile syscall):
+     - Normal: disk → kernel buffer → user buffer → socket buffer → NIC
+     - Zero-copy: disk → kernel buffer → NIC (skips user space entirely)
+     - Reduces CPU usage and memory bandwidth for consumers
+     - Enabled via: Linux sendfile() syscall (DMA)
+
+  3. BATCHING:
+     - Producer batches multiple records before sending
+     - Single network round-trip per batch (amortizes TCP overhead)
+     - Broker writes batch atomically in one I/O
+
+  4. PAGE CACHE:
+     - Kafka leverages OS page cache (not JVM heap) for buffer
+     - Recently produced data served directly from page cache to consumers
+     - Avoids GC pressure (data in OS memory, not JVM)
+
+  5. COMPRESSION:
+     - Compress at batch level → fewer bytes over network
+     - Broker stores compressed; consumer decompresses
+     - Throughput gain outweighs CPU cost for most use cases
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. PRODUCER THROUGHPUT TUNING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  High-throughput producer profile:
+
+  batch.size = 131072              → 128KB batches (default 16KB is too small)
+  linger.ms = 20                   → wait up to 20ms to fill batches
+  compression.type = lz4           → fast compression (lz4 > snappy > gzip)
+  buffer.memory = 67108864         → 64MB total buffer (default 32MB)
+  max.in.flight.requests.per.connection = 5   → 5 concurrent requests per broker
+  acks = 1                         → balance durability vs throughput
+  retries = MAX_INT
+  delivery.timeout.ms = 120000
+
+  // For maximum throughput at some durability cost:
+  // acks=0, no retries → highest possible throughput (metrics, high-frequency events)
+
+Key levers:
+  ┌────────────────────────────┬──────────────────────────────────────────────────┐
+  │ Config                     │ Throughput Effect                                │
+  ├────────────────────────────┼──────────────────────────────────────────────────┤
+  │ batch.size ↑               │ Larger batches = fewer round-trips               │
+  │ linger.ms ↑                │ More time to fill batches = bigger batches       │
+  │ compression.type           │ lz4/zstd reduces bytes → faster sends            │
+  │ buffer.memory ↑            │ More producer-side buffering before blocking     │
+  │ max.in.flight ↑            │ More parallel requests → higher throughput       │
+  │ partitions ↑               │ More parallelism → scale across brokers          │
+  └────────────────────────────┴──────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. CONSUMER THROUGHPUT TUNING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  High-throughput consumer profile:
+
+  fetch.min.bytes = 1048576        → 1MB minimum before broker responds
+  fetch.max.wait.ms = 500          → wait up to 500ms for fetch.min.bytes
+  max.partition.fetch.bytes = 10485760  → 10MB per partition per fetch
+  max.poll.records = 2000          → more records per poll (larger batches)
+  num.consumers = num.partitions   → full parallelism
+
+Key levers:
+  ┌────────────────────────────┬────────────────────────────────────────────────┐
+  │ Config                     │ Throughput Effect                              │
+  ├────────────────────────────┼────────────────────────────────────────────────┤
+  │ fetch.min.bytes ↑          │ Fewer fetch requests, larger responses         │
+  │ fetch.max.wait.ms ↑        │ More time to fill min bytes                    │
+  │ max.partition.fetch.bytes↑ │ More data per partition per fetch              │
+  │ max.poll.records ↑         │ More records per poll call                     │
+  │ consumer count ↑           │ Parallel consumption across partitions         │
+  └────────────────────────────┴────────────────────────────────────────────────┘
+
+  Processing throughput:
+  - If processing is CPU-bound: reduce max.poll.records → process in parallel threads
+  - If processing is I/O-bound (DB writes): batch writes, async processing
+  - Avoid blocking on poll thread: use pause()/resume() if backpressure needed
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. BROKER THROUGHPUT TUNING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  server.properties high-throughput configs:
+
+  num.network.threads = 8          → threads for network I/O (default 3)
+  num.io.threads = 16              → threads for disk I/O (default 8)
+  socket.send.buffer.bytes = 1048576     → 1MB TCP send buffer
+  socket.receive.buffer.bytes = 1048576 → 1MB TCP receive buffer
+  socket.request.max.bytes = 104857600  → 100MB max request size
+
+  log.segment.bytes = 1073741824   → 1GB segment (fewer segment rollovers)
+  log.index.interval.bytes = 4096  → how often to write index entries
+
+  replica.fetch.max.bytes = 10485760   → 10MB per replica fetch
+  num.replica.fetchers = 4             → 4 replication threads
+
+OS-level tuning:
+  # Increase max open file descriptors (Kafka opens many file handles)
+  ulimit -n 100000
+
+  # Linux: tune TCP stack
+  net.core.somaxconn = 32768
+  net.ipv4.tcp_max_syn_backlog = 8192
+
+  # Disable swap (Kafka relies on page cache — swapping kills performance)
+  vm.swappiness = 1
+
+  # Page cache dirty write tuning
+  vm.dirty_ratio = 80
+  vm.dirty_background_ratio = 5
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. PARTITIONS AND PARALLELISM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Partition count is the primary scaling knob in Kafka:
+  - More partitions → more parallelism → higher throughput
+  - Each partition can be served by a different broker
+  - Each consumer in a group handles at most one partition's worth of work
+
+Recommended partition count formula:
+  partitions = max(producer_throughput / single_producer_partition_throughput,
+                   consumer_throughput / single_consumer_partition_throughput)
+
+  Rough example:
+    Target throughput: 1 GB/s write
+    Single partition throughput: 50 MB/s
+    Partitions needed: 1000 / 50 = 20 partitions (minimum)
+
+Too many partitions:
+  - More file handles per broker (1 partition = 3 files: .log, .index, .timeindex)
+  - Longer leader election times (more partitions to reassign on failure)
+  - More memory for partition metadata
+  - Recommendation: < 4000 partitions per broker, < 200K per cluster
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. THROUGHPUT vs LATENCY TRADE-OFFS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌────────────────────┬────────────────────────────┬──────────────────────────┐
+  │ Config             │ High Throughput             │ Low Latency              │
+  ├────────────────────┼────────────────────────────┼──────────────────────────┤
+  │ linger.ms          │ 20-100ms                   │ 0 (send immediately)     │
+  │ batch.size         │ 128KB-1MB                  │ Small / irrelevant       │
+  │ acks               │ 1                          │ 1 (or 0)                 │
+  │ compression        │ lz4 or zstd                │ none (CPU cost avoided)  │
+  │ fetch.min.bytes    │ 1MB (wait for big batch)   │ 1 (respond immediately)  │
+  │ fetch.max.wait.ms  │ 500ms                      │ 0 (don't wait)           │
+  └────────────────────┴────────────────────────────┴──────────────────────────┘
+
+  For real-time systems (fraud detection, alerting):
+    Low latency profile: linger.ms=0, fetch.min.bytes=1, acks=1, no compression
+
+  For data pipeline / ETL:
+    High throughput: linger.ms=50, batch.size=256KB, compression=lz4, acks=all
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What are the main architectural reasons Kafka is so fast?
+A: Four key factors: (1) Sequential I/O — Kafka only appends to logs, no random
+   writes; sequential disk access is 100-1000x faster. (2) Zero-copy — consumer
+   fetches use the sendfile syscall to transfer data from page cache directly to
+   the network socket without copying through JVM. (3) Batching — producer groups
+   records into batches; one network round-trip delivers many records. (4) Page
+   cache — Kafka avoids JVM heap; data lives in the OS page cache, eliminating
+   GC overhead and enabling fast in-memory reads for recent data.
+
+Q: How do you tune a Kafka producer for maximum throughput?
+A: Increase batch.size (e.g., 128-512KB), set linger.ms to a non-zero value (20-100ms)
+   to wait for batches to fill, enable compression (lz4 or zstd), increase
+   buffer.memory to avoid producer blocking, and allow more in-flight requests
+   (max.in.flight.requests.per.connection=5 with idempotence). Also ensure enough
+   partitions for parallelism.
+
+Q: How do you reduce end-to-end latency in a Kafka pipeline?
+A: Set linger.ms=0 (send immediately), fetch.min.bytes=1 (don't wait for data),
+   fetch.max.wait.ms=0 (respond immediately), disable compression (CPU overhead
+   adds latency), use acks=1 instead of acks=all (skip full ISR wait), ensure
+   consumers are caught up (no lag), and minimize processing time per record
+   (avoid synchronous I/O on the poll thread).
+
+Q: What are the trade-offs of increasing partition count?
+A: More partitions allow more parallelism (higher throughput, more consumers).
+   But: each partition = 3 open file handles on every replica (3 brokers × 3 files
+   = 9 files per partition in RF=3 cluster). A cluster with 100K partitions has
+   900K open file handles — taxing the OS. Leader election takes longer with many
+   partitions. Recommendation: < 4,000 partitions per broker. Scale by adding
+   brokers rather than unlimited partition count.
+
+Q: When would you choose lz4 vs zstd compression?
+A: lz4 is the classic fast choice: very fast compression/decompression, moderate
+   compression ratio — good for high-throughput systems where CPU is a concern.
+   zstd (Kafka 2.1+) achieves better compression ratios than lz4/gzip with similar
+   or better speed, especially at higher compression levels. For most new deployments,
+   zstd is the better default. Use gzip only if compatibility with older consumers is
+   required or you need maximum compression ratio (at the cost of CPU).

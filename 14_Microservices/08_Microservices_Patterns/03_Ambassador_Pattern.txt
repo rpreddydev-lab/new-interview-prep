@@ -1,0 +1,184 @@
+================================================================================
+AMBASSADOR PATTERN (DEEP DIVE)
+================================================================================
+
+This file provides a detailed look at the Ambassador pattern with code examples.
+See 02_Sidecar_Pattern.txt for the conceptual overview and comparison.
+
+════════════════════════════════════════════════════════════════════════════════
+
+AMBASSADOR AS AN API FACADE
+============================
+
+The Ambassador pattern can also describe a top-level API Gateway acting as an
+ambassador for backend services — translating, authenticating, routing client
+requests.
+
+  Client (Mobile App)
+        │
+        ▼
+  ┌─────────────────────────────────────────────────────┐
+  │            Ambassador API Gateway                    │
+  │  - Authentication (JWT validation)                   │
+  │  - Rate limiting                                     │
+  │  - Request translation (REST → gRPC)                │
+  │  - Response aggregation                              │
+  │  - Retry / Circuit Breaking                          │
+  └───────────────────┬─────────────────────────────────┘
+         │            │            │
+         ▼            ▼            ▼
+    [Order Svc]  [Inventory]  [Payment Svc]
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING BOOT AMBASSADOR IMPLEMENTATION
+=======================================
+
+Use case: Service needs to call an external legacy REST API that requires:
+  - OAuth2 client_credentials token (refreshed every 15 minutes)
+  - Request signing (HMAC header)
+  - Retry on 429 (rate limit) and 5xx
+  - Circuit breaker
+  - Response protocol translation (legacy XML → modern JSON)
+
+Without Ambassador:
+  // Every service calling the legacy API would need ALL of this code
+  // Duplicated across 5 services
+
+With Ambassador:
+  // One shared Ambassador service handles all of this
+  // Other services call Ambassador's REST API at localhost or a cluster address
+
+  @Service
+  public class LegacyApiAmbassador {
+
+    private final WebClient legacyClient;
+    private final CircuitBreaker circuitBreaker;
+    private volatile String accessToken;
+    private volatile Instant tokenExpiry;
+
+    // Token management (cached, auto-refreshed)
+    private synchronized String getAccessToken() {
+      if (accessToken == null || Instant.now().isAfter(tokenExpiry.minusSeconds(60))) {
+        LegacyTokenResponse response = obtainNewToken();
+        accessToken = response.getAccessToken();
+        tokenExpiry = Instant.now().plusSeconds(response.getExpiresIn());
+      }
+      return accessToken;
+    }
+
+    // Request signing
+    private String computeHmacSignature(String body, String secret) {
+      try {
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(secret.getBytes(), "HmacSHA256"));
+        return Base64.getEncoder().encodeToString(mac.doFinal(body.getBytes()));
+      } catch (Exception e) {
+        throw new RuntimeException("HMAC signing failed", e);
+      }
+    }
+
+    // Ambassador method with circuit breaker + retry
+    @CircuitBreaker(name = "legacyApi", fallbackMethod = "fallback")
+    @Retry(name = "legacyApiRetry")
+    public ProductDTO getProduct(String productId) {
+      String token = getAccessToken();
+      String requestBody = "{\"productId\":\"" + productId + "\"}";
+      String signature = computeHmacSignature(requestBody, legacySecret);
+
+      // Call legacy XML API, translate response to JSON/DTO
+      String xmlResponse = legacyClient.get()
+        .uri("/products/{id}", productId)
+        .header("Authorization", "Bearer " + token)
+        .header("X-Signature", signature)
+        .retrieve()
+        .bodyToMono(String.class)
+        .block();
+
+      return xmlToProductDTO(xmlResponse);  // Protocol translation
+    }
+
+    private ProductDTO fallback(String productId, Exception e) {
+      log.warn("Legacy API unavailable for product {}: {}", productId, e.getMessage());
+      return ProductDTO.unknown(productId);
+    }
+
+    // XML → DTO translation (protocol translation)
+    private ProductDTO xmlToProductDTO(String xml) {
+      // XPath parsing or JAXB unmarshalling
+      Document doc = parseXml(xml);
+      return ProductDTO.builder()
+        .id(xpath(doc, "//product/@id"))
+        .name(xpath(doc, "//product/name/text()"))
+        .price(new BigDecimal(xpath(doc, "//product/price/text()")))
+        .available("Y".equals(xpath(doc, "//product/@available")))
+        .build();
+    }
+  }
+
+Other services use the ambassador — they don't know about OAuth, signing, XML:
+  @Service
+  public class OrderService {
+    @Autowired private LegacyApiAmbassador productAmbassador;
+
+    public Order createOrder(CreateOrderRequest request) {
+      // Simple call — complexity hidden in ambassador
+      ProductDTO product = productAmbassador.getProduct(request.getProductId());
+      // ...
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+NETWORK PROXY AMBASSADOR (ENVOY SIDECAR)
+==========================================
+
+For polyglot environments, an Envoy sidecar as Ambassador works for any language.
+
+envoy-ambassador.yaml (K8s pod with Node.js service + Envoy Ambassador):
+  apiVersion: apps/v1
+  kind: Deployment
+  spec:
+    template:
+      spec:
+        containers:
+        # Main Node.js service
+        - name: order-service
+          image: order-service-nodejs:latest
+          env:
+          - name: EXTERNAL_API_URL
+            value: "http://localhost:3000"   # Always calls Ambassador on localhost
+
+        # Ambassador sidecar (Envoy handles retry, circuit break, auth)
+        - name: envoy-ambassador
+          image: envoyproxy/envoy:v1.28.0
+          args: ["-c", "/etc/envoy/envoy-ambassador.yaml"]
+          volumeMounts:
+          - name: envoy-config
+            mountPath: /etc/envoy
+
+        volumes:
+        - name: envoy-config
+          configMap:
+            name: envoy-ambassador-config
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What specific problems does the Ambassador pattern solve?
+A: The Ambassador handles cross-cutting network concerns for a service's outbound
+   calls: authentication (token management, request signing), retry and circuit
+   breaking, protocol translation (XML→JSON, HTTP/1.1→HTTP/2), rate limiting
+   compliance, and logging. It keeps these concerns out of the service's business
+   logic and prevents duplication across services.
+
+Q: How is the Ambassador pattern different from the API Gateway?
+A: API Gateway is at the EDGE of the system — routes incoming client requests
+   to internal services, handles authentication, rate limiting, SSL termination.
+   Ambassador is a helper for OUTBOUND calls FROM a service to external or
+   downstream systems. Ambassador lives alongside the service (as a sidecar),
+   while API Gateway is a shared infrastructure component.
+
+================================================================================

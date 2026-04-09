@@ -1,0 +1,231 @@
+================================================================================
+  KAFKA BROKERS AND CLUSTERS
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHAT IS A KAFKA BROKER?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A Kafka broker is a single Kafka server instance. It is responsible for:
+  1. Receiving records from producers
+  2. Assigning offsets to records
+  3. Writing records to disk (sequential log files)
+  4. Replicating data to follower brokers
+  5. Serving records to consumers on fetch requests
+  6. Responding to metadata requests (which broker is leader for which partition?)
+
+A broker is identified by:
+  - broker.id (integer, must be unique in the cluster) — set in server.properties
+  - host:port (advertised.listeners in server.properties)
+
+A single broker can serve hundreds of partitions simultaneously.
+Production clusters typically have 3, 5, 7, or more brokers.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. CLUSTER FORMATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+How brokers form a cluster (KRaft mode):
+
+  1. A quorum of controller nodes is configured (3 or 5 brokers designated as controllers)
+  2. Controllers run the Raft consensus protocol, storing metadata in __cluster_metadata
+  3. When a broker starts, it registers with the active controller
+  4. Controllers manage partition leadership, ISR, and broker membership
+  5. Regular brokers (non-controllers) store topic data and serve clients
+
+Bootstrap process (client side):
+  - Client is configured with bootstrap.servers = "broker1:9092,broker2:9092,broker3:9092"
+  - Client connects to ANY of those brokers to get cluster metadata
+  - Metadata response includes ALL brokers and their partition leaders
+  - Client then connects DIRECTLY to the appropriate leader for each partition
+  - bootstrap.servers is just a starting point — not all brokers need to be listed
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. BROKER RESPONSIBILITIES IN DETAIL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+As LEADER for a partition:
+  - Receive writes from producers (ProduceRequest)
+  - Append to local log, assign offset
+  - Track which replicas have fetched which offsets (to manage HW)
+  - Respond to consumer FetchRequests (up to HW)
+  - Maintain ISR list for the partition
+
+As FOLLOWER for a partition:
+  - Continuously send FetchRequests to the leader (like a consumer)
+  - Append received records to local replica log
+  - Report its LEO to the leader on each FetchRequest
+  - Stay within replica.lag.time.max.ms to remain in ISR
+
+As CONTROLLER (one broker or controller quorum):
+  - Watch for broker join/leave events
+  - Elect new partition leaders when broker fails
+  - Update __cluster_metadata (KRaft) or ZooKeeper (legacy)
+  - Communicate leader changes to all brokers
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. IMPORTANT BROKER CONFIGURATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+server.properties (key settings):
+
+  # Broker Identity
+  broker.id=1                                    # unique integer per broker
+
+  # Storage
+  log.dirs=/var/kafka/data                       # where partition logs are stored
+  log.retention.hours=168                        # 7 days message retention
+  log.retention.bytes=-1                         # no size limit (set per-topic)
+  log.segment.bytes=1073741824                   # 1GB per segment file
+  log.segment.ms=604800000                       # Roll segment after 7 days too
+
+  # Network
+  num.network.threads=3                          # request handling threads
+  num.io.threads=8                               # disk I/O threads
+  socket.send.buffer.bytes=102400
+  socket.receive.buffer.bytes=102400
+  socket.request.max.bytes=104857600            # 100MB max request size
+
+  # Replication
+  default.replication.factor=3                   # default for auto-created topics
+  min.insync.replicas=2                          # minimum ISR for acks=all writes
+  replica.lag.time.max.ms=30000                  # 30 sec to consider follower in-sync
+
+  # KRaft mode
+  process.roles=broker,controller                # can be broker, controller, or both
+  node.id=1                                      # replaces broker.id in KRaft
+  controller.quorum.voters=1@host1:9093,2@host2:9093,3@host3:9093
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. BROKER FAILURE AND RECOVERY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Scenario: Broker 1 goes down (it was leader for 3 partitions)
+
+1. Other brokers detect failure (heartbeat timeout or ZooKeeper session expiry)
+2. Controller detects that Broker 1 is offline
+3. Controller looks at ISR for each partition where Broker 1 was leader
+4. Controller elects a new leader from the ISR for each affected partition
+5. Controller broadcasts the new partition → leader mapping to all brokers
+6. Producers and consumers refresh their metadata and reconnect to new leaders
+
+Recovery time:
+  - ZooKeeper mode: typically 30-60 seconds (limited by ZK session.timeout.ms)
+  - KRaft mode: typically 1-5 seconds (Raft failover is much faster)
+
+Preferred replica election:
+  - Kafka tracks the "preferred replica" (the original partition assignment)
+  - auto.leader.rebalance.enable=true ensures leaders are rebalanced after recovery
+  - Prevents all leaders from piling up on fewer brokers after failures
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. PARTITION ASSIGNMENT ACROSS BROKERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When a topic is created, Kafka distributes partition leaders evenly:
+
+Example: 6 partitions, 3 brokers, replication-factor 3
+
+  Partition  Leader  Replicas
+  ─────────────────────────────
+  0          Broker1 [Broker1, Broker2, Broker3]
+  1          Broker2 [Broker2, Broker3, Broker1]
+  2          Broker3 [Broker3, Broker1, Broker2]
+  3          Broker1 [Broker1, Broker3, Broker2]
+  4          Broker2 [Broker2, Broker1, Broker3]
+  5          Broker3 [Broker3, Broker2, Broker1]
+
+  → Each broker leads 2 partitions (balanced)
+  → Each broker's disk load is equal
+  → Producer writes are evenly distributed
+
+Rack-aware assignment (important for multi-AZ deployments):
+  - broker.rack=us-east-1a/b/c configured on each broker
+  - Kafka ensures replicas are spread across racks
+  - If broker.rack is set, Kafka guarantees at least 2 replicas in different AZs
+  - Survives entire AZ failure with replication.factor >= 3
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. CLUSTER SIZING GUIDELINES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+How many brokers do you need?
+
+1. Throughput-based:
+   - Each broker handles ~100-200 MB/s of writes (with SSDs)
+   - With replication-factor=3: effective write throughput = total / 3
+   - Example: need 600 MB/s → 3 brokers × 200 MB/s, but with RF=3 → need 9 brokers
+
+2. Storage-based:
+   - Calculate: (msg/sec × avg_msg_size × retention_days × 86400) × RF / brokers
+   - Example: 100k msg/sec × 1KB × 7 days × 86400 × 3 / broker_disk_size_TB
+
+3. Partition-based:
+   - Each broker can handle ~4000-5000 partitions (as leader + follower)
+   - With 100 partitions per topic and 50 topics = 5000 partitions → 3-5 brokers
+
+4. Fault tolerance requirement:
+   - Minimum 3 brokers for any production cluster
+   - 3 brokers with RF=3: can tolerate 1 broker failure
+   - For critical systems: 5 brokers with RF=3
+
+Hardware recommendations (per broker):
+  - CPU: 16-32 cores (I/O intensive, not CPU intensive)
+  - RAM: 32-128 GB (for OS page cache — don't use JVM heap for this!)
+  - Disk: SSDs preferred; separate disks for data and logs
+  - Network: 10 Gbps (replication + producer + consumer traffic)
+  - JVM heap: 4-8 GB MAX (rest of RAM for page cache)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. BROKER METRICS TO KNOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Key JMX metrics (important for monitoring):
+  kafka.server:type=BrokerTopicMetrics,name=BytesInPerSec       → write throughput
+  kafka.server:type=BrokerTopicMetrics,name=BytesOutPerSec      → read throughput
+  kafka.server:type=BrokerTopicMetrics,name=MessagesInPerSec    → message rate
+  kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions → data health!
+  kafka.server:type=ReplicaManager,name=OfflinePartitionsCount   → outage indicator
+  kafka.server:type=ReplicaManager,name=LeaderCount              → leader balance
+  kafka.controller:type=KafkaController,name=ActiveControllerCount → =1 is healthy
+  kafka.network:type=RequestMetrics,name=TotalTimeMs,request=Produce → p99 latency
+
+Alert thresholds:
+  - UnderReplicatedPartitions > 0 → CRITICAL (replication lag or broker failure)
+  - OfflinePartitionsCount > 0 → CRITICAL (data is unavailable)
+  - ActiveControllerCount != 1 → CRITICAL (no controller or split-brain)
+  - ProduceRequestMs p99 > 500ms → WARNING (throughput or hardware issue)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is a Kafka broker and what does it do?
+A: A broker is a Kafka server that stores topic partitions, receives producer writes,
+   replicates data to follower replicas, and serves consumer fetch requests. Each
+   broker has a unique broker.id and stores its assigned partition data on disk.
+
+Q: How does a Kafka client find the right broker to connect to?
+A: The client connects to any broker listed in bootstrap.servers to get cluster
+   metadata (which broker is the leader for each partition). Then it connects
+   directly to the appropriate partition leader for reads and writes. Metadata
+   is refreshed periodically.
+
+Q: What happens to a Kafka cluster when a broker fails?
+A: The controller detects the failure, looks at ISR lists for all partitions
+   that were led by the failed broker, and elects new leaders from the ISR.
+   It broadcasts the new leadership to all brokers. Producers/consumers refresh
+   metadata and reconnect to new leaders. With KRaft this recovery is < 5 seconds;
+   with ZooKeeper ~30-60 seconds.
+
+Q: What is the minimum number of brokers for a production Kafka cluster?
+A: 3 brokers is the minimum. With replication-factor=3 and min.insync.replicas=2,
+   you can tolerate 1 broker failure. For critical workloads, 5 brokers is common.
+   Odd numbers are preferred for quorum-based decisions (ZooKeeper/KRaft).
+
+Q: What is UnderReplicatedPartitions and why is it a critical metric?
+A: It counts partitions where the number of ISR replicas < replication factor.
+   A non-zero value means replication is lagging — data durability is compromised.
+   This can occur due to broker failure, GC pauses, or network issues. It should
+   always be alerted on and resolved quickly.

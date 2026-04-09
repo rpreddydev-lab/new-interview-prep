@@ -1,0 +1,237 @@
+================================================================================
+BLUE/GREEN AND CANARY DEPLOYMENTS
+================================================================================
+
+WHY ZERO-DOWNTIME DEPLOYMENT?
+-------------------------------
+In microservices, deploying new versions without disrupting users is critical.
+Multiple services deployed daily. Users cannot tolerate downtime.
+
+Deployment strategies:
+  1. Recreate: Stop v1, start v2. Simple but has downtime.
+  2. Rolling Update: Gradually replace pods. Default in K8s. Some risk.
+  3. Blue/Green: Two full environments, instant switch. Zero risk, high cost.
+  4. Canary: Gradual traffic shift. Low risk, catches real issues.
+
+────────────────────────────────────────────────────────────────────────────────
+
+BLUE/GREEN DEPLOYMENT
+======================
+
+Concept:
+  - Maintain two identical environments: Blue (current v1) and Green (new v2)
+  - Deploy v2 to Green while Blue serves 100% of traffic
+  - Test Green thoroughly
+  - Switch load balancer from Blue to Green (instant)
+  - Blue remains for instant rollback if needed
+
+  Load Balancer
+       │
+  100% ↓              0%
+  [BLUE - v1]    [GREEN - v2]   → switch → [BLUE - v1]  [GREEN - v2]
+  (active)        (standby)                (standby)    (active 100%)
+
+Implementation in Kubernetes:
+  # Both deployments exist simultaneously:
+  kubectl apply -f order-service-v1-deployment.yaml  # Blue
+  kubectl apply -f order-service-v2-deployment.yaml  # Green
+
+  # Service initially points to Blue (v1):
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: order-service
+  spec:
+    selector:
+      app: order-service
+      version: "v1"   # ← Blue
+    ports:
+    - port: 8080
+
+  # Switch to Green (v2) — instant cutover:
+  kubectl patch service order-service -p '{"spec":{"selector":{"version":"v2"}}}'
+
+  # Rollback in seconds:
+  kubectl patch service order-service -p '{"spec":{"selector":{"version":"v1"}}}'
+
+Argo Rollouts Blue/Green:
+  apiVersion: argoproj.io/v1alpha1
+  kind: Rollout
+  metadata:
+    name: order-service
+  spec:
+    strategy:
+      blueGreen:
+        activeService: order-service-active      # Receives production traffic
+        previewService: order-service-preview    # Receives preview traffic
+        autoPromotionEnabled: false              # Manual approval required
+        scaleDownDelaySeconds: 30               # Keep blue running 30s after switch
+    replicas: 3
+    selector:
+      matchLabels:
+        app: order-service
+    template:
+      metadata:
+        labels:
+          app: order-service
+      spec:
+        containers:
+        - name: order-service
+          image: order-service:v2
+
+Pros:
+  ✓ Zero-downtime cutover
+  ✓ Instant rollback (just switch selector back)
+  ✓ Full testing of new version before production traffic
+  ✓ Database migration can be pre-tested
+
+Cons:
+  ✗ Double resource cost (two full environments)
+  ✗ Database migrations must be backward-compatible (both versions run simultaneously)
+  ✗ Stateful session management (sessions in v1 don't transfer to v2)
+
+────────────────────────────────────────────────────────────────────────────────
+
+CANARY DEPLOYMENT
+==================
+
+Concept:
+  - Deploy new version (canary) alongside existing (stable)
+  - Route small percentage of traffic to canary (1%, 5%, 10%)
+  - Monitor error rates, latency, business metrics
+  - Gradually increase traffic or rollback
+
+  Users → [Load Balancer]
+             │         │
+           95%        5%
+             ↓         ↓
+         [Stable v1] [Canary v2]
+
+Implementation with Ingress NGINX annotations:
+  # Canary ingress (routes 10% of traffic to v2):
+  apiVersion: networking.k8s.io/v1
+  kind: Ingress
+  metadata:
+    name: order-service-canary
+    annotations:
+      nginx.ingress.kubernetes.io/canary: "true"
+      nginx.ingress.kubernetes.io/canary-weight: "10"   # 10% to canary
+      # OR by header (for internal testing):
+      # nginx.ingress.kubernetes.io/canary-by-header: "X-Canary"
+      # nginx.ingress.kubernetes.io/canary-by-header-value: "always"
+  spec:
+    rules:
+    - host: api.example.com
+      http:
+        paths:
+        - path: /api/orders
+          pathType: Prefix
+          backend:
+            service:
+              name: order-service-v2
+              port:
+                number: 8080
+
+Argo Rollouts Canary:
+  spec:
+    strategy:
+      canary:
+        steps:
+        - setWeight: 5             # Step 1: 5% traffic
+        - pause: {duration: 10m}   # Observe for 10 minutes
+        - setWeight: 20            # Step 2: 20% traffic
+        - pause:                   # Manual approval required
+            duration: {}
+        - setWeight: 50            # Step 3: 50% traffic
+        - pause: {duration: 10m}
+        - setWeight: 100           # Step 4: Full rollout
+        analysis:
+          templates:
+          - templateName: success-rate-check
+          startingStep: 2           # Start analysis at step 2
+
+  # AnalysisTemplate
+  apiVersion: argoproj.io/v1alpha1
+  kind: AnalysisTemplate
+  metadata:
+    name: success-rate-check
+  spec:
+    metrics:
+    - name: success-rate
+      successCondition: result[0] >= 0.95  # 95% success required
+      interval: 5m
+      provider:
+        prometheus:
+          address: http://prometheus:9090
+          query: |
+            sum(rate(http_requests_total{job="order-service",status!~"5.."}[5m])) /
+            sum(rate(http_requests_total{job="order-service"}[5m]))
+
+Pros:
+  ✓ Real traffic validation (catches issues not found in staging)
+  ✓ Low blast radius (only 5-10% affected if canary has a bug)
+  ✓ Gradual confidence building
+  ✓ Automated rollback based on metrics
+
+Cons:
+  ✗ Two versions running simultaneously → DB migrations must be backward-compatible
+  ✗ Complex routing (Istio or Ingress controller needed)
+  ✗ More complex to implement than rolling update
+
+────────────────────────────────────────────────────────────────────────────────
+
+DATABASE MIGRATIONS WITH ZERO-DOWNTIME DEPLOYMENTS
+=====================================================
+
+Problem: Both v1 and v2 run simultaneously during blue/green or canary.
+If v2 migration removes a column that v1 uses → v1 breaks.
+
+Solution: Expand-Contract (Parallel Change) pattern:
+
+  Phase 1 — Expand: Add new column/table (backward compatible)
+    - Add `email_address` column (nullable)
+    - v1 writes to `email`
+    - v2 writes to BOTH `email` and `email_address`
+
+  Phase 2 — Migrate: Backfill data
+    - Backfill `email_address` from `email` for existing rows
+
+  Phase 3 — Contract: Remove old column (after v1 is fully replaced)
+    - v2 only reads `email_address`
+    - Remove `email` column in separate deployment
+
+Tools:
+  - Flyway / Liquibase: version-controlled database migrations
+  - Flyway + Spring Boot: runs migrations on startup
+  
+  spring:
+    flyway:
+      enabled: true
+      locations: classpath:db/migration
+      baseline-on-migrate: true
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: When would you choose Blue/Green over Canary deployment?
+A: Blue/Green: when instant rollback is critical, for high-risk changes (DB
+   schema changes, major refactors), when resource cost is acceptable. Canary:
+   when you need to validate with real production traffic before full rollout,
+   for large-scale deployments where even 1% bug exposure is valuable feedback,
+   when you have automated analysis to detect regressions.
+
+Q: How do you handle database migrations during zero-downtime deployments?
+A: Use the Expand-Contract pattern: Step 1 (Expand) — add new column/table,
+   keeping old structure. Both versions co-exist. Step 2 — backfill data to
+   new structure. Step 3 (Contract) — once old version is fully replaced,
+   remove old column. Never make breaking database changes during deployment.
+
+Q: What is Argo Rollouts?
+A: A Kubernetes controller that extends Deployments with advanced strategies —
+   Canary and Blue/Green with automatic analysis. Integrates with Prometheus for
+   metric-based promotion/rollback, Ingress for traffic splitting, and provides
+   a CLI and dashboard for visibility.
+
+================================================================================

@@ -1,0 +1,189 @@
+================================================================
+Batch Processing in JPA/Hibernate
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHY BATCH PROCESSING?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Naïve loop:
+  for (Product p : products) {
+      em.persist(p);  // sends 1 INSERT per call to DB
+  }
+  // 10,000 products = 10,000 round trips to DB!
+
+With JDBC batch:
+  // Groups INSERT statements into batches sent in fewer round trips
+  // 10,000 products with batch size 50 = 200 batch calls = much faster
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. ENABLING JDBC BATCHING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+application.properties:
+  spring.jpa.properties.hibernate.jdbc.batch_size=50
+  spring.jpa.properties.hibernate.order_inserts=true    # group inserts by entity type
+  spring.jpa.properties.hibernate.order_updates=true    # group updates by entity type
+
+Important: IDENTITY generation strategy DISABLES batching!
+  @GeneratedValue(strategy = GenerationType.IDENTITY)   // BREAKS batching!
+  // Hibernate needs the generated ID immediately after INSERT to populate the entity,
+  // so it can't defer/batch inserts.
+
+  Fix: Use SEQUENCE strategy:
+  @GeneratedValue(
+      strategy = GenerationType.SEQUENCE,
+      generator = "product_seq"
+  )
+  @SequenceGenerator(name = "product_seq", sequenceName = "product_sequence",
+                     allocationSize = 50)   // pre-allocate 50 IDs at once
+  private Long id;
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. BATCH INSERT WITH PERIODIC FLUSH + CLEAR
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Without clear(), the persistence context accumulates all entities in memory!
+Must flush + clear periodically in the batch loop.
+
+@Transactional
+public void batchInsert(List<Product> products) {
+    int batchSize = 50;
+    for (int i = 0; i < products.size(); i++) {
+        em.persist(products.get(i));
+
+        if (i > 0 && i % batchSize == 0) {
+            em.flush();   // send batch to DB
+            em.clear();   // clear 1LC to prevent OOM
+        }
+    }
+    em.flush();  // flush remaining
+}
+
+Spring Data alternative with saveAll() (automatically batches if jdbc.batch_size is set):
+  productRepo.saveAll(products);
+  // Spring Data calls saveAll, which uses @Transactional internally
+  // With hibernate.jdbc.batch_size set, batching is automatic
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. BULK UPDATE / DELETE (JPQL)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Bulk operations bypass the persistence context entirely — one SQL statement.
+Ideal for mass updates/deletes without loading entities.
+
+// Bulk UPDATE:
+@Modifying
+@Query("UPDATE Product p SET p.price = p.price * :multiplier WHERE p.category = :cat")
+int updatePriceByCategory(@Param("multiplier") double m, @Param("cat") String cat);
+// Returns count of affected rows; does NOT load entities
+
+// Bulk DELETE:
+@Modifying
+@Query("DELETE FROM Product p WHERE p.category = :cat AND p.stock = 0")
+int deleteOutOfStockByCategory(@Param("cat") String cat);
+
+// IMPORTANT: After bulk update/delete, clear the persistence context
+// to avoid stale cached entities:
+@Modifying(clearAutomatically = true)    // auto-clears 1LC after execution
+@Query("UPDATE Product p SET p.stock = 0 WHERE p.id IN :ids")
+int clearStock(@Param("ids") List<Long> ids);
+
+// Or manually:
+em.clear();
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. STATELESS SESSION (Hibernate — No 1LC Overhead)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+StatelessSession bypasses the First-Level Cache entirely.
+Ideal for large batch reads/writes where entity tracking is not needed.
+
+@Autowired
+private SessionFactory sessionFactory;
+
+public void processBatch() {
+    StatelessSession session = sessionFactory.openStatelessSession();
+    Transaction tx = session.beginTransaction();
+    try {
+        ScrollableResults<Product> results = session.createQuery(
+            "FROM Product p WHERE p.stock > 0", Product.class)
+            .scroll(ScrollMode.FORWARD_ONLY);
+
+        while (results.next()) {
+            Product p = results.get();
+            p.setStock(p.getStock() - 1);
+            session.update(p);  // direct UPDATE, no dirty checking overhead
+        }
+        results.close();
+        tx.commit();
+    } catch (Exception e) {
+        tx.rollback();
+        throw e;
+    } finally {
+        session.close();
+    }
+}
+
+StatelessSession limitations:
+  - No first-level cache (no identity guarantee)
+  - No dirty checking
+  - No cascading
+  - No lazy loading
+  - Must manage lifecycle manually
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. SPRING BATCH FOR LARGE-SCALE JOBS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For enterprise batch processing (millions of records), use Spring Batch:
+  - JpaPagingItemReader / JpaCursorItemReader — reads in pages
+  - JpaItemWriter — writes in chunks
+  - Built-in retry, skip, restart, partitioning
+
+@Bean
+public Step productPriceUpdateStep(JpaItemWriter<Product> writer) {
+    return stepBuilderFactory.get("productPriceUpdate")
+        .<Product, Product>chunk(50)   // chunk = batch size
+        .reader(jpaPagingItemReader())
+        .processor(item -> { item.setPrice(item.getPrice().multiply(new BigDecimal("1.1"))); return item; })
+        .writer(writer)
+        .build();
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. INTERVIEW QUICK HITS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: Why does IDENTITY generation strategy disable JDBC batching?
+A: IDENTITY relies on the DB generating the ID during INSERT and returning
+   it immediately. Hibernate needs the ID to populate the entity and manage
+   identity in the persistence context. Because it must flush each INSERT
+   immediately to get the ID, it cannot accumulate inserts into a batch.
+   Use SEQUENCE strategy with allocationSize matching your batch size.
+
+Q: How do you prevent OutOfMemoryError during large batch inserts?
+A: Periodically call em.flush() then em.clear() inside the loop
+   (e.g., every 50 rows). flush() sends buffered SQL to the DB;
+   clear() releases entities from the persistence context (1LC).
+   Without clear(), all entities accumulate in memory.
+
+Q: What is the difference between @Modifying bulk update and entity-level update?
+A: @Modifying with JPQL executes a single UPDATE SQL statement without
+   loading any entities. Entity-level update requires: load entity (SELECT),
+   modify field, flush (UPDATE). For mass operations, @Modifying is
+   dramatically faster. Caveat: bulk updates bypass the 1LC — use
+   @Modifying(clearAutomatically=true) to avoid stale cached data.
+
+Q: What is StatelessSession and when should you use it?
+A: StatelessSession is a Hibernate session without a first-level cache,
+   dirty checking, or cascading. Each operation is a direct SQL call.
+   Use it for large-scale batch reads/writes where you don't need entity
+   tracking or lazy loading, to avoid memory overhead of the persistence context.
+
+Q: How would you process 10 million rows in Hibernate efficiently?
+A: Use JpaCursorItemReader or ScrollableResults in a StatelessSession
+   (forward-only cursor to stream rows), process in chunks, use
+   @Modifying bulk UPDATE where possible, set jdbc.batch_size=50,
+   use SEQUENCE key generation, and call flush+clear every N rows
+   to prevent 1LC memory buildup. Consider Spring Batch for restartability.

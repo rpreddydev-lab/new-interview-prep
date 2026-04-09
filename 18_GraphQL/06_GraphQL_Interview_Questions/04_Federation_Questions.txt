@@ -1,0 +1,212 @@
+================================================================
+GRAPHQL FEDERATION INTERVIEW QUESTIONS — IN DEPTH
+================================================================
+
+Q1: What is GraphQL Federation and why was it created?
+A: GraphQL Federation is a specification and architecture for building a
+   distributed GraphQL API from multiple independent microservices, each
+   owning a slice of the graph.
+   Problem it solves: As microservices grow, a single "monolithic" GraphQL
+   gateway that knows about all services becomes a bottleneck — a massive
+   schema that every team has to contribute to, creating coupling between
+   teams. Federation allows each service to own its own schema independently.
+   Who made it: Apollo (Apollo Federation v1 in 2019, v2 in 2022).
+   Alternative: Schema stitching (older, more manual approach).
+
+Q2: What is the difference between schema stitching and Apollo Federation?
+A: Schema Stitching (older):
+   - A gateway merges multiple schemas manually
+   - Gateway needs explicit configuration for cross-schema links
+   - Hard to maintain as schemas grow
+   - Gateway knows everything about all services
+   Apollo Federation (newer):
+   - Each service owns its schema and declares "I own User.id and name"
+   - Services declare @key (primary key) and @extends to add fields to remote types
+   - Gateway auto-composes schemas; less manual configuration
+   - Services are independent; teams work without coordinating
+   Federation is now the industry standard for GraphQL microservices.
+
+Q3: What is a "subgraph" in GraphQL Federation?
+A: A subgraph is an individual microservice that participates in the federated
+   graph. Each subgraph:
+   - Has its own GraphQL schema
+   - Declares its "entity" types with @key
+   - Runs its own GraphQL server
+   - Is registered with the Router (formerly Gateway)
+   Example: Users Subgraph owns User type; Posts Subgraph owns Post type
+   but references User by ID.
+
+Q4: What is the @key directive in Federation?
+A: @key marks a field (or set of fields) as the primary key of an entity.
+   It tells the Router: "this type can be fetched by this field".
+   ```graphql
+   # Users Subgraph
+   type User @key(fields: "id") {
+     id: ID!
+     name: String!
+     email: String!
+   }
+
+   # Posts Subgraph — references User by id
+   extend type User @key(fields: "id") {
+     id: ID! @external         # field owned by Users subgraph
+     posts: [Post!]!           # field owned by THIS subgraph
+   }
+   ```
+   The @key tells the Router how to fetch a User entity from the Users
+   subgraph when the Posts subgraph returns a User reference with just an id.
+
+Q5: What is an "entity" in Apollo Federation?
+A: An entity is a type that can be referenced across subgraphs. Entities:
+   - Declare @key with their primary key fields
+   - Can be "extended" by other subgraphs to add fields
+   - Are fetched via the `_entities(representations: [Any!]!): [_Entity]!`
+     query (automatically added by Federation)
+   Example: User is an entity — Users subgraph defines it; Posts subgraph
+   extends it to add `.posts`; Orders subgraph extends it to add `.orders`.
+
+Q6: What are @external, @provides, and @requires in Federation?
+A: @external: marks a field as belonging to another subgraph. Used in
+   extend type blocks to reference the key field.
+   ```graphql
+   extend type Product @key(fields: "id") {
+     id: ID! @external        # owned by Products subgraph
+     reviews: [Review!]!      # owned by Reviews subgraph
+   }
+   ```
+   @provides: tells the Router that a subgraph can return fields from
+   a referenced entity (avoids an extra round-trip to the entity's home subgraph).
+   ```graphql
+   type Review {
+     product: Product! @provides(fields: "name price")
+   }
+   ```
+   @requires: tells the Router that a field in this subgraph NEEDS fields
+   from the entity's home subgraph to resolve:
+   ```graphql
+   extend type Product @key(fields: "id") {
+     id: ID! @external
+     price: Float! @external
+     taxIncludedPrice: Float! @requires(fields: "price")
+   }
+   ```
+
+Q7: How does the Federation Router plan query execution across subgraphs?
+A: The Router receives a client query and creates a "query plan":
+   (1) Determine which subgraphs own which fields in the query
+   (2) Identify entity references that need to be resolved
+   (3) Parallelize independent subgraph calls
+   (4) For entity references: call the origin subgraph with
+       `_entities(representations: [{ __typename: "User", id: "1" }])`
+   (5) Merge all results into a unified response
+   The query plan is like an execution tree — the Router orchestrates
+   multiple backend calls transparently to the client.
+
+Q8: How does the @_entities query work in Federation?
+A: Each subgraph that defines entities must implement a special
+   `_entities(representations: [Any!]!): [_Entity]!` query.
+   The Router calls this when another subgraph returns an entity reference
+   (type + key fields) and the Router needs to resolve additional fields.
+   ```java
+   // Spring Boot subgraph implementation
+   @QueryMapping
+   public List<User> _entities(@Argument List<Map<String, Object>> representations) {
+     List<Long> ids = representations.stream()
+       .filter(r -> "User".equals(r.get("__typename")))
+       .map(r -> Long.valueOf(r.get("id").toString()))
+       .collect(Collectors.toList());
+     return userRepository.findAllById(ids);
+   }
+   ```
+   The Router batches entity fetches — all Users needed from one query
+   are fetched in one `_entities` call.
+
+Q9: What is Apollo Federation v2 and how does it differ from v1?
+A: Federation v2 introduced major improvements:
+   - @shareable: allows a field to be defined in multiple subgraphs
+     (previously each field had exactly one home subgraph)
+   - @override: lets one subgraph gradually migrate fields from another
+   - @inaccessible: marks types/fields as internal (not in the API schema)
+   - @composeDirective: exposes custom directives through the router
+   - Better support for value types (non-entity shared types)
+   - Improved query planning algorithm (fewer round-trips)
+   - Apollo Router (Rust) replaces the JS Apollo Gateway for production
+
+Q10: How do you implement a Federation subgraph in Spring for GraphQL?
+A: Spring for GraphQL has Federation support via spring-graphql-federation:
+   ```xml
+   <dependency>
+     <groupId>org.springframework.graphql</groupId>
+     <artifactId>spring-graphql</artifactId>
+   </dependency>
+   <!-- Add federation support -->
+   ```
+   
+   ```java
+   @Configuration
+   public class FederationConfig {
+     @Bean
+     public GraphQlSourceBuilderCustomizer federationCustomizer() {
+       return builder -> builder
+         .schemaFactory((registry, wiring) -> {
+           // Transform schema to add Federation directives and _entities query
+           return Federation.transform(registry, wiring).build();
+         });
+     }
+   }
+   ```
+
+   Entity resolver:
+   ```java
+   @Controller
+   public class UserEntityResolver {
+     @QueryMapping("_entities")
+     public List<Object> entities(
+         @Argument List<Map<String, Object>> representations) {
+       return representations.stream()
+         .map(rep -> resolveEntity(rep))
+         .collect(Collectors.toList());
+     }
+   }
+   ```
+
+Q11: What is a "reference resolver" in Federation?
+A: A reference resolver handles the `_entities` query for a specific type.
+   When the Router needs to resolve additional fields for a referenced User,
+   it calls the Users subgraph's `_entities` query with:
+   `[{ __typename: "User", id: "1" }]`
+   The reference resolver maps this to a User object from the DB.
+   It's essentially: "given just the key fields, load the full entity".
+
+Q12: What are the trade-offs of GraphQL Federation?
+A: Pros:
+   - Team independence: each team owns their schema slice
+   - Gradual adoption: add subgraphs incrementally
+   - Independent deployment: subgraphs deploy separately
+   - Single unified API for consumers
+   Cons:
+   - Complexity: Router, schema composition, entity resolution
+   - Distributed tracing harder to set up
+   - Cross-subgraph queries require multiple round-trips (mitigated by query planning)
+   - Schema composition errors caught at runtime (not build time)
+   - Learning curve: teams must understand @key, @external, etc.
+   When to use: multiple teams, clear domain boundaries, microservices architecture.
+   When NOT to use: single team, small schema, simple architecture.
+
+Q13: What is schema composition and what errors can it produce?
+A: Schema composition is the process of merging multiple subgraph schemas
+   into one supergraph schema at the Router level. It validates:
+   - No conflicting type definitions (unless @shareable)
+   - All @key fields exist on the referenced type
+   - All @external fields exist in the owning subgraph
+   - @requires fields are reachable
+   Common composition errors:
+   - Field in multiple subgraphs without @shareable
+   - @key references a field not defined in the type
+   - Type mismatch between subgraphs (different field types for same field)
+   Use `rover subgraph check` (Apollo tooling) in CI to catch composition
+   errors before deployment.
+
+================================================================
+END OF FILE
+================================================================

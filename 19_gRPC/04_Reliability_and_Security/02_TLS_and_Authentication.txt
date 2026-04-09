@@ -1,0 +1,354 @@
+================================================================
+TLS AND AUTHENTICATION IN gRPC
+================================================================
+
+----------------------------------------------------------------
+1. TRANSPORT SECURITY — TLS
+----------------------------------------------------------------
+
+gRPC supports two transport modes:
+  1. Plaintext (no encryption): usePlaintext() — dev/internal only
+  2. TLS (Transport Layer Security): default for production
+
+TLS in gRPC provides:
+  ✅ Encryption: all data in transit is encrypted
+  ✅ Server authentication: client verifies server certificate
+  ✅ Optional mTLS (mutual TLS): server also verifies client certificate
+
+gRPC uses HTTP/2, which requires TLS 1.2+ in most implementations.
+
+Certificate types:
+  - Self-signed: for testing, internal microservices
+  - CA-signed: for public-facing services (Let's Encrypt, etc.)
+
+----------------------------------------------------------------
+2. SERVER TLS CONFIGURATION
+----------------------------------------------------------------
+
+// ── JAVA — Manual Netty TLS ───────────────────────────────────
+
+File certChainFile = new File("server.crt");
+File privateKeyFile = new File("server.key");
+
+Server server = NettyServerBuilder.forPort(9090)
+    .useTransportSecurity(certChainFile, privateKeyFile)
+    .addService(new OrderServiceImpl())
+    .build()
+    .start();
+
+// ── With grpc-spring-boot-starter (application.yml) ───────────
+
+grpc:
+  server:
+    port: 9090
+    security:
+      enabled: true
+      certificate-chain: classpath:tls/server.crt
+      private-key: classpath:tls/server.key
+      # For mTLS:
+      client-auth: REQUIRE   # or OPTIONAL or NONE (default)
+      trust-cert-collection: classpath:tls/ca.crt  # CA to verify client certs
+
+// ── Programmatic SSL context with Netty ──────────────────────
+
+SslContext sslContext = GrpcSslContexts.forServer(certChainFile, privateKeyFile)
+    .trustManager(caCertFile)  // for mTLS
+    .clientAuth(ClientAuth.REQUIRE)  // for mTLS
+    .build();
+
+NettyServerBuilder.forPort(9090)
+    .sslContext(sslContext)
+    .addService(new OrderServiceImpl())
+    .build();
+
+----------------------------------------------------------------
+3. CLIENT TLS CONFIGURATION
+----------------------------------------------------------------
+
+// ── Default TLS (system trust store) ─────────────────────────
+// No special config needed — like HTTPS in browsers
+ManagedChannel channel = ManagedChannelBuilder
+    .forAddress("api.example.com", 443)
+    // No usePlaintext() → uses TLS automatically
+    .build();
+
+// ── Custom CA certificate (self-signed) ──────────────────────
+File trustCertFile = new File("ca.crt");
+
+SslContext sslContext = GrpcSslContexts.forClient()
+    .trustManager(trustCertFile)
+    .build();
+
+ManagedChannel channel = NettyChannelBuilder
+    .forAddress("internal.example.com", 9090)
+    .sslContext(sslContext)
+    .build();
+
+// ── mTLS (client certificate + key) ──────────────────────────
+File clientCertFile = new File("client.crt");
+File clientKeyFile = new File("client.key");
+File caCertFile = new File("ca.crt");
+
+SslContext sslContext = GrpcSslContexts.forClient()
+    .trustManager(caCertFile)            // trust the server's CA
+    .keyManager(clientCertFile, clientKeyFile)  // send our certificate
+    .build();
+
+ManagedChannel channel = NettyChannelBuilder
+    .forAddress("secure.example.com", 9090)
+    .sslContext(sslContext)
+    .build();
+
+// ── With grpc-spring-boot-starter (application.yml) ───────────
+
+grpc:
+  client:
+    secure-service:
+      address: dns:///secure.example.com:9090
+      negotiation-type: TLS
+      security:
+        certificate-chain: classpath:tls/client.crt
+        private-key: classpath:tls/client.key
+        trust-cert-collection: classpath:tls/ca.crt
+
+----------------------------------------------------------------
+4. AUTHENTICATION PATTERNS
+----------------------------------------------------------------
+
+TLS provides transport security. For identity (who is calling),
+use one of these application-level auth patterns:
+
+Pattern 1: JWT / OAuth 2.0 (most common for microservices)
+  - Client obtains JWT from auth server
+  - Client sends JWT as Authorization metadata header
+  - Server validates JWT in an interceptor
+
+Pattern 2: API Key
+  - Client sends API key as metadata header
+  - Server validates key against a key store
+
+Pattern 3: mTLS (mutual TLS)
+  - Client presents a certificate
+  - Server verifies certificate against a CA
+  - Certificate = identity (no separate token needed)
+  - Common in K8s service meshes (Istio, Linkerd)
+
+Pattern 4: Google Application Default Credentials (for GCP services)
+  - Uses service account credentials
+  - Managed by gRPC's ChannelCredentials mechanism
+
+----------------------------------------------------------------
+5. JWT AUTHENTICATION IMPLEMENTATION
+----------------------------------------------------------------
+
+// ── CLIENT: Send JWT in metadata header ──────────────────────
+
+@GrpcGlobalClientInterceptor
+public class JwtClientInterceptor implements ClientInterceptor {
+  
+  static final Metadata.Key<String> AUTHORIZATION =
+      Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER);
+  
+  private final TokenProvider tokenProvider;  // Spring bean that provides JWT
+  
+  @Override
+  public <Req, Resp> ClientCall<Req, Resp> interceptCall(
+      MethodDescriptor<Req, Resp> method,
+      CallOptions callOptions, Channel next) {
+    
+    return new ForwardingClientCall.SimpleForwardingClientCall<>(
+        next.newCall(method, callOptions)) {
+      
+      @Override
+      public void start(Listener<Resp> responseListener, Metadata headers) {
+        String token = tokenProvider.getCurrentToken();
+        headers.put(AUTHORIZATION, "Bearer " + token);
+        super.start(responseListener, headers);
+      }
+    };
+  }
+}
+
+// ── SERVER: Validate JWT in interceptor ──────────────────────
+
+@GrpcGlobalServerInterceptor
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class JwtServerInterceptor implements ServerInterceptor {
+  
+  static final Metadata.Key<String> AUTHORIZATION =
+      Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER);
+  
+  public static final Context.Key<Claims> JWT_CLAIMS = Context.key("jwt-claims");
+  
+  private final JwtParser jwtParser;  // e.g., io.jsonwebtoken.JwtParser
+  
+  @Override
+  public <Req, Resp> ServerCall.Listener<Req> interceptCall(
+      ServerCall<Req, Resp> call,
+      Metadata headers,
+      ServerCallHandler<Req, Resp> next) {
+    
+    String authHeader = headers.get(AUTHORIZATION);
+    
+    if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+      call.close(Status.UNAUTHENTICATED.withDescription("Missing bearer token"),
+          new Metadata());
+      return new ServerCall.Listener<>() {};
+    }
+    
+    String token = authHeader.substring(7);
+    
+    try {
+      Claims claims = jwtParser.parseClaimsJws(token).getBody();
+      
+      // Validate standard claims
+      if (claims.getExpiration().before(new Date())) {
+        call.close(Status.UNAUTHENTICATED.withDescription("Token expired"), new Metadata());
+        return new ServerCall.Listener<>() {};
+      }
+      
+      // Attach claims to context for service methods to read
+      Context ctx = Context.current().withValue(JWT_CLAIMS, claims);
+      return Contexts.interceptCall(ctx, call, headers, next);
+      
+    } catch (JwtException e) {
+      call.close(Status.UNAUTHENTICATED.withDescription("Invalid token: " + e.getMessage()),
+          new Metadata());
+      return new ServerCall.Listener<>() {};
+    }
+  }
+}
+
+// ── SERVICE: Access JWT claims ────────────────────────────────
+
+@GrpcService
+public class OrderServiceImpl extends OrderServiceGrpc.OrderServiceImplBase {
+  
+  @Override
+  public void createOrder(CreateOrderRequest request,
+                          StreamObserver<CreateOrderResponse> responseObserver) {
+    
+    Claims claims = JwtServerInterceptor.JWT_CLAIMS.get();
+    String userId = claims.getSubject();
+    List<String> roles = claims.get("roles", List.class);
+    
+    if (!roles.contains("ORDER_CREATE")) {
+      responseObserver.onError(
+          Status.PERMISSION_DENIED.withDescription("Missing ORDER_CREATE role").asException());
+      return;
+    }
+    
+    // ... create order with userId
+  }
+}
+
+----------------------------------------------------------------
+6. MTLS IDENTITY EXTRACTION
+----------------------------------------------------------------
+
+With mTLS, the client certificate IS the identity.
+Extract it from the gRPC context:
+
+@GrpcGlobalServerInterceptor
+public class MtlsIdentityInterceptor implements ServerInterceptor {
+  
+  public static final Context.Key<String> CLIENT_IDENTITY = Context.key("client-id");
+  
+  @Override
+  public <Req, Resp> ServerCall.Listener<Req> interceptCall(
+      ServerCall<Req, Resp> call, Metadata headers, ServerCallHandler<Req, Resp> next) {
+    
+    // Get client certificate from SSL session
+    SSLSession sslSession = call.getAttributes()
+        .get(Grpc.TRANSPORT_ATTR_SSL_SESSION);
+    
+    String clientId = "unknown";
+    if (sslSession != null) {
+      try {
+        Certificate[] certs = sslSession.getPeerCertificates();
+        if (certs.length > 0) {
+          X509Certificate x509 = (X509Certificate) certs[0];
+          // Extract CN from subject
+          clientId = x509.getSubjectDN().getName();
+        }
+      } catch (SSLPeerUnverifiedException e) {
+        call.close(Status.UNAUTHENTICATED.withDescription("No client certificate"),
+            new Metadata());
+        return new ServerCall.Listener<>() {};
+      }
+    }
+    
+    Context ctx = Context.current().withValue(CLIENT_IDENTITY, clientId);
+    return Contexts.interceptCall(ctx, call, headers, next);
+  }
+}
+
+----------------------------------------------------------------
+7. GENERATING TEST CERTIFICATES
+----------------------------------------------------------------
+
+# Self-signed CA
+openssl req -x509 -newkey rsa:4096 -days 365 -nodes \
+    -keyout ca.key -out ca.crt \
+    -subj "/CN=test-ca"
+
+# Server key + CSR
+openssl req -newkey rsa:4096 -nodes \
+    -keyout server.key -out server.csr \
+    -subj "/CN=localhost"
+
+# Server certificate signed by CA
+openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key \
+    -CAcreateserial -out server.crt -days 365
+
+# Client key + certificate (for mTLS)
+openssl req -newkey rsa:4096 -nodes \
+    -keyout client.key -out client.csr \
+    -subj "/CN=order-service-client"
+openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key \
+    -CAcreateserial -out client.crt -days 365
+
+----------------------------------------------------------------
+8. INTERVIEW KEY POINTS
+----------------------------------------------------------------
+
+Q: What is the difference between TLS and mTLS?
+A: TLS (one-way): the client verifies the server's certificate.
+   The server trusts any client. Used by most public APIs — like
+   HTTPS websites where the browser verifies the server's cert but
+   the server doesn't verify the browser's identity.
+   mTLS (mutual TLS): both sides present and verify certificates.
+   The server also validates the client's certificate. Used in K8s
+   service meshes and internal microservice auth to prove which
+   service is calling. The client certificate IS the identity.
+
+Q: How do you authenticate gRPC calls using JWT?
+A: On the client: use a ClientInterceptor to add an
+   "authorization: Bearer <token>" header to outgoing calls.
+   On the server: use a ServerInterceptor to extract the header,
+   validate the JWT (signature, expiry, issuer), and store the
+   claims in the gRPC Context. Service methods then call
+   Context.current().withValue(CLAIMS_KEY).get() to get the user's
+   identity and roles.
+
+Q: Can gRPC work without TLS? Is it recommended?
+A: Yes — use ManagedChannelBuilder.usePlaintext(). It's fine for
+   local development or internal service-to-service calls on a
+   trusted private network with a service mesh handling TLS.
+   Never use plaintext for internet-facing services. In K8s with
+   Istio/Linkerd, TLS is handled by the sidecar proxy, so the
+   application code uses plaintext to the sidecar, which encrypts
+   before sending over the network.
+
+Q: How does a service mesh provide TLS without changing application code?
+A: The service mesh deploys a sidecar proxy (Envoy) next to each pod.
+   The application calls the sidecar using plaintext (localhost).
+   The sidecar intercepts the traffic, terminates TLS from inbound
+   connections, and initiates new mTLS connections to destination
+   sidecars. The service identity comes from certificates automatically
+   issued by the mesh's certificate authority (e.g., Istio's Citadel).
+   The application is unaware of TLS — it only sees plaintext.
+
+================================================================
+END OF FILE
+================================================================

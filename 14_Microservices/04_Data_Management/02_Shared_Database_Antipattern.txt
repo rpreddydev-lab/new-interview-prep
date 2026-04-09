@@ -1,0 +1,153 @@
+================================================================================
+SHARED DATABASE ANTI-PATTERN
+================================================================================
+
+DEFINITION
+----------
+The Shared Database anti-pattern occurs when multiple microservices access the
+SAME database tables directly. Services bypass each other's APIs and query/write
+to shared tables.
+
+This is the most common mistake when migrating from a monolith to microservices.
+Services may be split at the code level but remain coupled at the data level.
+
+────────────────────────────────────────────────────────────────────────────────
+
+WHAT IT LOOKS LIKE
+====================
+
+  ┌──────────────┐    ┌────────────────────┐    ┌───────────────────┐
+  │ Order Service │───>│                    │<───│ Inventory Service  │
+  │              │    │   Shared Database  │    │                   │
+  │ Payment Svc  │───>│                    │<───│ Notification Svc  │
+  └──────────────┘    │   (orders, users,  │    └───────────────────┘
+                      │    products, etc.) │
+                      └────────────────────┘
+
+How it appears:
+  - Order Service runs `SELECT * FROM inventory.products WHERE id = ?`
+  - Payment Service writes directly to `orders.order_status`
+  - Multiple services share the same JPA entities / Spring Data repositories
+  - Connection strings point to the same database across services
+
+────────────────────────────────────────────────────────────────────────────────
+
+WHY IT'S AN ANTI-PATTERN
+==========================
+
+1. TIGHT COUPLING — Schema cannot evolve independently
+   - Changing table `orders` column names breaks every service that uses it
+   - Team A wants to add a column; must coordinate with Team B, Team C, Team D
+   - Risk: "Schema change freeze" — no one can change anything
+
+2. NO INDEPENDENT DEPLOYMENT
+   - Deploying Order Service may require Inventory Service to be updated too
+   - Rolling upgrades are dangerous (schema mismatch between old/new pods)
+   - Blue-green deployments require all services to be ready simultaneously
+
+3. NO TECHNOLOGY FREEDOM
+   - All services must use the same database technology
+   - Can't migrate one service to MongoDB without affecting others
+   - Can't choose DB features per service need
+
+4. NO INDEPENDENT SCALING
+   - Can't add a read replica specifically for the heavy-query Inventory Service
+   - All services compete for connections to the same DB
+   - A connection pool exhaustion by one service starves others
+
+5. FAILURE COUPLING
+   - If the shared DB goes down, ALL services go down
+   - A long-running query from Analytics locks tables used by Order Service
+
+6. BYPASSES BUSINESS LOGIC
+   - Service B updates Service A's tables directly, bypassing Service A's validations
+   - Business invariants can be broken silently
+
+────────────────────────────────────────────────────────────────────────────────
+
+THE EXCEPTION: TEMPORARY MIGRATION STEPPING STONE
+===================================================
+
+The shared database is ACCEPTABLE as a temporary state during migration:
+
+  Phase 1: Split code into services, keep shared DB (logical schemas)
+  Phase 2: Add strict access controls (each service only accesses its schema)
+  Phase 3: Replace direct DB access with API calls
+  Phase 4: Physically separate the databases
+
+This is the Strangler Fig approach for data migration.
+
+When temporary shared DB is "less bad":
+  - Different schemas per service (logical separation)
+  - Read-only access via views
+  - Strict database user permissions enforced
+
+────────────────────────────────────────────────────────────────────────────────
+
+IDENTIFYING SHARED DATABASE ANTI-PATTERNS
+==========================================
+
+Code smells:
+  ✗ Multiple services importing the same JPA entity classes
+  ✗ Multiple services in the same codebase sharing a "common-model" module
+  ✗ Services using the same DataSource/connection string
+  ✗ Cross-service JOIN queries
+
+SQL violations:
+  SELECT o.*, u.name, u.email, p.title, p.price
+  FROM orders o
+  JOIN users u ON o.user_id = u.id        -- users owned by User Service
+  JOIN products p ON oi.product_id = p.id -- products owned by Product Service
+  -- This JOIN crosses 3 service boundaries!
+
+────────────────────────────────────────────────────────────────────────────────
+
+HOW TO REFACTOR AWAY
+======================
+
+Before (shared DB):
+  // OrderService directly queries user data
+  @Repository
+  public interface UserRepository extends JpaRepository<User, Long> {
+    Optional<User> findByEmail(String email);
+  }
+
+After (API composition):
+  // OrderService calls User Service API
+  @FeignClient(name = "user-service")
+  public interface UserClient {
+    @GetMapping("/api/v1/users/{id}")
+    UserDTO getUser(@PathVariable Long id);
+  }
+
+Before (shared write):
+  // InventoryService writes directly to orders table
+  orderRepository.updateStatus(orderId, OrderStatus.CONFIRMED);
+
+After (event-driven):
+  // InventoryService publishes event; OrderService handles it
+  kafkaTemplate.send("inventory-events", new InventoryReservedEvent(orderId));
+  // OrderService listens and updates its own table
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is the Shared Database anti-pattern?
+A: Multiple microservices accessing the same database tables directly, bypassing
+   API contracts. Creates tight coupling at the data layer — schema changes
+   affect all services, independent deployment is impossible, services can't
+   scale or choose technology independently.
+
+Q: Is it ever acceptable to share a database between microservices?
+A: As a temporary migration step — split code first, database later. Use logical
+   schema separation with strict permissions. The goal is to eventually separate
+   the databases. Never acceptable as a permanent architecture.
+
+Q: How do you detect the shared database anti-pattern in code review?
+A: Look for: services sharing JPA entity classes, same DataSource beans across
+   services, cross-service JOIN queries, multiple services in the same
+   codebase sharing a "common-model" dependency.
+
+================================================================================

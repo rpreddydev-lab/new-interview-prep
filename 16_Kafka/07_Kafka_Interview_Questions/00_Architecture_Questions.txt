@@ -1,0 +1,188 @@
+================================================================================
+  KAFKA INTERVIEW QUESTIONS — ARCHITECTURE
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FUNDAMENTALS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q1: Describe Kafka's architecture at a high level. How is it different from
+    traditional message queues like RabbitMQ?
+
+A: Kafka is a distributed, append-only, durable commit log. Key design elements:
+   - BROKERS: stateless servers that store topic data on disk (log segments).
+   - TOPICS/PARTITIONS: topics split into ordered partitions; each partition is a
+     totally ordered, immutable sequence of records.
+   - PRODUCERS: push records to a chosen partition (by key hash, round-robin, or custom).
+   - CONSUMERS: pull records at their own pace; offset tracks position.
+   - REPLICATION: each partition replicated across RF brokers; one is the leader.
+
+   vs. RabbitMQ: RabbitMQ uses a push model (broker pushes to consumers), messages
+   are deleted after consumption (queue semantics), routing via exchanges/bindings is
+   flexible but complex. Kafka: pull model, messages retained by time/size (replay),
+   consumers control their offset. Kafka excels at high throughput, replay, and
+   event sourcing; RabbitMQ excels at complex routing, task queues, and per-message TTL.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q2: What is a partition leader and follower? What is the ISR?
+
+A: Each partition has one LEADER — the broker that handles all produce and consume
+   requests for that partition. FOLLOWERS are replicas on other brokers that pull
+   data from the leader to stay in sync.
+
+   ISR (In-Sync Replicas): the set of replicas that are caught up with the leader
+   within replica.lag.time.max.ms (default 30s). Only ISR members can be elected
+   as the new leader (unless unclean.leader.election.enable=true).
+
+   When a replica falls behind (network partition, GC pause, overloaded broker):
+   - It's removed from ISR
+   - Writes with min.insync.replicas may fail if ISR shrinks below threshold
+   - Once caught up, it's re-added to ISR
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q3: What is the High Watermark (HW) and Log End Offset (LEO)?
+
+A: LEO (Log End Offset): the next offset to be written on each replica.
+   It's the highest offset + 1 held by that broker.
+
+   HW (High Watermark): the highest offset that all ISR replicas have acknowledged.
+   Consumers can only read up to HW — records beyond HW are not yet visible.
+
+   Example: Leader LEO=10, Replica A LEO=9, Replica B LEO=8 → HW=8.
+   Record at offset 9 is on leader and Replica A but not B → not consumer-visible yet.
+
+   HW advances when the leader receives fetch requests from followers confirming
+   their LEO. This is how Kafka ensures a consumer never reads a record that
+   would be lost if the leader failed.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q4: What is the difference between ZooKeeper mode and KRaft mode?
+
+A: ZooKeeper mode (legacy, removed in Kafka 4.0):
+   - ZooKeeper (separate cluster) stores broker metadata, topic/partition assignments,
+     controller election, ACLs, consumer group offsets (old API)
+   - Controller is a single broker elected via ZooKeeper
+   - Metadata changes propagate via ZooKeeper watches → controllers → brokers
+   - ZK is a separate operational concern, limits scale (partitions ~200k)
+
+   KRaft mode (Kafka 3.3+ stable, default since 3.7):
+   - Kafka itself manages metadata via the Raft consensus algorithm
+   - Metadata log stored in @metadata topic on controller nodes
+   - Active Controller + Standby Controllers (3 or 5 node quorum)
+   - Faster controller failover (ms vs seconds), simpler operations, scales to millions of partitions
+   - Metadata changes propagate via Raft log → faster and more consistent
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q5: How does Kafka achieve high throughput? Explain the key I/O optimizations.
+
+A: Four key optimizations:
+   1. SEQUENTIAL DISK I/O: Kafka appends to log segments sequentially.
+      Sequential disk writes are 100-1000x faster than random writes.
+   2. ZERO-COPY: Kafka uses OS sendfile() syscall (bypasses user space) to transfer
+      data from page cache → NIC buffer directly. No CPU copies for read path.
+   3. BATCHING: Producers batch multiple records in a single request (batch.size).
+      linger.ms allows buffering to fill batches. Fewer network round-trips.
+   4. PAGE CACHE: Kafka relies on the OS page cache rather than JVM heap.
+      Recently written data is served directly from RAM (page cache) without disk read.
+      Also avoids GC pressure.
+   5. COMPRESSION: LZ4/Snappy/Zstd reduces bytes-on-wire and bytes-on-disk.
+      Brokers decompress only for validation; consumers decompress.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q6: What happens when a Kafka broker goes down? Walk through the failure recovery.
+
+A: 1. DETECTION: ZooKeeper session expiry (ZK mode) or controller Raft timeout
+      (KRaft). Active Controller detects broker unavailability.
+   2. PARTITION LEADER FAILOVER: Controller identifies partitions where the dead broker
+      was leader. For each, it picks a new leader from the ISR.
+   3. METADATA UPDATE: Controller sends LeaderAndIsr requests to all brokers with
+      updated leader assignments.
+   4. PRODUCER/CONSUMER REBALANCE: Producers get LEADER_NOT_AVAILABLE errors and
+      retry (with retries>0). Metadata refresh returns new leader. Consumers similarly
+      refresh metadata and reconnect to new leaders.
+   5. REPLICA RECOVERY: When the broker restarts, it rejoins as a follower, fetches
+      missing data from the new leader, catches up (back into ISR), and may resume
+      as preferred leader via preferred replica election.
+   KRaft advantage: controller failover takes milliseconds (Raft pre-election),
+   vs seconds in ZooKeeper mode.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ADVANCED ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q7: How many partitions should a topic have? What are the trade-offs?
+
+A: Factors:
+   - THROUGHPUT: more partitions = more parallelism (more consumer threads / instances).
+     Rule of thumb: target_throughput / single_partition_throughput.
+   - CONSUMER PARALLELISM: max useful consumers = partition count. Extra consumers idle.
+   - FILE HANDLES: each partition = multiple files on disk. Too many partitions exhaust
+     file descriptors and slow metadata operations.
+   - REPLICATION OVERHEAD: each partition × RF replicas = total replica count.
+     More partitions → more leader election work on controller.
+   - END-TO-END LATENCY: leader election after failure is O(partitions). Kafka's rule:
+     ~4000 partitions/broker, ~200k per cluster (ZK mode). KRaft supports millions.
+
+   General starting point: 1 partition per consumer instance you'll ever need.
+   Over-partition slightly (headroom for growth). Avoid single-digit counts for
+   high-throughput topics; avoid tens of thousands without KRaft.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q8: What is log compaction and when would you use it vs time-based retention?
+
+A: Log compaction: Kafka retains only the latest record for each key. Old records
+   with the same key are deleted by the log cleaner. Delete events are tombstones
+   (null value). The compacted topic is effectively a durable key-value store.
+
+   cleanup.policy=compact: use for change-data (user profiles, config, entity state),
+   where only the latest value per key matters. Enables rebuilding state from scratch
+   (consumers replay topic → reconstruct latest state for all keys).
+
+   cleanup.policy=delete: use for time-series, event logs, audit trails — where you
+   want a sliding window of history. Data expires by age or total size.
+
+   cleanup.policy=[compact,delete]: compacted AND old segments deleted. Use when you
+   want latest-per-key within a time window (e.g., last 7 days of user events, deduplicated).
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q9: What is the leader epoch and why was it introduced?
+
+A: The leader epoch is a monotonically increasing integer assigned to each leader tenure
+   for a partition. Introduced in Kafka 0.11 to solve log divergence after leader failover.
+
+   Problem: Before leader epoch, followers used HW for truncation on restart.
+   Scenario: Follower A crashes with offset 5, leader crashes at offset 6. A elects
+   as new leader with offset 5. Old leader (now follower) truncates to HW=5. But if
+   old leader rejoins before A commits offset 6, it could re-add offset 6 with
+   different data — causing log divergence.
+
+   Solution with leader epoch: followers fetch the epoch of their last known leader
+   when reconnecting. If the epoch has changed, they use OffsetsForLeaderEpoch request
+   to determine the correct truncation point, preventing divergence and data loss.
+   Especially critical for exactly-once semantics correctness.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q10: How does MirrorMaker 2 (MM2) work for cross-datacenter replication?
+
+A: MirrorMaker 2 is a Kafka Connect-based cross-cluster replication tool.
+   It runs as a Connect cluster with specialized source connectors:
+   - MirrorSourceConnector: replicates records from source → target cluster,
+     preserving timestamps, headers, and keys. Auto-discovers and replicates new topics.
+   - MirrorCheckpointConnector: replicates consumer group offsets so consumers can
+     failover to the target cluster at the same position.
+   - MirrorHeartbeatConnector: writes heartbeat records to track replication lag.
+
+   Topic naming: source topics appear as <source-cluster>.<topic> on target.
+   Use offset translation to map source offsets → target offsets for failover.
+
+   vs. MM1: MM1 was a simple consumer+producer pair, no automatic topic discovery,
+   no offset mapping, difficult to configure at scale. MM2 fixes all of these.

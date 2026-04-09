@@ -1,0 +1,237 @@
+================================================================================
+UNIT TESTING IN MICROSERVICES
+================================================================================
+
+UNIT TESTING PRINCIPLES
+------------------------
+Unit tests test a single class/method in complete isolation.
+All dependencies are replaced with mocks or stubs.
+Should be: fast (milliseconds), deterministic, independent, self-validating.
+
+FIRST Principles:
+  F — Fast (run in < 100ms each)
+  I — Independent (no shared state between tests)
+  R — Repeatable (same result every run)
+  S — Self-validating (pass or fail, no manual inspection)
+  T — Timely (written alongside or before production code)
+
+────────────────────────────────────────────────────────────────────────────────
+
+SERVICE LAYER UNIT TESTS
+=========================
+
+  @ExtendWith(MockitoExtension.class)
+  class OrderServiceTest {
+
+    @Mock private OrderRepository orderRepository;
+    @Mock private InventoryServiceClient inventoryClient;
+    @Mock private PaymentServiceClient paymentClient;
+    @Mock private EventPublisher eventPublisher;
+    @Mock private MeterRegistry meterRegistry;
+
+    @InjectMocks
+    private OrderService orderService;
+
+    @Test
+    void shouldCreateOrderSuccessfully() {
+      // Given
+      CreateOrderRequest request = CreateOrderRequest.builder()
+        .userId(1L)
+        .items(List.of(new OrderItem(100L, 2)))
+        .build();
+
+      InventoryReservation reservation = new InventoryReservation("res-1", RESERVED);
+      Order savedOrder = Order.builder().id(42L).status(PENDING).build();
+
+      given(inventoryClient.reserve(any())).willReturn(reservation);
+      given(orderRepository.save(any())).willReturn(savedOrder);
+      given(paymentClient.initiatePayment(any())).willReturn(new PaymentResult("txn-1"));
+
+      // When
+      OrderDTO result = orderService.createOrder(request);
+
+      // Then
+      assertThat(result.getId()).isEqualTo(42L);
+      assertThat(result.getStatus()).isEqualTo(PENDING);
+
+      // Verify interactions
+      verify(inventoryClient).reserve(argThat(r ->
+        r.getItems().get(0).getProductId().equals(100L) &&
+        r.getItems().get(0).getQuantity() == 2
+      ));
+      verify(orderRepository).save(any(Order.class));
+      verify(eventPublisher).publish(isA(OrderCreatedEvent.class));
+    }
+
+    @Test
+    void shouldThrowWhenInventoryNotAvailable() {
+      // Given
+      given(inventoryClient.reserve(any()))
+        .willThrow(new InsufficientInventoryException("Product 100 out of stock"));
+
+      // When & Then
+      assertThatThrownBy(() -> orderService.createOrder(anyRequest()))
+        .isInstanceOf(InsufficientInventoryException.class)
+        .hasMessageContaining("out of stock");
+
+      // Ensure order was NOT saved to DB
+      verify(orderRepository, never()).save(any());
+      verify(paymentClient, never()).initiatePayment(any());
+    }
+
+    @Test
+    void shouldRollbackReservationWhenPaymentFails() {
+      // Given
+      InventoryReservation reservation = new InventoryReservation("res-1", RESERVED);
+      given(inventoryClient.reserve(any())).willReturn(reservation);
+      given(paymentClient.initiatePayment(any()))
+        .willThrow(new PaymentException("Card declined"));
+
+      // When & Then
+      assertThatThrownBy(() -> orderService.createOrder(anyRequest()))
+        .isInstanceOf(PaymentException.class);
+
+      // Verify compensation - reservation must be cancelled
+      verify(inventoryClient).cancelReservation("res-1");
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, -1, -100})
+    void shouldRejectOrderWithInvalidQuantity(int quantity) {
+      CreateOrderRequest request = CreateOrderRequest.builder()
+        .items(List.of(new OrderItem(100L, quantity)))
+        .build();
+
+      assertThatThrownBy(() -> orderService.createOrder(request))
+        .isInstanceOf(ValidationException.class);
+
+      verifyNoInteractions(inventoryClient, paymentClient, orderRepository);
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING SLICE TESTS
+===================
+
+Test only a specific Spring layer without loading full context.
+
+@WebMvcTest — Controller layer only (HTTP, request mapping, validation):
+  @WebMvcTest(OrderController.class)
+  class OrderControllerTest {
+
+    @Autowired private MockMvc mockMvc;
+    @Autowired private ObjectMapper objectMapper;
+
+    @MockBean private OrderService orderService;  // Service is mocked
+
+    @Test
+    @WithMockUser(roles = "USER")
+    void shouldReturn201WhenOrderCreated() throws Exception {
+      CreateOrderRequest request = new CreateOrderRequest(1L, List.of(new OrderItem(100L, 2)));
+      OrderDTO response = new OrderDTO(42L, PENDING, List.of());
+
+      given(orderService.createOrder(any())).willReturn(response);
+
+      mockMvc.perform(post("/api/orders")
+        .contentType(MediaType.APPLICATION_JSON)
+        .content(objectMapper.writeValueAsString(request)))
+        .andExpect(status().isCreated())
+        .andExpect(jsonPath("$.id").value(42))
+        .andExpect(jsonPath("$.status").value("PENDING"))
+        .andExpect(header().exists("Location"));
+    }
+
+    @Test
+    void shouldReturn401WhenUnauthenticated() throws Exception {
+      mockMvc.perform(post("/api/orders")
+        .contentType(MediaType.APPLICATION_JSON)
+        .content("{}"))
+        .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @WithMockUser(roles = "USER")
+    void shouldReturn400WhenRequestBodyInvalid() throws Exception {
+      // Invalid: missing required fields
+      String invalidRequest = "{\"userId\": null, \"items\": []}";
+
+      mockMvc.perform(post("/api/orders")
+        .contentType(MediaType.APPLICATION_JSON)
+        .content(invalidRequest))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.errors").isArray());
+    }
+  }
+
+@DataJpaTest — Repository layer only (with H2 in-memory DB):
+  @DataJpaTest
+  @AutoConfigureTestDatabase(replace = NONE)  // Use Testcontainers instead of H2
+  @Import(TestcontainersConfig.class)
+  class OrderRepositoryTest {
+
+    @Autowired private OrderRepository orderRepository;
+    @Autowired private TestEntityManager entityManager;
+
+    @Test
+    void shouldFindActiveOrdersByUserId() {
+      // Given
+      entityManager.persist(Order.builder().userId(1L).status(ACTIVE).build());
+      entityManager.persist(Order.builder().userId(1L).status(COMPLETED).build());
+      entityManager.persist(Order.builder().userId(2L).status(ACTIVE).build());
+      entityManager.flush();
+
+      // When
+      List<Order> activeOrders = orderRepository.findByUserIdAndStatus(1L, ACTIVE);
+
+      // Then
+      assertThat(activeOrders).hasSize(1);
+      assertThat(activeOrders.get(0).getUserId()).isEqualTo(1L);
+    }
+
+    @Test
+    void shouldReturnOrdersWithItemsInSingleQuery() {
+      // Test N+1 query prevention
+      Order order = Order.builder().userId(1L)
+        .items(List.of(new OrderItem(100L, 2), new OrderItem(200L, 1)))
+        .build();
+      entityManager.persist(order);
+      entityManager.flush();
+      entityManager.clear();  // Clear first-level cache
+
+      // Use Hibernate statistics to verify query count
+      int queryCountBefore = getQueryCount();
+      Order found = orderRepository.findByIdWithItems(order.getId()).orElseThrow();
+      int queryCountAfter = getQueryCount();
+
+      assertThat(found.getItems()).hasSize(2);
+      assertThat(queryCountAfter - queryCountBefore).isEqualTo(1);  // Single JOIN query
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is the difference between a mock, stub, and spy?
+A: Stub: returns predefined values for method calls (no behavior verification).
+   Mock: stub + verification that expected interactions occurred (Mockito.verify).
+   Spy: wraps real object, some methods use real implementation, others are stubbed.
+   Use stubs when you only care about input/output. Use mocks when you need to
+   verify interactions (event published, repository called once, etc.).
+
+Q: What is @WebMvcTest and when do you use it?
+A: A Spring test slice that loads only the Web layer (controllers, filters,
+   security). All @Service, @Repository beans are not loaded — mock them with
+   @MockBean. Use for testing HTTP request mapping, request validation, response
+   status codes, and controller security without starting a full application.
+
+Q: What is @DataJpaTest?
+A: A Spring test slice that loads only JPA components (repositories, entity
+   listeners). Uses H2 in-memory DB by default (@AutoConfigureTestDatabase).
+   Use for testing custom query methods, pagination, projections. Replace H2
+   with TestContainers + NONE replacement for production-database-specific
+   features (PostgreSQL JSON, stored procedures).
+
+================================================================================

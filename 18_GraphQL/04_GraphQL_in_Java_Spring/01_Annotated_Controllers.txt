@@ -1,0 +1,379 @@
+================================================================
+ANNOTATED CONTROLLERS IN SPRING FOR GRAPHQL — IN DEPTH
+================================================================
+
+1. OVERVIEW
+------------
+Spring for GraphQL uses a controller-based model similar to Spring MVC.
+Instead of implementing DataFetcher manually, you annotate methods with
+@QueryMapping, @MutationMapping, @SubscriptionMapping, or @SchemaMapping
+and Spring handles the wiring automatically.
+
+Controllers are @Controller (NOT @RestController) classes.
+
+2. ANNOTATION REFERENCE TABLE
+--------------------------------
+  Annotation            Schema Type     Example Method Mapping
+  ----------------------------------------------------------------
+  @QueryMapping         Query           users()     → Query.users
+  @MutationMapping      Mutation        createUser  → Mutation.createUser
+  @SubscriptionMapping  Subscription    chatAdded   → Subscription.chatAdded
+  @SchemaMapping        Any type        author(Post)→ Post.author
+  @BatchMapping         Batch field     author(List<Post>) → Post.author (batched)
+
+3. @QUERYMAPPING IN DEPTH
+---------------------------
+  ```java
+  // Schema: type Query { users: [User!]!, user(id: ID!): User }
+  @Controller
+  public class UserQueryController {
+
+    private final UserService userService;
+
+    // Method name = field name on Query type
+    @QueryMapping
+    public List<User> users() {
+      return userService.findAll();
+    }
+
+    // Or explicitly specify field name
+    @QueryMapping("user")
+    public User getUser(@Argument Long id) {
+      return userService.findById(id).orElseThrow(
+        () -> new ResourceNotFoundException("User", id.toString())
+      );
+    }
+
+    // With multiple arguments
+    @QueryMapping
+    public Page<User> users(@Argument int page,
+                            @Argument int size,
+                            @Argument String sort) {
+      return userService.findAll(PageRequest.of(page, size, Sort.by(sort)));
+    }
+
+    // Nullable return (returns null if not found)
+    @QueryMapping
+    public User userByEmail(@Argument String email) {
+      return userService.findByEmail(email).orElse(null);
+    }
+  }
+  ```
+
+4. @ARGUMENT IN DEPTH
+-----------------------
+  4.1 Simple Arguments
+  ---------------------
+  ```java
+  @QueryMapping
+  public List<Post> posts(
+    @Argument int page,
+    @Argument int size
+  ) { ... }
+  ```
+
+  4.2 Nested Input Object (auto-mapped to Java record/class)
+  -----------------------------------------------------------
+  ```graphql
+  input CreateUserInput {
+    name: String!
+    email: String!
+    age: Int
+  }
+  ```
+  ```java
+  public record CreateUserInput(String name, String email, Integer age) {}
+
+  @MutationMapping
+  public User createUser(@Argument CreateUserInput input) {
+    return userService.create(input);
+  }
+  ```
+  Spring for GraphQL maps the input object to the Java record automatically
+  by matching field names. Works with both records and regular classes with
+  constructor/setters.
+
+  4.3 @Argument with Name Override
+  ----------------------------------
+  ```java
+  @QueryMapping
+  public Post post(@Argument("postId") Long id) { ... }
+  // Maps schema argument "postId" to Java parameter "id"
+  ```
+
+  4.4 Optional Nullable Argument
+  --------------------------------
+  ```graphql
+  type Query { search(query: String, filter: SearchFilter): [SearchResult!]! }
+  ```
+  ```java
+  @QueryMapping
+  public List<SearchResult> search(
+    @Argument @Nullable String query,
+    @Argument @Nullable SearchFilter filter
+  ) {
+    // Handle null arguments gracefully
+    if (query == null && filter == null) {
+      return List.of();
+    }
+    return searchService.search(query, filter);
+  }
+  ```
+
+5. @MUTATIONMAPPING IN DEPTH
+------------------------------
+  ```java
+  @Controller
+  public class UserMutationController {
+
+    // CREATE
+    @MutationMapping
+    public CreateUserPayload createUser(@Argument CreateUserInput input) {
+      try {
+        User user = userService.create(input);
+        return CreateUserPayload.builder()
+          .user(user)
+          .userErrors(List.of())
+          .build();
+      } catch (EmailAlreadyExistsException e) {
+        return CreateUserPayload.builder()
+          .user(null)
+          .userErrors(List.of(new UserError("Email already exists", List.of("email"), "EMAIL_TAKEN")))
+          .build();
+      }
+    }
+
+    // UPDATE with auth check
+    @MutationMapping
+    public User updateUser(@Argument Long id,
+                           @Argument UpdateUserInput input,
+                           @ContextValue User currentUser) {
+      if (!currentUser.getId().equals(id) && !currentUser.isAdmin()) {
+        throw new ForbiddenException("Cannot update another user's profile");
+      }
+      return userService.update(id, input);
+    }
+
+    // DELETE
+    @MutationMapping
+    public Boolean deleteUser(@Argument Long id,
+                               @ContextValue User currentUser) {
+      requireAdmin(currentUser);
+      userService.delete(id);
+      return true;
+    }
+
+    private void requireAdmin(User user) {
+      if (!user.hasRole("ADMIN")) throw new ForbiddenException("Admin required");
+    }
+  }
+  ```
+
+6. @SUBSCRIPTIONMAPPING IN DEPTH
+----------------------------------
+  ```java
+  @Controller
+  public class ChatController {
+    private final Sinks.Many<Message> messageSink =
+      Sinks.many().multicast().onBackpressureBuffer();
+
+    @SubscriptionMapping
+    public Flux<Message> messageAdded(@Argument Long roomId) {
+      return messageSink.asFlux()
+        .filter(msg -> msg.getRoomId().equals(roomId));  // filter per subscriber
+    }
+
+    @MutationMapping
+    public Message sendMessage(@Argument Long roomId,
+                               @Argument String content,
+                               @ContextValue User currentUser) {
+      Message msg = Message.builder()
+        .roomId(roomId)
+        .content(content)
+        .author(currentUser)
+        .timestamp(Instant.now())
+        .build();
+      messageRepository.save(msg);
+      messageSink.tryEmitNext(msg);   // Broadcast to all subscribers
+      return msg;
+    }
+  }
+  ```
+
+7. @SCHEMAMAPPING IN DEPTH
+----------------------------
+Used for non-root-type resolvers (field resolvers on object types).
+
+  ```java
+  @Controller
+  public class PostFieldController {
+
+    // Explicit typeName + field
+    @SchemaMapping(typeName = "Post", field = "author")
+    public User author(Post post) {
+      return userRepository.findById(post.getAuthorId()).orElse(null);
+    }
+
+    // Inferred typeName from parent type parameter (Post)
+    @SchemaMapping
+    public List<Comment> comments(Post post,
+                                  @Argument int first,
+                                  @Argument String after) {
+      return commentService.findByPost(post.getId(), first, after);
+    }
+
+    // Computed field (not in DB)
+    @SchemaMapping
+    public String displayName(User user) {
+      return user.getFirstName() + " " + user.getLastName();
+    }
+  }
+  ```
+
+8. @BATCHMAPPING IN DEPTH
+---------------------------
+Solves N+1 by batching all parent objects into a single call.
+
+  ```java
+  @Controller
+  public class UserBatchController {
+
+    // @BatchMapping automatically uses DataLoader under the hood
+    // posts = ALL Post objects needing their author in this request
+    @BatchMapping(typeName = "Post", field = "author")
+    public Map<Post, User> author(List<Post> posts) {
+      Set<Long> ids = posts.stream()
+        .map(Post::getAuthorId)
+        .collect(Collectors.toSet());
+
+      Map<Long, User> userMap = userRepository.findAllById(ids)
+        .stream()
+        .collect(Collectors.toMap(User::getId, Function.identity()));
+
+      return posts.stream()
+        .collect(Collectors.toMap(
+          Function.identity(),
+          post -> userMap.get(post.getAuthorId())
+        ));
+    }
+
+    // Returning a Mono (async)
+    @BatchMapping
+    public Mono<Map<User, List<Order>>> orders(List<User> users) {
+      List<Long> userIds = users.stream().map(User::getId).collect(Collectors.toList());
+      return orderService.findByUserIds(userIds)
+        .collectList()
+        .map(orders -> {
+          Map<Long, List<Order>> byUserId = orders.stream()
+            .collect(Collectors.groupingBy(Order::getUserId));
+          return users.stream()
+            .collect(Collectors.toMap(
+              Function.identity(),
+              user -> byUserId.getOrDefault(user.getId(), List.of())
+            ));
+        });
+    }
+  }
+  ```
+
+9. COMBINING ANNOTATIONS WITH CONTEXT
+----------------------------------------
+  ```java
+  @QueryMapping
+  public List<Post> myPosts(@ContextValue User currentUser,
+                            @Argument int page,
+                            @Argument int size) {
+    return postRepository.findByUserId(
+      currentUser.getId(),
+      PageRequest.of(page, size)
+    ).getContent();
+  }
+  ```
+
+10. RETURN TYPES SUPPORTED
+-----------------------------
+Spring for GraphQL resolvers can return:
+  - Direct types: `User`, `List<User>`, `Optional<User>`, `Page<User>`
+  - Reactive types: `Mono<User>`, `Flux<User>` (for WebFlux)
+  - Async: `CompletableFuture<User>`
+  - Void / null: for mutations that return Boolean or nothing
+  - `Flux<T>` for subscriptions
+
+11. VALIDATION WITH @VALID AND BEAN VALIDATION
+------------------------------------------------
+  ```java
+  public record CreateUserInput(
+    @NotBlank String name,
+    @Email String email,
+    @Min(18) Integer age
+  ) {}
+
+  @MutationMapping
+  public User createUser(@Argument @Valid CreateUserInput input) {
+    return userService.create(input);
+  }
+  ```
+
+  Configure exception handling for ConstraintViolationException:
+  ```java
+  @Override
+  protected GraphQLError resolveToSingleError(Throwable ex, DataFetchingEnvironment env) {
+    if (ex instanceof ConstraintViolationException cve) {
+      Map<String, String> violations = cve.getConstraintViolations().stream()
+        .collect(Collectors.toMap(
+          v -> v.getPropertyPath().toString(),
+          ConstraintViolation::getMessage
+        ));
+      return GraphqlErrorBuilder.newError(env)
+        .message("Validation failed")
+        .errorType(ErrorType.BAD_REQUEST)
+        .extensions(Map.of("violations", violations))
+        .build();
+    }
+    return null;
+  }
+  ```
+
+12. INTERVIEW QUESTIONS & ANSWERS
+-----------------------------------
+
+Q: What is the difference between @QueryMapping and @SchemaMapping?
+A: @QueryMapping is a shortcut for @SchemaMapping(typeName = "Query"). It
+   maps the method to a field on the root Query type. @SchemaMapping maps
+   to ANY type's field — typically used for nested fields like Post.author
+   or User.posts. Both register a DataFetcher under the hood.
+
+Q: How does @Argument work with complex input types?
+A: @Argument can map a scalar value (String, Long, Int) directly to a Java
+   parameter. For complex inputs, it maps a Map<String,Object> to a Java
+   class/record by matching field names. Spring uses its own ArgumentValue
+   mechanism; no Jackson needed. Works with records, classes with
+   constructors, and classes with setters.
+
+Q: What is @BatchMapping and when should you use it?
+A: @BatchMapping solves the N+1 problem. Instead of a @SchemaMapping that
+   loads one Post's author (called N times for N posts), @BatchMapping
+   receives ALL posts needing their author and returns a Map<Post, User>.
+   Spring's DataLoader mechanism distributes results. Use @BatchMapping
+   for any field that would otherwise cause N+1 database queries.
+
+Q: Can @MutationMapping return void?
+A: Yes, but it's bad practice in GraphQL (mutations should return something
+   meaningful for caching/optimistic updates). You can return void/null
+   in Java; GraphQL will serialize it as null. Best practice: always return
+   the modified object or a payload type with user errors.
+
+Q: How do you map a subscription to return multiple values over time?
+A: Return a Flux<T> from a @SubscriptionMapping method. Each element emitted
+   by the Flux is sent as a separate GraphQL response to the client over
+   WebSocket. Spring handles the protocol framing.
+
+Q: What is the difference between @SchemaMapping and @BatchMapping?
+A: @SchemaMapping is called once per parent object (N times for a list of N).
+   @BatchMapping is called once for ALL parent objects at once. Both map
+   to the same schema field. @BatchMapping is the preferred way to load
+   related data at scale to avoid N+1 queries.
+
+================================================================
+END OF FILE
+================================================================

@@ -1,0 +1,260 @@
+================================================================================
+TIMEOUT PATTERN
+================================================================================
+
+WHY TIMEOUTS ARE CRITICAL
+--------------------------
+"Never wait indefinitely" is one of the golden rules of distributed systems.
+
+Without timeouts:
+  - A slow/unresponsive service causes caller threads to block FOREVER
+  - All threads in the calling service get consumed → service hangs
+  - The hung service causes its callers to hang → cascade failure
+
+With timeouts:
+  - Caller gives up after N milliseconds
+  - Thread is freed to handle other requests
+  - Failure is handled quickly (fail fast)
+  - Fallback can be applied
+
+RULE: Set a timeout on EVERY network call. No exceptions.
+
+────────────────────────────────────────────────────────────────────────────────
+
+TYPES OF TIMEOUTS
+==================
+
+1. CONNECTION TIMEOUT
+   How long to wait to ESTABLISH a connection to the server.
+   If the server is down, we want to know quickly (e.g., 2 seconds).
+   
+   Typical value: 2-5 seconds
+   Error: Connection timed out / Connection refused
+
+2. READ TIMEOUT (Response Timeout)
+   How long to wait for the server to send a response AFTER connection is made.
+   The server might accept the connection but be slow to process/respond.
+   
+   Typical value: Depends on operation (1-30 seconds)
+   Error: Read timed out / SocketTimeoutException
+
+3. WRITE TIMEOUT
+   How long to wait for the server to acknowledge data we sent.
+   Less common to configure separately.
+
+4. IDLE TIMEOUT / KEEPALIVE TIMEOUT
+   For HTTP/2 and connection pooling: how long to keep idle connections.
+
+5. DEADLINE / OVERALL TIMEOUT (gRPC)
+   Total time budget for the entire operation including retries.
+   gRPC term: Deadline = absolute point in time when request must complete.
+   
+   Deadline propagation: When Service A calls B which calls C,
+   pass the remaining deadline so each service knows its time budget.
+
+────────────────────────────────────────────────────────────────────────────────
+
+TIMEOUT CONFIGURATION IN SPRING BOOT
+========================================
+
+RestTemplate:
+  @Bean
+  public RestTemplate restTemplate() {
+    HttpComponentsClientHttpRequestFactory factory = 
+      new HttpComponentsClientHttpRequestFactory();
+    factory.setConnectTimeout(2000);    // 2 seconds to connect
+    factory.setConnectionRequestTimeout(2000);  // 2 seconds to get from pool
+    factory.setReadTimeout(5000);       // 5 seconds for response
+    
+    return new RestTemplate(factory);
+  }
+
+WebClient (reactive):
+  @Bean
+  public WebClient webClient() {
+    HttpClient httpClient = HttpClient.create()
+      .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 2000)  // connect timeout
+      .responseTimeout(Duration.ofSeconds(5))              // response timeout
+      .doOnConnected(conn ->
+        conn.addHandlerLast(new ReadTimeoutHandler(5, TimeUnit.SECONDS))
+            .addHandlerLast(new WriteTimeoutHandler(5, TimeUnit.SECONDS))
+      );
+
+    return WebClient.builder()
+      .clientConnector(new ReactorClientHttpConnector(httpClient))
+      .build();
+  }
+
+  // Per-request timeout override:
+  webClient.get()
+    .uri("/api/v1/orders/{id}", orderId)
+    .retrieve()
+    .bodyToMono(OrderDTO.class)
+    .timeout(Duration.ofSeconds(3));  // Override: 3s for this specific call
+
+Feign Client:
+  feign:
+    client:
+      config:
+        inventory-service:
+          connect-timeout: 2000     # 2 seconds
+          read-timeout: 5000        # 5 seconds
+        payment-service:
+          connect-timeout: 2000
+          read-timeout: 10000       # Longer for payment (10 seconds)
+
+────────────────────────────────────────────────────────────────────────────────
+
+RESILIENCE4J TIME LIMITER
+============================
+Applies to CompletableFuture / reactive calls:
+
+  resilience4j:
+    timelimiter:
+      instances:
+        inventoryService:
+          timeout-duration: 3s          # Cancel after 3 seconds
+          cancel-running-future: true   # Cancel the underlying Future on timeout
+
+  @TimeLimiter(name = "inventoryService", fallbackMethod = "timeoutFallback")
+  @CircuitBreaker(name = "inventoryService")
+  public CompletableFuture<InventoryDTO> getInventory(Long productId) {
+    return CompletableFuture.supplyAsync(() ->
+      inventoryClient.getInventory(productId)
+    );
+  }
+
+  public CompletableFuture<InventoryDTO> timeoutFallback(Long productId,
+                                                          TimeoutException ex) {
+    log.warn("Inventory call timed out for product {}", productId);
+    return CompletableFuture.completedFuture(InventoryDTO.unavailable(productId));
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+DEADLINE PROPAGATION
+======================
+
+In distributed systems, each service should propagate the remaining time budget
+to downstream calls. This prevents a scenario where:
+  - Service A gives 10 seconds total to a request
+  - Service A spends 8 seconds on its own processing
+  - Service A calls Service B with a 5-second timeout
+  - Service B spends 5 seconds → total: 13 seconds (exceeds the 10s deadline!)
+
+gRPC Deadline propagation:
+  // gRPC automatically propagates deadlines if using Context
+  Context.current().withDeadlineAfter(5, TimeUnit.SECONDS, scheduler)
+    .call(() -> stub.getOrder(request));
+
+  // In gRPC service handler, check remaining deadline:
+  if (Context.current().getDeadline().isExpired()) {
+    throw Status.DEADLINE_EXCEEDED.asRuntimeException();
+  }
+
+HTTP deadline propagation (manual):
+  // At API Gateway: create X-Request-Deadline header
+  String deadline = Instant.now().plus(Duration.ofSeconds(10)).toString();
+  request.header("X-Request-Deadline", deadline);
+
+  // In service: check header, compute remaining budget
+  String deadlineStr = request.getHeader("X-Request-Deadline");
+  if (deadlineStr != null) {
+    Instant deadline = Instant.parse(deadlineStr);
+    Duration remaining = Duration.between(Instant.now(), deadline);
+    if (remaining.isNegative()) {
+      throw new DeadlineExceededException("Request deadline exceeded");
+    }
+    // Use remaining as timeout for downstream calls
+    downstreamClient.withTimeout(remaining.toMillis());
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+TIMEOUT SETTING GUIDELINES
+============================
+
+How to set the right timeout value:
+
+1. Measure the P99 latency of the downstream service
+   - P99 = 99th percentile latency (99% of calls complete within this time)
+   - Set timeout = 2-3× P99 (to accommodate outliers but not wait forever)
+
+2. Consider the user experience requirement
+   - User expects response within 2 seconds? Timeout all dependencies at < 2s
+
+3. Different timeouts for different operations
+   - Read operation: shorter timeout (should be fast)
+   - Write operation: longer timeout (may need DB write + response)
+   - Batch/report: much longer timeout (expected to take time)
+   - Health check: very short (100-500ms)
+
+4. Never set timeout = 0 or no timeout
+
+TIMEOUT TABLE EXAMPLES:
+  Operation                    │ Connect T/O │ Read T/O
+  ─────────────────────────────┼─────────────┼─────────
+  Simple GET (cached)          │ 1s          │ 2s
+  Complex query                │ 2s          │ 10s
+  Payment processing           │ 3s          │ 15s
+  File upload                  │ 5s          │ 60s
+  Report generation            │ 5s          │ 300s
+  Health check                 │ 0.5s        │ 1s
+
+────────────────────────────────────────────────────────────────────────────────
+
+TIMEOUT AND IDEMPOTENCY
+========================
+
+DANGER: Timeout doesn't mean the server didn't process the request!
+
+Scenario:
+  Client sends POST /payments
+  Server receives, processes payment, deducts $100
+  Server sends response — network timeout occurs
+  Client receives: TimeoutException
+  Client thinks: "payment failed"
+  Client retries: POST /payments
+  → DOUBLE CHARGE!
+
+Solution: Idempotency keys (same as with Retry pattern)
+  → Server checks if idempotency key already processed → returns cached result
+  → No double charge
+
+This is why timeout handling and idempotency always go together.
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: Why are timeouts critical in microservices?
+A: Without timeouts, slow/unresponsive services cause caller threads to block
+   indefinitely, leading to thread pool exhaustion and cascade failures. Timeouts
+   ensure threads are freed quickly, enabling the service to handle other requests
+   and apply fallback responses.
+
+Q: What's the difference between connection timeout and read timeout?
+A: Connection timeout: max time to establish a TCP connection to the server.
+   Read timeout: max time to wait for the server to send data AFTER the connection
+   is established. Both must be set on every HTTP client.
+
+Q: What is deadline propagation?
+A: Passing the remaining time budget to downstream services to prevent exceeding
+   the original request's total time limit. If Service A has a 10s total budget
+   and spends 8s internally, it should only give Service B 2 seconds, not 5.
+   gRPC does this natively; HTTP requires manual header-based propagation.
+
+Q: What happens if a timeout fires but the server already processed the request?
+A: The client sees a timeout but the server may have completed the operation.
+   This is the idempotency problem — retrying could cause duplicate processing.
+   Solve with idempotency keys: the server detects duplicate requests and returns
+   the original result without reprocessing.
+
+Q: What's the TimeLimiter in Resilience4j?
+A: TimeLimiter applies timeouts to async (CompletableFuture/reactive) calls.
+   It cancels the underlying Future when the timeout expires and calls the
+   fallback method. Used alongside CircuitBreaker and Retry for complete
+   resilience.
+
+================================================================================

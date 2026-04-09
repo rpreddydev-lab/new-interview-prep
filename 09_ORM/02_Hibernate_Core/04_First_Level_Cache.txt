@@ -1,0 +1,203 @@
+================================================================
+Hibernate First-Level Cache (Session Cache)
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHAT IS THE FIRST-LEVEL CACHE?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The First-Level Cache (1LC) is the PERSISTENCE CONTEXT in JPA terms.
+It is:
+  ✓ Always enabled — cannot be disabled
+  ✓ Scoped to a single Session (Hibernate) / EntityManager (JPA)
+  ✓ Transaction-scoped in Spring (new transaction = new 1LC)
+  ✓ A HashMap: Map<EntityKey(Class + ID), EntityInstance>
+
+What it does:
+  1. Identity guarantee: same entity ID within one session = same Java object
+  2. Avoids duplicate SQL: load entity twice → second load hits cache
+  3. Dirty checking: stores snapshot of entity state for change detection
+  4. Batches writes: accumulates SQL, flushes at transaction commit
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. IDENTITY GUARANTEE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Transactional
+public void identityDemo() {
+    User u1 = em.find(User.class, 1L);  // SQL: SELECT * FROM users WHERE id=1
+    User u2 = em.find(User.class, 1L);  // NO SQL: returned from 1LC
+    User u3 = userRepository.findById(1L).get(); // NO SQL: returned from 1LC
+
+    assert u1 == u2;  // TRUE — same object reference
+    assert u1 == u3;  // TRUE
+
+    System.out.println("Same object: " + (u1 == u2));  // true
+}
+
+Without 1LC, three SELECTs would fire. With 1LC, only one.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. DIRTY CHECKING MECHANISM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When Hibernate loads an entity into the 1LC:
+  1. It stores a snapshot of the entity's state
+  2. On flush/commit, it compares current state to snapshot
+  3. Generates UPDATE SQL only for changed fields
+  4. Only changed entities get an UPDATE
+
+@Transactional
+public void dirtyCheckDemo(Long userId) {
+    User user = em.find(User.class, userId);
+    // State snapshot: { email: "old@email.com", firstName: "Bob" }
+
+    user.setEmail("new@email.com");  // dirty!
+
+    // On commit:
+    // Hibernate compares: email changed → UPDATE users SET email=? WHERE id=?
+    // firstName unchanged → NOT included in UPDATE
+}
+
+@DynamicUpdate — Update only changed columns:
+  @Entity
+  @DynamicUpdate  // Hibernate-specific: only changed columns in UPDATE
+  public class User {
+      // Without @DynamicUpdate: UPDATE users SET col1=?, col2=?, col3=?, ...
+      // With @DynamicUpdate:    UPDATE users SET email=? WHERE id=?
+  }
+
+@DynamicInsert — Insert only non-null columns:
+  @Entity
+  @DynamicInsert  // Hibernate-specific: skip null fields in INSERT
+  public class User { ... }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. MANAGING THE FIRST-LEVEL CACHE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+em.contains(entity)   → check if entity is in 1LC (managed)
+em.detach(entity)     → remove one entity from 1LC
+em.clear()            → remove ALL entities from 1LC (detaches all)
+em.refresh(entity)    → reload entity from DB, discard pending changes
+
+// Useful in batch processing to prevent OutOfMemoryError:
+@Transactional
+public void processBatch(List<Long> ids) {
+    int count = 0;
+    for (Long id : ids) {
+        Product product = em.find(Product.class, id);
+        product.setPrice(product.getPrice().multiply(BigDecimal.valueOf(1.1)));
+        count++;
+        if (count % 50 == 0) {
+            em.flush();   // write SQL to DB
+            em.clear();   // free memory (detach all from 1LC)
+        }
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. 1LC SCOPE — PER TRANSACTION IN SPRING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+In Spring with transaction-scoped EntityManager (default):
+  - Each @Transactional method gets a FRESH EntityManager
+  - 1LC is empty at the start of each transaction
+  - 1LC is GONE after the transaction commits
+  - Entities become DETACHED after @Transactional returns
+
+Across two transactions:
+  @Transactional
+  public User loadUser(Long id) {
+      return em.find(User.class, id);  // SELECT fired, entity in 1LC
+      // Transaction ends, 1LC cleared, entity detached
+  }
+
+  @Transactional
+  public void updateUser(Long id, String email) {
+      User user = em.find(User.class, id);
+      // NEW transaction → NEW 1LC → SELECT fires again (no cache hit)
+      user.setEmail(email);
+      // commit → UPDATE fires
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. BYPASS THE 1LC (READ-ONLY QUERIES)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For large read-only operations, loading entities into the 1LC wastes memory.
+
+Option 1: Read-only entities (no snapshot stored, no dirty check):
+  session.setDefaultReadOnly(true);
+  // or per entity:
+  session.setReadOnly(entity, true);
+
+  // Via Spring Data:
+  @Transactional(readOnly = true)
+  public List<User> findAll() { return userRepository.findAll(); }
+
+Option 2: Projections / DTOs (never loaded into 1LC at all):
+  @Query("SELECT new com.example.UserDto(u.id, u.email) FROM User u")
+  List<UserDto> findAllDtos();
+
+Option 3: StatelessSession (Hibernate-specific, bypasses all caching):
+  StatelessSession stateless = sessionFactory.openStatelessSession();
+  // No 1LC, no dirty checking, no cascades — raw DB access
+  ScrollableResults<User> scroll = stateless.createQuery(
+      "FROM User", User.class).scroll(ScrollMode.FORWARD_ONLY);
+  while (scroll.next()) {
+      User u = scroll.get();
+      // process and immediately release
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. COMMON FIRST-LEVEL CACHE PITFALLS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Pitfall 1: Stale data after bulk JPQL/native UPDATE
+  em.createQuery("UPDATE User u SET u.active = false WHERE u.lastLogin < :d")
+    .setParameter("d", date).executeUpdate();
+  // 1LC still has old User entities with active=true!
+  em.clear();  // ← must clear 1LC after bulk DML
+
+Pitfall 2: OutOfMemoryError in batch processing
+  for (int i = 0; i < 1_000_000; i++) {
+      em.persist(new Product(...));
+      // 1LC grows to 1 million entities → OOM!
+  }
+  // Fix: flush + clear every N iterations
+
+Pitfall 3: Unexpected SELECT suppression
+  User u1 = em.find(User.class, 1L);  // SELECT
+  // Another thread updates user in DB
+  User u2 = em.find(User.class, 1L);  // NO SELECT — stale data returned!
+  // Fix: em.refresh(u1) to reload from DB
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. INTERVIEW QUICK HITS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the first-level cache in Hibernate?
+A: The persistence context (EntityManager scope). It tracks all entities
+   loaded within the current transaction. Same entity ID loaded twice →
+   no DB query, same Java object returned. It cannot be disabled.
+
+Q: What is dirty checking?
+A: When Hibernate loads an entity, it stores a snapshot. On flush/commit,
+   it compares current fields to the snapshot and auto-generates UPDATE SQL
+   for changed fields. No explicit save() call is needed.
+
+Q: How do you handle OutOfMemoryError in batch processing with JPA?
+A: Call em.flush() + em.clear() every N records (e.g., every 50 or 100).
+   flush() writes the SQL to DB; clear() removes all entities from the
+   1LC (frees memory). Alternatively, use Hibernate's StatelessSession.
+
+Q: What happens to the first-level cache after a bulk JPQL UPDATE?
+A: The DB is updated, but the 1LC is NOT automatically refreshed. Entities
+   in the 1LC still have stale state. Call em.clear() after bulk DML to
+   evict all entities, or use @Modifying(clearAutomatically = true).
+
+Q: What is the difference between the 1LC and 2LC?
+A: 1LC is per-Session/transaction, always enabled, stores entity instances.
+   2LC is per-SessionFactory (application-wide), optional, configurable,
+   shared across transactions. 2LC survives beyond a transaction.

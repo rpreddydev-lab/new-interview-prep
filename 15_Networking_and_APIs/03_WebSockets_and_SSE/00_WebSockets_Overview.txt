@@ -1,0 +1,345 @@
+================================================================================
+WEBSOCKETS — OVERVIEW & IN DEPTH
+================================================================================
+
+WHAT IS WEBSOCKET?
+-------------------
+WebSocket (RFC 6455) is a full-duplex, bidirectional communication protocol
+over a single, long-lived TCP connection. After the initial HTTP handshake,
+both client and server can send messages at any time without polling.
+
+Key properties:
+  - Full-duplex: both sides can send simultaneously
+  - Persistent: single TCP connection held open for the session lifetime
+  - Low latency: no HTTP overhead per message (no headers after handshake)
+  - Binary or text: can send JSON, Protocol Buffers, raw bytes
+  - Protocol: ws:// (plain) or wss:// (TLS, equivalent to https)
+
+HTTP comparison:
+  HTTP  : client must initiate every request; server cannot push unsolicited data
+  WebSocket: after handshake, server can push at any time; true bidirectional
+
+================================================================================
+1. WEBSOCKET HANDSHAKE
+================================================================================
+
+WebSocket starts as an HTTP/1.1 request and upgrades:
+
+CLIENT REQUEST:
+  GET /chat HTTP/1.1
+  Host: ws.example.com
+  Connection: Upgrade
+  Upgrade: websocket
+  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==   ← random base64
+  Sec-WebSocket-Version: 13
+  Origin: https://example.com
+
+SERVER RESPONSE (101 Switching Protocols):
+  HTTP/1.1 101 Switching Protocols
+  Connection: Upgrade
+  Upgrade: websocket
+  Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=  ← derived from key
+
+Sec-WebSocket-Accept is computed as:
+  SHA-1(Sec-WebSocket-Key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+  result base64-encoded
+
+After 101, the TCP connection is now a WebSocket connection. HTTP protocol
+is no longer used on this socket — WebSocket framing takes over.
+
+================================================================================
+2. WEBSOCKET FRAME FORMAT
+================================================================================
+
+Each message is sent as one or more frames:
+
+  0                   1                   2                   3
+  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+ +-+-+-+-+-------+-+-------------+-------------------------------+
+ |F|R|R|R| opcode|M| Payload len |    Extended payload length    |
+ |I|S|S|S|  (4)  |A|     (7)     |             (16/64)           |
+ |N|V|V|V|       |S|             |   (if payload len==126/127)   |
+ | |1|2|3|       |K|             |                               |
+ +-+-+-+-+-------+-+-------------+ - - - - - - - - - - - - - - -+
+
+FIN : 1 = final fragment; 0 = more fragments follow
+Opcode: 0x1 = text, 0x2 = binary, 0x8 = close, 0x9 = ping, 0xA = pong
+MASK: 1 = payload is masked (mandatory for client→server)
+Payload: actual data
+
+OPCODES:
+  0x0 : Continuation frame
+  0x1 : Text frame (UTF-8)
+  0x2 : Binary frame
+  0x8 : Close frame (can include status code + reason)
+  0x9 : Ping
+  0xA : Pong
+
+MASKING:
+  All client→server frames must be masked with a 4-byte masking key.
+  Server→client frames must NOT be masked.
+  Masking prevents cache poisoning attacks on HTTP proxies.
+
+================================================================================
+3. CONNECTION LIFECYCLE
+================================================================================
+
+  OPEN        → frames exchanged (text/binary)
+  PING/PONG   → keep-alive; either side sends ping, other replies with pong
+  CLOSE       → either side sends close frame; other echoes close; TCP closes
+
+CLOSE FRAME STATUS CODES:
+  1000 : Normal closure
+  1001 : Going away (server shutdown or browser navigation)
+  1002 : Protocol error
+  1003 : Unsupported data type
+  1006 : Abnormal closure (no close frame received)
+  1011 : Internal server error
+  1012 : Service restart
+  1013 : Try again later
+
+================================================================================
+4. SPRING BOOT — RAW WEBSOCKET (without STOMP)
+================================================================================
+
+DEPENDENCY:
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-websocket</artifactId>
+  </dependency>
+
+HANDLER:
+  @Component
+  public class ChatWebSocketHandler extends TextWebSocketHandler {
+
+      private final Map<String, WebSocketSession> sessions = new ConcurrentHashMap<>();
+
+      @Override
+      public void afterConnectionEstablished(WebSocketSession session) {
+          String userId = getUserId(session);
+          sessions.put(userId, session);
+          log.info("WebSocket connected: {}", session.getId());
+      }
+
+      @Override
+      protected void handleTextMessage(WebSocketSession session, TextMessage message)
+              throws Exception {
+          ChatMessage chat = objectMapper.readValue(message.getPayload(), ChatMessage.class);
+          
+          // Broadcast to all connected sessions
+          String outbound = objectMapper.writeValueAsString(
+              new ChatMessage("server", chat.getContent()));
+          
+          for (WebSocketSession s : sessions.values()) {
+              if (s.isOpen()) {
+                  s.sendMessage(new TextMessage(outbound));
+              }
+          }
+      }
+
+      @Override
+      public void afterConnectionClosed(WebSocketSession session,
+              CloseStatus closeStatus) {
+          sessions.values().remove(session);
+          log.info("WebSocket disconnected: {}, status: {}", 
+              session.getId(), closeStatus);
+      }
+
+      @Override
+      public void handleTransportError(WebSocketSession session, Throwable e) {
+          log.error("WebSocket error: {}", session.getId(), e);
+      }
+  }
+
+CONFIGURATION:
+  @Configuration
+  @EnableWebSocket
+  public class WebSocketConfig implements WebSocketConfigurer {
+
+      private final ChatWebSocketHandler chatHandler;
+
+      @Override
+      public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
+          registry.addHandler(chatHandler, "/ws/chat")
+              .addInterceptors(new HttpSessionHandshakeInterceptor())
+              .setAllowedOriginPatterns("https://*.example.com");
+      }
+  }
+
+================================================================================
+5. SOCKJS — BROWSER FALLBACK
+================================================================================
+
+SockJS provides WebSocket emulation for environments where WebSocket is blocked
+(corporate firewalls, older browsers). Falls back through:
+  1. WebSocket
+  2. HTTP streaming (EventSource)
+  3. HTTP long polling
+
+Enable in Spring:
+  registry.addHandler(chatHandler, "/ws/chat")
+      .withSockJS()           // enables SockJS fallback
+      .setHeartbeatTime(10_000)
+      .setDisconnectDelay(5_000);
+
+SockJS URL format: /ws/chat/{serverId}/{sessionId}/{transport}
+  Examples:
+  /ws/chat/123/abc/websocket       (WebSocket)
+  /ws/chat/123/abc/xhr-streaming   (XHR streaming)
+  /ws/chat/123/abc/xhr-polling     (XHR polling)
+
+================================================================================
+6. AUTHENTICATION IN WEBSOCKETS
+================================================================================
+
+HTTP headers are ONLY available during the handshake (not per message).
+
+STRATEGY 1 — Query parameter token (during handshake):
+  wss://api.example.com/ws?token=eyJhbGciOiJSUzI1NiJ9...
+  Validate in handshake interceptor.
+  Downside: token visible in server logs.
+
+STRATEGY 2 — First message token (after connection):
+  Client connects anonymously → sends {type:"auth", token:"..."} as first message
+  Server validates, stores principal in session, responds {type:"auth.success"}
+  Any other message before auth → close with 1008 (Policy Violation)
+
+STRATEGY 3 — Cookie-based:
+  If browser sends cookies on WebSocket upgrade, HttpSession / cookie auth works.
+  Configure Spring Security to allow WebSocket endpoint, use HttpSessionHandshakeInterceptor.
+
+SPRING SECURITY + WEBSOCKET:
+  @Configuration
+  public class WebSocketSecurityConfig extends AbstractSecurityWebSocketMessageBrokerConfigurer {
+      @Override
+      protected void configureInbound(MessageSecurityMetadataSourceRegistry messages) {
+          messages
+              .simpDestMatchers("/app/**").authenticated()
+              .simpSubscribeDestMatchers("/topic/**").authenticated()
+              .anyMessage().denyAll();
+      }
+
+      @Override
+      protected boolean sameOriginDisabled() {
+          return true; // Disable CSRF for WebSocket (use token instead)
+      }
+  }
+
+================================================================================
+7. SCALING WEBSOCKETS — PUB/SUB BROKER
+================================================================================
+
+PROBLEM: WebSocket sessions are stateful and tied to a specific server instance.
+In a cluster, a message from user A to user B (connected to a different node)
+won't reach them.
+
+SOLUTION: Use a message broker as a pub/sub relay.
+
+                ┌─────────────┐
+    Client A ───│  Server 1   │──┐
+                └─────────────┘  │  ┌──────────┐
+                                 ├──│  Redis   │
+                ┌─────────────┐  │  │  Pub/Sub │
+    Client B ───│  Server 2   │──┘  └──────────┘
+                └─────────────┘
+
+With STOMP over WebSocket + Spring Message Broker:
+  Spring integrates with RabbitMQ or ActiveMQ as a full STOMP broker.
+  Messages published to /topic/* are delivered to all subscribers on any node.
+
+  // Full STOMP broker relay (external broker)
+  @Override
+  public void configureMessageBroker(MessageBrokerRegistry registry) {
+      registry.enableStompBrokerRelay("/topic", "/queue")
+          .setRelayHost("rabbitmq")
+          .setRelayPort(61613)
+          .setClientLogin("guest")
+          .setClientPasscode("guest");
+      registry.setApplicationDestinationPrefixes("/app");
+  }
+
+  // Simple in-memory broker (single node)
+  registry.enableSimpleBroker("/topic", "/queue");
+
+================================================================================
+8. WEBSOCKET PERFORMANCE CONSIDERATIONS
+================================================================================
+
+Connection limits per server:
+  Each WebSocket = 1 TCP connection + OS resources (file descriptors)
+  Single Linux server can hold ~65k–100k concurrent connections with tuning:
+    sysctl net.core.somaxconn=65535
+    ulimit -n 100000
+
+Message throughput:
+  Binary (Protocol Buffers, MessagePack) is more efficient than JSON
+  Compress with per-message deflate extension (permessage-deflate)
+
+Keep-alive (heartbeats):
+  Servers/proxies time out idle connections
+  Application-level heartbeats: send ping every 30s
+  STOMP has built-in heartbeat negotiation
+
+Load balancing:
+  L7 LB (sticky sessions / session affinity) needed — route all traffic from
+  a client to the same backend node where their WS session lives.
+  OR use external broker (Redis/RabbitMQ) so any node can handle any client.
+
+================================================================================
+9. COMPARISON — WEBSOCKET vs SSE vs POLLING
+================================================================================
+
+Feature          | WebSocket          | SSE                | Long Polling
+-----------------|--------------------|--------------------|-----------------
+Direction        | Full-duplex        | Server → Client    | Client polls
+Protocol         | ws:// / wss://     | HTTP (EventSource) | HTTP
+Browser support  | All modern         | All modern         | All
+Reconnect auto   | No (manual)        | Yes (auto)         | Manual
+Binary support   | Yes                | No (text only)     | Yes
+Proxies/firewalls| Sometimes blocked  | Works (HTTP)       | Works (HTTP)
+Best for         | Chat, gaming,      | Live feeds, logs,  | Simple polling
+                 | collaborative edit | progress updates   | compatibility
+
+================================================================================
+10. INTERVIEW QUESTIONS — WEBSOCKETS
+================================================================================
+
+Q1: How does the WebSocket handshake work?
+    It starts as an HTTP/1.1 GET request with headers: Connection: Upgrade,
+    Upgrade: websocket, and a Sec-WebSocket-Key (random base64 nonce).
+    The server responds with 101 Switching Protocols and Sec-WebSocket-Accept
+    (SHA-1 hash of the key + a fixed GUID, base64 encoded). After that, the
+    TCP connection is repurposed as a WebSocket connection — HTTP framing is
+    replaced by WebSocket frame format.
+
+Q2: What is the difference between WebSocket and HTTP/2 Server Push?
+    HTTP/2 Server Push allows the server to push resources (CSS, JS, images)
+    that the client will need before it requests them — preemptive optimization.
+    It's unidirectional and not designed for real-time communication.
+    WebSocket is a bidirectional, full-duplex channel designed for real-time
+    message exchange. HTTP/2 Server Push is deprecated in Chrome/Firefox.
+    For real-time, use WebSocket or SSE.
+
+Q3: How do you handle WebSocket connections in a multi-node cluster?
+    Three approaches: 1) Sticky sessions (session affinity) at load balancer —
+    route each client to the same node for the lifetime of the connection.
+    2) External message broker (Redis Pub/Sub, RabbitMQ, Kafka) — all nodes
+    publish and subscribe to the broker; any node can deliver any message.
+    3) Shared state in Redis (session map). The broker approach is most scalable.
+
+Q4: What happens if a WebSocket connection is dropped unexpectedly?
+    Both sides get a close event with code 1006 (abnormal closure). The client
+    should implement exponential backoff reconnection logic. Before reconnecting,
+    the client should track message sequence numbers or timestamps so it can
+    request missed messages after reconnect (gap recovery). SockJS handles
+    this automatically with its session recovery.
+
+Q5: How do you authenticate WebSocket connections?
+    Headers are only available during the HTTP handshake. Options:
+    1) Pass JWT as query param during handshake (validate in interceptor)
+    2) Use cookie-based session (browser sends cookies on upgrade automatically)
+    3) First-message auth: client sends auth message right after connection;
+    server closes with 1008 if auth fails.
+    Never allow unauthenticated messages to reach the application layer.
+
+================================================================================

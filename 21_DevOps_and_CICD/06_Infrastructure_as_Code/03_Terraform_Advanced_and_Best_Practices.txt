@@ -1,0 +1,996 @@
+================================================================================
+TERRAFORM ADVANCED PATTERNS AND BEST PRACTICES
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Module Composition and the Module Registry
+2. Terragrunt — DRY Terraform Configurations
+3. Terraform Cloud / HCP Terraform
+4. Environment Management Strategies
+5. State Isolation and Remote State References
+6. Refactoring — moved, import, state mv
+7. Testing Infrastructure Code
+8. Terraform in CI/CD Pipelines
+9. Debugging and Performance
+10. Common Anti-patterns and Best Practices
+11. Common Interview Questions & Answers
+12. Quick Reference Cheat Sheet
+
+================================================================================
+1. MODULE COMPOSITION AND THE MODULE REGISTRY
+================================================================================
+
+Module Hierarchy:
+  Root Module      → your top-level Terraform code
+  Child Modules    → called with module { } blocks
+  Published Modules → from registry.terraform.io or private registry
+  
+  ┌──────────────────────────────────────┐
+  │          Root Module                 │
+  │  (environments/prod/main.tf)         │
+  │                                      │
+  │  module "vpc"  →  modules/vpc        │
+  │  module "eks"  →  modules/eks        │
+  │  module "rds"  →  modules/rds        │
+  └──────────────────────────────────────┘
+
+Good Module Design:
+  
+  # modules/vpc/main.tf:
+  terraform {
+    required_providers {
+      aws = {
+        source  = "hashicorp/aws"
+        version = "~> 5.0"
+      }
+    }
+  }
+  
+  resource "aws_vpc" "this" {
+    cidr_block           = var.cidr_block
+    enable_dns_hostnames = true
+    enable_dns_support   = true
+    
+    tags = merge(var.tags, {
+      Name = var.name
+    })
+  }
+  
+  resource "aws_subnet" "public" {
+    count = length(var.public_subnets)
+    
+    vpc_id            = aws_vpc.this.id
+    cidr_block        = var.public_subnets[count.index]
+    availability_zone = var.azs[count.index]
+    
+    map_public_ip_on_launch = true
+    
+    tags = merge(var.tags, {
+      Name = "${var.name}-public-${count.index + 1}"
+      "kubernetes.io/role/elb" = "1"   # EKS requirement
+    })
+  }
+  
+  # modules/vpc/variables.tf:
+  variable "name" {
+    type        = string
+    description = "Name prefix for all VPC resources"
+  }
+  
+  variable "cidr_block" {
+    type        = string
+    description = "CIDR block for the VPC"
+    
+    validation {
+      condition     = can(cidrhost(var.cidr_block, 0))
+      error_message = "cidr_block must be a valid IPv4 CIDR"
+    }
+  }
+  
+  variable "public_subnets" {
+    type        = list(string)
+    description = "List of CIDR blocks for public subnets"
+    default     = []
+  }
+  
+  variable "azs" {
+    type        = list(string)
+    description = "Availability zones"
+  }
+  
+  variable "tags" {
+    type        = map(string)
+    description = "Tags to apply to all resources"
+    default     = {}
+  }
+  
+  # modules/vpc/outputs.tf:
+  output "vpc_id" {
+    value       = aws_vpc.this.id
+    description = "VPC ID"
+  }
+  
+  output "public_subnet_ids" {
+    value       = aws_subnet.public[*].id
+    description = "IDs of public subnets"
+  }
+
+Using Public Registry Modules:
+  
+  # Official AWS VPC module:
+  module "vpc" {
+    source  = "terraform-aws-modules/vpc/aws"
+    version = "5.1.2"       # Always pin version!
+    
+    name = "my-vpc"
+    cidr = "10.0.0.0/16"
+    
+    azs             = ["us-east-1a", "us-east-1b"]
+    private_subnets = ["10.0.1.0/24", "10.0.2.0/24"]
+    public_subnets  = ["10.0.101.0/24", "10.0.102.0/24"]
+    
+    enable_nat_gateway = true
+    single_nat_gateway = true
+  }
+
+Private Module Registry:
+  HCP Terraform/Enterprise has a private registry.
+  Org members can publish and consume internal modules.
+
+================================================================================
+2. TERRAGRUNT — DRY TERRAFORM CONFIGURATIONS
+================================================================================
+
+Problem Terragrunt Solves:
+  Without Terragrunt, environments look like:
+  
+  environments/
+  ├── dev/
+  │   ├── main.tf        # 90% same as prod
+  │   ├── variables.tf   # Same
+  │   ├── backend.tf     # Different S3 key
+  │   └── terraform.tfvars  # Different values
+  └── prod/
+      ├── main.tf        # 90% same as dev
+      ├── variables.tf   # Same
+      ├── backend.tf     # Different S3 key
+      └── terraform.tfvars  # Different values
+  
+  Copy-paste problem: 90% duplication.
+
+Terragrunt Solution (DRY):
+  
+  # Root terragrunt.hcl (defines common backend config):
+  remote_state {
+    backend = "s3"
+    config = {
+      bucket = "my-terraform-state"
+      key    = "${path_relative_to_include()}/terraform.tfstate"
+      region = "us-east-1"
+      
+      dynamodb_table = "terraform-locks"
+      encrypt        = true
+    }
+    
+    generate = {
+      path      = "backend.tf"
+      if_exists = "overwrite_terragrunt"
+    }
+  }
+  
+  # Common inputs for all envs:
+  inputs = {
+    org = "my-company"
+  }
+  
+  # environments/dev/vpc/terragrunt.hcl:
+  include "root" {
+    path = find_in_parent_folders()   # Inherits root config
+  }
+  
+  terraform {
+    source = "git::https://github.com/org/terraform-modules.git//vpc?ref=v1.2.0"
+  }
+  
+  inputs = {
+    name       = "dev-vpc"
+    cidr_block = "10.0.0.0/16"
+    azs        = ["us-east-1a", "us-east-1b"]
+  }
+  
+  # environments/prod/vpc/terragrunt.hcl:
+  include "root" {
+    path = find_in_parent_folders()
+  }
+  
+  terraform {
+    source = "git::https://github.com/org/terraform-modules.git//vpc?ref=v1.2.0"
+  }
+  
+  inputs = {
+    name       = "prod-vpc"
+    cidr_block = "172.16.0.0/16"
+    azs        = ["us-east-1a", "us-east-1b", "us-east-1c"]
+  }
+
+Terragrunt Commands:
+  terragrunt plan                   # Plan single module
+  terragrunt apply                  # Apply single module
+  terragrunt run-all plan           # Plan ALL modules in directory tree
+  terragrunt run-all apply          # Apply ALL modules
+  terragrunt run-all destroy        # Destroy ALL modules
+  terragrunt output                 # Show outputs
+  
+  # Dependency management:
+  dependency "vpc" {
+    config_path = "../vpc"
+    
+    mock_outputs = {               # Used in plan when dep not yet created
+      vpc_id            = "vpc-00000000"
+      public_subnet_ids = ["subnet-00000000"]
+    }
+  }
+  
+  inputs = {
+    vpc_id     = dependency.vpc.outputs.vpc_id
+    subnet_ids = dependency.vpc.outputs.public_subnet_ids
+  }
+
+================================================================================
+3. TERRAFORM CLOUD / HCP TERRAFORM
+================================================================================
+
+Key Features:
+  Remote execution       Terraform runs on HCP servers (not your laptop)
+  State management       Remote state stored securely, no S3 setup needed
+  VCS integration        Trigger runs on git push
+  Workspace UI           Plan/apply visibility in web UI
+  Team permissions       Per-workspace access control
+  Sentinel policies      Policy as code (paid plans)
+  Private module registry Share modules across the org
+  Run triggers           Workspace A triggers workspace B after apply
+
+Workspace Configuration:
+  
+  # backend.tf (Terraform Cloud backend):
+  terraform {
+    cloud {
+      organization = "my-org"
+      
+      workspaces {
+        name = "my-app-prod"
+        # OR:
+        tags = ["app:my-app", "env:prod"]
+      }
+    }
+  }
+  
+  # Variables in HCP Terraform workspace:
+  # - Terraform vars: passed as -var (read by .tf files)
+  # - Environment vars: set in process env (TF_VAR_x, AWS_*, etc.)
+  # Both can be marked "sensitive" (write-only in UI)
+
+Remote Execution Modes:
+  Remote  → HCP runs terraform on their infra (need to allow IPs for target)
+  Local   → HCP stores state but you run locally (terraform init, then local run)
+
+Workspace Strategy:
+  One workspace per environment per component:
+  my-app-networking-dev
+  my-app-networking-staging
+  my-app-networking-prod
+  my-app-compute-dev
+  my-app-compute-staging
+  my-app-compute-prod
+
+================================================================================
+4. ENVIRONMENT MANAGEMENT STRATEGIES
+================================================================================
+
+Strategy 1: Workspaces
+  
+  terraform workspace new dev
+  terraform workspace new staging
+  terraform workspace new prod
+  terraform workspace select prod
+  terraform plan
+  
+  In code:
+  locals {
+    env = terraform.workspace
+    
+    instance_type = {
+      dev     = "t3.small"
+      staging = "t3.medium"
+      prod    = "m5.large"
+    }[terraform.workspace]
+  }
+  
+  Downside:
+  - All envs share same state backend (different keys, but same bucket)
+  - Easy to accidentally apply to wrong workspace
+  - No isolation if backend credentials compromised
+
+Strategy 2: Directories per Environment (Recommended)
+  
+  environments/
+  ├── _shared/               # Shared variable definitions
+  │   └── variables.tf
+  ├── dev/
+  │   ├── main.tf
+  │   ├── backend.tf         # dev-specific S3 key
+  │   └── terraform.tfvars   # dev-specific values
+  ├── staging/
+  │   ├── main.tf
+  │   ├── backend.tf
+  │   └── terraform.tfvars
+  └── prod/
+      ├── main.tf
+      ├── backend.tf         # prod-specific S3 key (maybe different account)
+      └── terraform.tfvars
+  
+  Benefits:
+  - Different AWS accounts per env (true isolation)
+  - Cannot accidentally apply dev changes to prod
+  - Clear audit trail
+
+Strategy 3: Terragrunt (Best for large teams)
+  Single source of truth modules + per-env values.
+  See section 2 above.
+
+================================================================================
+5. STATE ISOLATION AND REMOTE STATE REFERENCES
+================================================================================
+
+Why Isolate State?
+  Everything in one state file = blast radius is the entire infrastructure.
+  One corrupt state = everything at risk.
+  One user running terraform = everyone else locked.
+  
+  Recommended: Separate state per environment AND per component:
+  
+  s3://my-tf-state/
+  ├── global/iam/terraform.tfstate
+  ├── networking/dev/terraform.tfstate
+  ├── networking/staging/terraform.tfstate
+  ├── networking/prod/terraform.tfstate
+  ├── eks/dev/terraform.tfstate
+  ├── eks/prod/terraform.tfstate
+  ├── apps/my-service/dev/terraform.tfstate
+  └── apps/my-service/prod/terraform.tfstate
+
+Remote State Data Source:
+  Read outputs from another state file without managing those resources:
+  
+  # eks/main.tf reads from networking state:
+  data "terraform_remote_state" "networking" {
+    backend = "s3"
+    
+    config = {
+      bucket = "my-terraform-state"
+      key    = "networking/prod/terraform.tfstate"
+      region = "us-east-1"
+    }
+  }
+  
+  resource "aws_eks_cluster" "this" {
+    name = "prod-cluster"
+    
+    vpc_config {
+      subnet_ids = data.terraform_remote_state.networking.outputs.private_subnet_ids
+    }
+  }
+  
+  Downside: Creates coupling between state files.
+  Alternative: Use SSM Parameter Store or data sources to decouple.
+
+================================================================================
+6. REFACTORING: MOVED, IMPORT, STATE MV
+================================================================================
+
+The moved Block (Terraform 1.1+):
+  Rename a resource without destroying/recreating it.
+  
+  # Before: resource "aws_security_group" "sg" {}
+  # After: resource "aws_security_group" "web_sg" {}
+  
+  moved {
+    from = aws_security_group.sg
+    to   = aws_security_group.web_sg
+  }
+  
+  # Also works for module moves:
+  moved {
+    from = aws_instance.app
+    to   = module.app_server.aws_instance.this
+  }
+  
+  After apply: remove the moved block (or keep for history)
+
+terraform import (Bring existing resources under management):
+  For resources created outside Terraform (ClickOps).
+  
+  # Write resource definition in .tf first:
+  resource "aws_s3_bucket" "my_bucket" {
+    bucket = "already-exists-bucket"
+  }
+  
+  # Then import:
+  terraform import aws_s3_bucket.my_bucket already-exists-bucket
+  
+  # Terraform 1.5+ import block (declarative, no CLI needed):
+  import {
+    to = aws_s3_bucket.my_bucket
+    id = "already-exists-bucket"
+  }
+  
+  # Generate config from import (Terraform 1.5+):
+  terraform plan -generate-config-out=generated.tf
+
+terraform state Commands:
+  terraform state list                    # List all resources
+  terraform state show aws_instance.app  # Show resource details
+  terraform state mv                     # Rename resource in state
+  terraform state rm aws_instance.app    # Remove from state (NOT destroy)
+  terraform state pull                   # Download state JSON
+  terraform state push                   # Upload state JSON (DANGEROUS)
+  
+  # mv example (same as moved block but manual):
+  terraform state mv aws_instance.old aws_instance.new
+  
+  # Useful: remove resource from state without deleting (e.g., adopted by another root):
+  terraform state rm module.vpc.aws_vpc.this
+
+================================================================================
+7. TESTING INFRASTRUCTURE CODE
+================================================================================
+
+Levels of IaC Testing:
+  
+  ┌─────────────────────────────────────────────────────┐
+  │ Level 4: Compliance  (AWS Config, Security Hub)     │
+  │ Level 3: Integration (Terratest — real cloud)       │
+  │ Level 2: Unit Tests  (mock providers, plan output)  │
+  │ Level 1: Static      (tflint, tfsec, checkov)       │
+  └─────────────────────────────────────────────────────┘
+
+Static Analysis:
+  
+  # tflint — Linter:
+  tflint --init
+  tflint                              # Lint current directory
+  tflint --module                     # Also lint referenced modules
+  
+  Rules: deprecated resources, invalid instance types, naming conventions.
+  
+  # tfsec — Security scanner:
+  tfsec .                             # Scan current directory
+  tfsec --exclude aws-s3-enable-bucket-logging  # Skip specific rule
+  tfsec --minimum-severity HIGH       # Only high+ findings
+  
+  # checkov — Multi-tool scanner (Terraform, K8s, Dockerfile, CloudFormation):
+  pip install checkov
+  checkov -d .                        # Scan directory
+  checkov -f main.tf                  # Scan single file
+  checkov -d . --check CKV_AWS_18    # Run specific check only
+  checkov -d . --skip-check CKV_AWS_18  # Skip specific check
+  checkov -d . --output sarif        # SARIF output (GitHub Security tab)
+
+Terraform Validate:
+  terraform init -backend=false      # Init without real backend
+  terraform validate                 # Syntax and structure check (free, no API calls)
+
+Terratest (Go):
+  Deploys REAL resources, runs assertions, destroys.
+  
+  // test/vpc_test.go:
+  package test
+  
+  import (
+      "testing"
+      "github.com/gruntwork-io/terratest/modules/terraform"
+      "github.com/stretchr/testify/assert"
+  )
+  
+  func TestVPCModule(t *testing.T) {
+      t.Parallel()    // Run in parallel with other tests
+      
+      terraformOptions := &terraform.Options{
+          TerraformDir: "../modules/vpc",
+          Vars: map[string]interface{}{
+              "name":          "test-vpc",
+              "cidr_block":    "10.99.0.0/16",
+              "azs":           []string{"us-east-1a", "us-east-1b"},
+              "public_subnets": []string{"10.99.1.0/24", "10.99.2.0/24"},
+          },
+      }
+      
+      // Clean up on test completion:
+      defer terraform.Destroy(t, terraformOptions)
+      
+      // Deploy:
+      terraform.InitAndApply(t, terraformOptions)
+      
+      // Get outputs:
+      vpcID := terraform.Output(t, terraformOptions, "vpc_id")
+      subnetIDs := terraform.OutputList(t, terraformOptions, "public_subnet_ids")
+      
+      // Assertions:
+      assert.NotEmpty(t, vpcID)
+      assert.Equal(t, 2, len(subnetIDs))
+  }
+  
+  # Run tests:
+  cd test && go test -v -timeout 30m
+
+Policy as Code — OPA/Conftest:
+  Write policies in Rego to validate Terraform plan JSON.
+  
+  # policy/deny_public_s3.rego:
+  package main
+  
+  deny[msg] {
+    resource := input.resource_changes[_]
+    resource.type == "aws_s3_bucket"
+    resource.change.after.acl == "public-read"
+    msg := sprintf("S3 bucket '%v' must not be public", [resource.address])
+  }
+  
+  # Generate plan JSON and check:
+  terraform plan -out=plan.tfplan
+  terraform show -json plan.tfplan > plan.json
+  conftest test plan.json --policy policy/
+
+Sentinel (HCP Terraform Enterprise):
+  Built-in policy as code framework.
+  Policies evaluated between plan and apply (soft/hard mandatory).
+  
+  # Example Sentinel policy:
+  import "tfplan/v2" as tfplan
+  
+  # All S3 buckets must have versioning enabled
+  main = rule {
+    all tfplan.resource_changes as _, change {
+      change.type is "aws_s3_bucket" and change.mode is "managed" implies
+        change.change.after.versioning[0].enabled is true
+    }
+  }
+
+================================================================================
+8. TERRAFORM IN CI/CD PIPELINES
+================================================================================
+
+GitHub Actions Pipeline:
+  
+  # .github/workflows/terraform.yaml:
+  name: Terraform
+  on:
+    push:
+      branches: [main]
+    pull_request:
+      branches: [main]
+  
+  env:
+    TF_VERSION: "1.6.0"
+    AWS_DEFAULT_REGION: us-east-1
+  
+  jobs:
+    terraform:
+      runs-on: ubuntu-latest
+      permissions:
+        id-token: write          # For OIDC auth
+        contents: read
+        pull-requests: write     # To post plan as PR comment
+      
+      steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789:role/TerraformCIRole
+          aws-region: us-east-1
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: tflint
+        run: |
+          curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+          tflint --init && tflint
+      
+      - name: tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          minimum_severity: HIGH
+      
+      - name: Terraform Init
+        run: terraform init
+        working-directory: environments/prod
+      
+      - name: Terraform Validate
+        run: terraform validate
+        working-directory: environments/prod
+      
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color -out=tfplan
+        working-directory: environments/prod
+        continue-on-error: true    # So we can post comment even on failure
+      
+      # Post plan as PR comment:
+      - name: Comment Plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const planOutput = `${{ steps.plan.outputs.stdout }}`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '```hcl\n' + planOutput + '\n```'
+            });
+      
+      - name: Terraform Apply
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: terraform apply -auto-approve tfplan
+        working-directory: environments/prod
+
+Atlantis (Open Source PR-based Terraform automation):
+  
+  # atlantis.yaml:
+  version: 3
+  projects:
+  - name: networking-prod
+    dir: environments/prod/networking
+    workspace: default
+    autoplan:
+      when_modified: ["**/*.tf", "**/*.tfvars"]
+      enabled: true
+    apply_requirements:
+      - approved    # Require PR approval before apply
+      - mergeable   # No merge conflicts
+  
+  Workflow:
+  1. Open PR → Atlantis auto-comments terraform plan
+  2. Team reviews plan in PR
+  3. Reviewer comments "atlantis apply"
+  4. Atlantis applies, posts output, merges PR
+  
+  Benefit: Plan is deterministic (no local env variations).
+  PR history = full audit log of infra changes.
+
+================================================================================
+9. DEBUGGING AND PERFORMANCE
+================================================================================
+
+Debugging:
+  
+  # Enable detailed logging:
+  TF_LOG=DEBUG terraform apply 2>&1 | tee terraform-debug.log
+  TF_LOG=TRACE terraform plan         # Even more verbose
+  TF_LOG_PATH=/tmp/terraform.log      # Write to file instead of stderr
+  
+  Log levels: TRACE, DEBUG, INFO, WARN, ERROR
+  
+  # Inspect plan:
+  terraform show -json tfplan | jq '.resource_changes[] | select(.change.actions[] | contains("destroy"))'
+  
+  # View current state:
+  terraform state list
+  terraform state show aws_instance.app   # Full resource details with attributes
+  
+  # Refresh state (reconcile with real cloud):
+  terraform refresh                        # Deprecated, use:
+  terraform apply -refresh-only
+
+Performance:
+  
+  # Increase parallelism (default is 10):
+  terraform apply -parallelism=20
+  
+  # Target specific resource (partial apply — use sparingly):
+  terraform plan -target=module.vpc
+  terraform apply -target=aws_security_group.new_sg
+  
+  # Use -refresh=false if you trust state is current (speeds up plan):
+  terraform plan -refresh=false
+  
+  # Large states — use state splitting to reduce operations.
+
+Formatting:
+  terraform fmt                   # Format current directory
+  terraform fmt -recursive        # Format all subdirectories
+  terraform fmt -check            # Check without modifying (CI use)
+  terraform fmt -diff             # Show diff
+
+================================================================================
+10. COMMON ANTI-PATTERNS AND BEST PRACTICES
+================================================================================
+
+Anti-patterns to Avoid:
+  
+  ❌ Hardcoded values:
+  resource "aws_instance" "app" {
+    ami           = "ami-0abcdef1234567890"  # Hardcoded! Use data source.
+    instance_type = "m5.large"               # Hardcoded! Use variable.
+  }
+  
+  ❌ Everything in one state file:
+  # One state for ALL environments + ALL services = high blast radius
+  
+  ❌ No version pinning:
+  terraform {
+    required_providers {
+      aws = {
+        source = "hashicorp/aws"
+        # No version! Breaking changes on provider upgrade.
+      }
+    }
+  }
+  
+  ❌ Storing sensitive outputs in state without care:
+  output "db_password" {
+    value = aws_db_instance.main.password
+    # value stored in state in plaintext (even if sensitive=true, it's in tfstate)
+  }
+  # Use Secrets Manager instead; store secret ARN (not value) in output
+  
+  ❌ Using count for named resources (causes index shifts):
+  resource "aws_s3_bucket" "configs" {
+    count  = 3
+    bucket = "config-${count.index}"   # Removing middle = renumber!
+  }
+  # Use for_each with a set of strings instead.
+  
+  ❌ -auto-approve in production:
+  terraform apply -auto-approve   # Never in production without review
+
+Best Practices:
+  
+  ✅ Always pin provider and module versions
+  ✅ Use remote backend with state locking (S3 + DynamoDB)
+  ✅ Separate state per environment (different AWS account if possible)
+  ✅ Separate state per component (networking, compute, data)
+  ✅ Modules for everything > 50 lines of repeated config
+  ✅ Use for_each instead of count for named resources
+  ✅ Mark sensitive outputs sensitive = true
+  ✅ Use data sources instead of hardcoded IDs
+  ✅ Run terraform fmt and validate in CI
+  ✅ Run tfsec/checkov/tflint in PR pipeline
+  ✅ Require plan review before apply (Atlantis or HCP Terraform)
+  ✅ Use -target sparingly (only for emergencies)
+  ✅ Commit .terraform.lock.hcl to source control
+  ✅ Add terraform fmt and validate to pre-commit hooks
+
+Directory Structure Recommendation:
+  
+  terraform/
+  ├── modules/               # Reusable modules
+  │   ├── vpc/
+  │   ├── eks/
+  │   └── rds/
+  ├── environments/
+  │   ├── dev/
+  │   │   ├── main.tf        # Calls modules
+  │   │   ├── variables.tf
+  │   │   ├── backend.tf
+  │   │   └── terraform.tfvars
+  │   └── prod/
+  │       ├── main.tf
+  │       ├── variables.tf
+  │       ├── backend.tf
+  │       └── terraform.tfvars
+  └── global/                # Resources shared across envs (IAM, Route53 zones)
+      └── iam/
+          ├── main.tf
+          └── outputs.tf
+
+================================================================================
+11. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: How do you manage Terraform state across multiple environments?
+A: State management is critical — wrong state = destroyed infrastructure.
+   
+   Best practice: Separate state file per environment AND per component.
+   
+   S3 backend example:
+   # environments/prod/backend.tf:
+   terraform {
+     backend "s3" {
+       bucket         = "my-terraform-state-prod"  # Prod-specific bucket
+       key            = "networking/terraform.tfstate"
+       region         = "us-east-1"
+       dynamodb_table = "terraform-locks"          # Prevents concurrent applies
+       encrypt        = true
+     }
+   }
+   
+   Isolation strategies:
+   1. Different S3 key per component (networking vs. eks vs. apps)
+   2. Different S3 bucket per environment (dev/staging/prod)
+   3. BEST: Different AWS ACCOUNT per environment (true blast radius isolation)
+      - Dev compromised → can't touch prod state
+      - Use AWS Organizations for account management
+   
+   State locking: DynamoDB table prevents two engineers running apply simultaneously.
+   If lock is stuck: terraform force-unlock LOCK-ID (be careful!)
+   
+   Cross-state references: Use terraform_remote_state data source
+   to read outputs from another state without managing those resources.
+
+Q2: What is the difference between count and for_each in Terraform?
+A: Both create multiple instances of a resource, but with important differences.
+   
+   count (index-based):
+   resource "aws_instance" "app" {
+     count         = 3
+     instance_type = "t3.small"
+     ami           = data.aws_ami.ubuntu.id
+   }
+   # Creates: aws_instance.app[0], aws_instance.app[1], aws_instance.app[2]
+   
+   for_each (map/set-based):
+   resource "aws_instance" "app" {
+     for_each      = toset(["web", "api", "worker"])
+     instance_type = "t3.small"
+     ami           = data.aws_ami.ubuntu.id
+     tags = { Name = each.value }
+   }
+   # Creates: aws_instance.app["web"], aws_instance.app["api"], aws_instance.app["worker"]
+   
+   The critical problem with count:
+   If you have count=3 [a, b, c] and remove "b":
+   → Terraform sees [a, c] → index [0]=a, [1]=c
+   → It DESTROYS c and RECREATES it as [1] (was [2])
+   → Data loss risk!
+   
+   for_each is KEY-based, so removing "b" only removes "b":
+   → a and c are untouched
+   
+   RULE: Use count ONLY for truly identical resources (e.g., 3 identical replicas)
+   Use for_each for anything with distinct names or identities.
+
+Q3: How would you refactor Terraform code to move a resource into a module without destroying it?
+A: Use the moved block (Terraform 1.1+). This is safe, declarative, and testable.
+   
+   Scenario: aws_security_group.web_sg exists in root module.
+   Want to move into module.web_server.
+   
+   Step 1: Add moved block in root module:
+   moved {
+     from = aws_security_group.web_sg
+     to   = module.web_server.aws_security_group.this
+   }
+   
+   Step 2: Define the resource in the module:
+   # modules/web_server/main.tf:
+   resource "aws_security_group" "this" { ... }
+   
+   Step 3: Call the module:
+   module "web_server" { ... }
+   
+   Step 4: Run terraform plan → should show 0 destroys, just state moves
+   Step 5: terraform apply → state updated, no infrastructure change
+   Step 6: Optionally remove moved block (keep as history documentation)
+   
+   Alternative (pre-1.1): terraform state mv
+   terraform state mv aws_security_group.web_sg module.web_server.aws_security_group.this
+   
+   This is imperative and not tracked in code — less preferred.
+   
+   For bringing existing resources under management: terraform import.
+
+Q4: What is Terragrunt and when would you recommend it?
+A: Terragrunt is a thin wrapper around Terraform that solves configuration duplication.
+   
+   Core problems it solves:
+   1. Backend configuration: Normally you copy-paste backend.tf for each env.
+      Terragrunt generates backend config from a root terragrunt.hcl using
+      path_relative_to_include() — no duplication.
+   2. Provider config: Similar — inherit from root, override per env.
+   3. Remote module sourcing: Reference modules by Git tag (versioning baked in).
+   4. Dependency graph: dependency {} blocks define order, share outputs.
+   5. run-all: Deploy entire environment with one command.
+   
+   When to recommend:
+   - Large projects with many environments (dev/staging/prod)
+   - Multiple AWS accounts
+   - Many components with inter-dependencies
+   - Team wants standardized patterns
+   
+   When NOT to recommend:
+   - Simple single-environment setup
+   - Team unfamiliar with Terraform (adds complexity)
+   - HCP Terraform workspaces already solve your problems
+   
+   Alternatives: Terraform workspaces (simpler), Terramate (newer), Env0 (SaaS).
+
+Q5: How do you implement Terraform in a CI/CD pipeline safely?
+A: Key principles: review before apply, OIDC auth (no stored secrets), separate envs.
+   
+   Pipeline design:
+   PRs:  terraform init → tflint → tfsec → terraform validate → terraform plan
+   Main: terraform apply (only after plan review + approval)
+   
+   Authentication (AWS):
+   Use OIDC (GitHub Actions ↔ AWS IAM Role) instead of long-lived IAM keys.
+   Role has precise permissions — just what Terraform needs.
+   
+   State protection:
+   Different backends for dev vs. prod.
+   terraform plan output reviewed as PR comment before any apply.
+   Apply only on merge to main (not on PRs).
+   
+   Review process:
+   1. Engineer opens PR
+   2. Pipeline runs plan, posts output as PR comment
+   3. Reviewer sees EXACTLY what will change
+   4. Approval → merge → automated apply
+   
+   Tools:
+   - GitHub Actions + OIDC: Simplest for GitHub-based teams
+   - Atlantis: Self-hosted, PR-based, strong auditability
+   - HCP Terraform: Managed service, VCS integration, team access, Sentinel policies
+   - Spacelift/env0: SaaS alternatives with policy enforcement
+   
+   Safety rules:
+   - NEVER -auto-approve on prod without plan review
+   - State backend must use locking (DynamoDB)
+   - Least-privilege IAM roles per environment
+   - Scan with tfsec/checkov in pipeline (block on HIGH findings)
+
+================================================================================
+12. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+MODULE BEST PRACTICES:
+  Pin versions:         source = "terraform-aws-modules/vpc/aws"  version = "5.1.2"
+  Output everything:    All useful attributes should be outputs
+  Variable validation:  validation blocks with error_message
+  Default tags:         default_tags in provider config, merge in resources
+  README required:      Document inputs, outputs, example usage
+
+STATE COMMANDS:
+  terraform state list                     # List all managed resources
+  terraform state show <resource>         # Show resource details
+  terraform state mv <from> <to>          # Rename resource in state
+  terraform state rm <resource>           # Remove from state (not destroy)
+  terraform state pull                    # Download state JSON
+  terraform force-unlock <lock-id>        # Release stuck lock
+
+REFACTORING:
+  moved {}               Rename/move without destroy (declarative, 1.1+)
+  terraform import       Bring existing resource under management
+  terraform state mv     Imperative rename (pre-1.1 fallback)
+
+TESTING TOOLS:
+  terraform validate     Syntax check (fast, no API calls)
+  terraform fmt -check   Format check
+  tflint                 Linter (invalid config, deprecated resources)
+  tfsec                  Security scanner
+  checkov                Multi-IaC security scanner
+  Terratest             Integration tests in Go (real cloud resources)
+  conftest + OPA         Policy as code against plan JSON
+
+CI/CD SAFETY:
+  OIDC auth             No long-lived AWS keys in CI
+  Plan in PR            Review before apply
+  Apply on main only    Never apply from feature branches
+  Lock state            S3 + DynamoDB prevents concurrent runs
+  Separate backends     Dev/staging/prod each have own state
+
+DEBUGGING:
+  TF_LOG=DEBUG           Verbose logging
+  terraform show -json   Inspect plan/state as JSON
+  -target=resource       Partial apply (emergencies only)
+  -refresh=false         Skip state refresh (faster but trust state)
+
+================================================================================
+END OF FILE
+================================================================================

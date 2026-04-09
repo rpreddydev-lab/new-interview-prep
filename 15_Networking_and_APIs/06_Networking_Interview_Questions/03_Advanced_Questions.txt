@@ -1,0 +1,526 @@
+================================================================================
+ADVANCED NETWORKING AND API INTERVIEW QUESTIONS — COMPREHENSIVE Q&A
+================================================================================
+
+This file covers system design level questions: API gateways, rate limiting,
+WebSockets, microservices networking, resilience patterns, and distributed
+systems concepts. For senior/staff/principal engineer interviews.
+
+================================================================================
+SECTION 1: MICROSERVICES COMMUNICATION
+================================================================================
+
+Q: How do microservices communicate? When would you use synchronous vs asynchronous?
+A: SYNCHRONOUS (request-response):
+   REST/HTTP: standard, human-readable, easy debugging, stateless
+   gRPC: Protocol Buffers, strongly-typed, streaming, faster than JSON/REST
+   GraphQL: flexible client-driven queries, single endpoint
+   
+   Use synchronous when:
+   - Client needs an immediate response (user-facing reads)
+   - Simple, low-latency queries
+   - Response is needed to continue the flow (payment confirmation)
+   
+   ASYNCHRONOUS (event-driven):
+   Message queues: RabbitMQ, ActiveMQ (point-to-point delivery)
+   Event streaming: Kafka (durable log, replay, consumer groups)
+   
+   Use asynchronous when:
+   - Work can be deferred (email sending, notification, report generation)
+   - Loose coupling desired — services don't need to know about each other
+   - High throughput: producer is faster than consumer
+   - Fan-out: one event to many consumers
+   - Resilience: consumer can process when it's ready
+   
+   HYBRID PATTERN (Saga / orchestration):
+   Start with sync for critical path; fire async events for side effects.
+   Order creation: sync (create order, deduct inventory) → async (send email,
+   update analytics, trigger shipping process)
+
+Q: What is service discovery and why is it needed in microservices?
+A: In microservices, instances come and go (autoscaling, deployments, failures).
+   You can't hardcode IPs. Service discovery solves this.
+   
+   CLIENT-SIDE DISCOVERY:
+   Each service queries a registry (Eureka, Consul) and load balances itself.
+   Spring Cloud Eureka + Spring Cloud LoadBalancer (Ribbon deprecated).
+   
+   @EnableEurekaClient  // register with Eureka
+   @LoadBalanced        // WebClient uses service name, not IP
+   @Bean
+   public WebClient.Builder webClientBuilder() {
+       return WebClient.builder();
+   }
+   // Usage: webClient.get().uri("http://order-service/orders")
+   
+   SERVER-SIDE DISCOVERY:
+   Client calls a load balancer (DNS or API Gateway) which queries the registry.
+   AWS ELB + ECS service discovery; Kubernetes kube-proxy + DNS.
+   
+   KUBERNETES APPROACH:
+   DNS-based: order-service.default.svc.cluster.local resolves to Service ClusterIP
+   Service IP is stable; pods behind it change dynamically.
+   No client-side registry needed; kube-proxy handles load balancing.
+   
+   Prefer: Kubernetes DNS-based discovery for K8s deployments; Eureka for
+   non-K8s Spring Cloud environments.
+
+Q: What is the difference between orchestration and choreography in microservices?
+A: ORCHESTRATION:
+   A central orchestrator (Order Service / Saga Orchestrator) commands other
+   services and waits for responses.
+   
+   OrderService → "DeductInventory" → InventoryService (sync/async reply)
+   OrderService → "ProcessPayment"  → PaymentService
+   OrderService → "InitiateShipping" → ShippingService
+   
+   If PaymentService fails: orchestrator sends compensating commands (refund
+   inventory). Clear control flow; easy to debug. Creates coupling with orchestrator.
+   
+   CHOREOGRAPHY:
+   Services react to domain events independently; no central controller.
+   
+   OrderService publishes "OrderCreated" event
+   InventoryService subscribes → deducts stock → publishes "InventoryDeducted"
+   PaymentService subscribes → charges payment → publishes "PaymentProcessed"
+   ShippingService subscribes → initiates shipping
+   
+   Decoupled; services evolve independently. Harder to debug (no single place
+   to see the full flow). Harder to handle compensating transactions.
+   
+   RECOMMENDATION:
+   Orchestration: use for complex long-running workflows with compensation logic
+   (Temporal, Conductor, or custom Saga).
+   Choreography: use for simple event flows where services are truly independent.
+
+================================================================================
+SECTION 2: RESILIENCE PATTERNS
+================================================================================
+
+Q: What is the circuit breaker pattern? How does it work?
+A: The circuit breaker prevents cascading failures by stopping calls to a
+   failing service and failing fast instead.
+   
+   STATES:
+   CLOSED (normal): requests flow through; failures counted.
+     If failure rate > threshold (e.g., 50% over last 10 calls): OPEN
+   
+   OPEN (tripped): all requests fail immediately (short-circuit); no actual calls.
+     After waitDurationInOpenState (e.g., 30s): transition to HALF-OPEN
+   
+   HALF-OPEN (testing): allow N probe requests through.
+     If probes succeed: back to CLOSED
+     If probes fail: back to OPEN
+   
+   Resilience4j YAML:
+   resilience4j.circuitbreaker.instances.orderService:
+     slidingWindowType: COUNT_BASED
+     slidingWindowSize: 10
+     failureRateThreshold: 50
+     waitDurationInOpenState: 30s
+     permittedNumberOfCallsInHalfOpenState: 5
+     slowCallRateThreshold: 50
+     slowCallDurationThreshold: 2s
+   
+   CRITICAL: Always provide a fallback for circuit-breaker-protected methods.
+   Return cached data, degrade gracefully, or return partial results.
+   Never return an error to the user if you can serve stale data.
+
+Q: What is the difference between the circuit breaker and retry patterns?
+A: Retry: tries the same call multiple times on transient failure (brief hiccup).
+   Circuit Breaker: stops trying after a pattern of failures (service is down).
+   
+   Together (in order): CircuitBreaker → Retry → Timeout
+   
+   Flow:
+   1. Timeout: each attempt has a time limit
+   2. Retry: if attempt fails, retry N times with backoff
+   3. Circuit Breaker: if too many retried-and-failed calls, open the circuit
+      and stop retrying entirely (fail fast)
+   
+   Without circuit breaker: retries continue hammering a down service,
+   consuming threads and creating retry storms.
+   
+   Without retry: single transient failure fails the whole operation.
+   
+   Use both together; configure them carefully:
+   - Max retries × timeout = retry budget (should be < user-facing timeout)
+   - Circuit breaker threshold should account for retries
+     (3 retries × 10 calls = 30 actual calls; set sliding window accordingly)
+
+Q: What is the bulkhead pattern?
+A: Bulkhead isolates failures to a subset of the system, like watertight
+   compartments in a ship — one flooded compartment doesn't sink the whole ship.
+   
+   THREAD POOL BULKHEAD:
+   Give each downstream service its own thread pool. If Service A is slow
+   and exhausts its pool, Service B's pool is unaffected.
+   
+   resilience4j.thread-pool-bulkhead.instances.paymentService:
+     maxThreadPoolSize: 10
+     coreThreadPoolSize: 5
+     queueCapacity: 20
+   
+   Without bulkhead: one slow service can exhaust the shared server thread pool,
+   making ALL services appear unresponsive.
+   
+   SEMAPHORE BULKHEAD:
+   Limits concurrent calls without extra threads.
+   resilience4j.bulkhead.instances.inventoryService:
+     maxConcurrentCalls: 25
+     maxWaitDuration: 50ms
+   
+   Prefer thread pool bulkhead when calls are blocking (RestTemplate, JDBC).
+   Prefer semaphore bulkhead for reactive/non-blocking code (WebFlux).
+
+================================================================================
+SECTION 3: API GATEWAY ADVANCED
+================================================================================
+
+Q: How do you handle authentication in a microservices architecture?
+A: TWO APPROACHES:
+   
+   1. CENTRALIZED AUTH AT GATEWAY:
+   API Gateway validates JWT/OAuth token → sets X-User-Id header → forwards to services.
+   
+   Pros: single auth implementation; services are simpler.
+   Cons: services blindly trust X-User-Id header (trust the gateway/network).
+   
+   2. DISTRIBUTED AUTH (SERVICE MESH / mTLS):
+   Each service validates its own JWT.
+   Services use mTLS to prove identity to each other.
+   
+   Pros: zero-trust; no single auth point of failure.
+   Cons: every service needs JWT validation logic; certificate management.
+   
+   RECOMMENDED HYBRID:
+   - Edge: API Gateway validates JWT, rejects invalid tokens early
+   - Internal: services also validate JWT (defense in depth) OR use mTLS
+     (via service mesh like Istio) to trust that gateway pre-validated
+   - Never trust X-Forwarded-* headers from outside the trusted network
+   
+   Spring Gateway JWT Filter:
+   @Component
+   public class JwtAuthFilter implements GlobalFilter {
+       @Override
+       public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+           String token = extractToken(exchange.getRequest());
+           Claims claims = jwtService.validateAndExtract(token);
+           ServerHttpRequest mutated = exchange.getRequest().mutate()
+               .header("X-User-Id", claims.getSubject())
+               .header("X-User-Roles", String.join(",", claims.get("roles", List.class)))
+               .build();
+           return chain.filter(exchange.mutate().request(mutated).build());
+       }
+   }
+
+Q: How does an API Gateway handle WebSocket connections?
+A: WebSocket connections are long-lived; most API gateways support proxying:
+   
+   Spring Cloud Gateway:
+   - Supports WebSocket by default (reactive Netty handles WS natively)
+   - Route: uri: ws://chat-service → WebSocket upgrade proxied transparently
+   - Filters apply on the initial HTTP Upgrade request (not individual frames)
+   - Rate limiting applies per connection establishment, not per message
+   
+   Nginx:
+   location /ws/ {
+       proxy_pass http://backend;
+       proxy_http_version 1.1;
+       proxy_set_header Upgrade $http_upgrade;
+       proxy_set_header Connection "upgrade";
+       proxy_read_timeout 1h;  # keep WS connection alive
+   }
+   
+   AWS API Gateway: WebSocket APIs have specific support (route selection key
+   distinguishes message types); separate from HTTP APIs.
+   
+   CHALLENGES:
+   - Sticky routing: subsequent WS messages must go to same backend node
+     that holds the WS session. Use IP hash or connection-aware routing.
+   - Scaling: use Redis Pub/Sub or message broker to relay messages between
+     nodes if WS session may be on different node than target recipient.
+   - Timeouts: increase proxy read timeout; send heartbeats/pings.
+
+================================================================================
+SECTION 4: RATE LIMITING AND PERFORMANCE
+================================================================================
+
+Q: A client is getting 429 Too Many Requests. How do you debug and fix this?
+A: DEBUGGING STEPS:
+   
+   1. Read the response headers:
+      X-RateLimit-Limit: 100         — total quota
+      X-RateLimit-Remaining: 0       — remaining requests
+      X-RateLimit-Reset: 1705300800  — Unix timestamp when limit resets
+      Retry-After: 60                — seconds to wait
+   
+   2. Identify the rate limit type:
+      - Per user/API key? (check X-RateLimit-Scope or docs)
+      - Per IP? (shared between team members?)
+      - Per endpoint? (some endpoints have tighter limits)
+      - Burst vs sustained? (token bucket: burst allowed; sliding window: no burst)
+   
+   3. Common fixes:
+      - Add exponential backoff with retry (respect Retry-After header)
+      - Cache responses to avoid repeated identical requests
+      - Request batching: /users?ids=1,2,3 instead of /users/1, /users/2, /users/3
+      - Upgrade tier / request quota increase
+      - Distribute calls across API keys (for internal systems)
+      - Reduce polling frequency; use webhooks/SSE instead
+   
+   CODE: Respect Retry-After header:
+   if (response.statusCode() == 429) {
+       long retryAfter = Long.parseLong(
+           response.headers().firstValue("Retry-After").orElse("60"));
+       Thread.sleep(retryAfter * 1000);
+       // retry
+   }
+
+Q: How would you implement distributed rate limiting?
+A: Distributed rate limiting requires shared state across all service instances.
+   Redis is the de facto standard.
+   
+   TOKEN BUCKET WITH REDIS LUA SCRIPT (atomic operation):
+   
+   local key = KEYS[1]
+   local capacity = tonumber(ARGV[1])
+   local refill_rate = tonumber(ARGV[2])
+   local now = tonumber(ARGV[3])
+   local tokens_requested = tonumber(ARGV[4])
+   
+   local data = redis.call("HMGET", key, "tokens", "last_refill")
+   local tokens = tonumber(data[1]) or capacity
+   local last_refill = tonumber(data[2]) or now
+   
+   local elapsed = now - last_refill
+   local refilled = elapsed * refill_rate
+   tokens = math.min(capacity, tokens + refilled)
+   
+   if tokens >= tokens_requested then
+       tokens = tokens - tokens_requested
+       redis.call("HMSET", key, "tokens", tokens, "last_refill", now)
+       redis.call("EXPIRE", key, 86400)
+       return {1, math.floor(tokens)}  -- allowed
+   else
+       redis.call("HMSET", key, "tokens", tokens, "last_refill", now)
+       return {0, 0}  -- rejected
+   end
+   
+   SLIDING WINDOW COUNTER (simpler, good for most cases):
+   local key = "rl:" .. userId .. ":" .. math.floor(now / window_ms)
+   local count = redis.call("INCR", key)
+   redis.call("EXPIRE", key, window_seconds * 2)  -- expire after 2 windows
+   return count <= limit
+   
+   PROS of Redis-based distributed rate limiting:
+   - Single source of truth across all instances
+   - Sub-millisecond operations
+   - Atomic Lua scripts prevent race conditions
+   - Redis cluster handles high throughput
+
+================================================================================
+SECTION 5: REAL-WORLD SYSTEM DESIGN SCENARIOS
+================================================================================
+
+Q: How would you design a real-time notification system?
+A: REQUIREMENTS:
+   - Push notifications to web clients (online users)
+   - Handle millions of users, not all online simultaneously
+   - Deliver to offline users when they reconnect
+   - Support notification types: in-app alerts, email, SMS, push
+
+   ARCHITECTURE:
+   
+   ONLINE USERS (real-time delivery):
+   SSE: client establishes SSE connection to Notification Service
+   GET /notifications/stream  → text/event-stream
+   
+   Notification Service manages: Map<userId, SseEmitter>
+   When event arrives (from Kafka): find user's emitter → send event
+   
+   For multi-node: use Redis Pub/Sub for fan-out to the correct node.
+   event.on("notification", userId) → Pub to Redis channel "notif:userId"
+   Each node subscribes to Redis; only the node holding that user's SSE sends.
+   
+   OFFLINE USERS:
+   Store notifications in DB (notification table with read/unread flag)
+   On SSE connect: send missed notifications (since last_seen_id)
+   
+   PERSISTENCE LAYER:
+   notifications table: id, userId, type, payload, read, createdAt
+   Index: (userId, read, createdAt) for unread notification queries
+   
+   PUSH FOR MOBILE:
+   Use FCM (Firebase Cloud Messaging) / APNs for mobile push
+   Notification Service → FCM API → Android/iOS device
+   
+   SCALING:
+   - SSE connections: each is a long-lived HTTP connection; use async/reactive
+     (WebFlux handles 100k+ SSE connections per instance)
+   - Redis Pub/Sub: fan-out within cluster
+   - Kafka: durable event log; decouple notification producers from the service
+
+Q: How would you build an API that handles 100k requests per second?
+A: This is a systems design question; think in layers:
+   
+   1. EDGE LAYER:
+      CDN: cache static content + cacheable API responses (product catalog)
+      DDoS protection, WAF, TLS termination at CDN/load balancer
+      Anycast routing: users connect to nearest PoP
+   
+   2. API GATEWAY LAYER:
+      Horizontal scaling: 10-20 gateway instances
+      Rate limiting: Redis-based, protect backends
+      Auth: JWT validation (stateless, no DB hit)
+      Connection pooling to backends
+   
+   3. APPLICATION LAYER:
+      Reactive (Spring WebFlux / Vert.x): non-blocking I/O handles many
+      concurrent connections per instance (vs thread-per-request servlet model)
+      Stateless: any instance handles any request
+      Auto-scaling: target 60-70% CPU to allow headroom
+   
+   4. DATABASE LAYER:
+      Read replicas: distribute read load (80-90% of DB load is reads)
+      Caching (Redis): L1 cache for hot data (user profiles, product data)
+      Connection pooling (HikariCP): 10-20 connections per instance
+      DB sharding: distribute write load across shards
+      Denormalization: pre-compute expensive joins
+   
+   5. ASYNC FOR HEAVY OPERATIONS:
+      Anything > 100ms: move to async queue (Kafka)
+      Decouple slow operations (email, analytics) from request path
+   
+   6. MONITORING:
+      p99 latency target: < 50ms for reads, < 200ms for writes
+      Alert on: error rate > 1%, p99 > SLA, queue depth growth
+      Chaos engineering: test failure scenarios regularly
+
+================================================================================
+SECTION 6: WEBSOCKET AND REAL-TIME DEEP DIVE
+================================================================================
+
+Q: How do you scale WebSocket connections across multiple nodes?
+A: Problem: WS connection is stateful — tied to one server. If you have
+   3 app nodes, a message to User A (connected to node 1) must reach node 1.
+   
+   SOLUTION 1: Redis Pub/Sub fan-out
+   All nodes subscribe to Redis channels. When node 2 receives a message
+   for User A, it publishes to Redis channel "ws:messages". All nodes receive
+   it; only node 1 (which has User A's connection) forwards to the client.
+   
+   Implementation:
+   @Service
+   public class WebSocketMessageRelay {
+       private final RedisTemplate<String, String> redis;
+       private final WebSocketSessionRegistry sessions;
+       
+       @PostConstruct
+       public void subscribeToMessages() {
+           redis.listenToChannel("ws:messages", message -> {
+               WsMessage msg = parse(message);
+               WebSocketSession session = sessions.get(msg.getUserId());
+               if (session != null) {
+                   session.sendMessage(new TextMessage(msg.getPayload()));
+               }
+           });
+       }
+       
+       public void sendToUser(String userId, String payload) {
+           redis.publish("ws:messages", new WsMessage(userId, payload));
+       }
+   }
+   
+   SOLUTION 2: STOMP with external broker (RabbitMQ/ActiveMQ)
+   Configure Spring STOMP to use external broker relay.
+   RabbitMQ handles message routing across nodes; clients subscribe to
+   /queue/user-specific-queue. Any node can publish; broker delivers to
+   correct subscriber regardless of which node they're connected to.
+   
+   SOLUTION 3: Sticky sessions (simple but fragile)
+   Load balancer routes user to same node each time (IP hash or cookie).
+   Works but: if node fails, all its WS connections drop; uneven load distribution.
+
+Q: What is the difference between WebSocket, SSE, and long polling? When to use each?
+A: LONG POLLING:
+   - Client makes request → server holds until data available → responds → repeat
+   - Compatible with everything (just HTTP)
+   - High overhead: new connection per message; not efficient for frequent messages
+   - Good for: legacy systems, infrequent updates, simple implementation
+   
+   SSE (Server-Sent Events):
+   - Single HTTP connection, server streams events to client
+   - Browser handles reconnection automatically
+   - Only server → client (one-directional)
+   - Works over HTTP/2 (many SSE streams share one TCP connection)
+   - Good for: live feeds, dashboards, notifications, stock prices
+   
+   WEBSOCKET:
+   - Full-duplex persistent connection (client ↔ server)
+   - Low overhead after handshake (2-8 byte frame header vs HTTP headers)
+   - Requires WSS (TLS) in production
+   - More complex: handle reconnection, heartbeats, auth per message
+   - Good for: chat, multiplayer games, live collaboration, trading platforms
+   
+   DECISION TREE:
+   - Need client-to-server messages? → WebSocket
+   - Server → client only? → SSE (simpler)
+   - Low frequency updates? → Long polling or SSE
+   - Need binary data (audio/video)? → WebSocket
+   - Fire-and-forget server push (mobile)? → FCM/APNs (WebSocket won't work when app is background)
+   
+   HTTP/2 + SSE: HTTP/2 eliminates the 6 connection limit per domain that made
+   HTTP/1.1 SSE impractical for many streams — this is why SSE has seen a
+   resurgence.
+
+================================================================================
+SECTION 7: BEHAVIORAL AND SITUATIONAL
+================================================================================
+
+Q: Tell me about a time you had to debug a production API performance issue.
+A: FRAMEWORK FOR ANSWERING (STAR):
+   
+   SITUATION: Describe the symptoms (high latency, timeouts, 500 errors)
+   Example: "Our order API's p99 latency spiked from 200ms to 8s after a deploy."
+   
+   TASK: What was your role and what needed to be solved
+   
+   ACTION (most important — detail your methodology):
+   1. Check monitoring/APM: identify which endpoint / which service
+   2. Check if correlated with deploy (rollback candidate?)
+   3. Look at metrics: DB query time? External service call? CPU/memory?
+   4. Distributed tracing (Jaeger/Zipkin): find the slow span
+   5. Found: new code added a JOIN that did a full table scan on orders table
+      (no index on the new filter column)
+   6. Added index → p99 dropped back to 200ms
+   
+   RESULT: Quantify impact (latency reduced by X%, X customers unaffected)
+   
+   LESSONS: Always check query plans for new queries; add monitoring for DB
+   slow queries (slow_query_log in MySQL, pg_stat_statements in PostgreSQL).
+
+Q: How do you handle backward compatibility when evolving an API?
+A: ADDITIVE CHANGES (safe, no versioning needed):
+   - Add new optional fields to responses
+   - Add new optional request fields (with defaults)
+   - Add new endpoints
+   - Add new query parameters (optional)
+   
+   BREAKING CHANGES (require versioning or migration):
+   - Remove or rename a field
+   - Change a field's type
+   - Change HTTP method or URL structure
+   - Change response status codes semantics
+   - Add required request fields
+   
+   STRATEGY:
+   1. Prefer additive changes; design responses to be extensible (clients ignore
+      unknown fields — Postel's Law: be liberal in what you accept)
+   2. For breaking changes: introduce v2 endpoint alongside v1
+   3. Run both versions simultaneously during migration period
+   4. Monitor v1 traffic; contact remaining consumers
+   5. Deprecation headers on v1; sunset after agreed period
+   6. Consumer-driven contract tests (Pact) catch breaking changes before deploy
+
+================================================================================

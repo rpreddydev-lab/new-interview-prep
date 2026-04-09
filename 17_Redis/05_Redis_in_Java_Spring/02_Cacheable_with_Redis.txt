@@ -1,0 +1,282 @@
+================================================================================
+SPRING @CACHEABLE WITH REDIS — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. SPRING CACHE ABSTRACTION
+─────────────────────────────
+  Spring Cache provides annotations that transparently cache method results.
+  When you annotate a method: Spring intercepts the call, checks the cache.
+  If cache hit: returns cached value without executing the method.
+  If cache miss: executes method, stores result in cache, returns result.
+
+  Core annotations:
+    @Cacheable      → cache method result; return cached on next call
+    @CachePut       → always execute method; always update cache
+    @CacheEvict     → remove entry from cache
+    @Caching        → group multiple cache annotations
+    @CacheConfig    → class-level defaults for all cache annotations
+
+
+2. DEPENDENCIES AND CONFIG
+────────────────────────────
+  <!-- Spring Boot automatically configures RedisCacheManager -->
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-cache</artifactId>
+  </dependency>
+
+  Enable caching:
+    @SpringBootApplication
+    @EnableCaching                  // ← required
+    public class MyApp { ... }
+
+  application.yml (basic):
+    spring:
+      cache:
+        type: redis
+      redis:
+        host: localhost
+        port: 6379
+
+
+3. REDICACHEMANAGER CONFIGURATION
+────────────────────────────────────
+  @Configuration
+  @EnableCaching
+  public class CacheConfig {
+
+      @Bean
+      public RedisCacheConfiguration defaultCacheConfig() {
+          return RedisCacheConfiguration.defaultCacheConfig()
+              .entryTtl(Duration.ofMinutes(10))              // default TTL
+              .serializeKeysWith(
+                  RedisSerializationContext.SerializationPair
+                      .fromSerializer(new StringRedisSerializer()))
+              .serializeValuesWith(
+                  RedisSerializationContext.SerializationPair
+                      .fromSerializer(new GenericJackson2JsonRedisSerializer()))
+              .disableCachingNullValues();                   // don't cache nulls
+      }
+
+      @Bean
+      public RedisCacheManager cacheManager(RedisConnectionFactory factory) {
+          // Per-cache TTL overrides
+          Map<String, RedisCacheConfiguration> cacheConfigs = new HashMap<>();
+          cacheConfigs.put("products",
+              RedisCacheConfiguration.defaultCacheConfig()
+                  .entryTtl(Duration.ofHours(1)));
+          cacheConfigs.put("sessions",
+              RedisCacheConfiguration.defaultCacheConfig()
+                  .entryTtl(Duration.ofMinutes(30)));
+
+          return RedisCacheManager.builder(factory)
+              .cacheDefaults(defaultCacheConfig())
+              .withInitialCacheConfigurations(cacheConfigs)
+              .build();
+      }
+  }
+
+
+4. @CACHEABLE
+──────────────
+  Caches the return value. Subsequent calls with same key return cached value.
+
+  @Service
+  public class ProductService {
+
+      @Cacheable("products")                    // cache name = "products"
+      public Product getProduct(Long id) {
+          return productRepository.findById(id) // only called on cache miss
+              .orElseThrow();
+      }
+
+      // Custom cache key (SpEL expression)
+      @Cacheable(value = "products", key = "#id")
+      public Product getById(Long id) { ... }
+
+      // Composite key
+      @Cacheable(value = "products", key = "#category + ':' + #page")
+      public List<Product> getByCategory(String category, int page) { ... }
+
+      // Method parameter object field
+      @Cacheable(value = "orders", key = "#request.userId + ':' + #request.status")
+      public List<Order> getOrders(OrderRequest request) { ... }
+
+      // Conditional caching (only cache if condition true)
+      @Cacheable(value = "products", key = "#id", condition = "#id > 0")
+      public Product getProduct(Long id) { ... }
+
+      // Unless (don't cache if result meets condition)
+      @Cacheable(value = "products", key = "#id", unless = "#result == null")
+      public Product getProduct(Long id) { ... }
+  }
+
+  Redis key format: "products::<key>"
+  e.g., @Cacheable("products") with key "#id" and id=42:
+    → Redis key: "products::42"
+
+
+5. @CACHEPUT
+─────────────
+  ALWAYS executes the method AND updates the cache.
+  Used when you want to update both DB and cache atomically.
+
+  @CachePut(value = "products", key = "#product.id")
+  public Product updateProduct(Product product) {
+      return productRepository.save(product);   // always called
+  }
+  // Result: DB updated + cache updated with new value
+
+
+6. @CACHEEVICT
+───────────────
+  Removes cache entry. Triggered on method call.
+
+  // Evict single entry
+  @CacheEvict(value = "products", key = "#id")
+  public void deleteProduct(Long id) {
+      productRepository.deleteById(id);
+  }
+
+  // Evict entire cache
+  @CacheEvict(value = "products", allEntries = true)
+  public void clearProductCache() { }
+
+  // Evict before method execution (beforeInvocation = true)
+  @CacheEvict(value = "products", key = "#id", beforeInvocation = true)
+  public void deleteProduct(Long id) {
+      productRepository.deleteById(id);
+  }
+  // Default: evict AFTER method completes
+  // beforeInvocation = true: evict even if method throws an exception
+
+
+7. @CACHING — MULTIPLE ANNOTATIONS
+─────────────────────────────────────
+  // Update cache under two different names
+  @Caching(
+      put = {
+          @CachePut(value = "products", key = "#result.id"),
+          @CachePut(value = "products-by-sku", key = "#result.sku")
+      }
+  )
+  public Product saveProduct(Product product) { ... }
+
+  // Evict from multiple caches
+  @Caching(
+      evict = {
+          @CacheEvict(value = "products", key = "#id"),
+          @CacheEvict(value = "products-by-sku", allEntries = true)
+      }
+  )
+  public void deleteProduct(Long id) { ... }
+
+
+8. @CACHECONFIG — CLASS-LEVEL DEFAULTS
+─────────────────────────────────────────
+  @Service
+  @CacheConfig(cacheNames = "products")  // default cache name for this class
+  public class ProductService {
+
+      @Cacheable                           // uses "products"
+      public Product getProduct(Long id) { ... }
+
+      @CachePut(key = "#result.id")        // uses "products"
+      public Product save(Product p) { ... }
+
+      @CacheEvict(key = "#id")             // uses "products"
+      public void delete(Long id) { ... }
+  }
+
+
+9. CUSTOM KEY GENERATOR
+─────────────────────────
+  Default key: generated from method parameter values.
+  Custom key generator:
+
+  @Bean
+  public KeyGenerator customKeyGenerator() {
+      return (target, method, params) -> {
+          StringBuilder sb = new StringBuilder();
+          sb.append(target.getClass().getSimpleName()).append(":");
+          sb.append(method.getName()).append(":");
+          for (Object p : params) sb.append(p).append(":");
+          return sb.toString();
+      };
+  }
+
+  @Cacheable(value = "products", keyGenerator = "customKeyGenerator")
+  public Product getProduct(Long id) { ... }
+
+
+10. CACHE ASIDE PATTERN MANUALLY (WITHOUT @CACHEABLE)
+───────────────────────────────────────────────────────
+  @Autowired StringRedisTemplate redisTemplate;
+  @Autowired ObjectMapper objectMapper;
+
+  public Product getProduct(Long id) throws Exception {
+      String key = "products:" + id;
+      String cached = redisTemplate.opsForValue().get(key);
+      if (cached != null) {
+          return objectMapper.readValue(cached, Product.class);
+      }
+      Product product = productRepository.findById(id).orElseThrow();
+      redisTemplate.opsForValue().set(key,
+          objectMapper.writeValueAsString(product),
+          1, TimeUnit.HOURS);
+      return product;
+  }
+
+
+11. CACHE SERIALIZATION ISSUE — COMMON PITFALL
+────────────────────────────────────────────────
+  Problem: Default Spring Boot cache uses JDK serialization.
+    Value stored as binary blob — unreadable in redis-cli.
+    Not portable across Java versions.
+    Classes must be Serializable.
+
+  Solution: Configure JSON serializer (see section 3 above).
+
+  Another pitfall: ClassCastException on deserialization.
+    GenericJackson2JsonRedisSerializer stores type info:
+    {"@class":"com.example.Product","id":42,"name":"Widget"}
+    → Works fine as long as class package hasn't changed.
+    If you refactor the class package: cached values become undeserializable.
+    → Must FLUSH the cache after package refactoring.
+
+
+12. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: What's the difference between @Cacheable and @CachePut?
+  A: @Cacheable skips the method execution on cache hit and returns the cached
+     value. @CachePut always executes the method and updates the cache with the
+     result. Use @Cacheable for reads, @CachePut for write-through updates where
+     you want both the DB and cache updated.
+
+  Q: How does @CacheEvict work with beforeInvocation?
+  A: By default (beforeInvocation=false), the cache entry is evicted AFTER the
+     method completes successfully. If the method throws an exception, the cache
+     is NOT evicted (protects consistency). With beforeInvocation=true, eviction
+     happens before execution — the cache is always cleared even if the method
+     fails, which can leave you with a cache miss until the next read.
+
+  Q: How do you set different TTLs for different caches?
+  A: Use RedisCacheManager with per-cache RedisCacheConfiguration overrides:
+     RedisCacheManager.builder(factory)
+         .cacheDefaults(defaultConfig)
+         .withInitialCacheConfigurations(Map.of(
+             "products", config.entryTtl(Duration.ofHours(1)),
+             "sessions", config.entryTtl(Duration.ofMinutes(30))
+         )).build();
+
+  Q: What format does Spring Cache use for Redis keys?
+  A: Default format: "<cacheName>::<key>", e.g., "products::42".
+     The key part is determined by the SpEL expression in the key attribute,
+     or auto-generated from parameters if not specified. You can customize
+     the separator with RedisCacheConfiguration.computePrefixWith().
+
+================================================================================

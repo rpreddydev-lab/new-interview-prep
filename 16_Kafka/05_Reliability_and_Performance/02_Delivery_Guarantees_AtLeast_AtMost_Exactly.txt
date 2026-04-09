@@ -1,0 +1,196 @@
+================================================================================
+  KAFKA DELIVERY GUARANTEES — AT-MOST, AT-LEAST, EXACTLY-ONCE
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. THE THREE DELIVERY GUARANTEES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  AT-MOST-ONCE:   message may be lost, never duplicated
+  AT-LEAST-ONCE:  message may be duplicated, never lost
+  EXACTLY-ONCE:   message delivered and processed exactly once (no loss, no duplicate)
+
+These guarantees span two dimensions:
+  1. PRODUCER → BROKER: can the write be duplicated or lost?
+  2. CONSUMER → PROCESSING: can the processing be repeated or skipped?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. AT-MOST-ONCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PRODUCER SIDE:
+  - acks=0: producer sends and immediately continues — no ack awaited
+  - If broker is down or slow → message silently dropped
+  - Highest throughput, lowest latency
+
+CONSUMER SIDE:
+  - Commit offsets BEFORE processing
+  - If consumer crashes after commit but before processing → record skipped
+
+  Consumer pattern:
+    consumer.commitSync();       // commit FIRST
+    process(records);            // then process
+    // Crash here → records skipped
+
+Use case:
+  - Metrics collection: occasional dropped data-point is acceptable
+  - Activity tracking: losing a few page-view events is tolerable
+  - Log pipeline where gaps are okay
+
+Config:
+  acks=0
+  enable.auto.commit=true (auto commits before poll returns, in theory)
+  OR:
+  enable.auto.commit=false
+  consumer.commitSync() before processing loop
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. AT-LEAST-ONCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PRODUCER SIDE:
+  - acks=1 or acks=all: producer waits for broker acknowledgement
+  - If network drops the ack → producer retries → duplicate may be written
+  - Broker has the message; producer doesn't know → retries create duplicates
+
+  Timeline (acks=1, retry scenario):
+    Producer sends record
+    Broker writes + acks → ack lost in network
+    Producer timeout → retries
+    Broker writes AGAIN → DUPLICATE in partition!
+
+CONSUMER SIDE:
+  - Process records THEN commit offset
+  - If consumer crashes between processing and commit → reprocessing on restart
+  - Application must tolerate duplicates (idempotent processing)
+
+  Consumer pattern:
+    process(records);            // process first
+    consumer.commitSync();       // then commit
+    // Crash here → records reprocessed on restart (duplicate, but no loss)
+
+Idempotent processing to handle duplicates:
+  - Database UPSERT with primary key (deduplicates by record ID)
+  - Check-before-write: "has order-123 been processed?"
+  - Versioned updates: ignore updates for a version already seen
+
+Config (reliable at-least-once):
+  acks=all
+  retries=MAX_INT
+  enable.idempotence=true (prevents broker-side duplicates from retries)
+  enable.auto.commit=false
+  manual commitSync() after processing
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. EXACTLY-ONCE — KAFKA TRANSACTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Exactly-once within Kafka (Kafka-to-Kafka):
+  - Use transactional producer + sendOffsetsToTransaction
+  - Consumer uses isolation.level=read_committed
+
+  producer.initTransactions();
+  while (true) {
+    ConsumerRecords<K, V> records = consumer.poll(duration);
+    producer.beginTransaction();
+    try {
+      for (ConsumerRecord<K, V> record : records) {
+        producer.send(new ProducerRecord<>(outputTopic, record.key(), transform(record.value())));
+      }
+      // Tie the consumer offset commit to the transaction
+      producer.sendOffsetsToTransaction(offsets(records), consumer.groupMetadata());
+      producer.commitTransaction();   // atomic: writes + offset advance
+    } catch (Exception e) {
+      producer.abortTransaction();    // nothing committed, offset not advanced
+    }
+  }
+
+Requirements:
+  Producer:
+    transactional.id = unique stable ID per producer instance
+    enable.idempotence = true (auto-set)
+    acks = all (auto-set)
+  Consumer:
+    enable.auto.commit = false
+    isolation.level = read_committed
+
+Exactly-once OUTSIDE Kafka (to external systems):
+  Kafka transactions only work Kafka-to-Kafka. For writes to a database or HTTP API,
+  you cannot use Kafka transactions. Options:
+
+  a) Idempotent processing + at-least-once:
+     - Application logic ensures duplicate writes are safe (UPSERT by primary key)
+     - Simplest and most common real-world approach
+
+  b) External transactional store:
+     - Write result to database AND save the Kafka offset in the SAME DB transaction
+     - On restart: query DB for last offset → seek consumer to that offset
+     - True exactly-once at application level (no Kafka transactions needed)
+
+  c) Two-phase commit (complex, rarely used):
+     - Distributed transaction between Kafka and external system
+     - Very complex and fragile; not recommended
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. COMPARISON TABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌────────────────────┬───────────────────────┬───────────────────────────────┐
+  │ Semantic           │ Config                │ Use Case                      │
+  ├────────────────────┼───────────────────────┼───────────────────────────────┤
+  │ At-most-once       │ acks=0                │ Metrics, activity tracking    │
+  │                    │ commit before process │ Where loss is tolerable       │
+  ├────────────────────┼───────────────────────┼───────────────────────────────┤
+  │ At-least-once      │ acks=all              │ Most business events          │
+  │                    │ idempotence=true      │ Email notifications (dedup OK)│
+  │                    │ commit after process  │ Order processing              │
+  ├────────────────────┼───────────────────────┼───────────────────────────────┤
+  │ Exactly-once       │ transactional.id      │ Financial transactions        │
+  │ (Kafka-to-Kafka)   │ sendOffsets...        │ Billing / inventory           │
+  │                    │ read_committed        │ Kafka Streams pipelines       │
+  └────────────────────┴───────────────────────┴───────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: How does the producer create duplicate messages even with retries?
+A: The producer sends a record and waits for a broker acknowledgement. If the
+   broker writes the record but the network drops the ack before it reaches the
+   producer, the producer times out and retries. The broker receives the retry
+   and writes a SECOND copy — a duplicate. The producer never knew the first write
+   succeeded. Solution: enable.idempotence=true — Kafka deduplicates using
+   (Producer ID, partition, sequence number).
+
+Q: Can you achieve exactly-once when writing from Kafka to a database?
+A: Not using Kafka transactions alone — Kafka transactions only guarantee atomic
+   writes across Kafka topics. For Kafka-to-database, the standard approach is
+   at-least-once with idempotent database writes (UPSERT by primary key). For
+   true exactly-once, store the Kafka offset atomically in the SAME database
+   transaction as the result. On restart, seek the consumer to the DB-stored
+   offset. This achieves exactly-once at the application level.
+
+Q: What is the danger of auto-commit with at-most-once semantics?
+A: Auto-commit commits offsets in the background on a timer. It may commit the
+   offset of records that the consumer received via poll() but hasn't yet processed.
+   If the consumer crashes between the auto-commit and actual processing, those
+   records won't be re-read (offset already advanced) — they're silently lost.
+   This is only acceptable for low-value data. For business-critical data, always
+   use manual commit-after-processing (at-least-once).
+
+Q: What does isolation.level=read_committed do and when is it required?
+A: With read_committed, a consumer only reads records that are part of a committed
+   transaction or written without a transaction. Records from open or aborted
+   transactions are invisible. This is required for the consumer side of an
+   exactly-once pipeline: without it, the consumer could read records from an
+   ongoing transaction that may later be aborted. The trade-off: consumer can
+   only advance to the Last Stable Offset (LSO), not the High Watermark.
+
+Q: What is the most pragmatic way to handle duplicates in at-least-once systems?
+A: Include a unique idempotency key in each message (e.g., UUID, order-ID).
+   At the consumer, use database UPSERT (INSERT ... ON CONFLICT UPDATE) keyed on
+   that ID. This makes duplicate processing safe: the second write is just an
+   identical upsert that updates the same row. This pattern is widely used in
+   production because it's simpler and more portable than Kafka transactions,
+   while achieving the same end result.

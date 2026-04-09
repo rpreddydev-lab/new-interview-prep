@@ -1,0 +1,567 @@
+========================================================
+SPRING SECURITY — OAUTH2 RESOURCE SERVER
+========================================================
+
+A Resource Server is a service that hosts protected resources (APIs) and
+validates access tokens to allow or deny access. In OAuth2 terms, when your
+Spring Boot application exposes APIs and accepts Bearer tokens from clients,
+it's acting as a Resource Server.
+
+Spring Security provides first-class support for OAuth2 Resource Servers
+via the spring-boot-starter-oauth2-resource-server dependency.
+
+========================================================
+1. DEPENDENCY & AUTO-CONFIGURATION
+========================================================
+
+Maven:
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+</dependency>
+
+When this starter is on the classpath, Spring Boot will:
+  - Configure BearerTokenAuthenticationFilter
+  - Set up JwtDecoder (if issuer-uri is configured) OR
+    OpaqueTokenIntrospector (if introspection-uri is configured)
+
+Minimal application.yml for JWT Resource Server:
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://auth-server.example.com
+          # OR specify JWKS directly:
+          jwk-set-uri: https://auth-server.example.com/.well-known/jwks.json
+
+With just this config, Spring Security will:
+  1. Auto-discover JWKS endpoint via /.well-known/openid-configuration
+  2. Cache public keys from JWKS endpoint
+  3. Validate JWT signature, issuer, and expiration on every request
+  4. Map scopes to authorities with SCOPE_ prefix
+
+========================================================
+2. BASIC RESOURCE SERVER CONFIGURATION
+========================================================
+
+@Configuration
+@EnableWebSecurity
+public class ResourceServerConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/public/**").permitAll()
+                .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                .anyRequest().authenticated()
+            )
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(Customizer.withDefaults())  // Uses auto-configured JwtDecoder
+            )
+            .csrf(csrf -> csrf.disable())
+            .sessionManagement(session -> session
+                .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            );
+
+        return http.build();
+    }
+}
+
+========================================================
+3. JWTDECODER BEAN
+========================================================
+
+The JwtDecoder is responsible for:
+  1. Downloading and caching JWKS (public keys)
+  2. Verifying JWT signature
+  3. Parsing JWT claims
+  4. Validating standard claims (iss, exp, iat, nbf)
+
+Auto-configured JwtDecoder (via issuer-uri):
+  Spring Boot creates a NimbusJwtDecoder that:
+  - Hits {issuer-uri}/.well-known/openid-configuration
+  - Retrieves jwks_uri from discovery document
+  - Fetches public keys from jwks_uri
+  - Caches them (refreshes on unknown kid)
+
+Custom JwtDecoder beans:
+
+// Option 1: From JWKS URI (asymmetric - RS256/ES256)
+@Bean
+public JwtDecoder jwtDecoder() {
+    return NimbusJwtDecoder.withJwkSetUri("https://auth-server.example.com/jwks")
+        .jwsAlgorithm(SignatureAlgorithm.RS256)  // Restrict algorithm!
+        .build();
+}
+
+// Option 2: From symmetric secret (HS256)
+@Bean
+public JwtDecoder jwtDecoder() {
+    SecretKeySpec secretKey = new SecretKeySpec(
+        "my-secret-key-32-chars-minimum".getBytes(), "HmacSHA256");
+    return NimbusJwtDecoder.withSecretKey(secretKey)
+        .macAlgorithm(MacAlgorithm.HS256)
+        .build();
+}
+
+// Option 3: From RSA public key (for testing/single-AS setups)
+@Bean
+public JwtDecoder jwtDecoder() throws Exception {
+    RSAPublicKey publicKey = loadPublicKeyFromFile("/keys/public.pem");
+    return NimbusJwtDecoder.withPublicKey(publicKey).build();
+}
+
+// Option 4: Issuer-uri with custom validator
+@Bean
+public JwtDecoder jwtDecoder(OAuth2ResourceServerProperties properties) {
+    NimbusJwtDecoder decoder = NimbusJwtDecoder
+        .withIssuerLocation(properties.getJwt().getIssuerUri())
+        .build();
+
+    // Add custom validators
+    OAuth2TokenValidator<Jwt> withIssuer =
+        JwtValidators.createDefaultWithIssuer(properties.getJwt().getIssuerUri());
+    OAuth2TokenValidator<Jwt> withAudience = new JwtClaimValidator<List<String>>(
+        JwtClaimNames.AUD,
+        aud -> aud != null && aud.contains("my-api")
+    );
+    OAuth2TokenValidator<Jwt> validators =
+        new DelegatingOAuth2TokenValidator<>(withIssuer, withAudience);
+
+    decoder.setJwtValidator(validators);
+    return decoder;
+}
+
+========================================================
+4. JWT VALIDATION — CUSTOM VALIDATORS
+========================================================
+
+Beyond signature verification, you often need to validate:
+  - Audience (aud) claim: Is this token meant for MY service?
+  - Custom claims: Does the token have required custom fields?
+
+Custom OAuth2TokenValidator:
+
+// Audience validator
+public class AudienceValidator implements OAuth2TokenValidator<Jwt> {
+
+    private final String expectedAudience;
+
+    @Override
+    public OAuth2TokenValidatorResult validate(Jwt jwt) {
+        List<String> audiences = jwt.getAudience();
+        if (audiences.contains(expectedAudience)) {
+            return OAuth2TokenValidatorResult.success();
+        }
+        return OAuth2TokenValidatorResult.failure(
+            new OAuth2Error("invalid_token",
+                "Token audience missing: " + expectedAudience, null)
+        );
+    }
+}
+
+// Custom claim validator
+public class TenantValidator implements OAuth2TokenValidator<Jwt> {
+
+    @Override
+    public OAuth2TokenValidatorResult validate(Jwt jwt) {
+        String tenantId = jwt.getClaimAsString("tenant_id");
+        if (tenantId != null && !tenantId.isBlank()) {
+            return OAuth2TokenValidatorResult.success();
+        }
+        return OAuth2TokenValidatorResult.failure(
+            new OAuth2Error("invalid_token", "Missing tenant_id claim", null)
+        );
+    }
+}
+
+// Wire validators
+@Bean
+public JwtDecoder jwtDecoder() {
+    NimbusJwtDecoder decoder = NimbusJwtDecoder
+        .withJwkSetUri("https://auth-server.example.com/jwks")
+        .build();
+
+    OAuth2TokenValidator<Jwt> validators = new DelegatingOAuth2TokenValidator<>(
+        JwtValidators.createDefaultWithIssuer("https://auth-server.example.com"),
+        new AudienceValidator("my-resource-server"),
+        new TenantValidator()
+    );
+
+    decoder.setJwtValidator(validators);
+    return decoder;
+}
+
+========================================================
+5. JWT AUTHENTICATION CONVERTER
+========================================================
+
+The JwtAuthenticationConverter converts a validated Jwt into an
+Authentication object (specifically a JwtAuthenticationToken).
+
+Key responsibility: mapping JWT claims → Spring Security GrantedAuthorities
+
+Default behavior:
+  - Reads "scope" or "scp" claim
+  - Maps each scope to "SCOPE_{scope}" authority
+
+Custom authorities from custom claims:
+
+// For Keycloak realm_access.roles:
+@Bean
+public JwtAuthenticationConverter jwtAuthenticationConverter() {
+    JwtAuthenticationConverter converter = new JwtAuthenticationConverter();
+    converter.setJwtGrantedAuthoritiesConverter(jwt -> {
+        List<GrantedAuthority> authorities = new ArrayList<>();
+
+        // Realm roles from Keycloak
+        Map<String, Object> realmAccess =
+            jwt.getClaimAsMap("realm_access");
+        if (realmAccess != null) {
+            List<String> roles = (List<String>) realmAccess.get("roles");
+            if (roles != null) {
+                roles.stream()
+                    .map(role -> new SimpleGrantedAuthority("ROLE_" + role.toUpperCase()))
+                    .forEach(authorities::add);
+            }
+        }
+
+        // Client roles from Keycloak resource_access
+        Map<String, Object> resourceAccess =
+            jwt.getClaimAsMap("resource_access");
+        if (resourceAccess != null) {
+            Map<String, Object> clientAccess =
+                (Map<String, Object>) resourceAccess.get("my-client");
+            if (clientAccess != null) {
+                List<String> clientRoles = (List<String>) clientAccess.get("roles");
+                if (clientRoles != null) {
+                    clientRoles.stream()
+                        .map(r -> new SimpleGrantedAuthority("ROLE_" + r.toUpperCase()))
+                        .forEach(authorities::add);
+                }
+            }
+        }
+
+        // Standard scopes
+        String scope = jwt.getClaimAsString("scope");
+        if (scope != null) {
+            Arrays.stream(scope.split(" "))
+                .map(s -> new SimpleGrantedAuthority("SCOPE_" + s))
+                .forEach(authorities::add);
+        }
+
+        return authorities;
+    });
+    return converter;
+}
+
+Wire into security config:
+.oauth2ResourceServer(oauth2 -> oauth2
+    .jwt(jwt -> jwt
+        .jwtAuthenticationConverter(jwtAuthenticationConverter())
+    )
+)
+
+========================================================
+6. BEARER TOKEN AUTHENTICATION FILTER
+========================================================
+
+BearerTokenAuthenticationFilter runs before AuthorizationFilter and:
+  1. Reads Authorization header: "Bearer <token>"
+  2. Extracts token using BearerTokenExtractor
+  3. Creates BearerTokenAuthenticationToken
+  4. Passes to AuthenticationManager
+
+Token extraction customization:
+  - Default: reads Authorization: Bearer header
+  - Custom: can extract from query param (not recommended for production)
+
+// Custom bearer token resolver (e.g., also accept query param for WebSockets):
+@Bean
+public BearerTokenResolver bearerTokenResolver() {
+    DefaultBearerTokenResolver resolver = new DefaultBearerTokenResolver();
+    resolver.setAllowFormEncodedBodyParameter(false);
+    resolver.setAllowUriQueryParameter(true);  // Allow ?access_token=... (WS use case)
+    return resolver;
+}
+
+// Wire:
+.oauth2ResourceServer(oauth2 -> oauth2
+    .bearerTokenResolver(bearerTokenResolver())
+    .jwt(Customizer.withDefaults())
+)
+
+========================================================
+7. OPAQUE TOKEN RESOURCE SERVER
+========================================================
+
+For opaque (reference) tokens, Spring Security calls the Authorization Server's
+introspection endpoint to validate each token.
+
+application.yml:
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        opaquetoken:
+          introspection-uri: https://auth-server.example.com/oauth2/introspect
+          client-id: resource-server-client
+          client-secret: resource-server-secret
+
+Java config:
+.oauth2ResourceServer(oauth2 -> oauth2
+    .opaqueToken(opaque -> opaque
+        .introspectionUri("https://auth-server.example.com/oauth2/introspect")
+        .introspectionClientCredentials("resource-server-client", "secret")
+    )
+)
+
+Custom OpaqueTokenIntrospector (with caching):
+
+@Component
+public class CachingOpaqueTokenIntrospector implements OpaqueTokenIntrospector {
+
+    private final NimbusOpaqueTokenIntrospector delegate;
+    private final Cache<String, OAuth2AuthenticatedPrincipal> cache;
+
+    public CachingOpaqueTokenIntrospector(
+            OAuth2ResourceServerProperties properties) {
+        this.delegate = new NimbusOpaqueTokenIntrospector(
+            properties.getOpaquetoken().getIntrospectionUri(),
+            properties.getOpaquetoken().getClientId(),
+            properties.getOpaquetoken().getClientSecret()
+        );
+        this.cache = Caffeine.newBuilder()
+            .expireAfterWrite(5, TimeUnit.MINUTES)
+            .maximumSize(10_000)
+            .build();
+    }
+
+    @Override
+    public OAuth2AuthenticatedPrincipal introspect(String token) {
+        return cache.get(token, t -> {
+            OAuth2AuthenticatedPrincipal principal = delegate.introspect(t);
+            // Only cache active tokens
+            Boolean active = principal.getAttribute("active");
+            if (active == null || !active) {
+                throw new OAuth2AuthenticationException(
+                    new OAuth2Error("invalid_token", "Token is not active", null));
+            }
+            return principal;
+        });
+    }
+}
+
+========================================================
+8. MULTI-TENANT RESOURCE SERVER
+========================================================
+
+For multi-tenant apps where tokens can come from different issuers:
+
+@Component
+public class TenantJwtIssuerValidator implements OAuth2TokenValidator<Jwt> {
+
+    private final Map<String, JwtIssuerValidator> validators = new ConcurrentHashMap<>();
+    private final TenantRepository tenantRepository;
+
+    @Override
+    public OAuth2TokenValidatorResult validate(Jwt jwt) {
+        String issuer = jwt.getIssuer().toString();
+        JwtIssuerValidator validator = validators.computeIfAbsent(
+            issuer, this::fromIssuer);
+        return validator.validate(jwt);
+    }
+
+    private JwtIssuerValidator fromIssuer(String issuer) {
+        // Verify this is a known tenant's issuer
+        if (!tenantRepository.existsByIssuer(issuer)) {
+            throw new IllegalArgumentException("Unknown tenant: " + issuer);
+        }
+        return new JwtIssuerValidator(issuer);
+    }
+}
+
+// Or use AuthenticationManagerResolver for per-tenant JwtDecoder:
+@Bean
+public AuthenticationManagerResolver<HttpServletRequest>
+        authenticationManagerResolver() {
+    return request -> {
+        String tenantId = request.getHeader("X-Tenant-ID");
+        JwtDecoder decoder = resolveDecoderForTenant(tenantId);
+        JwtAuthenticationProvider provider = new JwtAuthenticationProvider(decoder);
+        provider.setJwtAuthenticationConverter(jwtAuthenticationConverter());
+        return provider::authenticate;
+    };
+}
+
+// Wire:
+.oauth2ResourceServer(oauth2 -> oauth2
+    .authenticationManagerResolver(authenticationManagerResolver())
+)
+
+========================================================
+9. RESOURCE SERVER COMPLETE EXAMPLE
+========================================================
+
+// application.yml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://keycloak.example.com/realms/my-realm
+
+// SecurityConfig.java
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+public class ResourceServerConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/actuator/health").permitAll()
+                .requestMatchers("/api/public/**").permitAll()
+                .anyRequest().authenticated()
+            )
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(jwt -> jwt
+                    .jwtAuthenticationConverter(jwtAuthenticationConverter())
+                    .decoder(jwtDecoder())
+                )
+            )
+            .exceptionHandling(ex -> ex
+                .authenticationEntryPoint(new BearerTokenAuthenticationEntryPoint())
+                .accessDeniedHandler(new BearerTokenAccessDeniedHandler())
+            )
+            .csrf(AbstractHttpConfigurer::disable)
+            .sessionManagement(s -> s
+                .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            );
+
+        return http.build();
+    }
+
+    @Bean
+    public JwtDecoder jwtDecoder() {
+        String issuerUri = "https://keycloak.example.com/realms/my-realm";
+        NimbusJwtDecoder decoder = NimbusJwtDecoder
+            .withIssuerLocation(issuerUri)
+            .jwsAlgorithm(SignatureAlgorithm.RS256)
+            .build();
+
+        OAuth2TokenValidator<Jwt> validators = new DelegatingOAuth2TokenValidator<>(
+            JwtValidators.createDefaultWithIssuer(issuerUri),
+            new AudienceValidator("my-api")
+        );
+        decoder.setJwtValidator(validators);
+        return decoder;
+    }
+
+    @Bean
+    public JwtAuthenticationConverter jwtAuthenticationConverter() {
+        JwtAuthenticationConverter converter = new JwtAuthenticationConverter();
+        converter.setJwtGrantedAuthoritiesConverter(jwt -> {
+            List<GrantedAuthority> authorities = new ArrayList<>();
+
+            // Keycloak realm roles
+            Map<String, Object> realmAccess = jwt.getClaimAsMap("realm_access");
+            if (realmAccess instanceof Map) {
+                @SuppressWarnings("unchecked")
+                List<String> roles = (List<String>) realmAccess.get("roles");
+                if (roles != null) {
+                    roles.forEach(role ->
+                        authorities.add(new SimpleGrantedAuthority("ROLE_" + role.toUpperCase())));
+                }
+            }
+            return authorities;
+        });
+        return converter;
+    }
+}
+
+// OrderController.java
+@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+
+    @GetMapping
+    @PreAuthorize("hasRole('USER') or hasRole('ADMIN')")
+    public List<Order> getOrders(@AuthenticationPrincipal Jwt jwt) {
+        String userId = jwt.getSubject();
+        return orderService.findOrdersByUser(userId);
+    }
+
+    @DeleteMapping("/{id}")
+    @PreAuthorize("hasRole('ADMIN')")
+    public void deleteOrder(@PathVariable Long id) {
+        orderService.delete(id);
+    }
+}
+
+========================================================
+10. JWKS CACHING AND KEY ROTATION
+========================================================
+
+Spring Security's NimbusJwtDecoder caches JWKS:
+  - Keys are cached in memory after first fetch
+  - On unknown kid (key ID): automatically re-fetches JWKS
+  - This enables zero-downtime key rotation
+
+Key rotation process:
+  1. AS generates new key pair
+  2. Adds new public key to JWKS (keep old key too)
+  3. Start signing new tokens with new private key (include new kid)
+  4. Resource Server on unknown kid: re-fetches JWKS, finds new key
+  5. After all old tokens expire: remove old key from JWKS
+
+JWKS caching behavior:
+  - Cache refresh: Triggered by unknown kid in incoming JWT
+  - No TTL by default (refreshed on demand)
+  - Thread-safe
+
+========================================================
+11. COMMON INTERVIEW QUESTIONS
+========================================================
+
+Q: What is the difference between a Resource Server and Authorization Server?
+A: Authorization Server (AS) issues tokens, manages client registrations, user
+   authentication. Resource Server (RS) validates tokens and protects APIs.
+   A single application can be both, but it's better to separate them.
+
+Q: How does Spring Security validate JWT tokens?
+A: 1) BearerTokenAuthenticationFilter extracts token from Authorization header
+   2) JwtAuthenticationProvider calls JwtDecoder.decode()
+   3) NimbusJwtDecoder fetches JWKS, verifies signature
+   4) Validates registered claims: exp (not expired), iss (matches expected issuer)
+   5) Custom validators run (audience, custom claims)
+   6) JwtAuthenticationConverter maps claims to GrantedAuthorities
+   7) Authentication stored in SecurityContextHolder
+
+Q: How do you validate the audience claim in Spring Security?
+A: Implement OAuth2TokenValidator<Jwt> that checks jwt.getAudience().contains("your-api")
+   and wire it via decoder.setJwtValidator(new DelegatingOAuth2TokenValidator<>(
+       JwtValidators.createDefaultWithIssuer(issuer), audienceValidator)).
+
+Q: What happens when the Authorization Server rotates JWT signing keys?
+A: Spring Security's NimbusJwtDecoder re-fetches JWKS when it encounters an unknown
+   kid (key ID) in the JWT header. This supports zero-downtime key rotation.
+   The AS must keep old keys in JWKS until all tokens signed with them expire.
+
+Q: How do you protect against algorithm confusion attacks in Spring Security?
+A: Use .jwsAlgorithm(SignatureAlgorithm.RS256) in NimbusJwtDecoder to restrict
+   which algorithms are accepted. Never allow the "none" algorithm.
+
+Q: What is BearerTokenAuthenticationFilter?
+A: It's a Spring Security filter that reads the Authorization: Bearer header,
+   extracts the token, and creates an authentication request. It then delegates
+   to AuthenticationManager which uses JwtAuthenticationProvider or
+   OpaqueTokenAuthenticationProvider to validate the token.
+
+Q: When would you use opaque tokens vs JWT in a Resource Server?
+A: JWT: When latency is critical, token volume is high, and you want local validation.
+   Opaque: When you need immediate revocation, tokens contain sensitive data, or
+   the introspection overhead is acceptable (typically internal/trusted services).

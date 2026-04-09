@@ -1,0 +1,368 @@
+================================================================================
+RATE LIMITING STRATEGIES — IN DEPTH
+================================================================================
+
+WHAT IS RATE LIMITING?
+-----------------------
+Rate limiting controls how many requests a client can make to an API within a
+time window. Protects backend services from overload, prevents abuse and
+scraping, and enables fair resource allocation among API consumers.
+
+Distinguished from throttling:
+  Rate Limiting : Hard limit — reject requests exceeding the quota (429 Too Many Requests)
+  Throttling    : Slow down — delay processing of excess requests (queue them)
+
+Rate limiting dimensions:
+  Per IP address
+  Per user / API key
+  Per API endpoint
+  Per tenant (multi-tenant SaaS)
+  Global (total across all clients)
+  Combination (user + endpoint)
+
+================================================================================
+1. FIXED WINDOW COUNTER
+================================================================================
+
+CONCEPT:
+  Divide time into fixed-size windows (e.g., 1 minute buckets).
+  Count requests per window. Reset counter at window boundary.
+
+  Window 1: [10:00:00 - 10:00:59]  → counter = 100/100 → ALLOW
+  Window 2: [10:01:00 - 10:01:59]  → counter = 0/100  → ALLOW
+
+PROBLEM — BOUNDARY BURST:
+  Limit: 100 req/minute
+  10:00:55 → 100 requests (end of window 1) → counter = 100 (limit hit)
+  10:01:00 → 100 requests (start of window 2) → counter = 0 (limit reset)
+  Result: 200 requests in 10 seconds!
+
+IMPLEMENTATION:
+  Redis counter per window:
+  
+  String key = "rate:" + userId + ":" + (currentTimeMillis / 60_000);
+  Long count = redisTemplate.opsForValue().increment(key);
+  if (count == 1) {
+      redisTemplate.expire(key, 60, TimeUnit.SECONDS);
+  }
+  if (count > LIMIT) {
+      throw new RateLimitExceededException();
+  }
+
+Pros : Simple; O(1) time and space; easy to implement
+Cons : Boundary burst (2x limit possible at window edge)
+
+================================================================================
+2. SLIDING WINDOW LOG
+================================================================================
+
+CONCEPT:
+  Maintain a log (sorted set) of request timestamps.
+  For each new request: remove entries older than window, count remaining,
+  reject if count >= limit.
+
+IMPLEMENTATION (Redis Sorted Set):
+  String key = "rate_log:" + userId;
+  long now = System.currentTimeMillis();
+  long windowStart = now - 60_000;  // 60 second window
+
+  // Remove old entries
+  redisTemplate.opsForZSet().removeRangeByScore(key, 0, windowStart);
+  
+  // Count current window
+  Long count = redisTemplate.opsForZSet().size(key);
+  
+  if (count >= LIMIT) {
+      // Find earliest entry to compute retry-after
+      Set<ZSetOperations.TypedTuple<String>> oldest = 
+          redisTemplate.opsForZSet().rangeWithScores(key, 0, 0);
+      long retryAfterMs = oldest.iterator().next().getScore().longValue() 
+          + 60_000 - now;
+      throw new RateLimitExceededException(retryAfterMs);
+  }
+  
+  // Add current request
+  redisTemplate.opsForZSet().add(key, String.valueOf(now), now);
+  redisTemplate.expire(key, 60, TimeUnit.SECONDS);
+
+Pros : Accurate; no boundary burst; computes exact Retry-After
+Cons : O(N) space per user (stores each request timestamp); memory-intensive
+
+================================================================================
+3. SLIDING WINDOW COUNTER
+================================================================================
+
+CONCEPT:
+  Hybrid of fixed window and sliding log. Use two adjacent fixed windows;
+  interpolate using the position within the current window.
+
+  Effective rate = (previous_window_requests * (1 - elapsed_fraction))
+                  + current_window_requests
+
+  Example: Limit 100 req/min
+    Previous window: 80 requests
+    Current window: 25 requests
+    Time elapsed in current window: 30% (18 seconds of 60)
+    
+    Effective = 80 * (1 - 0.30) + 25 = 56 + 25 = 81 → ALLOW
+
+IMPLEMENTATION:
+  long currentWindow = currentTimeMillis / 60_000;
+  long prevWindow = currentWindow - 1;
+  
+  String prevKey = "rate:" + userId + ":" + prevWindow;
+  String currKey = "rate:" + userId + ":" + currentWindow;
+  
+  long prevCount = Long.parseLong(redisTemplate.opsForValue()
+      .getOrDefault(prevKey, "0").toString());
+  long currCount = redisTemplate.opsForValue().increment(currKey);
+  
+  if (currCount == 1) redisTemplate.expire(currKey, 120, TimeUnit.SECONDS);
+  
+  double elapsedFraction = (currentTimeMillis % 60_000) / 60_000.0;
+  double effective = prevCount * (1 - elapsedFraction) + currCount;
+  
+  if (effective > LIMIT) {
+      throw new RateLimitExceededException();
+  }
+
+Pros : Low memory (only 2 counters per user); no boundary burst; fast
+Cons : Approximate (interpolation); not exact
+
+================================================================================
+4. TOKEN BUCKET
+================================================================================
+
+CONCEPT:
+  A bucket has a maximum capacity of N tokens.
+  Tokens are added at a fixed rate (refill rate).
+  Each request consumes one (or more) tokens.
+  If bucket is empty → reject.
+
+  Allows bursting up to bucket capacity, then limits to refill rate.
+
+  Example: Capacity=100, Refill=10 tokens/second
+    Burst of 100 requests? Allowed (uses all tokens instantly).
+    After burst: max 10 req/s sustained.
+
+  This mirrors how real-world APIs work: AWS, Stripe use token bucket.
+
+IMPLEMENTATION:
+  @Component
+  public class TokenBucketRateLimiter {
+      
+      // Using Guava RateLimiter (in-process, single node)
+      private final Map<String, RateLimiter> limiters = new ConcurrentHashMap<>();
+      
+      public boolean tryAcquire(String key, int permitsPerSecond) {
+          RateLimiter limiter = limiters.computeIfAbsent(key, k ->
+              RateLimiter.create(permitsPerSecond));
+          return limiter.tryAcquire();
+      }
+  }
+
+  // Distributed token bucket with Redis
+  // Use Lua script for atomic check-and-update
+  private static final String TOKEN_BUCKET_LUA = """
+      local key = KEYS[1]
+      local capacity = tonumber(ARGV[1])
+      local refill_rate = tonumber(ARGV[2])   -- tokens per second
+      local now = tonumber(ARGV[3])            -- current time in milliseconds
+      local cost = tonumber(ARGV[4])           -- tokens this request costs
+      
+      local bucket = redis.call('HMGET', key, 'tokens', 'last_refill')
+      local tokens = tonumber(bucket[1]) or capacity
+      local last_refill = tonumber(bucket[2]) or now
+      
+      -- Refill tokens based on elapsed time
+      local elapsed = (now - last_refill) / 1000.0
+      tokens = math.min(capacity, tokens + elapsed * refill_rate)
+      
+      if tokens >= cost then
+          tokens = tokens - cost
+          redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
+          redis.call('EXPIRE', key, 3600)
+          return 1   -- allowed
+      else
+          redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
+          return 0   -- denied
+      end
+      """;
+
+Pros : Handles burst traffic gracefully; smooth rate limiting
+Cons : Distributed implementation requires atomic Lua scripts; slightly complex
+
+================================================================================
+5. LEAKY BUCKET
+================================================================================
+
+CONCEPT:
+  Requests enter a queue (bucket). Queue drains at a fixed rate.
+  If queue is full → reject (or block).
+
+  Unlike token bucket which allows bursts, leaky bucket enforces a strictly
+  constant output rate — even if 1000 requests arrive simultaneously,
+  they are processed at exactly R req/s.
+
+  Used for traffic shaping (smooth output), not just admission control.
+
+  Example: Drain rate = 10 req/s, Queue capacity = 100
+    100 concurrent requests arrive → queued
+    Processed at 10/second → last request waits 10 seconds
+    101st request → rejected (queue full)
+
+Pros : Prevents bursty traffic reaching backend; smooth output
+Cons : Adds latency for bursty workloads; doesn't reflect real usage patterns
+       well for interactive APIs
+
+TOKEN BUCKET vs LEAKY BUCKET:
+  Token Bucket  : Allows bursting; limits average rate; requests allowed if tokens available
+  Leaky Bucket  : Enforces constant rate; queues excess; smooths output
+
+================================================================================
+6. RESPONSE HEADERS FOR RATE LIMITS
+================================================================================
+
+Standard headers (de-facto, no official RFC — draft-polli-ratelimit-headers):
+  
+  X-RateLimit-Limit: 1000          # Total limit for this window
+  X-RateLimit-Remaining: 456       # Remaining requests in current window
+  X-RateLimit-Reset: 1714500060    # Unix timestamp when window resets
+  Retry-After: 30                  # Seconds to wait (on 429 response)
+  X-RateLimit-Policy: 1000;w=60   # Advanced: IETF draft format
+
+429 RESPONSE:
+  HTTP/1.1 429 Too Many Requests
+  Content-Type: application/json
+  X-RateLimit-Limit: 1000
+  X-RateLimit-Remaining: 0
+  X-RateLimit-Reset: 1714500060
+  Retry-After: 30
+
+  {
+    "error": "RATE_LIMIT_EXCEEDED",
+    "message": "Too many requests. Retry after 30 seconds.",
+    "retryAfter": 30,
+    "limit": 1000,
+    "windowSeconds": 60
+  }
+
+================================================================================
+7. SPRING CLOUD GATEWAY — REDIS RATE LIMITER
+================================================================================
+
+# application.yml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: api-service
+          uri: lb://API-SERVICE
+          predicates:
+            - Path=/api/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 10    # tokens/second
+                redis-rate-limiter.burstCapacity: 20    # max burst
+                redis-rate-limiter.requestedTokens: 1   # cost per request
+                key-resolver: "#{@userKeyResolver}"
+
+Key resolvers:
+  @Bean
+  KeyResolver userKeyResolver() {
+      return exchange -> Mono.justOrEmpty(
+          exchange.getRequest().getHeaders().getFirst("X-User-Id"))
+          .defaultIfEmpty("anonymous");
+  }
+
+  @Bean
+  KeyResolver ipKeyResolver() {
+      return exchange -> Mono.just(
+          exchange.getRequest().getRemoteAddress().getAddress().getHostAddress());
+  }
+
+  @Bean
+  KeyResolver apiKeyResolver() {
+      return exchange -> Mono.justOrEmpty(
+          exchange.getRequest().getQueryParams().getFirst("apiKey"))
+          .defaultIfEmpty("no-key");
+  }
+
+PROGRAMMATIC RATE LIMITING FILTER:
+  @Component
+  public class RateLimitFilter extends AbstractGatewayFilterFactory<RateLimitFilter.Config> {
+
+      @Override
+      public GatewayFilter apply(Config config) {
+          return (exchange, chain) -> {
+              String userId = exchange.getRequest().getHeaders().getFirst("X-User-Id");
+              
+              return rateLimiterService.tryAcquire(userId, config.getLimit())
+                  .flatMap(allowed -> {
+                      if (!allowed) {
+                          ServerHttpResponse response = exchange.getResponse();
+                          response.setStatusCode(HttpStatus.TOO_MANY_REQUESTS);
+                          response.getHeaders().add("Retry-After", "60");
+                          return response.setComplete();
+                      }
+                      return chain.filter(exchange);
+                  });
+          };
+      }
+  }
+
+================================================================================
+8. COMPARISON TABLE
+================================================================================
+
+Algorithm       | Burst Allowed | Memory   | Precision | Complexity | Use Case
+----------------|---------------|----------|-----------|------------|------------------
+Fixed Window    | Yes (2x edge) | O(1)     | Low       | Simple     | Basic protection
+Sliding Log     | No            | O(n) req | High      | Moderate   | Exact tracking
+Sliding Counter | No (approx)   | O(1)     | Medium    | Moderate   | Good balance
+Token Bucket    | Yes (controlled)| O(1)   | High      | Moderate   | APIs (Stripe, AWS)
+Leaky Bucket    | No (queued)   | O(n) req | High      | Moderate   | Traffic shaping
+
+================================================================================
+9. INTERVIEW QUESTIONS — RATE LIMITING
+================================================================================
+
+Q1: Explain the difference between Token Bucket and Leaky Bucket algorithms.
+    Token Bucket: bucket accumulates tokens at refill rate up to a maximum.
+    Each request consumes a token. Allows burst traffic up to bucket capacity.
+    Smooth sustained rate after burst. AWS API Gateway and most CDNs use this.
+    Leaky Bucket: requests enter a queue; queue drains at a fixed rate.
+    No burst — even 1000 simultaneous requests are processed at exactly R req/s.
+    Token bucket = burst-friendly; leaky bucket = strict smoothing.
+
+Q2: Why is fixed window rate limiting problematic?
+    The boundary burst problem: a client can make N requests at the end of
+    window 1 and N more at the start of window 2 (when counter resets),
+    resulting in 2N requests in a short span. A 100 req/min limit effectively
+    becomes 200 req in 2 seconds at window boundaries. Sliding window algorithms
+    (log or counter) solve this by always looking at a true rolling window.
+
+Q3: How do you implement distributed rate limiting?
+    Each app node must share state. Use Redis (INCR + EXPIRE for fixed window;
+    sorted sets for sliding log; Lua scripts for token bucket atomic operations).
+    Spring Cloud Gateway uses Redis-backed RequestRateLimiter out of the box.
+    Alternative: specialized rate limiting services (Envoy rate limit service,
+    AWS WAF, Cloudflare). Key consideration: Lua scripts for atomic operations
+    — INCR and EXPIRE must be atomic to prevent race conditions.
+
+Q4: What HTTP status code and headers should a rate-limited response include?
+    Status: 429 Too Many Requests. Headers: X-RateLimit-Limit (total),
+    X-RateLimit-Remaining (remaining), X-RateLimit-Reset (Unix timestamp when
+    window resets), Retry-After (seconds to wait). Body: JSON with error code
+    RATE_LIMIT_EXCEEDED, message, retryAfter. Do NOT silently drop requests —
+    always return 429 so clients can implement retry with backoff.
+
+Q5: How do you handle rate limiting in a microservices architecture?
+    Layer it: API Gateway enforces per-client/per-endpoint global limits.
+    Individual services can implement secondary limits for their own protection.
+    Use Redis as shared state across gateway instances. Propagate rate limit
+    headers from gateway to clients. Consider circuit breakers (Resilience4j)
+    at the service layer to complement rate limiting.
+
+================================================================================

@@ -1,0 +1,269 @@
+================================================================
+RENDERING PERFORMANCE OVERVIEW
+================================================================
+
+THE BROWSER RENDERING PIPELINE
+────────────────────────────────
+To display a web page, the browser goes through a multi-step pipeline.
+Understanding each step helps you know WHERE to optimize.
+
+FULL PIPELINE STEPS:
+  1. JAVASCRIPT: Execute JS code (DOM mutations, style changes)
+  2. STYLE: Calculate which CSS rules apply to each element (Style Calc)
+  3. LAYOUT (REFLOW): Calculate size and position of every element
+  4. PAINT: Fill pixels (colors, images, shadows, borders)
+  5. COMPOSITE: Draw layers onto screen in correct order
+
+NOT EVERY CHANGE TRIGGERS ALL STEPS:
+  
+  JS → Style → Layout → Paint → Composite  ← Triggers reflow (most expensive)
+  JS → Style → Paint → Composite            ← No layout (e.g., background-color)
+  JS → Composite                             ← No layout or paint (transform, opacity)
+
+THE COMPOSITING FAST PATH:
+  transform and opacity changes ONLY trigger compositing.
+  The browser hands these off to the GPU compositor thread
+  (separate from the main thread).
+  Result: 60fps animations even when main thread is busy!
+
+================================================================
+LAYERS AND COMPOSITING
+================================================================
+
+THE BROWSER CREATES MULTIPLE LAYERS:
+  Layers are like transparent sheets — browser paints them separately
+  and composites them into the final image.
+  
+  PROMOTED TO OWN LAYER:
+  - Elements with transform: translateZ(0) or will-change: transform
+  - Elements with position: fixed or position: sticky (in some browsers)
+  - Elements with CSS 3D transforms
+  - Elements with canvas, video, or WebGL
+  - Elements with opacity animations
+  - Elements with CSS filters
+  
+  LAYER PROMOTION WITH will-change:
+  will-change: transform;
+  // Tells browser "this element will animate" → promotes to GPU layer
+  // BEFORE animation starts (no promotion cost during animation)
+  
+  // Remove will-change after animation to free GPU memory:
+  element.addEventListener('animationend', () => {
+    element.style.willChange = 'auto';
+  });
+
+LAYER EXPLOSION (ANTI-PATTERN):
+  Promoting TOO MANY elements to layers wastes GPU memory.
+  "Layer storm": having 200+ composited layers = crash on mobile.
+  Use will-change sparingly — only for animated elements!
+
+================================================================
+CHECKING THE RENDERING PIPELINE
+================================================================
+
+CHROME DEVTOOLS RENDERING PANEL:
+  1. Open DevTools > More Tools > Rendering
+  2. PAINT FLASHING: Green flashes where repaints occur
+     → If whole page flashes: inefficient, full-page repaint
+     → If small area flashes: efficient, targeted repaint
+  3. LAYER BORDERS: Shows orange borders around composited layers
+     → Too many? Layer explosion problem
+  4. FPS METER: Real-time frames per second
+     → Below 60fps during animations = janky
+
+CHROME DEVTOOLS PERFORMANCE PANEL:
+  1. Record while interacting / animating
+  2. Look in the "Frames" row:
+     → Red frames = dropped frames (< 60fps)
+  3. Main thread: Find the tasks causing the frames to drop
+  4. "Rendering" row: Shows Layout, Paint, Composite events
+     → Frequent purple Layout blocks = too many reflows
+
+================================================================
+THE CRITICAL RENDERING PATH (CRP)
+================================================================
+
+CRP = the steps to show FIRST content from blank screen
+
+  HTML download → DOM construction
+  CSS download  → CSSOM construction  ← CSS is RENDER BLOCKING
+  DOM + CSSOM   → Render Tree
+  Render Tree   → Layout
+  Layout        → Paint
+  Paint         → Composite → FIRST PAINT!
+
+WHAT BLOCKS RENDERING:
+  CSS: Browser cannot render until CSSOM is built.
+  Reason: A later CSS rule could change everything already rendered.
+  → All <link rel="stylesheet"> are render-blocking.
+  
+  JS: Parser-blocking AND render-blocking (unless async/defer).
+  Reason: JS might call document.write() which changes the document.
+  → JS can also block CSSOM construction (JS after CSS in HTML waits for CSS)
+
+OPTIMIZING CRP:
+  1. INLINE CRITICAL CSS: Above-fold CSS inlined in <style> tag
+     → No network request, CSSOM built immediately from HTML
+     
+  2. DEFER NON-CRITICAL CSS:
+     <link rel="stylesheet" media="print" onload="this.media='all'">
+     → Browser downloads at low priority, doesn't block rendering
+  
+  3. DEFER/ASYNC SCRIPTS:
+     <script defer src="app.js"> → Downloads parallel, executes after HTML parse
+     
+  4. MINIMIZE CRP RESOURCES:
+     → Reduce number of render-blocking resources
+     → Reduce file sizes of blocking resources
+     → Shorten the critical path (reduce render-blocking bytes × round trips)
+
+================================================================
+REFLOW TRIGGERS (AVOID THESE ON HOT PATHS)
+================================================================
+
+PROPERTIES THAT TRIGGER LAYOUT (REFLOW):
+  Reading geometry: offsetWidth, offsetHeight, getBoundingClientRect()
+  Box model: width, height, padding, margin, border, top, left
+  Position: position, float, display
+  Layout: flexbox, grid
+  
+PROPERTIES THAT TRIGGER PAINT ONLY (NO LAYOUT):
+  Visual: color, background-color, background-image
+  Text: text-decoration, text-shadow
+  Shadow: box-shadow
+  Outline: outline, outline-color
+  
+COMPOSITED ONLY (NO LAYOUT OR PAINT):
+  transform, opacity (when promoted to own layer)
+  
+RESOURCE: csstriggers.com — lists which CSS properties trigger which steps
+
+================================================================
+JAVASCRIPT RENDERING PERFORMANCE
+================================================================
+
+AVOID FORCED SYNCHRONOUS LAYOUT (LAYOUT THRASHING):
+  // ❌ Layout thrashing: alternating read-write causes multiple reflows
+  for (const item of items) {
+    const width = item.offsetWidth;   // READ  → browser flushes pending changes
+    item.style.width = width * 2 + 'px'; // WRITE → invalidates layout
+    // Next iteration: READ again → forces new layout!
+    // Result: N reflows for N items
+  }
+  
+  // ✅ Batch reads, then batch writes:
+  const widths = items.map(item => item.offsetWidth);  // READ all first
+  items.forEach((item, i) => {
+    item.style.width = widths[i] * 2 + 'px';           // WRITE all after
+  });
+  // Result: 1 reflow (or 0 if browser can batch writes)
+
+USE REQUESTANIMATIONFRAME FOR DOM CHANGES:
+  // ❌ DOM mutation outside rAF (out of sync with paint cycle)
+  window.addEventListener('scroll', () => {
+    element.style.transform = `translateY(${scrollY}px)`;
+    // May run multiple times between frames → wasted work
+  });
+  
+  // ✅ Batch with rAF (see RequestAnimationFrame.txt for more)
+  let pending = false;
+  window.addEventListener('scroll', () => {
+    if (!pending) {
+      pending = true;
+      requestAnimationFrame(() => {
+        element.style.transform = `translateY(${window.scrollY}px)`;
+        pending = false;
+      });
+    }
+  });
+
+================================================================
+CSS CONTAIN PROPERTY
+================================================================
+
+CSS contain tells the browser that an element is independent from the
+rest of the document — changes inside it don't affect outside.
+This allows the browser to skip much of the rendering pipeline for
+areas outside the contained element.
+
+  .isolated-component {
+    contain: content;  /* Equivalent to: layout paint style */
+  }
+  
+  contain: layout;    /* Layout changes inside don't affect outside */
+  contain: paint;     /* Painting is clipped to element bounds */
+  contain: style;     /* Counters don't escape this element */
+  contain: size;      /* Size doesn't depend on children */
+  contain: strict;    /* All containment: layout paint style size */
+  contain: content;   /* layout + paint + style (common, safe choice) */
+
+  /* CSS Containment benefits for React apps: */
+  .card {
+    contain: content; /* Card layout changes don't trigger full-page reflow */
+  }
+  
+  /* content-visibility: auto — combines contain with lazy rendering */
+  .below-fold-section {
+    content-visibility: auto;  /* Section not rendered until near viewport */
+    contain-intrinsic-size: 600px; /* Estimated size for scroll bar accuracy */
+  }
+  
+  /* content-visibility: auto can improve initial render time by 50-70%
+     by skipping off-screen content rendering */
+
+================================================================
+RENDER BUDGET
+================================================================
+
+THE 16.67ms BUDGET:
+  60 fps = one frame every 16.67ms
+  ALL rendering work (JS + Style + Layout + Paint + Composite) must
+  fit in 16.67ms for smooth 60fps animation.
+  
+  In practice: allow 10ms for your code, leave 6.67ms for browser.
+  
+  IF YOU MISS THE BUDGET:
+  - Browser drops the frame
+  - Animation stutters (jank)
+  - User perceives lag
+  
+  120hz DISPLAYS (modern mobiles + MacBook Pro):
+  Budget is halved: 8.33ms per frame!
+  Even more critical to keep tasks short.
+
+WHAT FITS IN 16ms:
+  - Simple calculations: YES
+  - Updating 10 DOM elements: YES
+  - Sorting 10,000 items: NO (moves to Worker or batch)
+  - Rendering 1000 React components: MAYBE (need to measure)
+
+================================================================
+INTERVIEW ANSWERS
+================================================================
+
+Q: What is the browser rendering pipeline and how does it affect performance?
+A: The rendering pipeline has 5 steps: JavaScript execution → Style calculation
+   (which CSS rules apply) → Layout (sizing/positioning) → Paint (fill pixels)
+   → Composite (assemble layers). Not every change triggers all steps — only
+   CSS layout properties trigger the full pipeline. CSS paint-only properties
+   (background-color) skip layout. transform and opacity only trigger compositing
+   (GPU-accelerated, runs on compositor thread independently of main thread).
+   The goal is to keep changes on the "compositing only" fast path for smooth 60fps.
+
+Q: What is layer promotion and when should you use it?
+A: Layer promotion means a browser element gets its own GPU compositing layer,
+   separate from the main document layer. This allows transforms and opacity
+   changes to happen on the GPU compositor thread (not blocking main thread).
+   Use will-change: transform to promote elements that will animate — do it
+   before the animation starts. The downside: each layer uses GPU memory and
+   takes texture upload time. Never over-promote; a "layer storm" of 200+ layers
+   causes crashes on mobile. Use paint flashing and layer borders in DevTools
+   Rendering panel to audit.
+
+Q: What is layout thrashing and how do you prevent it?
+A: Layout thrashing is when JavaScript alternately reads geometry (like
+   offsetWidth) and modifies styles in a loop. Each read after a write forces
+   the browser to flush pending style calculations and recalculate layout
+   synchronously — N iterations = N layouts. The fix: batch all reads first,
+   then batch all writes. You can also use requestAnimationFrame to defer
+   writes to the next frame, or FastDOM library which manages read/write batching.

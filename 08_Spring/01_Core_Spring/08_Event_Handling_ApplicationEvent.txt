@@ -1,0 +1,284 @@
+================================================================
+  SPRING EVENT HANDLING — ApplicationEvent — IN DEPTH
+================================================================
+
+================================================================
+OVERVIEW
+================================================================
+
+  Spring's event model allows beans to communicate in a
+  loosely-coupled, publish-subscribe manner without direct
+  dependencies between publisher and subscriber.
+
+  Key components:
+    ApplicationEvent          -- base class for events
+    ApplicationEventPublisher -- publishes events
+    ApplicationListener<E>    -- listens for events
+    @EventListener             -- annotation-based listener (Spring 4.2+)
+
+================================================================
+BUILT-IN APPLICATION EVENTS
+================================================================
+
+  Spring publishes these lifecycle events automatically:
+
+  Event                       | When Published
+  ----------------------------|----------------------------------------------
+  ContextRefreshedEvent       | Context initialized/refreshed (all beans ready)
+  ContextStartedEvent         | ctx.start() called
+  ContextStoppedEvent         | ctx.stop() called
+  ContextClosedEvent          | ctx.close() / shutdown hook triggered
+  ApplicationStartingEvent    | Spring Boot: very early startup
+  ApplicationEnvironmentPreparedEvent | Spring Boot: Environment ready
+  ApplicationContextInitializedEvent  | Spring Boot: ApplicationContext created
+  ApplicationPreparedEvent    | Spring Boot: context loaded, before refresh
+  ApplicationStartedEvent     | Spring Boot: app started, before runners
+  ApplicationReadyEvent       | Spring Boot: fully started, runners done
+  ApplicationFailedEvent      | Spring Boot: startup failed
+  RequestHandledEvent         | Web: after each HTTP request is handled
+
+================================================================
+CREATING CUSTOM EVENTS
+================================================================
+
+  // Option 1: Extend ApplicationEvent (traditional)
+  public class UserRegisteredEvent extends ApplicationEvent {
+
+      private final User user;
+
+      public UserRegisteredEvent(Object source, User user) {
+          super(source);
+          this.user = user;
+      }
+
+      public User getUser() { return user; }
+  }
+
+  // Option 2: Plain POJO (Spring 4.2+) — recommended
+  public class UserRegisteredEvent {
+      private final User user;
+      private final Instant timestamp = Instant.now();
+
+      public UserRegisteredEvent(User user) {
+          this.user = user;
+      }
+
+      public User getUser() { return user; }
+      public Instant getTimestamp() { return timestamp; }
+  }
+
+================================================================
+PUBLISHING EVENTS
+================================================================
+
+  @Service
+  public class UserService {
+
+      // Option 1: Inject ApplicationEventPublisher
+      @Autowired
+      private ApplicationEventPublisher eventPublisher;
+
+      public User register(RegisterRequest request) {
+          User user = userRepository.save(new User(request));
+          eventPublisher.publishEvent(new UserRegisteredEvent(user));
+          return user;
+      }
+  }
+
+  // Option 2: Implement ApplicationEventPublisherAware
+  @Service
+  public class OrderService implements ApplicationEventPublisherAware {
+
+      private ApplicationEventPublisher publisher;
+
+      @Override
+      public void setApplicationEventPublisher(ApplicationEventPublisher publisher) {
+          this.publisher = publisher;
+      }
+
+      public void placeOrder(Order order) {
+          orderRepository.save(order);
+          publisher.publishEvent(new OrderPlacedEvent(order));
+      }
+  }
+
+================================================================
+LISTENING TO EVENTS
+================================================================
+
+  // Option 1: Implement ApplicationListener<E> (traditional)
+  @Component
+  public class WelcomeEmailListener
+      implements ApplicationListener<UserRegisteredEvent> {
+
+      @Autowired
+      private EmailService emailService;
+
+      @Override
+      public void onApplicationEvent(UserRegisteredEvent event) {
+          emailService.sendWelcome(event.getUser().getEmail());
+      }
+  }
+
+  // Option 2: @EventListener (Spring 4.2+ — preferred)
+  @Component
+  public class UserEventHandlers {
+
+      @EventListener
+      public void onUserRegistered(UserRegisteredEvent event) {
+          emailService.sendWelcome(event.getUser().getEmail());
+      }
+
+      // Listen to multiple event types
+      @EventListener({UserRegisteredEvent.class, UserImportedEvent.class})
+      public void onAnyUserCreated(Object event) { ... }
+
+      // Conditional listening via SpEL
+      @EventListener(condition = "#event.user.role == 'ADMIN'")
+      public void onAdminCreated(UserRegisteredEvent event) {
+          auditService.logAdminCreation(event.getUser());
+      }
+  }
+
+================================================================
+ASYNC EVENT HANDLING
+================================================================
+
+  By default, events are handled SYNCHRONOUSLY in the same thread.
+  Use @Async to handle events in a separate thread pool.
+
+  // Step 1: Enable async
+  @Configuration
+  @EnableAsync
+  public class AsyncConfig {
+
+      @Bean
+      public TaskExecutor taskExecutor() {
+          ThreadPoolTaskExecutor exec = new ThreadPoolTaskExecutor();
+          exec.setCorePoolSize(4);
+          exec.setMaxPoolSize(16);
+          exec.setQueueCapacity(100);
+          exec.setThreadNamePrefix("event-handler-");
+          exec.initialize();
+          return exec;
+      }
+  }
+
+  // Step 2: Mark listener as async
+  @Component
+  public class AsyncEmailListener {
+
+      @Async
+      @EventListener
+      public void handleUserRegistered(UserRegisteredEvent event) {
+          // Runs in a separate thread — publisher is not blocked
+          emailService.sendWelcome(event.getUser().getEmail());
+          analyticsService.trackRegistration(event.getUser());
+      }
+  }
+
+  Caveat: With @Async, exceptions are NOT propagated to the publisher.
+  Use AsyncUncaughtExceptionHandler to log/handle them.
+
+================================================================
+TRANSACTION-BOUND EVENTS — @TransactionalEventListener
+================================================================
+
+  Events published inside a transaction can be deferred until
+  the transaction commits (prevent handling rolled-back events).
+
+  @Component
+  public class TransactionalEventHandlers {
+
+      // Default: runs AFTER_COMMIT — only if transaction committed
+      @TransactionalEventListener
+      public void onOrderPlaced(OrderPlacedEvent event) {
+          notificationService.notifyCustomer(event.getOrder());
+      }
+
+      // Phase options:
+      @TransactionalEventListener(phase = TransactionPhase.AFTER_ROLLBACK)
+      public void onRollback(OrderPlacedEvent event) {
+          alertService.alertOnFailure(event.getOrder());
+      }
+
+      @TransactionalEventListener(phase = TransactionPhase.BEFORE_COMMIT)
+      public void beforeCommit(OrderPlacedEvent event) {
+          auditLog.record(event.getOrder());
+      }
+
+      @TransactionalEventListener(phase = TransactionPhase.AFTER_COMPLETION)
+      public void afterCompletion(OrderPlacedEvent event) {
+          // Called regardless of commit/rollback
+          cacheService.invalidate(event.getOrder().getId());
+      }
+  }
+
+  TransactionPhase values:
+    BEFORE_COMMIT     -- inside transaction, before commit
+    AFTER_COMMIT      -- after successful commit (DEFAULT)
+    AFTER_ROLLBACK    -- after rollback
+    AFTER_COMPLETION  -- after commit OR rollback
+
+  fallbackExecution = true:
+    Execute even when no active transaction:
+    @TransactionalEventListener(fallbackExecution = true)
+    public void handle(UserRegisteredEvent e) { ... }
+
+================================================================
+EVENT ORDERING
+================================================================
+
+  // Control listener execution order
+  @EventListener
+  @Order(1)   // lower number = higher priority
+  public void firstListener(UserRegisteredEvent event) { ... }
+
+  @EventListener
+  @Order(2)
+  public void secondListener(UserRegisteredEvent event) { ... }
+
+================================================================
+RETURN VALUE FROM @EventListener — EVENT CHAINING
+================================================================
+
+  @EventListener can return a new event which is automatically published:
+
+  @EventListener
+  public WelcomeEmailEvent onUserRegistered(UserRegisteredEvent event) {
+      // Return value is automatically published as a new event
+      return new WelcomeEmailEvent(event.getUser());
+  }
+
+  @EventListener
+  public void onWelcomeEmail(WelcomeEmailEvent event) {
+      emailService.send(event.getUser().getEmail(), "Welcome!");
+  }
+
+================================================================
+INTERVIEW QUESTIONS — EVENTS
+================================================================
+
+  Q: What is the advantage of Spring events over direct method calls?
+  A: Events decouple publisher from subscriber. The publisher has no
+     knowledge of who handles the event or how many handlers exist.
+     This supports Open/Closed Principle — add new behavior without
+     modifying existing code.
+
+  Q: What is @TransactionalEventListener and why use it?
+  A: It defers event handling until after the transaction commits.
+     This prevents side effects (e.g., sending emails) when the
+     database transaction might roll back.
+
+  Q: What is the default execution mode for Spring events?
+  A: Synchronous — the publisher thread handles the event before
+     returning. Use @Async to make handlers non-blocking.
+
+  Q: How do you make a Spring event listener async?
+  A: Add @Async on the @EventListener method and enable async with
+     @EnableAsync on a @Configuration class.
+
+  Q: Can a @EventListener method return a value? What happens?
+  A: Yes. If the return type is another event object, Spring
+     automatically publishes it, enabling event chaining.
+

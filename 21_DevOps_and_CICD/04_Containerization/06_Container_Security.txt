@@ -1,0 +1,1216 @@
+================================================================================
+CONTAINER SECURITY — COMPREHENSIVE INTERVIEW GUIDE
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Container Security Overview
+2. Non-Root Containers
+3. Read-Only Filesystems
+4. Linux Capabilities
+5. Seccomp Profiles
+6. AppArmor and SELinux
+7. Image Security (Scanning, SBOM)
+8. Secrets Management in Containers
+9. Privileged Containers and Security Risks
+10. Rootless Docker and Podman
+11. Distroless and Minimal Images
+12. Kubernetes Pod Security
+13. Network Security for Containers
+14. Runtime Security (Falco)
+15. Supply Chain Security
+16. Common Interview Questions & Answers
+17. Quick Reference Cheat Sheet
+
+================================================================================
+1. CONTAINER SECURITY OVERVIEW
+================================================================================
+
+Container Security is Not VM Security:
+  Containers share the host kernel. There is NO hardware-level isolation.
+  
+  Attack surface considerations:
+  
+  TRADITIONAL VM:
+  ┌───────┐  ┌───────┐  ┌───────┐
+  │ App A │  │ App B │  │ App C │
+  │ Guest │  │ Guest │  │ Guest │
+  │  OS   │  │  OS   │  │  OS   │
+  └───────┘  └───────┘  └───────┘
+  │      Hypervisor (hardware isolation)       │
+  └────────────────────────────────────────────┘
+  
+  CONTAINERS:
+  ┌────────┐  ┌────────┐  ┌────────┐
+  │ App A  │  │ App B  │  │ App C  │
+  │        │  │        │  │        │
+  └────────┘  └────────┘  └────────┘
+  │         Shared Linux Kernel                │
+  └────────────────────────────────────────────┘
+  
+  Container escape: Compromised container + kernel vulnerability = host access
+
+Container Security Defense-in-Depth:
+  
+  ┌─────────────────────────────────────────────────────────┐
+  │  LAYER 1: Image Security                                │
+  │  - Minimal base images (distroless)                     │
+  │  - Vulnerability scanning (Trivy, Snyk, Grype)          │
+  │  - Image signing (Cosign/Sigstore)                      │
+  │  - No secrets baked in                                  │
+  ├─────────────────────────────────────────────────────────┤
+  │  LAYER 2: Container Runtime Security                    │
+  │  - Non-root user                                        │
+  │  - Read-only filesystem                                 │
+  │  - Drop ALL capabilities, add only needed               │
+  │  - Seccomp profiles                                     │
+  │  - AppArmor/SELinux profiles                            │
+  │  - No privileged mode                                   │
+  │  - Resource limits (CPU/memory)                         │
+  ├─────────────────────────────────────────────────────────┤
+  │  LAYER 3: Orchestration Security (Kubernetes)           │
+  │  - Pod Security Standards / Admission Controllers       │
+  │  - Network Policies                                     │
+  │  - RBAC                                                 │
+  │  - Secret management (Vault, External Secrets)          │
+  ├─────────────────────────────────────────────────────────┤
+  │  LAYER 4: Runtime Threat Detection                      │
+  │  - Falco (syscall monitoring)                           │
+  │  - Container-aware SIEM                                 │
+  │  - Audit logging                                        │
+  └─────────────────────────────────────────────────────────┘
+
+Security Principles:
+  LEAST PRIVILEGE: Grant minimum necessary permissions
+  IMMUTABILITY: Containers should not be modified at runtime
+  DEFENSE IN DEPTH: Multiple security layers, not one strong one
+  SHIFT LEFT: Find security issues at build time, not runtime
+
+================================================================================
+2. NON-ROOT CONTAINERS
+================================================================================
+
+Why Non-Root Matters:
+  By default, Docker runs processes as root inside containers.
+  Root inside container = root outside container (on the host kernel).
+  Container escape vulnerability → attacker has root on host.
+  
+  With non-root: container escape still dangerous, but attacker is limited
+  to a non-privileged user on the host.
+
+Implementing Non-Root in Dockerfile:
+  
+  # Method 1: Create dedicated user (Debian/Ubuntu base):
+  FROM ubuntu:22.04
+  
+  RUN groupadd -r --gid 1001 appgroup \
+      && useradd -r --uid 1001 -g appgroup \
+         --home /app --shell /sbin/nologin \
+         --comment "App Service Account" appuser
+  
+  WORKDIR /app
+  COPY --chown=appuser:appgroup . .
+  USER appuser
+  
+  # Method 2: Alpine base:
+  FROM alpine:3.18
+  
+  RUN addgroup -S -g 1001 appgroup \
+      && adduser -S -u 1001 -G appgroup \
+         -H -s /sbin/nologin appuser
+  
+  USER appuser
+  
+  # Method 3: Use existing non-root user in official images:
+  FROM node:18-alpine
+  # node image includes "node" user (UID 1000)
+  USER node
+  
+  # Method 4: Use numeric UID (doesn't require user to exist in image):
+  USER 1001:1001
+  # Note: This user won't have a home dir or shell
+
+Override at Runtime:
+  docker run --user 1001:1001 myapp      # Override as numeric UID:GID
+  docker run --user nobody myapp         # Override with named user
+
+Verifying Container User:
+  docker exec mycontainer whoami         # Should NOT print "root"
+  docker exec mycontainer id             # Show UID/GID
+
+Kubernetes Non-Root:
+  
+  # In Pod spec:
+  spec:
+    securityContext:
+      runAsNonRoot: true          # Kubernetes rejects root containers
+      runAsUser: 1001
+      runAsGroup: 1001
+      fsGroup: 1001               # Files in volumes are owned by this GID
+    
+    containers:
+    - name: app
+      image: myapp:v1
+      securityContext:
+        runAsUser: 1001
+        allowPrivilegeEscalation: false  # Can't gain more privileges
+        readOnlyRootFilesystem: true
+
+================================================================================
+3. READ-ONLY FILESYSTEMS
+================================================================================
+
+Why Read-Only Filesystem:
+  Prevents attackers from:
+  - Installing tools/malware
+  - Modifying application code at runtime
+  - Persisting after restart
+  
+  Makes containers IMMUTABLE at runtime.
+  Legitimate writes go through specific mounted volumes.
+
+Using Read-Only in Docker:
+  
+  # docker run:
+  docker run --read-only myapp
+  
+  # For paths that need to be writable, use tmpfs:
+  docker run --read-only \
+    --tmpfs /tmp \
+    --tmpfs /var/run \
+    -v logs:/var/log/app \         # Named volume for logs
+    myapp
+
+Using Read-Only in Kubernetes:
+  
+  spec:
+    containers:
+    - name: app
+      securityContext:
+        readOnlyRootFilesystem: true    # Immutable container FS
+      volumeMounts:
+      - name: tmp
+        mountPath: /tmp
+      - name: run
+        mountPath: /var/run
+      - name: app-logs
+        mountPath: /var/log/app
+    
+    volumes:
+    - name: tmp
+      emptyDir:
+        medium: Memory                  # tmpfs in Kubernetes
+    - name: run
+      emptyDir:
+        medium: Memory
+    - name: app-logs
+      persistentVolumeClaim:
+        claimName: app-logs-pvc
+
+Testing Your App with Read-Only FS:
+  # Try running with read-only — discover what needs to be writable
+  docker run --read-only myapp
+  # Watch for errors about writing to specific paths
+  # Then add those paths as tmpfs mounts or volumes
+
+================================================================================
+4. LINUX CAPABILITIES
+================================================================================
+
+What Are Linux Capabilities:
+  Traditional UNIX: Two worlds — root (omnipotent) and non-root (limited)
+  
+  Linux capabilities: Divide root's privileges into ~40 individual units.
+  Each capability can be independently granted or revoked.
+  
+  Examples:
+  CAP_NET_BIND_SERVICE   Bind to ports < 1024
+  CAP_NET_ADMIN          Configure network interfaces
+  CAP_SYS_PTRACE         Trace processes (needed by debuggers)
+  CAP_SYS_ADMIN          Many system administration operations (very powerful!)
+  CAP_CHOWN              Change file ownership
+  CAP_DAC_OVERRIDE       Bypass file read/write/execute permission checks
+  CAP_KILL               Send signals to any process
+  CAP_SETUID             Switch user ID
+  CAP_MKNOD              Create device files
+  CAP_SYS_TIME           Set system time
+
+Default Capabilities for Docker Containers:
+  By default, Docker grants a limited set:
+  CHOWN, DAC_OVERRIDE, FSETID, FOWNER, MKNOD, NET_RAW,
+  SETGID, SETUID, SETFCAP, SETPCAP, NET_BIND_SERVICE,
+  SYS_CHROOT, KILL, AUDIT_WRITE
+  
+  This is still more than most apps need!
+
+Best Practice: Drop ALL, Add Only What's Needed:
+  
+  # Docker run:
+  docker run \
+    --cap-drop ALL \                    # Drop everything
+    --cap-add NET_BIND_SERVICE \        # Add only what's needed
+    nginx
+  
+  # Kubernetes:
+  spec:
+    containers:
+    - name: nginx
+      securityContext:
+        capabilities:
+          drop:
+          - ALL                          # Drop all capabilities
+          add:
+          - NET_BIND_SERVICE             # Only add what's needed
+
+Common Capability Requirements:
+  
+  Web servers needing port 80/443:    NET_BIND_SERVICE
+  Network packet capture (tcpdump):  NET_ADMIN + NET_RAW
+  Kubernetes debugging tools:        SYS_PTRACE
+  NFS client:                        DAC_READ_SEARCH
+  Container escape avoidance:        Drop SYS_ADMIN (especially)
+
+Finding Required Capabilities:
+  # Run with all dropped, see what errors occur:
+  docker run --cap-drop ALL myapp 2>&1 | grep -i "operation not permitted"
+  
+  # Use capable/capsh to analyze:
+  docker run --cap-drop ALL --cap-add SYS_PTRACE -it ubuntu:22.04 \
+    capsh --print
+
+================================================================================
+5. SECCOMP PROFILES
+================================================================================
+
+What is Seccomp:
+  Secure Computing Mode. Linux kernel feature.
+  Restricts which system calls a process can make.
+  
+  A container uses ~50 syscalls out of ~300+ available.
+  By restricting to only needed syscalls, even a container escape
+  has limited ability to exploit the host kernel.
+
+Docker Default Seccomp Profile:
+  Docker ships with a default seccomp profile that blocks ~44 dangerous syscalls:
+  - keyctl, ptrace, reboot, init_module, iopl, ...
+  - Blocks mount, umount (prevent filesystem manipulation)
+  - Blocks ptrace (prevent process tracing)
+  - Blocks clone with CLONE_NEWUSER (prevent user namespace tricks)
+  
+  Docker applies this by default unless disabled.
+
+Custom Seccomp Profiles:
+  
+  # Generate profile with audit mode first:
+  # Run with SCMP_ACT_LOG to log (not block) syscalls:
+  docker run --security-opt seccomp:audit.json myapp
+  
+  # minimal.json — only allow specific syscalls:
+  {
+    "defaultAction": "SCMP_ACT_ERRNO",
+    "architectures": ["SCMP_ARCH_X86_64"],
+    "syscalls": [
+      {
+        "names": [
+          "read", "write", "open", "close", "fstat", "mmap",
+          "mprotect", "munmap", "brk", "rt_sigaction", "rt_sigprocmask",
+          "ioctl", "access", "pipe", "select", "sched_yield",
+          "mremap", "msync", "mincore", "madvise", "dup", "dup2",
+          "nanosleep", "getitimer", "alarm", "setitimer", "getpid",
+          "sendfile", "socket", "connect", "accept", "sendto", "recvfrom",
+          "sendmsg", "recvmsg", "shutdown", "bind", "listen", "getsockname",
+          "getpeername", "socketpair", "setsockopt", "getsockopt",
+          "clone", "fork", "vfork", "execve", "exit", "wait4",
+          "kill", "uname", "fcntl", "flock", "fsync", "fdatasync",
+          "truncate", "ftruncate", "getdents", "getcwd", "chdir",
+          "rename", "mkdir", "rmdir", "creat", "link", "unlink",
+          "symlink", "readlink", "chmod", "fchmod", "chown", "fchown",
+          "lchown", "umask", "gettimeofday", "getrlimit", "getrusage",
+          "sysinfo", "times", "ptrace", "getuid", "syslog",
+          "getgid", "setuid", "setgid", "geteuid", "getegid",
+          "exit_group", "futex", "set_tid_address", "set_robust_list",
+          "prctl", "arch_prctl", "gettid", "time", "getpgrp",
+          "openat", "getdents64", "epoll_create1", "epoll_ctl", "epoll_wait",
+          "accept4", "eventfd2", "timerfd_create", "timerfd_settime",
+          "timerfd_gettime", "signalfd4", "fchownat", "newfstatat",
+          "unlinkat", "renameat", "readlinkat", "pread64", "pwrite64",
+          "pipe2", "dup3", "inotify_init1", "inotify_add_watch",
+          "mmap2", "stat", "lstat", "poll"
+        ],
+        "action": "SCMP_ACT_ALLOW"
+      }
+    ]
+  }
+  
+  # Apply:
+  docker run --security-opt seccomp:./minimal.json myapp
+
+Disable Seccomp (DANGEROUS):
+  docker run --security-opt seccomp:unconfined myapp   # No syscall restrictions
+
+In Kubernetes:
+  
+  spec:
+    securityContext:
+      seccompProfile:
+        type: RuntimeDefault          # Use container runtime's default
+        # type: Localhost             # Use custom profile from node
+        # localhostProfile: profiles/custom.json
+        # type: Unconfined            # No seccomp (dangerous)
+
+================================================================================
+6. APPARMOR AND SELINUX
+================================================================================
+
+AppArmor:
+  Mandatory Access Control (MAC) system.
+  Profiles define what files/capabilities a program can access.
+  Path-based: rules on what filesystem paths are accessible.
+  
+  Common on Ubuntu/Debian systems.
+  
+  Check AppArmor status:
+  sudo aa-status
+  
+  Docker default AppArmor profile:
+  /etc/apparmor.d/docker
+  
+  Apply custom profile:
+  docker run --security-opt apparmor:my-profile myapp
+  
+  Disable AppArmor for container:
+  docker run --security-opt apparmor:unconfined myapp
+
+SELinux:
+  Mandatory Access Control system.
+  Label-based: every file, process, and socket has a label.
+  Very granular policy enforcement.
+  
+  Common on RHEL/CentOS/Fedora systems.
+  
+  Check SELinux status:
+  sestatus
+  getenforce          # Enforcing | Permissive | Disabled
+  
+  Container process context:
+  ps -Z               # Show SELinux context of processes
+  
+  Files for containers:
+  chcon -Rt container_file_t /mydata    # Set type for bind mount
+  # Or: :z flag to let Docker relabel
+  docker run -v /data:/data:z myapp     # Relabel (shared)
+  docker run -v /data:/data:Z myapp     # Relabel (private)
+
+================================================================================
+7. IMAGE SECURITY (SCANNING, SBOM)
+================================================================================
+
+Vulnerability Scanning:
+
+  TRIVY (Open Source — Most Comprehensive):
+    # Scan image
+    trivy image myapp:v1.2.3
+    
+    # Only critical and high
+    trivy image --severity CRITICAL,HIGH myapp:v1.2.3
+    
+    # Exit with error on critical (CI gate)
+    trivy image --exit-code 1 --severity CRITICAL myapp:v1.2.3
+    
+    # Scan Dockerfile
+    trivy config Dockerfile
+    
+    # Output JSON for processing
+    trivy image --format json -o trivy-results.json myapp:v1.2.3
+    
+    # Scan filesystem
+    trivy fs /path/to/project
+    
+    # Scan K8s cluster
+    trivy k8s --report summary cluster
+  
+  GRYPE (Anchore):
+    grype myapp:v1.2.3
+    grype myapp:v1.2.3 --fail-on critical
+  
+  SNYK:
+    snyk container test myapp:v1.2.3
+    snyk container test myapp:v1.2.3 --severity-threshold=high
+  
+  CLAIR (CoreOS):
+    Server-based scanner. Often integrated into Harbor and Quay.
+  
+  AWS INSPECTOR (for ECR):
+    # Enable in ECR repository settings
+    # Automatic scan on push, integration with Security Hub
+
+In GitHub Actions:
+  
+  - name: Scan image with Trivy
+    uses: aquasecurity/trivy-action@master
+    with:
+      image-ref: 'myapp:${{ github.sha }}'
+      format: 'sarif'
+      output: 'trivy-results.sarif'
+      severity: 'CRITICAL,HIGH'
+      exit-code: '1'               # Fail pipeline on findings
+  
+  - name: Upload Trivy scan results to GitHub Security tab
+    uses: github/codeql-action/upload-sarif@v3
+    if: always()
+    with:
+      sarif_file: 'trivy-results.sarif'
+
+SBOM (Software Bill of Materials):
+  A manifest of all components and dependencies in a container image.
+  Required for supply chain security, compliance (EO 14028).
+  
+  Generate with Syft:
+  syft myapp:v1.2.3 -o spdx-json > sbom.spdx.json
+  syft myapp:v1.2.3 -o cyclonedx-json > sbom.cyclonedx.json
+  
+  Attach to image with Cosign:
+  cosign attach sbom --sbom sbom.spdx.json myapp:v1.2.3
+  
+  Scan SBOM for vulnerabilities:
+  grype sbom:sbom.spdx.json
+
+Fixable vs Non-Fixable Vulnerabilities:
+  Many vulnerabilities in base OS packages have no fix yet.
+  Strategy:
+  1. Fix what's fixable (update packages, update base image)
+  2. Accept risk for non-fixable with documented exception
+  3. Use minimal base images to reduce attack surface (fewer packages = fewer CVEs)
+  4. Set a threshold: block only CRITICAL, or CRITICAL+HIGH with fix available
+
+================================================================================
+8. SECRETS MANAGEMENT IN CONTAINERS
+================================================================================
+
+Common Mistakes (DON'T DO THESE):
+  
+  # In Dockerfile: NEVER
+  ENV DB_PASSWORD=supersecret         # Visible in docker inspect, docker history
+  ARG API_KEY=supersecret             # Visible in docker history
+  RUN wget --user admin --password secret http://...  # In build cache!
+  
+  # In docker run: Avoid for production
+  docker run -e DB_PASSWORD=supersecret myapp   # Visible in process list!
+  # (ps aux or /proc/PID/environ shows it)
+
+Correct Approaches:
+
+  1. ENVIRONMENT AT RUNTIME (acceptable for non-sensitive config):
+     docker run -e DB_HOST=db:5432 myapp   # Not a secret, fine
+  
+  2. ENV FROM SECRET MANAGER (best practice):
+     # App reads from Vault/AWS SSM at startup
+     DB_PASSWORD=$(aws ssm get-parameter --name /prod/db/password \
+       --with-decryption --query Parameter.Value --output text)
+     docker run -e DB_PASSWORD=$DB_PASSWORD myapp
+  
+  3. DOCKER SECRETS (Docker Swarm):
+     # Create secret:
+     echo "supersecret" | docker secret create db_password -
+     
+     # Use in service:
+     docker service create \
+       --secret db_password \
+       --name myapp myapp
+     # Available at /run/secrets/db_password inside container
+     # App reads: open("/run/secrets/db_password").read()
+  
+  4. KUBERNETES SECRETS:
+     kubectl create secret generic db-secret \
+       --from-literal=password=supersecret
+     
+     # Mount as file:
+     env:
+     - name: DB_PASSWORD
+       valueFrom:
+         secretKeyRef:
+           name: db-secret
+           key: password
+     
+     # Or as file:
+     volumeMounts:
+     - name: db-secret
+       mountPath: /run/secrets
+       readOnly: true
+  
+  5. EXTERNAL SECRET MANAGERS:
+     HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager
+     Use External Secrets Operator (K8s) to sync into Kubernetes Secrets
+     
+     # ExternalSecret CRD:
+     apiVersion: external-secrets.io/v1beta1
+     kind: ExternalSecret
+     spec:
+       refreshInterval: 1h
+       secretStoreRef:
+         name: aws-ssm
+         kind: SecretStore
+       target:
+         name: db-secret
+       data:
+       - secretKey: password
+         remoteRef:
+           key: /prod/db/password
+
+BuildKit Secrets (Build Time):
+  For secrets needed during build (private repos, pip credentials):
+  
+  # syntax=docker/dockerfile:1
+  FROM python:3.11
+  
+  # Mount secret temporarily — NOT baked into any layer
+  RUN --mount=type=secret,id=pip_config,target=/root/.pip/pip.conf \
+      pip install --no-cache-dir private-package
+  
+  # Build with:
+  docker build --secret id=pip_config,src=./pip.conf .
+
+================================================================================
+9. PRIVILEGED CONTAINERS AND SECURITY RISKS
+================================================================================
+
+What is --privileged:
+  Grants container ALL Linux capabilities.
+  Disables seccomp filtering.
+  Disables AppArmor/SELinux profiles.
+  Allows mounting host devices.
+  Allows managing network interfaces.
+  
+  Effectively removes almost all container isolation!
+  A privileged container can trivially escape to the host.
+
+Why --privileged Exists:
+  Some legitimate use cases:
+  - Docker-in-Docker (DinD) — running Docker inside a container
+  - Kubernetes node agent (kubelet) — needs host access
+  - System administration tools
+  - Container security testing
+  - Some storage volume plugins
+
+Container Escape with --privileged:
+  # Classic privileged escape (educational only — DO NOT use maliciously)
+  docker run --privileged -it ubuntu:22.04 bash
+  
+  # Inside privileged container:
+  fdisk -l                         # See host disks
+  mkdir /tmp/host && mount /dev/sda1 /tmp/host  # Mount host filesystem!
+  chroot /tmp/host                 # Now in host root!
+  # You're now root on the host.
+
+Alternatives to --privileged:
+  
+  # Specific capabilities instead:
+  docker run --cap-add SYS_ADMIN --security-opt apparmor:unconfined myapp
+  
+  # Docker-in-Docker without privileged (Rootless DinD):
+  docker run -it \
+    --security-opt apparmor:unconfined \
+    --security-opt seccomp:unconfined \
+    --tmpfs /run \
+    --tmpfs /var/lib/docker:exec \
+    docker:dind-rootless
+  
+  # Use kaniko instead of DinD for building images in CI:
+  # kaniko builds images without Docker daemon, without --privileged
+
+Kubernetes: Don't Allow Privileged Pods:
+  
+  # Pod Security Admission (K8s 1.23+):
+  # Add label to namespace to prevent privileged:
+  kubectl label namespace production \
+    pod-security.kubernetes.io/enforce=restricted
+  
+  # In Kyverno policy:
+  spec:
+    validationFailureAction: enforce
+    rules:
+    - name: no-privileged
+      validate:
+        message: "Privileged containers are not allowed"
+        pattern:
+          spec:
+            =(initContainers):
+            - =(securityContext):
+                =(privileged): "false"
+            containers:
+            - =(securityContext):
+                =(privileged): "false"
+
+================================================================================
+10. ROOTLESS DOCKER AND PODMAN
+================================================================================
+
+Rootless Docker:
+  Normally Docker daemon (dockerd) runs as root.
+  Rootless Docker: Docker daemon and containers run as non-root.
+  
+  Container escape in rootless mode: attacker is a regular user on host.
+  Dramatically reduces blast radius.
+  
+  Enable Rootless Docker:
+  # After Docker installation:
+  dockerd-rootless-setuptool.sh install
+  export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock
+  
+  # Systemd:
+  systemctl --user enable docker
+  systemctl --user start docker
+  
+  Limitations:
+  - Some features don't work (--network host, etc.)
+  - Lower performance for some workloads
+  - Overlay network requires root or privileged
+
+Podman:
+  Container engine by Red Hat. OCI compatible.
+  Daemon-less: each container is a direct child process of the user.
+  No central daemon (no dockerd).
+  Rootless by default.
+  
+  podman run -d -p 8080:80 nginx
+  podman build -t myapp .
+  podman push myapp registry.example.com/myapp:v1
+  
+  Drop-in replacement for Docker CLI:
+  alias docker=podman
+  
+  Advantages over Docker:
+  ✓ No daemon → more secure
+  ✓ Rootless by default
+  ✓ Each container is a process owned by the user
+  ✓ Pods natively (Podman pods = K8s pods)
+  ✓ Systemd integration
+  ✓ No Docker Desktop license needed on RHEL
+  
+  Podman Compose (for docker-compose.yml files):
+  pip install podman-compose
+  podman-compose up -d
+
+================================================================================
+11. DISTROLESS AND MINIMAL IMAGES
+================================================================================
+
+Distroless Images (Google):
+  Contains ONLY the application runtime + libraries.
+  No shell, no package manager, no debugging tools, no OS utilities.
+  
+  Benefit: Smallest attack surface possible.
+  Trade-off: Cannot exec into the container for debugging.
+  
+  Available distroless images:
+  gcr.io/distroless/static-debian12       # Static Go binaries
+  gcr.io/distroless/base-debian12         # Dynamic binaries
+  gcr.io/distroless/java17-debian12       # Java 17 JRE
+  gcr.io/distroless/python3-debian12      # Python 3
+  gcr.io/distroless/nodejs18-debian12     # Node.js 18
+  gcr.io/distroless/cc-debian12           # C/C++ with glibc
+  
+  # Debug variants (include busybox for debugging — don't ship in production!):
+  gcr.io/distroless/java17-debian12:debug
+
+Python Distroless Example:
+  
+  FROM python:3.11-slim AS builder
+  WORKDIR /app
+  COPY requirements.txt .
+  RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+  COPY . .
+  
+  FROM gcr.io/distroless/python3-debian12
+  WORKDIR /app
+  COPY --from=builder /install /usr
+  COPY --from=builder /app .
+  USER nonroot:nonroot          # distroless includes "nonroot" user (UID 65532)
+  CMD ["app.py"]                # Note: exec form, no shell available
+
+Go Static Binary to Scratch:
+  
+  FROM golang:1.21 AS builder
+  WORKDIR /app
+  COPY go.mod go.sum ./
+  RUN go mod download
+  COPY . .
+  RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o server .
+  
+  FROM scratch
+  COPY --from=builder /app/server /server
+  COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+  USER 65532:65532              # non-root UID
+  ENTRYPOINT ["/server"]
+
+Debugging Distroless Containers:
+  
+  # Option 1: Use debug variant temporarily
+  FROM gcr.io/distroless/java17-debian12:debug
+  
+  # Option 2: Ephemeral debug container (Kubernetes 1.23+)
+  kubectl debug -it myapp-pod \
+    --image=gcr.io/distroless/java17-debian12:debug \
+    --target=myapp-container
+  
+  # Option 3: Copy to container
+  kubectl cp /usr/local/bin/my-debug-tool myapp-pod:/tmp/
+
+================================================================================
+12. KUBERNETES POD SECURITY
+================================================================================
+
+Pod Security Standards (K8s 1.23+, Stable):
+  Three levels:
+  
+  PRIVILEGED:  No restrictions. For privileged system workloads.
+  
+  BASELINE:    Minimal restrictions. Prevents known privilege escalations.
+               Allows: some capabilities, running as any user
+               Disallows: privileged containers, hostPID, hostNetwork
+  
+  RESTRICTED:  Highly restrictive. Follows Pod Security best practices.
+               Requires: non-root, no privilege escalation,
+                         seccompProfile, drop capabilities
+               This is what most production workloads should use.
+
+Apply Pod Security Admission to Namespace:
+  
+  # Add labels to namespace:
+  apiVersion: v1
+  kind: Namespace
+  metadata:
+    name: production
+    labels:
+      pod-security.kubernetes.io/enforce: restricted    # Block non-conforming
+      pod-security.kubernetes.io/audit: restricted      # Log non-conforming
+      pod-security.kubernetes.io/warn: restricted       # Warn on admission
+
+Security Context (Container Level):
+  
+  spec:
+    securityContext:                   # Pod-level
+      runAsNonRoot: true
+      runAsUser: 1001
+      runAsGroup: 1001
+      fsGroup: 1001
+      seccompProfile:
+        type: RuntimeDefault
+    
+    containers:
+    - name: app
+      securityContext:                 # Container-level (overrides pod)
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+          - ALL
+          add:
+          - NET_BIND_SERVICE           # Only if binding ports < 1024
+
+Admission Controllers for Additional Security:
+  
+  OPA GATEKEEPER:
+    Policy as code in Rego language.
+    Prevent: certain images, missing resource limits, missing labels, etc.
+    
+    # Example: Require resource limits
+    apiVersion: constraints.gatekeeper.sh/v1beta1
+    kind: K8sRequiredResources
+    metadata:
+      name: require-resource-limits
+    spec:
+      match:
+        kinds: [{apiGroups: [""], kinds: ["Pod"]}]
+  
+  KYVERNO:
+    Kubernetes-native policy engine (YAML-based, no Rego).
+    
+    apiVersion: kyverno.io/v1
+    kind: ClusterPolicy
+    metadata:
+      name: disallow-root-user
+    spec:
+      validationFailureAction: enforce
+      rules:
+      - name: check-containers
+        match:
+          resources:
+            kinds: [Pod]
+        validate:
+          message: "Containers must not run as root"
+          pattern:
+            spec:
+              containers:
+              - =(securityContext):
+                  =(runAsNonRoot): "true"
+
+Network Policies:
+  Default: All pods can talk to all pods.
+  Network Policies restrict pod-to-pod communication.
+  
+  # Deny all ingress to a namespace:
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: deny-all-ingress
+    namespace: production
+  spec:
+    podSelector: {}       # All pods
+    policyTypes:
+    - Ingress
+    ingress: []           # No rules = deny all ingress
+  
+  # Allow only from specific pods:
+  spec:
+    podSelector:
+      matchLabels:
+        app: database
+    policyTypes: [Ingress]
+    ingress:
+    - from:
+      - podSelector:
+          matchLabels:
+            app: api     # Only api pods can reach database
+
+================================================================================
+13. NETWORK SECURITY FOR CONTAINERS
+================================================================================
+
+Container-to-Container Isolation:
+  Containers on different networks cannot communicate.
+  Use user-defined networks with minimal connectivity.
+  
+  Only connect containers to networks they NEED.
+  Database should not be on public-facing network.
+
+Encrypt Traffic Between Containers:
+  
+  # TLS within the cluster (service mesh):
+  # Istio, Linkerd provide mTLS automatically
+  
+  # Manual TLS in application code:
+  # App generates/uses TLS certs for all inter-service communication
+
+Kubernetes Network Policy Best Practices:
+  
+  1. Start with "deny all" ingress and egress
+  2. Explicitly allow only required communication
+  3. Use DNS names (service selectors) not IPs
+  
+  # Allow api to reach db:
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: allow-api-to-db
+  spec:
+    podSelector:
+      matchLabels:
+        app: database
+    ingress:
+    - from:
+      - podSelector:
+          matchLabels:
+            app: api
+      ports:
+      - protocol: TCP
+        port: 5432
+
+================================================================================
+14. RUNTIME SECURITY (FALCO)
+================================================================================
+
+What is Falco:
+  Open-source runtime security tool (CNCF).
+  Monitors syscalls in real-time.
+  Detects anomalous behavior in containers and hosts.
+  
+  Examples of what Falco can detect:
+  - Shell spawn in a container (docker exec bash)
+  - Reading sensitive files (/etc/passwd, /etc/shadow)
+  - Outbound network connections from database containers
+  - Writing binaries to non-writable filesystems
+  - Privilege escalation attempts
+
+Falco Rules Example:
+  
+  # Detect shell in container:
+  - rule: Terminal shell in container
+    desc: A shell was used as the entrypoint/exec in a container
+    condition: >
+      evt.type = execve
+      and evt.dir = <
+      and container.id != host
+      and proc.name in (bash, sh, zsh, ksh, fish)
+    output: >
+      Shell in a container
+      (user=%user.name container_id=%container.id
+       container_name=%container.name
+       shell=%proc.name parent=%proc.pname
+       cmdline=%proc.cmdline image=%container.image.repository)
+    priority: WARNING
+
+Deploy Falco in Kubernetes:
+  
+  helm repo add falcosecurity https://falcosecurity.github.io/charts
+  helm install falco falcosecurity/falco \
+    --namespace falco \
+    --create-namespace \
+    --set driver.kind=ebpf \
+    --set falcosidekick.enabled=true \
+    --set falcosidekick.webui.enabled=true
+
+================================================================================
+15. SUPPLY CHAIN SECURITY
+================================================================================
+
+Software Supply Chain Attacks:
+  SolarWinds, Codecov, Log4Shell — demonstrate that attackers target
+  the build pipeline and dependencies, not just production systems.
+  
+  Container supply chain attack vectors:
+  - Compromised base images on Docker Hub
+  - Malicious packages in pip/npm
+  - Compromised CI system that modifies images during build
+  - Registry MITM attack swapping image
+
+Defense Strategies:
+
+  1. SIGNED BASE IMAGES:
+     Use official images and verify signatures
+     Pin to digest: FROM ubuntu@sha256:exact-digest-here
+  
+  2. DEPENDENCY SCANNING:
+     Scan for vulnerable packages at build time
+     Use private package mirrors/proxy with approved packages
+  
+  3. BUILD ENVIRONMENT SECURITY:
+     Sign all commits (GPG)
+     Use OIDC for CI authentication (no long-lived secrets)
+     Pin action versions to commit SHA (not tags) in GitHub Actions
+  
+  4. IMAGE SIGNING:
+     Sign all images with Cosign after build
+     Verify signatures before deployment
+     Use Kubernetes admission webhook to enforce signed images
+  
+  5. PROVENANCE (SLSA):
+     SLSA (Supply-chain Levels for Software Artifacts) framework
+     Levels 1-4, higher = more trust
+     L3: Build is hermetic, provenance signed by build service
+     
+     # Sigstore/slsa-verifier:
+     slsa-verifier verify-image myapp:v1.2.3 \
+       --source-uri github.com/owner/repo \
+       --builder-id https://github.com/slsa-framework/slsa-github-generator
+
+SBOM and Compliance (Executive Order 14028):
+  US Executive Order requires SBOM for federal software.
+  Syft → Cosign → attach SBOM to image registry
+  Tools: Syft, Tern, Trivy (with --format sbom)
+
+================================================================================
+16. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: Why is running containers as root dangerous, and how do you prevent it?
+A: Containers share the host Linux kernel. If a container is running as root
+   and there's a container escape vulnerability (kernel bug, misconfiguration),
+   the attacker gets root access on the host.
+   
+   Prevention in Dockerfile:
+   RUN useradd -r -u 1001 -g appgroup appuser
+   USER appuser
+   
+   Prevention in Kubernetes:
+   securityContext:
+     runAsNonRoot: true
+     runAsUser: 1001
+     allowPrivilegeEscalation: false
+   
+   Pod Security Admission with "restricted" standard enforces this cluster-wide.
+   
+   Additionally, running as a specific numeric UID (1001) rather than root
+   ensures that even if the container somehow gains root capabilities, the
+   damage is limited because processes outside the container run as a
+   non-privileged user.
+
+Q2: What is a privileged container and why is it dangerous?
+A: A privileged container (--privileged flag) runs with ALL Linux capabilities,
+   disables seccomp filtering, disables AppArmor/SELinux, and can access host
+   devices. It essentially has root access to the host.
+   
+   Why it's dangerous: A classic privileged container escape is trivial:
+   mount the host's disk and chroot into it. You're now root on the host.
+   
+   When it's needed: Docker-in-Docker, some system agents, specific storage
+   plugins.
+   
+   Better alternatives:
+   - Grant specific capabilities instead of all: --cap-add SYS_PTRACE
+   - Use rootless Docker or Podman (no daemon to escape from)
+   - Use kaniko for building images without Docker (no DinD needed)
+   - For K8s: use Pod Security Standards to prevent privileged pods
+
+Q3: Explain the concept of Linux capabilities in container security.
+A: Linux capabilities divide root's omnipotent powers into ~40 individual
+   privileges that can be independently granted or revoked.
+   
+   Examples:
+   NET_BIND_SERVICE: Bind to ports below 1024 (like 80, 443)
+   CAP_SYS_ADMIN: Very broad — system administration operations
+   CAP_NET_RAW: Create raw sockets (needed for ping)
+   
+   Docker grants a limited default set of capabilities, but it's still more
+   than most apps need.
+   
+   Best practice: --cap-drop ALL, then --cap-add only what's needed:
+   docker run --cap-drop ALL --cap-add NET_BIND_SERVICE nginx
+   
+   In Kubernetes:
+   securityContext:
+     capabilities:
+       drop: [ALL]
+       add: [NET_BIND_SERVICE]
+   
+   This follows the principle of least privilege and reduces the blast
+   radius if a container is compromised.
+
+Q4: How do you handle secrets in containers securely?
+A: Common WRONG approach: Bake secrets into Docker images via ENV or build
+   args. This embeds secrets in image layers visible via docker history.
+   
+   CORRECT approaches (in order of security level):
+   
+   1. Pass at runtime via environment:
+      docker run -e DB_PASSWORD="$SECRET" myapp
+      Problem: Visible in process list, /proc
+   
+   2. Mount as file from host:
+      docker run -v /secure/secrets/db.txt:/run/secrets/db_password:ro myapp
+      App reads: open("/run/secrets/db_password")
+   
+   3. Docker Secrets (Swarm) / Kubernetes Secrets:
+      Secrets are encrypted in Swarm/etcd
+      Mounted at /run/secrets/ in container
+      Not in environment variables
+   
+   4. External Secret Managers (best for production):
+      HashiCorp Vault, AWS Secrets Manager
+      App uses SDK to retrieve secrets at runtime
+      Never stored in cluster — fetched directly
+      Combined with Kubernetes: External Secrets Operator syncs to K8s Secrets
+   
+   5. BuildKit secrets for build-time secrets:
+      RUN --mount=type=secret,id=pip_config pip install private-package
+      Secret exists only during that RUN layer — NOT in final image
+
+Q5: What security best practices would you apply to all containers in production?
+A: A comprehensive container security checklist:
+   
+   IMAGE SECURITY:
+   ✓ Use minimal base images (distroless, slim, alpine)
+   ✓ Pin to specific image digest (immutable reference)
+   ✓ Scan images with Trivy in CI pipeline — fail on CRITICAL
+   ✓ Sign images with Cosign
+   ✓ No secrets in Dockerfile
+   ✓ Multi-stage builds (no build tools in production image)
+   ✓ Keep base images updated regularly
+   
+   RUNTIME SECURITY:
+   ✓ Non-root user (USER instruction in Dockerfile)
+   ✓ Read-only root filesystem
+   ✓ Drop ALL capabilities, add only what's needed
+   ✓ No --privileged
+   ✓ Set memory and CPU limits
+   ✓ No writable volumes except specific paths
+   
+   KUBERNETES SECURITY:
+   ✓ Pod Security Standards (restricted level) applied to namespaces
+   ✓ Network Policies (deny-all default, explicit allows)
+   ✓ RBAC (minimal permissions)
+   ✓ Secrets stored in Kubernetes Secrets / Vault, not environment
+   ✓ Liveness and readiness probes configured
+   
+   MONITORING:
+   ✓ Falco for runtime anomaly detection
+   ✓ Container-aware logging (ship to centralized log system)
+   ✓ Alerting on suspicious activity (shell in container, etc.)
+
+================================================================================
+17. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+SECURITY CHECKLIST (Every Container):
+  ✓ USER appuser (non-root)
+  ✓ --read-only (immutable FS)
+  ✓ --cap-drop ALL --cap-add SPECIFIC
+  ✓ No --privileged
+  ✓ No secrets in ENV/ARG/Dockerfile
+  ✓ Resource limits (--memory, --cpus)
+  ✓ Minimal base image
+  ✓ Image scanned with Trivy
+
+NON-ROOT USER:
+  Dockerfile:  RUN useradd -r appuser && USER appuser
+  K8s:         securityContext.runAsNonRoot: true, runAsUser: 1001
+
+READ-ONLY FS:
+  docker run:  --read-only --tmpfs /tmp --tmpfs /run
+  K8s:         securityContext.readOnlyRootFilesystem: true
+
+CAPABILITIES:
+  Drop all:    --cap-drop ALL
+  Add back:    --cap-add NET_BIND_SERVICE
+  K8s:         capabilities.drop: [ALL], capabilities.add: [NET_BIND_SERVICE]
+
+SECCOMP:
+  Default:     Docker applies seccomp by default (blocks ~44 syscalls)
+  K8s:         seccompProfile.type: RuntimeDefault
+
+SECRETS:
+  NEVER:       ENV SECRET=... or ARG SECRET=... in Dockerfile
+  DO:          Docker Secrets, K8s Secrets, Vault, External Secrets Operator
+  Build time:  RUN --mount=type=secret,id=mysecret pip install private-pkg
+
+IMAGE SCANNING:
+  trivy image myapp:v1            # Scan image
+  trivy image --severity CRITICAL,HIGH --exit-code 1 myapp  # CI gate
+  syft myapp:v1 -o spdx-json > sbom.json  # Generate SBOM
+
+IMAGE SIGNING:
+  cosign sign --key cosign.key myapp:v1
+  cosign verify --key cosign.pub myapp:v1
+
+KUBERNETES POD SECURITY:
+  # Namespace label:
+  pod-security.kubernetes.io/enforce: restricted
+  
+  # Security context (container):
+  runAsNonRoot: true
+  runAsUser: 1001
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities.drop: [ALL]
+  seccompProfile.type: RuntimeDefault
+
+PRIVILEGED CONTAINERS:
+  NEVER use --privileged in production
+  Use specific --cap-add instead
+  Use kaniko for building images (no DinD)
+  Use rootless Docker or Podman
+
+RUNTIME SECURITY:
+  Falco: Syscall-level monitoring, detect anomalous behavior
+  Alert on: shell in container, reading sensitive files, privesc
+
+DISTROLESS BENEFITS:
+  No shell, no package manager, no utilities
+  Smallest attack surface
+  Cannot exec into (use :debug tag for debugging)
+  gcr.io/distroless/java17-debian12
+  gcr.io/distroless/python3-debian12
+
+================================================================================
+END OF FILE
+================================================================================

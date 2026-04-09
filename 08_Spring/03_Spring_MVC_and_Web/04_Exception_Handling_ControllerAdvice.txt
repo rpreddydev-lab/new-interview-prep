@@ -1,0 +1,301 @@
+================================================================
+  EXCEPTION HANDLING & @CONTROLLERADVICE — IN DEPTH
+================================================================
+
+================================================================
+DEFAULT SPRING MVC EXCEPTION HANDLING
+================================================================
+
+  Without custom handling, Spring maps common exceptions to HTTP:
+
+    MethodArgumentNotValidException     → 400
+    ConstraintViolationException        → 400
+    HttpMessageNotReadableException     → 400
+    MissingServletRequestParameterException → 400
+    NoHandlerFoundException             → 404
+    HttpRequestMethodNotSupportedException → 405
+    HttpMediaTypeNotSupportedException  → 415
+    ResponseStatusException             → (code set on exception)
+    RuntimeException (unhandled)        → 500
+
+================================================================
+@RestControllerAdvice — GLOBAL EXCEPTION HANDLER
+================================================================
+
+  @RestControllerAdvice                // = @ControllerAdvice + @ResponseBody
+  public class GlobalExceptionHandler {
+
+      // --- 400 Bad Request — Validation failures ---
+      @ExceptionHandler(MethodArgumentNotValidException.class)
+      @ResponseStatus(HttpStatus.BAD_REQUEST)
+      public ErrorResponse handleValidation(MethodArgumentNotValidException ex) {
+          List<FieldError> errors = ex.getBindingResult().getFieldErrors()
+              .stream()
+              .map(fe -> new FieldError(fe.getField(), fe.getDefaultMessage()))
+              .toList();
+          return new ErrorResponse("VALIDATION_FAILED", errors);
+      }
+
+      // --- 400 — Malformed JSON body ---
+      @ExceptionHandler(HttpMessageNotReadableException.class)
+      @ResponseStatus(HttpStatus.BAD_REQUEST)
+      public ErrorResponse handleBadJson(HttpMessageNotReadableException ex) {
+          return new ErrorResponse("MALFORMED_REQUEST", ex.getMostSpecificCause().getMessage());
+      }
+
+      // --- 404 Not Found ---
+      @ExceptionHandler(EntityNotFoundException.class)
+      @ResponseStatus(HttpStatus.NOT_FOUND)
+      public ErrorResponse handleNotFound(EntityNotFoundException ex) {
+          return new ErrorResponse("NOT_FOUND", ex.getMessage());
+      }
+
+      // --- 409 Conflict ---
+      @ExceptionHandler(DuplicateResourceException.class)
+      @ResponseStatus(HttpStatus.CONFLICT)
+      public ErrorResponse handleDuplicate(DuplicateResourceException ex) {
+          return new ErrorResponse("CONFLICT", ex.getMessage());
+      }
+
+      // --- 403 Forbidden ---
+      @ExceptionHandler(AccessDeniedException.class)
+      @ResponseStatus(HttpStatus.FORBIDDEN)
+      public ErrorResponse handleAccessDenied(AccessDeniedException ex) {
+          return new ErrorResponse("FORBIDDEN", "Access denied");
+      }
+
+      // --- 500 fallback ---
+      @ExceptionHandler(Exception.class)
+      @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+      public ErrorResponse handleAll(Exception ex) {
+          log.error("Unhandled exception", ex);
+          return new ErrorResponse("INTERNAL_ERROR", "Unexpected error");
+      }
+  }
+
+================================================================
+ERROR RESPONSE DTOs
+================================================================
+
+  // Standard problem details (RFC 9457 / RFC 7807)
+  public record ErrorResponse(
+      String type,      // URI identifying problem type
+      String title,     // short description
+      int status,       // HTTP status code
+      String detail,    // human-readable explanation
+      String instance   // URI identifying the specific occurrence
+  ) { }
+
+  // Simple error response
+  public record ErrorResponse(String code, Object detail) { }
+
+  // Field-level error
+  public record FieldError(String field, String message) { }
+
+================================================================
+@ResponseStatus ON EXCEPTIONS
+================================================================
+
+  @ResponseStatus(HttpStatus.NOT_FOUND)          // HTTP 404 always
+  public class OrderNotFoundException extends RuntimeException {
+      public OrderNotFoundException(Long id) {
+          super("Order not found: " + id);
+      }
+  }
+
+  // reason attribute sets WWW-Authenticate / reason body
+  @ResponseStatus(value = HttpStatus.CONFLICT,
+                  reason = "Email already registered")
+  public class EmailConflictException extends RuntimeException { }
+
+================================================================
+ResponseStatusException — PROGRAMMATIC THROW
+================================================================
+
+  @GetMapping("/users/{id}")
+  public UserDto getUser(@PathVariable Long id) {
+      return userRepo.findById(id)
+          .map(userMapper::toDto)
+          .orElseThrow(() ->
+              new ResponseStatusException(HttpStatus.NOT_FOUND,
+                                          "User not found: " + id));
+  }
+
+  // With cause chained
+  throw new ResponseStatusException(HttpStatus.UNPROCESSABLE_ENTITY,
+      "Invalid state transition", originalException);
+
+================================================================
+RFC 9457 — PROBLEM DETAILS (Spring 6.x)
+================================================================
+
+  Spring 6 / Spring Boot 3 has built-in ProblemDetail support.
+
+  // application.properties
+  spring.mvc.problemdetails.enabled=true
+
+  @RestControllerAdvice
+  public class ProblemDetailsHandler extends ResponseEntityExceptionHandler {
+
+      @ExceptionHandler(EntityNotFoundException.class)
+      public ProblemDetail handleNotFound(EntityNotFoundException ex,
+                                          HttpServletRequest request) {
+          ProblemDetail pd = ProblemDetail
+              .forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
+          pd.setType(URI.create("https://api.example.com/errors/not-found"));
+          pd.setTitle("Resource Not Found");
+          pd.setProperty("timestamp", Instant.now());
+          pd.setProperty("requestUri", request.getRequestURI());
+          return pd;
+      }
+  }
+
+  // Output JSON (RFC 9457):
+  // {
+  //   "type": "https://api.example.com/errors/not-found",
+  //   "title": "Resource Not Found",
+  //   "status": 404,
+  //   "detail": "Order not found: 42",
+  //   "instance": null,
+  //   "timestamp": "2024-01-15T10:30:00Z"
+  // }
+
+================================================================
+ResponseEntityExceptionHandler — BASE CLASS
+================================================================
+
+  Extend this to override how Spring's own exceptions are formatted:
+
+  @RestControllerAdvice
+  public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
+
+      @Override
+      protected ResponseEntity<Object> handleMethodArgumentNotValid(
+              MethodArgumentNotValidException ex,
+              HttpHeaders headers,
+              HttpStatusCode status,
+              WebRequest request) {
+
+          List<String> violations = ex.getBindingResult().getFieldErrors()
+              .stream()
+              .map(fe -> fe.getField() + ": " + fe.getDefaultMessage())
+              .toList();
+
+          ProblemDetail pd = ProblemDetail.forStatus(status);
+          pd.setTitle("Validation Failed");
+          pd.setProperty("violations", violations);
+
+          return handleExceptionInternal(ex, pd, headers, status, request);
+      }
+  }
+
+================================================================
+NARROWING @ControllerAdvice SCOPE
+================================================================
+
+  // Handle only exceptions from specific packages
+  @ControllerAdvice("com.example.orders")
+
+  // Handle only specific controller classes
+  @ControllerAdvice(assignableTypes = {OrderController.class,
+                                       PaymentController.class})
+
+  // Handle only controllers with specific annotations
+  @ControllerAdvice(annotations = RestController.class)
+
+================================================================
+LOCAL vs GLOBAL EXCEPTION HANDLING
+================================================================
+
+  Precedence: local @ExceptionHandler > @ControllerAdvice global
+
+  @RestController
+  public class OrderController {
+
+      // Handles only in this controller
+      @ExceptionHandler(IllegalArgumentException.class)
+      @ResponseStatus(HttpStatus.BAD_REQUEST)
+      public ErrorResponse handleIllegal(IllegalArgumentException ex) {
+          return new ErrorResponse("BAD_ARGUMENT", ex.getMessage());
+      }
+  }
+
+================================================================
+EXCEPTION HANDLING PRIORITY
+================================================================
+
+  1. @ExceptionHandler in the same @Controller (most specific)
+  2. @ExceptionHandler in @ControllerAdvice
+     (ordered by @Order / Ordered; first match wins)
+  3. Spring's HandlerExceptionResolver chain:
+       DefaultHandlerExceptionResolver (Spring MVC exceptions)
+       ResponseStatusExceptionResolver (@ResponseStatus)
+       SimpleMappingExceptionResolver (class→view name)
+       ExceptionHandlerExceptionResolver (@ExceptionHandler)
+
+================================================================
+CUSTOM HandlerExceptionResolver
+================================================================
+
+  @Component
+  @Order(Ordered.HIGHEST_PRECEDENCE)
+  public class CustomExceptionResolver implements HandlerExceptionResolver {
+
+      @Override
+      public ModelAndView resolveException(
+              HttpServletRequest request,
+              HttpServletResponse response,
+              Object handler,
+              Exception ex) {
+          if (ex instanceof RateLimitException) {
+              response.setStatus(429);
+              // write JSON directly
+              try {
+                  response.getWriter().write("{\"error\":\"rate_limited\"}");
+              } catch (IOException ignored) { }
+              return new ModelAndView();  // non-null = handled
+          }
+          return null;  // null = not handled; pass to next resolver
+      }
+  }
+
+================================================================
+INTERVIEW QUESTIONS — EXCEPTION HANDLING
+================================================================
+
+  Q: What is the difference between @ControllerAdvice and
+     @RestControllerAdvice?
+  A: @RestControllerAdvice = @ControllerAdvice + @ResponseBody.
+     Handler methods return domain objects serialised to JSON
+     instead of view names.
+
+  Q: What is ResponseEntityExceptionHandler and why extend it?
+  A: It's a convenient base class that handles all standard Spring
+     MVC exceptions (MethodArgumentNotValidException, etc.) and
+     maps them to ResponseEntity. Extending it lets you override
+     individual handlers to change response format consistently.
+
+  Q: How does @ResponseStatus on an exception class differ from
+     throwing ResponseStatusException?
+  A: @ResponseStatus is declarative, set at class definition. The
+     status is always fixed. ResponseStatusException is programmatic
+     — you can choose the status and detail at throw time.
+
+  Q: What is ProblemDetail (RFC 9457)?
+  A: A standard JSON structure for HTTP errors with fields: type,
+     title, status, detail, instance. Spring 6+ supports it via
+     spring.mvc.problemdetails.enabled=true.
+
+  Q: If two @ControllerAdvice beans both handle the same exception,
+     which one wins?
+  A: The one with the highest @Order value (lower number = higher
+     priority) runs first. First match wins; once an advice handles
+     an exception the chain stops.
+
+  Q: Can you handle exceptions in an async controller method
+     (@Async / DeferredResult)?
+  A: Exceptions from DeferredResult.setErrorResult() or Callable
+     are processed through the same ExceptionHandlerExceptionResolver
+     chain. @Async bean method exceptions are NOT caught by
+     @ExceptionHandler; use AsyncUncaughtExceptionHandler instead.
+

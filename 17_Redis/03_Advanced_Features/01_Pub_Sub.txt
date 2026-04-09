@@ -1,0 +1,239 @@
+================================================================================
+REDIS PUB/SUB — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. WHAT IS REDIS PUB/SUB?
+───────────────────────────
+Redis Pub/Sub (Publish/Subscribe) is a messaging paradigm where:
+  - Publishers send messages to channels (without knowing subscribers)
+  - Subscribers receive messages from channels (without knowing publishers)
+  - The channel is the communication medium
+
+  Decoupling: publisher and subscriber don't need to know each other.
+  Fan-out: one publish → delivered to ALL subscribers of that channel.
+
+  Redis Pub/Sub is entirely in-memory, fire-and-forget:
+  - If a subscriber is offline when a message is published → message is LOST
+  - Messages are NOT stored in Redis
+  - No replay, no persistence, no consumer groups
+
+
+2. CORE COMMANDS
+─────────────────
+  Subscribe:
+    SUBSCRIBE channel [channel …]       → subscribe to exact channels
+    PSUBSCRIBE pattern [pattern …]      → subscribe to pattern-matched channels
+                                           Patterns: ? (single char), * (any)
+                                           [hH]ello → matches hello or Hello
+
+    UNSUBSCRIBE [channel …]             → unsubscribe from channels
+    PUNSUBSCRIBE [pattern …]            → unsubscribe from patterns
+
+  Publish:
+    PUBLISH channel message             → deliver message to all channel subscribers
+                                          Returns: number of clients that received it
+
+  Inspect:
+    PUBSUB CHANNELS [pattern]           → list active channels (with subscribers)
+    PUBSUB NUMSUB [channel …]           → subscriber count per channel
+    PUBSUB NUMPAT                       → number of active pattern subscriptions
+    PUBSUB SHARDCHANNELS [pattern]      → shard channels (Redis 7.0+)
+    PUBSUB SHARDNUMSUB [channel …]      → shard channel subscriber counts
+
+
+3. HOW PUB/SUB WORKS INTERNALLY
+─────────────────────────────────
+  Client enters "subscriber mode" after SUBSCRIBE.
+  In subscriber mode: the client can ONLY execute:
+    SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PING, RESET, QUIT
+
+  Redis server maintains:
+    - subscriptions dict: channel → list of subscribed clients
+    - psubscriptions dict: pattern → list of subscribed clients
+
+  On PUBLISH channel message:
+    1. Look up channel in subscriptions dict
+    2. Send message to each subscribed client
+    3. Also match channel against all patterns in psubscriptions
+    4. Send to all matching pattern subscribers
+
+  Message format received by subscriber:
+    1) "message"         (type)
+    2) "news:tech"       (channel)
+    3) "Redis 8 released" (message body)
+
+  Pattern message format:
+    1) "pmessage"
+    2) "news:*"          (pattern)
+    3) "news:tech"       (matched channel)
+    4) "Redis 8 released" (message body)
+
+
+4. SUBSCRIBE EXAMPLE (INTERACTIVE)
+────────────────────────────────────
+  Terminal 1 (Subscriber):
+    > SUBSCRIBE chat:room1
+    Reading messages... (press Ctrl-C to quit)
+    1) "subscribe"
+    2) "chat:room1"
+    3) (integer) 1        ← subscription count
+
+    (Waiting for messages...)
+    1) "message"
+    2) "chat:room1"
+    3) "Hello, World!"
+
+  Terminal 2 (Publisher):
+    > PUBLISH chat:room1 "Hello, World!"
+    (integer) 1   ← 1 client received it
+
+  Pattern subscription:
+    > PSUBSCRIBE "news:*"
+    → receives messages from: news:tech, news:sports, news:finance, etc.
+
+
+5. USE CASES
+─────────────
+
+5a. Real-Time Chat:
+  Each chat room = a Redis channel.
+  Users subscribe to the channel for their room.
+  Messages published to the channel → delivered to all connected users.
+  Backend WebSocket servers subscribe to Redis channels.
+
+5b. Live Dashboard Updates:
+  Metrics service:  PUBLISH metrics:cpu "75.2"
+  Dashboard server: SUBSCRIBE metrics:cpu, metrics:memory, metrics:requests
+  Dashboard pushes to browser via WebSocket on receive.
+
+5c. Cache Invalidation Broadcast:
+  On DB update in service-A:
+    PUBLISH cache:invalidate "product:42"
+  All service instances subscribe to "cache:invalidate":
+    → Each instance deletes product:42 from its local cache.
+
+5d. Real-Time Notifications:
+  User service: PUBLISH user:42:notifications '{"type":"new_message","from":99}'
+  Notification server (subscribed to user:42:notifications):
+    → Pushes to user's browser/mobile via WebSocket/FCM.
+
+5e. Microservices Events:
+  Order service: PUBLISH events:order-placed '{"orderId":42}'
+  Inventory service: SUBSCRIBE events:order-placed
+  Email service:    SUBSCRIBE events:order-placed
+  Analytics service: SUBSCRIBE events:order-placed
+  → All three services react independently to the same event.
+
+5f. Live Feed / Activity Stream:
+  PSUBSCRIBE user:*:activity
+  → Receive all user activity events (user:42:activity, user:99:activity, etc.)
+
+
+6. LIMITATIONS — CRITICAL FOR INTERVIEWS
+──────────────────────────────────────────
+  ✗ No message persistence: publisher offline → messages lost permanently
+  ✗ No message replay: can't retrieve past messages
+  ✗ No consumer groups: all subscribers receive ALL messages (no partitioning)
+  ✗ No acknowledgment: publisher can't know if subscriber processed the message
+  ✗ Subscriber disconnect = missed messages (no buffering)
+  ✗ No backpressure: if subscriber is slow, messages are dropped
+
+  These are fundamental limitations of the Pub/Sub model in Redis.
+  → For durable messaging: use Redis Streams (XADD/XREADGROUP/XACK)
+
+
+7. PUB/SUB vs REDIS STREAMS
+─────────────────────────────
+  Feature               │ Pub/Sub               │ Redis Streams
+  ──────────────────────┼───────────────────────┼────────────────────────────
+  Persistence           │ No (fire-and-forget)  │ Yes (append-only log)
+  Message replay        │ No                    │ Yes (XRANGE from ID)
+  Consumer groups       │ No (all get all)      │ Yes (distributed processing)
+  Acknowledgment        │ No                    │ Yes (XACK)
+  Offline subscribers   │ Miss messages         │ Messages wait (PEL)
+  Retention             │ None                  │ Configurable (MAXLEN)
+  Message ordering      │ Per-channel           │ Per-stream (timestamp ID)
+  Fan-out               │ Yes (native)          │ Multiple groups needed
+  Latency               │ Sub-ms                │ Sub-ms
+  Use case              │ Live events, chat     │ Task queue, event sourcing
+
+
+8. SHARDED PUB/SUB (REDIS 7.0+)
+─────────────────────────────────
+  Problem with classic Pub/Sub in Redis Cluster:
+    A message PUBLISHED on any node is forwarded to ALL other nodes.
+    Even if only 1 subscriber exists on 1 shard.
+    → O(N) network traffic per publish (N = cluster nodes)
+    → Doesn't scale horizontally
+
+  Sharded Pub/Sub (Redis 7.0+):
+    Each channel is pinned to a specific hash slot (like regular keys).
+    Publishers must connect to the right shard.
+    Messages don't fan out to other shards.
+    → O(1) network traffic per publish
+    → Scales with the cluster
+
+    SSUBSCRIBE channel [channel …]  → shard-subscribe
+    SUNSUBSCRIBE [channel …]        → shard-unsubscribe
+    SPUBLISH channel message         → shard-publish
+
+  Note: Libraries must support sharded Pub/Sub (Jedis, Lettuce do).
+
+
+9. SPRING/JAVA INTEGRATION
+────────────────────────────
+  // Spring Data Redis Pub/Sub
+  @Bean
+  RedisMessageListenerContainer container(RedisConnectionFactory factory,
+                                           MessageListenerAdapter listenerAdapter) {
+      RedisMessageListenerContainer container = new RedisMessageListenerContainer();
+      container.setConnectionFactory(factory);
+      container.addMessageListener(listenerAdapter, new PatternTopic("news:*"));
+      return container;
+  }
+
+  @Bean
+  MessageListenerAdapter listenerAdapter(NewsSubscriber subscriber) {
+      return new MessageListenerAdapter(subscriber, "onMessage");
+  }
+
+  @Component
+  class NewsSubscriber {
+      public void onMessage(String message, String channel) {
+          System.out.println("Received: " + message + " from: " + channel);
+      }
+  }
+
+  // Publisher
+  @Autowired StringRedisTemplate redisTemplate;
+  redisTemplate.convertAndSend("news:tech", "Redis 8.0 released!");
+
+
+10. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: What is Redis Pub/Sub and when would you use it?
+  A: Redis Pub/Sub is a message broadcasting system where publishers send to
+     channels and all current subscribers receive the message. Use it for
+     real-time events where message loss is acceptable: live dashboards, chat
+     systems, cache invalidation broadcasts, real-time notifications. Not suitable
+     when message delivery guarantees are needed.
+
+  Q: What's the biggest limitation of Redis Pub/Sub?
+  A: Messages are NOT persisted. If a subscriber is offline or disconnected
+     when a message is published, it's permanently lost. There's no replay,
+     no consumer groups, and no acknowledgment. For durable messaging with
+     guaranteed delivery, use Redis Streams instead.
+
+  Q: How is Pub/Sub different from Streams?
+  A: Pub/Sub is fire-and-forget: messages are delivered to current subscribers
+     only and immediately discarded. Streams are an append-only persistent log:
+     messages are stored, can be replayed, support consumer groups with ACK
+     semantics, and work even when consumers are temporarily offline.
+
+  Q: How does Pub/Sub work in Redis Cluster?
+  A: In classic Pub/Sub, PUBLISH broadcasts the message to ALL cluster nodes
+     (O(N) traffic). This is why Redis 7.0 introduced Sharded Pub/Sub
+     (SSUBSCRIBE/SPUBLISH), which pins channels to specific hash slots and
+     avoids cluster-wide fanout.
+
+================================================================================

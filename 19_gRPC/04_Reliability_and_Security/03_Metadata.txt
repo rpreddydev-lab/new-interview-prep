@@ -1,0 +1,289 @@
+================================================================
+gRPC METADATA (HEADERS AND TRAILERS)
+================================================================
+
+----------------------------------------------------------------
+1. WHAT IS METADATA?
+----------------------------------------------------------------
+
+gRPC Metadata is the equivalent of HTTP headers.
+It is key-value pairs sent alongside the RPC request and response.
+
+Two types of metadata in gRPC:
+  1. Headers (initial metadata): sent at the beginning of the call
+  2. Trailers (trailing metadata): sent at the END of the call (with status)
+
+HTTP/2 mapping:
+  Client request headers  → HEADERS frame (start of stream)
+  Server initial metadata → HEADERS frame (before first DATA)
+  Server trailing metadata → TRAILERS frame (end of stream)
+
+Metadata.Key types:
+  ASCII key:   name must end in anything, value is ASCII string
+  Binary key:  name must end in "-bin", value is byte[] (base64 encoded on wire)
+
+Common use cases:
+  ✅ Authentication tokens (authorization: Bearer <jwt>)
+  ✅ Request tracing (x-trace-id, x-span-id)
+  ✅ Tenant/context propagation (x-tenant-id, x-user-id)
+  ✅ API version (x-api-version)
+  ✅ Rich error details (returned in trailers)
+  ✅ Rate limit info (x-ratelimit-remaining)
+
+----------------------------------------------------------------
+2. METADATA KEY NAMING RULES
+----------------------------------------------------------------
+
+ASCII keys:
+  - Lowercase letters, digits, underscores, hyphens, periods
+  - Must NOT end in "-bin"
+  - Examples: "authorization", "x-trace-id", "content-type"
+
+Binary keys:
+  - Same characters as ASCII keys
+  - MUST end in "-bin"
+  - Value is raw bytes (framework base64-encodes automatically)
+  - Examples: "grpc-status-details-bin", "user-profile-bin"
+
+Reserved gRPC keys (managed by framework, don't set manually):
+  "grpc-*"    — reserved prefix
+  "content-type", "te"  — HTTP/2 standard headers
+
+----------------------------------------------------------------
+3. READING AND WRITING METADATA IN JAVA
+----------------------------------------------------------------
+
+// ── Define metadata keys ──────────────────────────────────────
+
+public class GrpcMetadataKeys {
+  
+  // ASCII key
+  public static final Metadata.Key<String> TENANT_ID =
+      Metadata.Key.of("x-tenant-id", Metadata.ASCII_STRING_MARSHALLER);
+  
+  // ASCII key
+  public static final Metadata.Key<String> AUTHORIZATION =
+      Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER);
+  
+  // Binary key
+  public static final Metadata.Key<byte[]> REQUEST_PROFILE =
+      Metadata.Key.of("x-request-profile-bin", Metadata.BINARY_BYTE_MARSHALLER);
+  
+  // Proto binary key (serialized protobuf value)
+  public static final Metadata.Key<UserProfile> USER_PROFILE_KEY =
+      ProtoUtils.keyForProto(UserProfile.getDefaultInstance());
+  // Key name: "user-profile-proto-bin"
+}
+
+// ── CLIENT: Attach metadata to outgoing requests ──────────────
+
+// Option 1: MetadataUtils.attachHeaders (static, per-call)
+Metadata metadata = new Metadata();
+metadata.put(GrpcMetadataKeys.TENANT_ID, "tenant-abc");
+metadata.put(GrpcMetadataKeys.AUTHORIZATION, "Bearer " + token);
+
+OrderServiceGrpc.OrderServiceBlockingStub stub =
+    MetadataUtils.attachHeaders(baseStub, metadata);
+
+// Option 2: Client interceptor (applies to all calls on a channel)
+// See 03_Interceptors.txt for JwtClientInterceptor example
+
+// ── SERVER: Read request metadata in interceptor ──────────────
+
+@Override
+public <Req, Resp> ServerCall.Listener<Req> interceptCall(
+    ServerCall<Req, Resp> call, Metadata headers, ServerCallHandler<Req, Resp> next) {
+  
+  String tenantId = headers.get(GrpcMetadataKeys.TENANT_ID);
+  String authorization = headers.get(GrpcMetadataKeys.AUTHORIZATION);
+  
+  // Store in context for service methods
+  Context ctx = Context.current()
+      .withValue(TENANT_KEY, tenantId)
+      .withValue(AUTH_KEY, authorization);
+  
+  return Contexts.interceptCall(ctx, call, headers, next);
+}
+
+// ── SERVER: Send initial metadata (response headers) ──────────
+
+@Override
+public void createOrder(CreateOrderRequest request,
+                        StreamObserver<CreateOrderResponse> responseObserver) {
+  
+  ServerCallStreamObserver<CreateOrderResponse> serverObserver =
+      (ServerCallStreamObserver<CreateOrderResponse>) responseObserver;
+  
+  // Send initial metadata BEFORE any onNext() calls
+  Metadata initialMetadata = new Metadata();
+  initialMetadata.put(
+      Metadata.Key.of("x-request-id", Metadata.ASCII_STRING_MARSHALLER),
+      UUID.randomUUID().toString());
+  
+  serverObserver.sendHeaders(initialMetadata);
+  
+  // Process and respond
+  serverObserver.onNext(response);
+  serverObserver.onCompleted();
+}
+
+// ── SERVER: Send trailing metadata (trailers) ─────────────────
+
+// Trailers are typically sent automatically with onCompleted().
+// To send custom trailers, use a ForwardingServerCall:
+
+@Override
+public <Req, Resp> ServerCall.Listener<Req> interceptCall(
+    ServerCall<Req, Resp> call, Metadata headers, ServerCallHandler<Req, Resp> next) {
+  
+  ServerCall<Req, Resp> trailingMetadataCall =
+      new ForwardingServerCall.SimpleForwardingServerCall<>(call) {
+    
+    @Override
+    public void close(Status status, Metadata trailers) {
+      // Add custom trailers
+      trailers.put(
+          Metadata.Key.of("x-processing-time-ms", Metadata.ASCII_STRING_MARSHALLER),
+          String.valueOf(System.currentTimeMillis() - startTime));
+      super.close(status, trailers);
+    }
+  };
+  
+  return next.startCall(trailingMetadataCall, headers);
+}
+
+// ── CLIENT: Read response metadata (headers) ──────────────────
+
+// AsyncStub: use MetadataUtils.newAttachHeadersInterceptor
+AtomicReference<Metadata> responseHeaders = new AtomicReference<>();
+AtomicReference<Metadata> responseTrailers = new AtomicReference<>();
+
+OrderServiceGrpc.OrderServiceStub stub = OrderServiceGrpc.newStub(channel)
+    .withInterceptors(
+        MetadataUtils.newCaptureMetadataInterceptor(responseHeaders, responseTrailers));
+
+stub.createOrder(request, new StreamObserver<CreateOrderResponse>() {
+  @Override
+  public void onNext(CreateOrderResponse r) {
+    // Response headers available now
+    String requestId = responseHeaders.get()
+        .get(Metadata.Key.of("x-request-id", Metadata.ASCII_STRING_MARSHALLER));
+    System.out.println("Request ID: " + requestId);
+  }
+  @Override public void onError(Throwable t) {
+    // Trailers available in e.getTrailers() for StatusRuntimeException
+  }
+  @Override public void onCompleted() {}
+});
+
+// ── CLIENT: Read trailers on error ────────────────────────────
+
+try {
+  stub.createOrder(request);
+} catch (StatusRuntimeException e) {
+  Metadata trailers = e.getTrailers();
+  if (trailers != null) {
+    String retryAfter = trailers.get(
+        Metadata.Key.of("retry-after", Metadata.ASCII_STRING_MARSHALLER));
+    if (retryAfter != null) {
+      long waitMs = Long.parseLong(retryAfter);
+      Thread.sleep(waitMs);
+      // retry...
+    }
+  }
+}
+
+----------------------------------------------------------------
+4. PROTO-TYPED METADATA KEYS
+----------------------------------------------------------------
+
+For strongly-typed binary metadata using Protocol Buffers:
+
+// Using ProtoUtils for type-safe metadata
+message RequestContext {
+  string tenant_id = 1;
+  string user_id = 2;
+  repeated string roles = 3;
+}
+
+// Define key
+Metadata.Key<RequestContext> REQUEST_CONTEXT_KEY =
+    ProtoUtils.keyForProto(RequestContext.getDefaultInstance());
+
+// Client: send
+Metadata metadata = new Metadata();
+metadata.put(REQUEST_CONTEXT_KEY, RequestContext.newBuilder()
+    .setTenantId("tenant-1")
+    .setUserId("user-abc")
+    .addRoles("ORDER_CREATE")
+    .build());
+
+// Server: receive
+RequestContext ctx = headers.get(REQUEST_CONTEXT_KEY);
+String tenantId = ctx.getTenantId();
+
+----------------------------------------------------------------
+5. METADATA CONVENTIONS
+----------------------------------------------------------------
+
+Standard metadata patterns (commonly used in production):
+
+  Header Name              Purpose
+  ─────────────────────────────────────────────────────────────
+  authorization            Auth token: "Bearer <jwt>"
+  x-request-id             Unique request identifier
+  x-trace-id               Distributed tracing trace ID
+  x-span-id                Distributed tracing span ID
+  x-tenant-id              Multi-tenancy routing
+  x-forwarded-for          Original client IP
+  user-agent               Client SDK version info
+  x-api-version            API version negotiation
+  x-retry-count            Current retry attempt number
+  retry-after              Seconds to wait before retry (trailer)
+  grpc-status-details-bin  Rich error details (Status proto, trailer)
+
+Best practices:
+  ✅ Use lowercase with hyphens: "x-tenant-id" not "X_TENANT_ID"
+  ✅ Prefix custom headers with "x-" to avoid conflicts
+  ✅ Validate all metadata in interceptors, not service methods
+  ✅ Don't put sensitive data in headers if not using TLS
+  ✅ Keep metadata small — large metadata bloats HTTP/2 HEADERS frames
+  ✅ Use context values (not metadata) for internal service propagation
+
+----------------------------------------------------------------
+6. INTERVIEW KEY POINTS
+----------------------------------------------------------------
+
+Q: What is the difference between gRPC headers and trailers?
+A: Headers (initial metadata) are sent at the beginning of the call
+   before any response data. Trailers (trailing metadata) are sent
+   at the very end of the call along with the status code. Headers
+   are used for response-time metadata like request IDs and rate
+   limit headers. Trailers are used for status codes and error details.
+   For unary RPCs, the gRPC framework often merges headers and trailers
+   into a single HEADERS frame with END_STREAM. For streaming RPCs,
+   headers come first and trailers are the final HEADERS frame.
+
+Q: How do you attach metadata to a gRPC call without modifying every call site?
+A: Use a ClientInterceptor registered globally with @GrpcGlobalClientInterceptor.
+   In the interceptor's interceptCall(), use a ForwardingClientCall that
+   overrides start() and adds your metadata to the headers parameter.
+   This applies to ALL outgoing calls on channels that have this interceptor.
+
+Q: How would you read response headers (not trailers) from a gRPC call?
+A: On the client, use MetadataUtils.newCaptureMetadataInterceptor()
+   to capture headers and trailers into AtomicReference<Metadata> holders.
+   In the response observer's onNext(), the headers AtomicReference will
+   already be populated. For errors, trailers are available via
+   StatusRuntimeException.getTrailers().
+
+Q: Can metadata contain arbitrary binary data?
+A: Yes, for keys ending in "-bin". These binary-valued keys can hold
+   any byte[] data, including serialized proto messages. The gRPC
+   framework automatically base64-encodes binary metadata values
+   for transport over HTTP/2 and decodes them on receipt.
+   Use ProtoUtils.keyForProto() for strongly-typed proto-valued keys.
+
+================================================================
+END OF FILE
+================================================================

@@ -1,0 +1,247 @@
+================================================================================
+  SPRING KAFKA — TESTING WITH EMBEDDED KAFKA
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHAT IS EMBEDDED KAFKA?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Spring Kafka provides @EmbeddedKafka — an in-memory Kafka broker that starts and
+stops with your test. No external Kafka cluster required.
+
+  Dependency (Maven):
+  <dependency>
+    <groupId>org.springframework.kafka</groupId>
+    <artifactId>spring-kafka-test</artifactId>
+    <scope>test</scope>
+  </dependency>
+
+  Dependency (Gradle):
+  testImplementation 'org.springframework.kafka:spring-kafka-test'
+
+  // Auto-imported by spring-boot-starter-test if spring-kafka is on classpath.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. BASIC SETUP WITH @EmbeddedKafka
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  @SpringBootTest
+  @EmbeddedKafka(
+    partitions = 1,
+    topics = {"orders", "shipped-orders"},
+    brokerProperties = {
+      "listeners=PLAINTEXT://localhost:${spring.kafka.bootstrap-servers}",
+      "log.dir=/tmp/kafka-test-logs"
+    }
+  )
+  class OrderIntegrationTest {
+
+    @Autowired
+    private KafkaTemplate<String, Order> kafkaTemplate;
+
+    @Autowired
+    private EmbeddedKafkaBroker embeddedKafka;
+
+    // ...
+  }
+
+  # application-test.properties (auto-used by @SpringBootTest):
+  spring.kafka.bootstrap-servers=${spring.embedded.kafka.brokers}
+
+  # OR override in @TestPropertySource:
+  @TestPropertySource(properties = {
+    "spring.kafka.bootstrap-servers=${spring.embedded.kafka.brokers}"
+  })
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. TESTING A PRODUCER: SEND AND VERIFY WHAT WAS CONSUMED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  @Test
+  void testOrderSent() {
+    // Create a test consumer to read from the topic
+    Map<String, Object> consumerProps = KafkaTestUtils.consumerProps(
+      "test-group", "true", embeddedKafka
+    );
+    DefaultKafkaConsumerFactory<String, String> cf =
+      new DefaultKafkaConsumerFactory<>(consumerProps);
+    Consumer<String, String> consumer = cf.createConsumer();
+    embeddedKafka.consumeFromEmbeddedTopics(consumer, "orders");
+
+    // Act: produce a message
+    Order order = new Order("123", "PAID");
+    kafkaTemplate.send("orders", order.getId(), order);
+
+    // Assert: consume it
+    ConsumerRecords<String, String> records =
+      KafkaTestUtils.getRecords(consumer, Duration.ofSeconds(5));
+
+    assertThat(records).hasSize(1);
+    ConsumerRecord<String, String> record = records.iterator().next();
+    assertThat(record.key()).isEqualTo("123");
+    assertThat(record.value()).contains("PAID");
+
+    consumer.close();
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. TESTING A CONSUMER: PRODUCE AND VERIFY @KafkaListener IS INVOKED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Since @KafkaListener is async, use CountDownLatch to synchronize the test:
+
+  // In your listener (or a test spy):
+  @Component
+  public class OrderListener {
+    public CountDownLatch latch = new CountDownLatch(1);
+    public Order received;
+
+    @KafkaListener(topics = "orders")
+    public void handleOrder(Order order) {
+      this.received = order;
+      latch.countDown();
+    }
+  }
+
+  @SpringBootTest
+  @EmbeddedKafka(partitions = 1, topics = "orders")
+  @TestPropertySource(properties = "spring.kafka.bootstrap-servers=${spring.embedded.kafka.brokers}")
+  class OrderListenerTest {
+
+    @Autowired
+    private KafkaTemplate<String, Order> kafkaTemplate;
+
+    @Autowired
+    private OrderListener orderListener;
+
+    @Test
+    void testListenerReceivesOrder() throws InterruptedException {
+      Order order = new Order("456", "PENDING");
+
+      kafkaTemplate.send("orders", order.getId(), order);
+
+      // Wait up to 10 seconds for the listener to be invoked
+      boolean received = orderListener.latch.await(10, TimeUnit.SECONDS);
+
+      assertThat(received).isTrue(); // latch counted down = listener fired
+      assertThat(orderListener.received.getId()).isEqualTo("456");
+      assertThat(orderListener.received.getStatus()).isEqualTo("PENDING");
+    }
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. TESTING WITH MOCKITO SPIES (REAL LISTENER + ASSERTIONS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  @SpringBootTest
+  @EmbeddedKafka(partitions = 1, topics = "orders")
+  @TestPropertySource(properties = "spring.kafka.bootstrap-servers=${spring.embedded.kafka.brokers}")
+  class OrderListenerSpyTest {
+
+    @SpyBean
+    private OrderListener orderListener;
+
+    @Autowired
+    private KafkaTemplate<String, Order> kafkaTemplate;
+
+    @Test
+    void testListenerCalledWithCorrectOrder() throws InterruptedException {
+      Order order = new Order("789", "SHIPPED");
+      kafkaTemplate.send("orders", order.getId(), order);
+
+      // Use Awaitility for cleaner async assertions
+      await()
+        .atMost(10, SECONDS)
+        .untilAsserted(() ->
+          verify(orderListener, times(1)).handleOrder(argThat(o -> o.getId().equals("789")))
+        );
+    }
+  }
+
+  // Add Awaitility dependency:
+  // testImplementation 'org.awaitility:awaitility:4.2.0'
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. TESTING ERROR HANDLING AND DLQ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  @SpringBootTest
+  @EmbeddedKafka(partitions = 1, topics = {"orders", "orders.DLT"})
+  @TestPropertySource(properties = "spring.kafka.bootstrap-servers=${spring.embedded.kafka.brokers}")
+  class DlqTest {
+
+    @Autowired
+    private KafkaTemplate<String, Order> kafkaTemplate;
+
+    @Autowired
+    private EmbeddedKafkaBroker embeddedKafka;
+
+    @Test
+    void testPoisonPillSentToDlt() {
+      // Invalid order that causes listener to throw
+      Order badOrder = new Order(null, "INVALID");
+      kafkaTemplate.send("orders", badOrder);
+
+      // Create consumer on DLT
+      Map<String, Object> consumerProps =
+        KafkaTestUtils.consumerProps("dlt-test", "true", embeddedKafka);
+      DefaultKafkaConsumerFactory<String, String> cf =
+        new DefaultKafkaConsumerFactory<>(consumerProps);
+      Consumer<String, String> dltConsumer = cf.createConsumer();
+      embeddedKafka.consumeFromEmbeddedTopics(dltConsumer, "orders.DLT");
+
+      // After retries exhausted, message should appear in DLT
+      ConsumerRecords<String, String> dltRecords =
+        KafkaTestUtils.getRecords(dltConsumer, Duration.ofSeconds(30)); // allow retry time
+
+      assertThat(dltRecords).isNotEmpty();
+      dltConsumer.close();
+    }
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is @EmbeddedKafka and why is it used in tests?
+A: @EmbeddedKafka spins up an in-memory Kafka broker (using kafka-clients internals)
+   for the duration of the test. No external Kafka installation needed. It's fast
+   (seconds to start), isolated (no test data pollution across runs), and integrates
+   directly with Spring's test context via the ${spring.embedded.kafka.brokers}
+   property placeholder. It supports multiple brokers, custom partitions, and topic
+   auto-creation. Ideal for integration tests that exercise real Kafka behavior
+   (serialization, offset management, consumer groups).
+
+Q: How do you test an asynchronous @KafkaListener in a unit test?
+A: The listener runs on a background thread, so the test thread must wait. Two
+   patterns: (1) CountDownLatch — the listener calls latch.countDown() when invoked;
+   the test calls latch.await(timeout). Fails if the listener never fires. (2) Awaitility
+   — use await().atMost(10, SECONDS).untilAsserted(() -> verify(spy, times(1))...).
+   Awaitility polls the assertion repeatedly until it passes or times out, making tests
+   more readable. Both patterns should use a reasonable timeout (10-30s for embedded Kafka).
+
+Q: What does KafkaTestUtils.getRecords() do?
+A: It's a test utility that polls a Consumer for records with a configurable timeout.
+   It returns ConsumerRecords<K,V> containing all records received within the timeout.
+   Pair it with embeddedKafka.consumeFromEmbeddedTopics(consumer, "topic") to assign
+   the test consumer to the embedded topic. Useful for producer-side integration tests
+   where you want to verify what was actually written to Kafka by producing then
+   consuming with a test consumer.
+
+Q: How do you configure the Spring Kafka test to point to the embedded broker?
+A: Set spring.kafka.bootstrap-servers=${spring.embedded.kafka.brokers} in a
+   @TestPropertySource annotation or in src/test/resources/application.properties.
+   The placeholder ${spring.embedded.kafka.brokers} is automatically populated by
+   @EmbeddedKafka with the actual host:port of the embedded broker. Without this,
+   the application context will try to connect to the default localhost:9092 which
+   won't exist in the test environment.
+
+Q: When would you use @SpyBean vs CountDownLatch for testing a Kafka listener?
+A: CountDownLatch is simpler and has no dependencies — just add latch.countDown() in
+   the listener. Good for straightforward "did the listener fire?" tests. @SpyBean wraps
+   the real listener bean with Mockito, enabling verify() assertions (was it called with
+   the right arguments? how many times?), stubbing (to override behavior for certain
+   inputs), and capturing argument values via ArgumentCaptor. Use @SpyBean when you need
+   precise argument matching or call count verification, and CountDownLatch for basic
+   invocation confirmation.

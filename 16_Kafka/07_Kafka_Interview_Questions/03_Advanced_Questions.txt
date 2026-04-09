@@ -1,0 +1,287 @@
+================================================================================
+  KAFKA INTERVIEW QUESTIONS — ADVANCED AND SCENARIO-BASED
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SCENARIO: DESIGN AND TROUBLESHOOTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q1: You have a consumer group that is falling behind. Consumer lag is growing.
+    Walk through how you would diagnose and fix this.
+
+A: DIAGNOSIS STEPS:
+   1. Confirm lag is growing: kafka-consumer-groups.sh --describe. Which partitions?
+      All partitions equally or just a few? Uneven lag → specific partition problem.
+   2. Check consumer CPU and memory: are consumers saturated? OOM kills?
+   3. Check processing time: add timing logs around core processing. Is one downstream
+      call (DB, API) slow? Profile the hottest path.
+   4. Check batch sizes: max.poll.records too large → processing takes longer than
+      max.poll.interval.ms → consumer kicked out → rebalance → more lag.
+   5. Check if downstream service is the bottleneck (DB slow, rate limits hit).
+   6. Check for rebalance loops: consumer logs showing frequent rebalances indicate
+      a heartbeat/poll issue, not a processing issue.
+
+   FIXES (in order of escalation):
+   - Tune: reduce max.poll.records, reduce processing scope per record.
+   - Scale: add more consumer instances (up to partition count).
+   - Increase partitions: if all consumers are busy and you need more parallelism.
+   - Move heavy work async: consumer acknowledges quickly, offloads to thread pool
+     or another service (note: lose ordering guarantee unless careful).
+   - Horizontal shard: split topic into multiple topics with fewer consumers each.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q2: Design a system to process 1 million user events per second with Kafka.
+    What would your architecture look like?
+
+A: KEY COMPONENTS:
+
+   PRODUCERS (event sources):
+   - Multiple app servers/edge nodes publishing to Kafka.
+   - enable.idempotence=true, acks=1 (or all for critical events),
+     compression.type=lz4, batch.size=131072, linger.ms=5.
+   - Partition key = user_id (co-locate all user events on same partition for ordering).
+
+   KAFKA CLUSTER:
+   - 10-20 brokers (depend on RF and throughput per broker).
+   - Partition count: 1M events/s ÷ ~100K events/partition/s = ~10 partitions minimum.
+     Over-provision: 50-100 partitions for future growth.
+   - RF=3, min.insync.replicas=2.
+   - retention.bytes sized for your replay window.
+   - Log compaction if keyed state needed; delete policy for raw events.
+
+   CONSUMERS:
+   - Consumer group per downstream system (analytics, ML pipeline, recommendations).
+   - Consumer concurrency = partition count (one thread per partition).
+   - Batch processing: max.poll.records=500, process in micro-batches.
+   - Downstream: write to columnar store (Parquet/ORC in S3 via Kafka Connect S3 Sink)
+     for analytics; write to Redis/Cassandra for real-time lookups.
+
+   MONITORING:
+   - Consumer lag alerts, broker URP alerts, producer error rate alerts.
+   - Kafka Streams or Flink for stateful aggregations (e.g., session counts per user).
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q3: You're using Kafka for payment processing. A consumer reads a payment event,
+    calls an external payment gateway, and writes the result to a DB. How do you
+    ensure exactly-once processing?
+
+A: TRUE exactly-once across Kafka + external API + DB is impossible (external
+   APIs don't participate in Kafka transactions). Practical approaches:
+
+   1. IDEMPOTENT PAYMENT GATEWAY:
+      - Include a client-generated idempotency key in the payment request
+        (e.g., paymentId = Kafka offset + topic + partition, or a UUID stored with the event).
+      - Payment gateway deduplicates by idempotency key.
+      - Allows safe retries from Kafka.
+
+   2. OFFSET IN DB TRANSACTION:
+      - In same DB transaction: write payment result + write consumed offset to a
+        kafka_offsets table.
+      - On startup: read offsets from DB, call consumer.seek() to those positions.
+      - If app crashes after DB COMMIT → Kafka offset is durably stored.
+      - If app crashes before DB COMMIT → DB rolls back → offset not advanced → re-process.
+      - Combine with idempotent gateway for end-to-end safety.
+
+   3. OUTBOX PATTERN (producing results):
+      - Write payment_result and idempotency_key to DB in one TX.
+      - Separate publisher (or Debezium) reads outbox → publishes to Kafka result topic.
+      - Exactly-once DB write, at-least-once Kafka publish with idempotent consumer downstream.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q4: How would you handle schema evolution in a Kafka topic that has many
+    producers and consumers with different deploy schedules?
+
+A: Use the Confluent Schema Registry with a compatibility strategy:
+
+   BACKWARD COMPATIBILITY (recommended default):
+   - New schema can read data written by old schema.
+   - Allows consumers to upgrade BEFORE producers.
+   - Safe changes: add optional fields with defaults, remove fields consumers don't use.
+   - Unsafe: rename fields, change types, remove required fields.
+
+   FORWARD COMPATIBILITY:
+   - Old schema can read data written by new schema.
+   - Allows producers to upgrade BEFORE consumers.
+   - Safe: remove optional fields, add fields with defaults (old consumers ignore).
+
+   FULL COMPATIBILITY: both backward + forward. Most restrictive but safest for
+   large teams with many independent consumers.
+
+   DEPLOYMENT STRATEGY:
+   1. Register new schema version against the subject.
+   2. Schema Registry validates compatibility automatically (rejects if incompatible).
+   3. Deploy consumers first (they can read old and new format).
+   4. Deploy producers (they start writing new format).
+   5. Old records with old schema remain valid — consumers handle both via Avro unions
+      or optional fields.
+
+   PRACTICAL TIPS:
+   - Use Avro union types for fields that may change type.
+   - Never rename fields — add a new field, deprecate old, remove in next major version.
+   - Use schema subjects per topic (topic-value, topic-key) for fine-grained control.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q5: What is the Kafka Streams topology, and how does task assignment work?
+
+A: A Kafka Streams TOPOLOGY is a DAG (directed acyclic graph) of:
+   - SOURCE NODES: consume from Kafka topics
+   - PROCESSOR NODES: transform, filter, join, aggregate
+   - SINK NODES: write back to Kafka topics
+
+   Each source node + all downstream processors = one SUB-TOPOLOGY. A sub-topology
+   with a single source topic produces one TASK per partition of that topic.
+
+   TASKS and THREADS:
+   - StreamsBuilder builds the topology. Each input partition = one task.
+   - Kafka Streams starts num.stream.threads threads per instance.
+   - Tasks are distributed across threads within an instance.
+   - When you run multiple instances (scale-out), tasks distribute across instances
+     via a consumer group rebalance (application.id = group.id).
+
+   STATE STORES:
+   - Stateful operations (count, aggregate, join) maintain a local RocksDB state store.
+   - Each task owns its state store partition (no sharing between tasks).
+   - Changelog topic (compacted): replicates state store for fault tolerance.
+   - On task reassignment: new task restores state from changelog. Standby replicas
+     (num.standby.replicas) keep a hot copy to minimize restore time.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q6: When would you use Kafka Connect vs a custom consumer + producer?
+
+A: KAFKA CONNECT:
+   + No-code/low-code integration: mature connectors for 200+ systems (DB, S3, ES...)
+   + Built-in fault tolerance, distributed mode, auto-restart on failure.
+   + Exactly-once with transactional connectors.
+   + Configuration-driven (JSON), REST API management.
+   + SMTs for lightweight transformations without writing code.
+   - Limited for complex business logic.
+   - Debugging connector issues requires understanding connector internals.
+   - Custom connectors require Java + Kafka Connect API knowledge.
+
+   CUSTOM CONSUMER + PRODUCER:
+   + Full control over transformation logic, error handling, retry semantics.
+   + Better for complex business rules, conditional routing, multi-step enrichment.
+   + Easier to unit test (standard Spring Boot / Java testing).
+   + Can integrate with DB transactions (outbox pattern).
+   - More boilerplate: offset management, rebalance handling, error handling.
+   - Must re-implement what Connect provides for free (restart, DLQ, monitoring).
+
+   HYBRID: Use Connect for ingestion (Debezium → Kafka, Kafka → S3/ES) and custom
+   consumers for business logic (Kafka → microservice → DB + downstream Kafka topics).
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q7: How does Kafka handle time for stream processing? What are event time vs
+    ingestion time vs wall clock time?
+
+A: Three time concepts:
+   EVENT TIME: the time when the event actually happened, encoded in the record itself
+   (e.g., order.createdAt). Most accurate for business semantics, but events can
+   arrive late (out-of-order due to network delays, mobile clients going offline).
+
+   INGESTION TIME (broker time): when the record was written to Kafka broker.
+   Monotonically non-decreasing within a partition. Less semantically meaningful but
+   reliable — no late events by definition once a record is in Kafka.
+
+   WALL CLOCK TIME (processing time): the current system clock when the consumer
+   processes the record. Simplest, but least meaningful for analytics (depends on
+   consumer throughput, pauses, restarts).
+
+   STREAM TIME in Kafka Streams:
+   - Kafka Streams tracks the maximum timestamp seen across all partitions (stream time).
+   - Stream time only advances when new records arrive — it does NOT advance during idle.
+   - Window calculations are based on event time (record timestamp) + stream time for
+     grace period triggering.
+   - Late records (timestamp < stream time - grace period) are discarded.
+   - Grace period: how long after a window closes to still accept late records.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q8: How does Debezium capture changes from a relational database?
+
+A: Debezium is a CDC (Change Data Capture) tool implemented as Kafka Connect source connectors.
+
+   MYSQL: reads from the MySQL binary log (binlog). Binlog records every
+   INSERT/UPDATE/DELETE as an event. Debezium acts like a MySQL replica, receiving
+   binlog events in real time.
+
+   POSTGRESQL: uses logical replication slots with an output plugin (pgoutput or decoderbufs).
+   PostgreSQL writes WAL (Write-Ahead Log); the slot decodes WAL changes into a stream
+   that Debezium reads.
+
+   Record structure:
+   {
+     "before": { "id": 1, "status": "PENDING" },  // null for INSERT
+     "after":  { "id": 1, "status": "SHIPPED" },  // null for DELETE
+     "op":     "u",  // c=create, u=update, d=delete, r=read (snapshot)
+     "ts_ms":  1700000000000
+   }
+
+   INITIAL SNAPSHOT: on first startup, Debezium performs a consistent snapshot
+   (SELECT all rows) to establish baseline. Subsequent changes come via binlog/WAL.
+
+   Use cases: sync data to Elasticsearch, populate read models, audit trails,
+   cache invalidation, real-time analytics from OLTP data.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q9: What are the trade-offs between Kafka and a cloud messaging service like
+    AWS SQS or Azure Event Hubs?
+
+A: KAFKA vs SQS:
+   Kafka: pull-based, ordered per partition, replay by offset, high throughput,
+   strong ecosystem (Streams, Connect). Operational overhead. Best for event streaming,
+   high-throughput pipelines, replay scenarios.
+   SQS: push-based, serverless/managed, visibility timeout for distributed consumers,
+   FIFO queues for ordering. Simple to use, scales automatically. No replay after
+   consumption. Best for task queues, work distribution, simple async decoupling.
+
+   KAFKA vs Azure Event Hubs:
+   Event Hubs is Kafka-compatible (uses Kafka protocol on port 9093). Fully managed,
+   auto-scales, no cluster management. Lacks some Kafka advanced features (transactions
+   support varies, Kafka Streams compatibility). Good for Azure-native shops wanting
+   Kafka semantics without ops burden.
+
+   Decision factors:
+   - Need replay/reprocessing → Kafka or Event Hubs
+   - Need complex routing, per-message TTL → RabbitMQ or SQS
+   - Need stateful stream processing → Kafka Streams
+   - Need serverless + simple → SQS/SNS
+   - Need Kafka without ops → Azure Event Hubs / Confluent Cloud / MSK
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q10: You want to migrate a large consumer group to a new version of your
+     application with new business logic. How do you do a zero-downtime migration?
+
+A: STRATEGY 1 — BLUE/GREEN WITH SEPARATE CONSUMER GROUP:
+   1. Deploy new version with a DIFFERENT group.id (e.g., orders-consumer-v2).
+   2. Set auto.offset.reset=earliest or seek to specific offset on the new group.
+   3. Run old and new groups in parallel for validation (compare outputs).
+   4. Once validated, stop old group, decommission old version.
+   - Pros: zero risk to old group. Can roll back by switching back.
+   - Cons: double processing cost during validation.
+
+   STRATEGY 2 — ROLLING UPDATE OF SAME CONSUMER GROUP:
+   1. Use CooperativeStickyAssignor to minimize rebalance disruption.
+   2. Deploy new version pods one at a time.
+   3. As each old pod shuts down: partitions rebalance to remaining old + new pods.
+   4. CooperativeStickyAssignor ensures only affected partitions move.
+   5. Validate each pod before proceeding.
+   - Pros: no double processing, same group, in-place migration.
+   - Cons: mixed versions handling same partitions; ensure backward compatibility.
+
+   STRATEGY 3 — PAUSE AND RESUME:
+   1. Stop all consumers (or use KafkaListenerEndpointRegistry.pause()).
+   2. Deploy new version.
+   3. Resume consumers.
+   - Downtime proportional to deploy time. Only acceptable for non-critical systems.
+
+   KEY CONSIDERATION: if new code changes how offsets are managed (e.g., migrating
+   from auto-commit to manual), ensure offset state is consistent during transition.

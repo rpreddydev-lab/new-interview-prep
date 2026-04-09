@@ -1,0 +1,387 @@
+================================================================
+GRAPHQL SUBSCRIPTIONS — IN DEPTH
+================================================================
+
+1. WHAT ARE SUBSCRIPTIONS?
+---------------------------
+Subscriptions are the third operation type in GraphQL, enabling REAL-TIME
+data delivery. Unlike queries and mutations (request-response), subscriptions
+create a persistent connection and push updates to clients as events occur.
+
+Use cases:
+  - Live notifications (new message, order status update)
+  - Real-time dashboards (stock prices, live metrics)
+  - Collaborative features (user typing indicator, concurrent edits)
+  - Live sports scores, auction bids, chat
+
+2. HOW SUBSCRIPTIONS WORK
+---------------------------
+```
+Client                     Server
+  │                            │
+  │── subscribe({ query }) ──> │  1. Client sends subscription query
+  │                            │  2. Server registers the subscription
+  │                            │  3. Event triggers (DB change, message)
+  │ <── { data: {...} } ──────│  4. Server pushes update to client
+  │ <── { data: {...} } ──────│  5. More events → more pushes
+  │── unsubscribe ──────────> │  6. Client closes connection
+  │                            │
+```
+
+Transport mechanisms:
+  - WebSocket (most common) — bidirectional, low latency
+  - Server-Sent Events (SSE) — unidirectional, simpler setup
+  - gRPC streaming (less common for GraphQL)
+
+Protocols:
+  - `graphql-ws` (modern, recommended): https://github.com/enisdenjo/graphql-ws
+  - `subscriptions-transport-ws` (legacy, Apollo's old protocol)
+
+3. SUBSCRIPTION SYNTAX
+-----------------------
+```graphql
+# Basic subscription
+subscription OnNewMessage {
+  messageAdded {
+    id
+    body
+    sender {
+      name
+      avatar
+    }
+    sentAt
+  }
+}
+
+# Subscription with arguments (filtered)
+subscription OnOrderStatusChanged($orderId: ID!) {
+  orderStatusChanged(orderId: $orderId) {
+    id
+    status
+    updatedAt
+    estimatedDelivery
+  }
+}
+
+# Chat room subscription
+subscription OnChatMessage($channelId: ID!) {
+  messageAdded(channelId: $channelId) {
+    id
+    body
+    type
+    sender { id name avatar }
+    sentAt
+    reactions { emoji count }
+  }
+}
+```
+
+4. SUBSCRIPTION SCHEMA DESIGN
+--------------------------------
+```graphql
+type Subscription {
+  # Real-time notifications
+  notificationReceived(userId: ID!): Notification!
+
+  # Chat
+  messageAdded(channelId: ID!): Message!
+  userTyping(channelId: ID!): TypingIndicator!
+
+  # Orders
+  orderStatusChanged(orderId: ID!): OrderStatusEvent!
+  newOrderPlaced: Order!                    # Admin — all new orders
+
+  # Live data
+  productPriceUpdated(productId: ID!): PriceUpdate!
+  stockLevelChanged(warehouseId: ID!): StockEvent!
+
+  # Presence
+  userOnlineStatusChanged(userId: ID!): UserPresence!
+}
+
+type OrderStatusEvent {
+  orderId: ID!
+  previousStatus: OrderStatus!
+  newStatus: OrderStatus!
+  changedAt: DateTime!
+  changedBy: User
+  notes: String
+}
+
+type TypingIndicator {
+  user: User!
+  channelId: ID!
+  isTyping: Boolean!
+}
+
+type PriceUpdate {
+  product: Product!
+  oldPrice: Float!
+  newPrice: Float!
+  percentageChange: Float!
+  updatedAt: DateTime!
+}
+```
+
+5. SUBSCRIPTION IMPLEMENTATION (SPRING FOR GRAPHQL)
+----------------------------------------------------
+Spring for GraphQL uses Project Reactor (Flux) for subscriptions:
+
+```java
+// Schema:
+// type Subscription { orderUpdated(orderId: ID!): Order! }
+
+@Controller
+public class OrderSubscriptionController {
+
+  private final OrderEventPublisher eventPublisher;
+
+  // Option 1: Flux-based subscription
+  @SubscriptionMapping
+  public Flux<Order> orderUpdated(@Argument String orderId) {
+    return eventPublisher.getOrderEvents()
+      .filter(event -> event.getOrderId().equals(orderId))
+      .map(event -> orderRepository.findById(orderId).orElseThrow());
+  }
+
+  // Option 2: Publisher-based with Spring ApplicationEvents
+  @SubscriptionMapping
+  public Flux<Order> newOrderPlaced() {
+    return Flux.create(sink -> {
+      // Subscribe to Spring application events
+      ApplicationListener<OrderPlacedEvent> listener = event ->
+        sink.next(event.getOrder());
+
+      // Register listener... (simplified)
+    });
+  }
+}
+```
+
+Using Spring's reactive pub/sub with Sinks:
+```java
+@Component
+public class OrderEventPublisher {
+  private final Sinks.Many<OrderEvent> sink =
+    Sinks.many().multicast().onBackpressureBuffer();
+
+  public void publishOrderEvent(OrderEvent event) {
+    sink.tryEmitNext(event);
+  }
+
+  public Flux<OrderEvent> getOrderEvents() {
+    return sink.asFlux();
+  }
+}
+
+@Controller
+public class OrderSubscriptionController {
+
+  private final OrderEventPublisher publisher;
+
+  @SubscriptionMapping
+  public Flux<Order> orderStatusChanged(@Argument String orderId) {
+    return publisher.getOrderEvents()
+      .filter(e -> e.getOrderId().equals(orderId))
+      .map(OrderEvent::getOrder);
+  }
+}
+
+// Trigger the event from a mutation or service:
+@Service
+public class OrderService {
+
+  private final OrderEventPublisher publisher;
+
+  public Order updateStatus(String orderId, OrderStatus newStatus) {
+    Order order = orderRepository.findById(orderId).orElseThrow();
+    order.setStatus(newStatus);
+    order = orderRepository.save(order);
+
+    // Publish event to all subscribers
+    publisher.publishOrderEvent(new OrderEvent(orderId, order));
+    return order;
+  }
+}
+```
+
+6. WEBSOCKET SETUP (SPRING BOOT)
+----------------------------------
+```yaml
+# application.yml
+spring:
+  graphql:
+    websocket:
+      path: /graphql-ws
+```
+
+```java
+@Configuration
+public class WebSocketConfig {
+  @Bean
+  public WebSocketGraphQlInterceptor subscriptionInterceptor() {
+    return new WebSocketGraphQlInterceptor() {
+      @Override
+      public Mono<Object> handleCancelledSubscription(
+          WebSocketSession session,
+          SubscriptionCancelledEvent event) {
+        // Cleanup resources
+        return WebSocketGraphQlInterceptor.super.handleCancelledSubscription(session, event);
+      }
+    };
+  }
+}
+```
+
+Client-side (JavaScript with graphql-ws):
+```javascript
+import { createClient } from 'graphql-ws';
+
+const client = createClient({
+  url: 'ws://localhost:8080/graphql-ws',
+  connectionParams: {
+    Authorization: `Bearer ${token}`
+  }
+});
+
+// Subscribe
+const unsubscribe = client.subscribe(
+  {
+    query: `subscription { orderStatusChanged(orderId: "123") { status updatedAt } }`,
+  },
+  {
+    next: (data) => console.log('Update:', data),
+    error: (err) => console.error('Error:', err),
+    complete: () => console.log('Subscription complete'),
+  }
+);
+
+// Unsubscribe when done
+unsubscribe();
+```
+
+7. AUTHENTICATION IN SUBSCRIPTIONS
+------------------------------------
+Token must be passed during WebSocket handshake (not in each message):
+
+```javascript
+// Client sends auth token in connection params
+const client = createClient({
+  url: 'ws://localhost:8080/graphql-ws',
+  connectionParams: async () => ({
+    Authorization: `Bearer ${await getToken()}`
+  })
+});
+```
+
+Server-side interceptor:
+```java
+@Component
+public class AuthWebSocketInterceptor implements WebSocketGraphQlInterceptor {
+
+  @Override
+  public Mono<Object> intercept(WebSocketMessage message, Chain chain) {
+    // Extract token from connection params
+    return chain.next(message);
+  }
+
+  @Override
+  public Mono<WebSocketHandlerConfig> handleConnectionInitialization(
+      WebSocketSession session,
+      Map<String, Object> payload) {
+
+    String token = (String) payload.get("Authorization");
+    // Validate token and add user to session attributes
+    if (!isValidToken(token)) {
+      return Mono.error(new UnauthorizedException("Invalid token"));
+    }
+    return Mono.just(WebSocketHandlerConfig.newInstance()
+      .attribute("user", extractUser(token))
+      .build());
+  }
+}
+```
+
+8. SUBSCRIPTION SECURITY
+--------------------------
+  ✓ Authenticate at WebSocket connection time (not per-message)
+  ✓ Authorize per subscription field (check in subscription resolver)
+  ✓ Implement subscription limits (max concurrent subscriptions per user)
+  ✓ Filter events server-side (don't send events to unauthorized clients)
+  ✓ Rate limit subscription connections
+  ✗ Don't pass auth tokens in subscription query variables (insecure URL logging)
+
+```java
+@SubscriptionMapping
+public Flux<Order> myOrders(@ContextValue User currentUser) {
+  if (currentUser == null) {
+    return Flux.error(new UnauthorizedException("Must be logged in"));
+  }
+  return orderEventPublisher.getOrderEvents()
+    .filter(event -> event.getUserId().equals(currentUser.getId()))
+    .map(OrderEvent::getOrder);
+}
+```
+
+9. SUBSCRIPTION VS POLLING
+-----------------------------
+  Feature           | WebSocket Subscriptions  | Polling (Query + interval)
+  ─────────────────────────────────────────────────────────────────────────
+  Latency           | Real-time (milliseconds)  | Depends on interval (seconds)
+  Server load       | Low (push only on change) | High (constant requests)
+  Network usage     | Low (only on change)      | High (even when no change)
+  Complexity        | High (WS setup, state)    | Low (just repeat a query)
+  Stateless         | No (persistent connection)| Yes
+  CDN/proxy         | Doesn't work              | Works
+  Use when          | Need real-time            | Acceptable delay, simpler setup
+
+  When to use polling instead:
+  - Simple dashboards where a 5-second delay is acceptable
+  - Infrastructure doesn't support WebSockets
+  - Stateless serverless deployment
+  - Low-frequency updates (no more than once per minute)
+
+10. INTERVIEW QUESTIONS & ANSWERS
+-----------------------------------
+
+Q: How do GraphQL subscriptions work under the hood?
+A: The client sends a subscription query to the server over WebSocket. The
+   server registers the subscription and creates an event stream (e.g., a
+   Reactor Flux in Spring). When events occur (DB changes, user actions), the
+   server filters them against the subscription criteria and pushes matching
+   events to the client as GraphQL responses. The connection stays open until
+   either side closes it.
+
+Q: What protocol does GraphQL use for subscriptions?
+A: Most commonly WebSocket. Two protocols: `graphql-ws` (modern, recommended)
+   and `subscriptions-transport-ws` (legacy Apollo). Some implementations also
+   support Server-Sent Events (SSE) for simpler unidirectional streaming.
+
+Q: How do you authenticate subscriptions?
+A: Authentication should happen at WebSocket connection initialization, not
+   per-message. The client sends auth credentials in the `connection_params`
+   during the WebSocket handshake. The server validates the token and stores
+   the user in the WebSocket session. Per-subscription authorization is then
+   done in subscription resolvers using the session user.
+
+Q: What's the difference between subscriptions and polling?
+A: Subscriptions use a persistent WebSocket connection and push data when
+   events occur — real-time with minimal overhead. Polling repeatedly sends
+   query requests at intervals. Subscriptions are better for truly real-time
+   needs; polling is simpler and works where WebSockets aren't available.
+
+Q: How do you prevent a subscription from exposing data to unauthorized users?
+A: Filter events in the subscription resolver based on the authenticated user.
+   Only emit events that the current user is authorized to see. The filter
+   runs server-side before pushing to the client. Additionally, close the
+   WebSocket if authentication fails or the token expires.
+
+Q: What is the N+1 problem in subscriptions?
+A: If a subscription returns an entity with nested fields, each push event
+   could trigger multiple resolver calls (N+1). DataLoader works in the
+   subscription context too — create fresh DataLoader instances per
+   subscription event to batch field-level queries.
+
+================================================================
+END OF FILE
+================================================================

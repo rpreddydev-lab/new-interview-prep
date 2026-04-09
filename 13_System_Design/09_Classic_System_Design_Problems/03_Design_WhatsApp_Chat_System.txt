@@ -1,0 +1,294 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DESIGN: WHATSAPP / CHAT SYSTEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FUNCTIONAL:
+  - 1-on-1 messaging (text, images, videos, files)
+  - Group messaging (up to 256 members)
+  - Message delivery receipts: sent ✓, delivered ✓✓, read ✓✓ (blue)
+  - Online presence indicator (last seen)
+  - Push notifications for offline users
+  - Message history (last 30 days online; full history on device)
+  - End-to-end encryption (bonus)
+
+NON-FUNCTIONAL:
+  - 2B DAU, 100B messages/day
+  - Message delivery latency: p99 < 500ms for online users
+  - Availability: 99.99% (people depend on this for emergencies)
+  - Messages must be delivered EXACTLY ONCE (no duplicates)
+  - Message ordering: Messages from same sender arrive in order
+  - Offline users: Messages queued and delivered when they come online
+
+SCALE:
+  100B messages/day / 86,400 ≈ 1.16M messages/second
+  Peak: ~3-4M messages/second
+
+
+2. ESTIMATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MESSAGES:
+  100B messages/day × 200 bytes avg = 20TB/day text messages
+  Plus media: Images/videos stored in object storage
+
+CONNECTIONS:
+  2B users, 20% active concurrently = 400M concurrent connections
+  With 100K connections per chat server: 400M / 100K = 4,000 chat servers
+
+CHAT SERVERS:
+  Each WebSocket connection uses ~50KB RAM
+  100K connections × 50KB = 5GB RAM per server (manageable with modern servers)
+
+
+3. API / PROTOCOL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TRANSPORT: WebSockets (persistent bidirectional connection)
+  Why not HTTP polling?
+    - HTTP polling: client asks "any messages?" every few seconds → high latency
+    - Long polling: client waits (up to 30s) → better latency, complex
+    - WebSocket: server PUSHES messages to client → instant delivery
+
+  Connection: ws://chat.server.com/ws?token=JWT
+  
+MESSAGE FRAME FORMAT:
+  {
+    "type": "message",
+    "messageId": "uuid-v4",           (client-generated for deduplication)
+    "conversationId": "conv-123",
+    "recipientId": "user-456",
+    "content": "Hello!",
+    "contentType": "text",            (text/image/video/file)
+    "timestamp": 1700000000000,       (client timestamp, ms)
+    "clientSeq": 42                   (sequence per sender, for ordering)
+  }
+
+ACK PROTOCOL:
+  Client → Server: send message (messageId: X)
+  Server → Client: ack {messageId: X, serverTimestamp: T, status: "sent"}
+  Server → Recipient: push message
+  Recipient → Server: ack {messageId: X, status: "delivered"}
+  Server → Sender: delivery receipt {messageId: X, status: "delivered"}
+  Recipient opens chat → Server → Sender: read receipt {messageId: X, status: "read"}
+
+
+4. HIGH-LEVEL ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+KEY INSIGHT: Can't route message directly from Sender's chat server to
+             Recipient's chat server — need connection routing.
+
+  [Sender] ──WS──→ [Chat Server A] → [Message Service]
+                                              ↓ lookup recipient's server
+                                      [Connection Registry (Redis)]
+                                              ↓ "Recipient is on Chat Server B"
+                                      [Chat Server B] ──push──→ [Recipient]
+
+  If recipient is OFFLINE:
+    Message Service → [Offline Message Queue (Redis/Kafka)]
+    When recipient connects → batch deliver queued messages
+
+CONNECTION REGISTRY:
+  Redis: user_id → chat_server_hostname
+  Set when WebSocket connects: SET conn:{user_id} "chat-server-42" EX 30
+  Heartbeat refreshes every 10 seconds
+  TTL expiry: user offline (no heartbeat)
+  
+  On message send:
+    1. Sender's chat server saves message to DB
+    2. Lookup recipient's server in Redis
+    3. Send message to recipient's server via internal gRPC call
+    4. Recipient's server pushes to recipient's WebSocket
+
+FULL ARCHITECTURE:
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ Client (Mobile/Web)                                             │
+  └──────────────────────┬──────────────────────────────────────────┘
+                WebSocket │
+  ┌──────────────────────▼──────────────────────────────────────────┐
+  │ API Gateway / Load Balancer (with WebSocket support)            │
+  │ Sticky sessions: same client → same chat server (important!)    │
+  └──────────────────────┬──────────────────────────────────────────┘
+                         │
+  ┌──────────────────────▼──────────────────────────────────────────┐
+  │ Chat Server Fleet (4,000+ servers)                              │
+  │ Each: 100K concurrent WebSocket connections                     │
+  └──┬──────────────────────┬───────────────────────────────────────┘
+     │                      │
+  ┌──▼──────────────┐  ┌────▼──────────────────────────────────────┐
+  │ Connection      │  │ Message Service                           │
+  │ Registry        │  │ - Persist message to DB                   │
+  │ (Redis)         │  │ - Lookup recipient's server               │
+  │ user→server     │  │ - Route to online server OR queue offline  │
+  └─────────────────┘  └────┬──────────────────────────────────────┘
+                             │
+                    ┌────────┴──────────────────────────────────────┐
+                    │                                               │
+         ┌──────────▼──────────┐                    ┌──────────────▼──┐
+         │ Message DB          │                    │ Push Notification│
+         │ (Cassandra)         │                    │ Service          │
+         │ conv_id + timestamp │                    │ (FCM/APNs)       │
+         └─────────────────────┘                    └─────────────────┘
+
+
+5. MESSAGE STORAGE — CASSANDRA DATA MODEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WHY CASSANDRA?
+  - Very high write throughput (millions/second)
+  - Time-series access pattern (messages ordered by timestamp within conversation)
+  - Wide row design maps perfectly to conversations
+
+SCHEMA:
+  CREATE TABLE messages (
+    conversation_id UUID,
+    message_id      TIMEUUID,    -- time-sortable UUID (built-in ordering)
+    sender_id       BIGINT,
+    content         TEXT,
+    content_type    VARCHAR(10),
+    status          VARCHAR(10),  -- sent/delivered/read
+    PRIMARY KEY (conversation_id, message_id)
+  ) WITH CLUSTERING ORDER BY (message_id DESC)    -- most recent first
+    AND COMPACTION = { 'class': 'TimeWindowCompactionStrategy' };
+
+  -- Fetch last 50 messages in a conversation:
+  SELECT * FROM messages
+  WHERE conversation_id = ?
+  LIMIT 50;
+
+CONVERSATIONS TABLE:
+  CREATE TABLE conversations (
+    conversation_id UUID PRIMARY KEY,
+    type            VARCHAR(10),   -- 'direct' or 'group'
+    participants    SET<BIGINT>,   -- user IDs
+    created_at      TIMESTAMP,
+    last_message_id TIMEUUID
+  );
+
+USER CONVERSATIONS (inbox):
+  CREATE TABLE user_conversations (
+    user_id         BIGINT,
+    conversation_id UUID,
+    last_seen_msg   TIMEUUID,     -- for unread count
+    PRIMARY KEY (user_id, conversation_id)
+  );
+
+HOT CONVERSATION CACHING:
+  Recent messages per conversation: Redis list
+  Key: "conv:{conversation_id}:messages"
+  Value: Last 100 message IDs (LPUSH, LTRIM to 100)
+  Hydrate from DB if older messages needed
+
+
+6. GROUP MESSAGING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Groups up to 256 members — manageable fan-out
+  
+  When message sent to group:
+    1. Message saved once to group conversation (Cassandra)
+    2. Message Service looks up all 256 group members
+    3. For each online member: route to their chat server via connection registry
+    4. For each offline member: add to offline queue (or rely on notification)
+    5. Return message ID to sender immediately
+  
+  Group delivery receipt:
+    "Delivered" when all online members receive it
+    "Read" when all members open the conversation
+
+LARGE GROUPS (>256, like Telegram's 200K):
+  Cassandra stores message once (not N copies)
+  Each group member fetches message on demand (pull model)
+  For larger fan-out, use a message fan-out queue (Kafka)
+
+
+7. OFFLINE MESSAGE DELIVERY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+OFFLINE MESSAGE STORAGE:
+  Messages stored in Cassandra always (regardless of recipient status)
+  Pending delivery tracking: Redis sorted set per user
+    Key: "pending:{user_id}"
+    Score: timestamp
+    Member: message_id
+  
+  On reconnect:
+    1. Chat server detects user_id reconnection
+    2. Fetch all pending message IDs from Redis sorted set
+    3. Fetch message bodies from Cassandra
+    4. Push all pending messages in order to client
+    5. Remove from pending set as client ACKs each
+
+PUSH NOTIFICATIONS (while offline):
+  Message Service → Push Notification Service
+    → FCM (Firebase Cloud Messaging) for Android
+    → APNs (Apple Push Notification Service) for iOS
+  
+  Notification: "You have a new message from Alice"
+  Badge count: Unread message count
+  
+  Rate limiting: Don't send notification per message in a burst
+  Batch: If 10 messages arrive in 5 seconds, send 1 notification
+
+
+8. END-TO-END ENCRYPTION (WhatsApp Signal Protocol)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CORE PRINCIPLE: Server never sees plaintext message content
+
+SIGNAL PROTOCOL OVERVIEW:
+  Each device generates:
+    - Long-term identity key pair (IK)
+    - Signed pre-key pair (SPK, rotated periodically)
+    - One-time pre-keys (OPK, consumed on first message)
+  
+  Public keys uploaded to server (identity key server)
+  
+  Session establishment (X3DH - Extended Triple Diffie-Hellman):
+    Sender fetches recipient's public keys from server
+    Both parties derive same shared secret without server knowing it
+    
+  Message encryption (Double Ratchet Algorithm):
+    - Generates new encryption key for EACH message
+    - Compromise of one message key doesn't reveal others
+    - Forward secrecy + break-in recovery
+
+SERVER'S ROLE WITH E2E:
+  Server stores and routes ENCRYPTED messages only
+  Server cannot read message content
+  Server sees: sender, recipient, timestamp, encrypted_blob
+  
+  This means: No server-side message moderation possible
+              Backup requires client-side key management (tricky)
+              Law enforcement cannot access messages (by design)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWER — "How does WhatsApp handle message delivery at scale?"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"The core challenge is routing 100B messages/day with < 500ms latency.
+
+I use WebSocket connections for persistent bidirectional communication —
+HTTP polling is too slow and resource-intensive. With 400M concurrent
+users, that's ~4,000 chat servers each handling 100K WebSocket connections.
+
+The routing problem: Sender is connected to Server A; recipient is on
+Server B. A Redis connection registry maps user_id → chat_server_hostname.
+Server A looks up the registry, then makes an internal gRPC call to Server B,
+which pushes the message over the recipient's WebSocket.
+
+Messages are stored in Cassandra — optimized for time-series writes with
+conversation_id as partition key and message TIMEUUID as clustering key.
+This gives ordered message retrieval within a conversation in O(1).
+
+For offline users: Messages stay in Cassandra, and I maintain a Redis
+sorted set of pending deliveries per user. On reconnect, all pending
+messages are fetched and delivered in order.
+
+The key reliability guarantee: at-least-once delivery via client ACKs.
+Each message has a client-generated UUID. If no ACK in 5 seconds, retry.
+On the receiving side, deduplicate by message UUID. This gives exactly-once
+semantics from the user's perspective."

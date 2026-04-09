@@ -1,0 +1,287 @@
+================================================================
+  SPRING CLOUD GATEWAY
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. WHAT IS AN API GATEWAY?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+An API Gateway is the single entry point for all external clients.
+Instead of clients calling each microservice directly, they call the
+gateway, which routes, filters, and forwards the request.
+
+Responsibilities:
+  - Routing → forward requests to the correct microservice
+  - Authentication / Authorization → validate JWT before forwarding
+  - Rate Limiting → protect services from overload
+  - Load Balancing → distribute across instances
+  - SSL Termination → TLS ends at gateway, internal traffic is plain HTTP
+  - Request/Response transformation → headers, body rewriting
+  - Circuit Breaking → fail fast if a downstream service is unhealthy
+  - Logging / Tracing → centralized observability
+
+Spring Cloud Gateway (reactive, WebFlux-based — the recommended choice for Spring Boot 3.x)
+Spring Cloud Gateway MVC (servlet-based, added in Spring Cloud 2023.x)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. DEPENDENCY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-gateway</artifactId>
+</dependency>
+
+Note: Spring Cloud Gateway uses Spring WebFlux (Netty).
+DO NOT add spring-boot-starter-web (Tomcat) — they conflict.
+Use spring-boot-starter-webflux if you need to add reactive endpoints.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. ROUTING — YAML CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# application.yml
+spring:
+  cloud:
+    gateway:
+      routes:
+
+        # Route to order-service (by service name via Eureka)
+        - id: order-service-route
+          uri: lb://order-service             # lb:// = load balanced lookup
+          predicates:
+            - Path=/api/orders/**
+          filters:
+            - StripPrefix=1                   # strip /api prefix before forwarding
+            - AddRequestHeader=X-Gateway-Source, spring-gateway
+            - AddResponseHeader=X-Response-Time, ${System.currentTimeMillis()}
+
+        # Route with path rewriting
+        - id: inventory-route
+          uri: lb://inventory-service
+          predicates:
+            - Path=/inventory/**
+          filters:
+            - RewritePath=/inventory/(?<segment>.*), /api/$\{segment}
+
+        # Route by Header
+        - id: v2-route
+          uri: lb://order-service-v2
+          predicates:
+            - Path=/api/orders/**
+            - Header=X-API-Version, v2
+
+        # Route by Method
+        - id: readonly-route
+          uri: lb://catalog-service
+          predicates:
+            - Path=/api/products/**
+            - Method=GET,HEAD
+
+        # Route with CircuitBreaker filter
+        - id: payment-route
+          uri: lb://payment-service
+          predicates:
+            - Path=/api/payments/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: paymentCircuitBreaker
+                fallbackUri: forward:/fallback/payment
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. ROUTING — JAVA DSL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Configuration
+public class GatewayRoutingConfig {
+
+    @Bean
+    public RouteLocator routeLocator(RouteLocatorBuilder builder) {
+        return builder.routes()
+
+            .route("order-service", r -> r
+                .path("/api/orders/**")
+                .filters(f -> f
+                    .stripPrefix(1)
+                    .addRequestHeader("X-Gateway-Source", "gateway")
+                    .circuitBreaker(c -> c
+                        .setName("orderCircuitBreaker")
+                        .setFallbackUri("forward:/fallback/orders"))
+                    .retry(retry -> retry.setRetries(3)
+                        .setMethods(HttpMethod.GET))
+                )
+                .uri("lb://order-service")
+            )
+
+            .route("rate-limited-route", r -> r
+                .path("/api/search/**")
+                .filters(f -> f
+                    .requestRateLimiter(config -> config
+                        .setRateLimiter(redisRateLimiter())
+                        .setKeyResolver(userKeyResolver()))
+                )
+                .uri("lb://search-service")
+            )
+
+            .build();
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. GLOBAL FILTERS (CROSS-CUTTING CONCERNS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Global filters apply to ALL routes — ideal for auth, logging, tracing.
+
+@Component
+public class JwtAuthFilter implements GlobalFilter, Ordered {
+
+    private final JwtService jwtService;
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        ServerHttpRequest request = exchange.getRequest();
+        String path = request.getPath().value();
+
+        // Skip auth for public endpoints
+        List<String> publicPaths = List.of("/auth/login", "/auth/register");
+        if (publicPaths.stream().anyMatch(path::startsWith)) {
+            return chain.filter(exchange);
+        }
+
+        String authHeader = request.getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            return unauthorized(exchange);
+        }
+
+        String token = authHeader.substring(7);
+        try {
+            String username = jwtService.extractUsername(token);
+            // Add user info as downstream header
+            ServerHttpRequest modifiedRequest = request.mutate()
+                .header("X-Auth-User", username)
+                .build();
+            return chain.filter(exchange.mutate().request(modifiedRequest).build());
+        } catch (JwtException e) {
+            return unauthorized(exchange);
+        }
+    }
+
+    private Mono<Void> unauthorized(ServerWebExchange exchange) {
+        exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+        return exchange.getResponse().setComplete();
+    }
+
+    @Override
+    public int getOrder() {
+        return -100;  // run before routing filters
+    }
+}
+
+// Logging filter
+@Component
+public class LoggingFilter implements GlobalFilter, Ordered {
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        long start = System.currentTimeMillis();
+        log.info("→ {} {}", exchange.getRequest().getMethod(),
+            exchange.getRequest().getPath());
+
+        return chain.filter(exchange).doFinally(signalType -> {
+            long elapsed = System.currentTimeMillis() - start;
+            log.info("← {} {}ms",
+                exchange.getResponse().getStatusCode(), elapsed);
+        });
+    }
+
+    @Override
+    public int getOrder() { return Ordered.LOWEST_PRECEDENCE; }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. RATE LIMITING (Redis-based)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Requires spring-boot-starter-data-redis-reactive
+
+@Bean
+public RedisRateLimiter redisRateLimiter() {
+    // replenishRate = tokens/sec, burstCapacity = max burst, requestedTokens = per request
+    return new RedisRateLimiter(10, 20, 1);
+}
+
+@Bean
+public KeyResolver userKeyResolver() {
+    // Rate limit by authenticated user
+    return exchange -> Mono.justOrEmpty(
+        exchange.getRequest().getHeaders().getFirst("X-Auth-User")
+    ).defaultIfEmpty("anonymous");
+}
+
+@Bean
+public KeyResolver ipKeyResolver() {
+    // Rate limit by IP
+    return exchange -> Mono.just(
+        exchange.getRequest().getRemoteAddress().getAddress().getHostAddress()
+    );
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. FALLBACK CONTROLLER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@RestController
+@RequestMapping("/fallback")
+public class FallbackController {
+
+    @GetMapping("/orders")
+    public ResponseEntity<Map<String, String>> ordersFallback() {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+            .body(Map.of("error", "Order service is currently unavailable",
+                         "code", "ORDER_SERVICE_DOWN"));
+    }
+
+    @GetMapping("/payment")
+    public ResponseEntity<Map<String, String>> paymentFallback() {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+            .body(Map.of("error", "Payment service is currently unavailable",
+                         "message", "Please try again in a few moments"));
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the difference between a Gateway Filter and a Global Filter?
+A: Gateway Filters are route-specific — defined per route in YAML or
+   RouteLocator. Global Filters apply to ALL requests regardless of route.
+   Global Filters are ideal for auth, logging, and tracing. Route-specific
+   filters are ideal for rewriting, retrying, or rate-limiting specific routes.
+
+Q: How does Spring Cloud Gateway differ from Zuul?
+A: Zuul (Netflix) is servlet-based (blocking I/O, Tomcat). Spring Cloud
+   Gateway is WebFlux-based (non-blocking, Netty). Gateway handles much
+   higher concurrency with fewer threads, supports reactive programming,
+   and is actively maintained (Zuul is deprecated in Spring Cloud).
+
+Q: How do you implement JWT validation at the Gateway level?
+A: Implement a GlobalFilter that extracts the Authorization header,
+   validates the JWT (via JwtService or Spring Security OAuth2 resource
+   server), and either forwards the request with user info in headers
+   or returns 401. Downstream services can trust the gateway-added headers
+   and skip their own token validation.
+
+Q: What is the difference between Predicates and Filters in SCG?
+A: Predicates determine WHETHER a request matches a route (path, method,
+   header, query param, host, etc.). Filters determine WHAT happens to
+   the request/response when it matches (strip prefix, add header, rate
+   limit, circuit break, retry, etc.).
+
+Q: How does load balancing work in Spring Cloud Gateway?
+A: When you prefix the URI with lb:// (e.g., lb://order-service), the
+   gateway uses Spring Cloud LoadBalancer to resolve the service name
+   from the registry (Eureka/Consul), get a list of healthy instances,
+   and pick one (round-robin by default) before forwarding the request.

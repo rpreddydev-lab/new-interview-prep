@@ -1,0 +1,316 @@
+================================================================================
+EVENT SOURCING
+================================================================================
+
+DEFINITION
+----------
+Instead of storing only the CURRENT STATE of an entity, Event Sourcing stores
+the full sequence of STATE-CHANGING EVENTS that led to the current state.
+
+Traditional approach (State-based):
+  orders table:
+  id=1, status=SHIPPED, total=150.00, updated_at=2024-01-15
+
+  → Only know the current state. History is lost.
+
+Event Sourcing approach:
+  order_events table:
+  (1) OrderCreated:     orderId=1, userId=42, total=150.00, at=2024-01-10 10:00
+  (2) OrderConfirmed:   orderId=1,                          at=2024-01-10 10:01
+  (3) PaymentProcessed: orderId=1, paymentId=pay-99,        at=2024-01-10 10:02
+  (4) OrderShipped:     orderId=1, trackingId=TRK-XYZ,      at=2024-01-15 14:00
+
+  → Full history is the source of truth. Current state derived by replaying events.
+
+────────────────────────────────────────────────────────────────────────────────
+
+HOW EVENT SOURCING WORKS
+==========================
+
+Core concept: The event log IS the database.
+
+Current state reconstruction:
+  To get current order state:
+  → Load all events for orderId=1
+  → Apply them in order (fold/reduce)
+  → Result: current state
+
+  Order order = events.stream()
+    .reduce(new Order(), Order::apply, (a, b) -> b);
+
+Event immutability:
+  Events are NEVER modified or deleted.
+  Appended only to the event log.
+  This provides a perfect audit trail.
+
+Snapshots (optimization):
+  For entities with many events (thousands), replaying all events is slow.
+  Create periodic snapshots:
+  - After every 100 events, save a snapshot of current state
+  - To load state: load latest snapshot + events after snapshot
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING BOOT EVENT SOURCING IMPLEMENTATION
+==========================================
+
+Domain Events:
+  public sealed interface OrderEvent permits
+      OrderCreatedEvent, OrderConfirmedEvent, PaymentProcessedEvent,
+      OrderShippedEvent, OrderCancelledEvent { }
+
+  public record OrderCreatedEvent(Long orderId, Long userId,
+      List<OrderItem> items, BigDecimal total, Instant occurredAt) implements OrderEvent {}
+
+  public record OrderShippedEvent(Long orderId, String trackingId,
+      String carrier, Instant occurredAt) implements OrderEvent {}
+
+Order Aggregate (reconstructed from events):
+  public class Order {
+    private Long id;
+    private Long userId;
+    private OrderStatus status;
+    private BigDecimal total;
+    private String trackingId;
+    private List<OrderItem> items = new ArrayList<>();
+
+    // Empty constructor for reconstruction
+    public Order() {}
+
+    // Apply event to reconstruct state
+    public Order apply(OrderEvent event) {
+      return switch (event) {
+        case OrderCreatedEvent e -> {
+          this.id = e.orderId();
+          this.userId = e.userId();
+          this.items = new ArrayList<>(e.items());
+          this.total = e.total();
+          this.status = OrderStatus.PENDING;
+          yield this;
+        }
+        case OrderConfirmedEvent e -> {
+          this.status = OrderStatus.CONFIRMED;
+          yield this;
+        }
+        case PaymentProcessedEvent e -> {
+          this.status = OrderStatus.PAYMENT_RECEIVED;
+          yield this;
+        }
+        case OrderShippedEvent e -> {
+          this.status = OrderStatus.SHIPPED;
+          this.trackingId = e.trackingId();
+          yield this;
+        }
+        case OrderCancelledEvent e -> {
+          this.status = OrderStatus.CANCELLED;
+          yield this;
+        }
+      };
+    }
+  }
+
+Event Store:
+  @Repository
+  public interface EventStoreRepository extends JpaRepository<EventEntity, Long> {
+    List<EventEntity> findByAggregateIdOrderBySequenceAsc(Long aggregateId);
+    Optional<EventEntity> findTopByAggregateIdOrderBySequenceDesc(Long aggregateId);
+  }
+
+  @Entity
+  @Table(name = "event_store")
+  public class EventEntity {
+    @Id @GeneratedValue
+    private Long id;
+    private Long aggregateId;
+    private String aggregateType;  // "ORDER", "PAYMENT", etc.
+    private String eventType;      // "OrderCreatedEvent"
+    private Long sequence;
+    private String eventData;      // JSON serialized event
+    private Instant occurredAt;
+  }
+
+  @Service
+  public class OrderEventStore {
+
+    @Autowired private EventStoreRepository repository;
+    @Autowired private ObjectMapper objectMapper;
+
+    @Transactional
+    public void save(Long orderId, OrderEvent event) {
+      Long nextSeq = getNextSequence(orderId);
+      EventEntity entity = new EventEntity();
+      entity.setAggregateId(orderId);
+      entity.setAggregateType("ORDER");
+      entity.setEventType(event.getClass().getSimpleName());
+      entity.setSequence(nextSeq);
+      entity.setEventData(serialize(event));
+      entity.setOccurredAt(Instant.now());
+      repository.save(entity);
+    }
+
+    public Order load(Long orderId) {
+      List<EventEntity> entities = repository.findByAggregateIdOrderBySequenceAsc(orderId);
+      if (entities.isEmpty()) throw new OrderNotFoundException(orderId);
+
+      Order order = new Order();
+      for (EventEntity entity : entities) {
+        OrderEvent event = deserialize(entity);
+        order = order.apply(event);
+      }
+      return order;
+    }
+  }
+
+Order Command Service:
+  @Service
+  public class OrderCommandService {
+
+    @Autowired private OrderEventStore eventStore;
+    @Autowired private EventPublisher eventPublisher;
+
+    @Transactional
+    public Long createOrder(CreateOrderCommand cmd) {
+      Long orderId = generateId();
+      OrderCreatedEvent event = new OrderCreatedEvent(
+        orderId, cmd.userId(), cmd.items(), calculateTotal(cmd.items()), Instant.now()
+      );
+
+      eventStore.save(orderId, event);        // Persist event
+      eventPublisher.publish(event);          // Notify other services (Outbox pattern)
+
+      return orderId;
+    }
+
+    @Transactional
+    public void shipOrder(Long orderId, String trackingId, String carrier) {
+      Order order = eventStore.load(orderId); // Reconstruct current state
+
+      if (order.getStatus() != OrderStatus.PAYMENT_RECEIVED) {
+        throw new InvalidOrderStateException("Cannot ship unpaid order");
+      }
+
+      OrderShippedEvent event = new OrderShippedEvent(orderId, trackingId, carrier, Instant.now());
+      eventStore.save(orderId, event);
+      eventPublisher.publish(event);
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+EVENT SOURCING WITH AXON FRAMEWORK
+=====================================
+
+Axon Framework is the most popular Java framework for Event Sourcing + CQRS:
+
+  @Aggregate
+  public class OrderAggregate {
+
+    @AggregateIdentifier
+    private Long orderId;
+    private OrderStatus status;
+
+    // Command handler — processes CreateOrderCommand, emits event
+    @CommandHandler
+    public OrderAggregate(CreateOrderCommand cmd) {
+      // Validate, then emit event (Axon handles persistence)
+      AggregateLifecycle.apply(new OrderCreatedEvent(
+        cmd.getOrderId(), cmd.getUserId(), cmd.getItems(), cmd.getTotal()
+      ));
+    }
+
+    // Event sourcing handler — rebuilds state from event
+    @EventSourcingHandler
+    public void on(OrderCreatedEvent event) {
+      this.orderId = event.orderId();
+      this.status = OrderStatus.PENDING;
+    }
+
+    @CommandHandler
+    public void handle(ShipOrderCommand cmd) {
+      if (status != OrderStatus.PAYMENT_RECEIVED)
+        throw new IllegalStateException("Cannot ship");
+      AggregateLifecycle.apply(new OrderShippedEvent(orderId, cmd.getTrackingId()));
+    }
+
+    @EventSourcingHandler
+    public void on(OrderShippedEvent event) {
+      this.status = OrderStatus.SHIPPED;
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+BENEFITS OF EVENT SOURCING
+============================
+  ✓ Perfect audit trail (every change recorded with timestamp)
+  ✓ Debug production issues by replaying events
+  ✓ Time travel: load entity state at any point in time
+  ✓ Event replay: rebuild read models (fix bugs in projections)
+  ✓ Temporal queries: "What was the state of this order on Jan 10?"
+  ✓ Natural integration with CQRS and messaging
+
+COSTS OF EVENT SOURCING
+========================
+  ✗ Higher complexity (event design, schema evolution)
+  ✗ Query complexity (can't query event store directly with SQL)
+  ✗ Performance: loading entity = replay all events (mitigated by snapshots)
+  ✗ Event schema evolution is hard (old events with old schema must still work)
+  ✗ Not suitable for simple CRUD
+
+────────────────────────────────────────────────────────────────────────────────
+
+EVENT SCHEMA EVOLUTION
+========================
+
+Events are stored forever. Old code must handle old event formats.
+
+Strategies:
+  1. Upcasting: Transform old event format to new format on read
+  2. Weak schema (Avro/Schema Registry): Forward/backward compatibility
+  3. Never change events — add new event types instead
+
+Bad:
+  // Cannot rename field in stored event
+  record OrderCreatedEvent(Long id, Long customerId) {}  // Old
+  record OrderCreatedEvent(Long orderId, Long userId) {}  // Breaking change!
+
+Good:
+  // Add optional fields, never remove/rename
+  record OrderCreatedEvent(Long orderId, Long userId, 
+                            @Nullable String customerEmail) {}  // OK
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is Event Sourcing?
+A: Instead of storing current state, store the sequence of events that led to
+   the state. Current state is reconstructed by replaying events. Provides
+   full audit trail, time-travel queries, event replay for fixing projections,
+   and natural integration with messaging and CQRS.
+
+Q: What is a snapshot in Event Sourcing?
+A: Periodic captures of aggregate state to avoid replaying all events from the
+   beginning. To load state: start from latest snapshot and replay only events
+   after it. Typically after every 50-100 events.
+
+Q: How do you handle schema evolution in Event Sourcing?
+A: Events are immutable and stored forever. Strategies: add optional fields
+   only (never rename/remove), use upcasters to transform old events on read,
+   use Avro with schema registry for forward/backward compatibility, or create
+   new event types when behavior changes significantly.
+
+Q: When would you NOT use Event Sourcing?
+A: Simple CRUD applications where audit history isn't needed, small teams with
+   limited distributed systems experience, applications requiring complex SQL
+   queries on the current state, or when eventual consistency of projections
+   is not acceptable.
+
+Q: How do Event Sourcing and CQRS work together?
+A: Event Sourcing produces events as the natural byproduct of state changes.
+   CQRS consumes those events to build optimized read models (projections).
+   They're separate patterns but complement each other: ES gives you the event
+   stream; CQRS gives you optimized queries from that stream.
+
+================================================================================

@@ -1,0 +1,225 @@
+================================================================================
+BACKENDS FOR FRONTENDS (BFF) PATTERN
+================================================================================
+
+WHAT IS BFF?
+-------------
+BFF (Backends for Frontends) creates separate backend services tailored to
+different client types (mobile app, web app, IoT device, partner API).
+
+The Problem with One Generic API:
+  One API for all clients means:
+  - Mobile gets massive responses (designed for web) → wastes bandwidth
+  - Web app needs aggregated data → makes 5 separate calls to different services
+  - IoT device needs a tiny subset → gets unnecessary fields
+  - Each client has different auth requirements, protocols, data shapes
+
+The BFF Solution:
+  One backend per client type — each optimized for its client.
+
+  ┌──────────┐   ┌──────────┐   ┌──────────┐
+  │Mobile App│   │  Web App │   │  Partner │
+  └────┬─────┘   └────┬─────┘   └────┬─────┘
+       │              │              │
+  ┌────▼─────┐  ┌─────▼────┐  ┌─────▼────┐
+  │Mobile BFF│  │  Web BFF │  │Partner BFF│
+  │(minimal  │  │(rich data│  │(API keys, │
+  │ responses│  │ aggreg.) │  │ different │
+  │ push notif│ │WebSocket │  │ contract) │
+  └────┬─────┘  └────┬─────┘  └─────┬────┘
+       └──────────────┴──────────────┘
+                      │
+          ┌───────────┼───────────┐
+          ▼           ▼           ▼
+    [Order Svc]  [Product Svc]  [User Svc]
+
+────────────────────────────────────────────────────────────────────────────────
+
+MOBILE BFF vs WEB BFF DIFFERENCES
+=====================================
+
+Mobile BFF:
+  - Minimal response payloads (saves bandwidth on mobile networks)
+  - Push notifications via FCM/APNS
+  - Offline sync support
+  - Aggressive caching headers
+  - Authentication via mobile token refresh
+  - Handles poor network (larger timeouts, retry)
+
+  GET /mobile/v1/home
+  Response: {
+    "userName": "John",
+    "orderCount": 3,
+    "cartItemCount": 2,
+    "badge": { "count": 5, "message": "2 orders shipped!" }
+  }
+
+Web BFF:
+  - Rich aggregated data (one call returns everything for a page)
+  - Server-Side Events / WebSocket for real-time updates
+  - Session-based auth or cookie-based JWT
+  - Full search, filtering, pagination
+  - Server-Side Rendering data shapes
+
+  GET /web/v1/dashboard
+  Response: {
+    "user": { "name": "John Doe", "avatar": "...", "tier": "Premium" },
+    "recentOrders": [{ full order objects with items, status, tracking }],
+    "recommendations": [{ full product objects with images, reviews }],
+    "notifications": [...],
+    "statistics": { "totalSpent": 1250.00, "ordersThisYear": 12 }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING BOOT BFF IMPLEMENTATION
+================================
+
+Mobile BFF — aggregating from multiple services:
+
+  @RestController
+  @RequestMapping("/mobile/v1")
+  public class MobileBffController {
+
+    @Autowired private OrderServiceClient orderClient;
+    @Autowired private UserServiceClient userClient;
+    @Autowired private NotificationServiceClient notificationClient;
+    @Autowired private CartServiceClient cartClient;
+
+    @GetMapping("/home")
+    public Mono<MobileHomeResponse> getHome(
+        @AuthenticationPrincipal JwtAuthenticationToken jwt) {
+
+      String userId = jwt.getToken().getSubject();
+
+      // Aggregate data from 4 services in PARALLEL (reactive)
+      return Mono.zip(
+        userClient.getUser(userId),
+        orderClient.getActiveOrderCount(userId),
+        cartClient.getCartItemCount(userId),
+        notificationClient.getUnreadCount(userId)
+      ).map(tuple -> MobileHomeResponse.builder()
+        .userName(tuple.getT1().getFirstName())   // Only first name for mobile
+        .orderCount(tuple.getT2())
+        .cartItemCount(tuple.getT3())
+        .unreadNotifications(tuple.getT4())
+        .build()
+      );
+    }
+
+    @GetMapping("/orders/{orderId}")
+    public Mono<MobileOrderResponse> getOrder(
+        @PathVariable String orderId,
+        @AuthenticationPrincipal JwtAuthenticationToken jwt) {
+
+      return orderClient.getOrder(orderId)
+        .map(order -> MobileOrderResponse.builder()
+          // Mobile gets only fields it needs (not 50 fields of full order)
+          .id(order.getId())
+          .status(order.getStatus())
+          .estimatedDelivery(order.getEstimatedDelivery())
+          .trackingUrl(order.getTrackingUrl())
+          .itemCount(order.getItems().size())
+          .totalAmount(order.getTotalAmount())
+          .build()
+        );
+    }
+  }
+
+  // Lean mobile response — minimal payload
+  @Builder
+  public record MobileOrderResponse(
+    String id,
+    OrderStatus status,
+    LocalDate estimatedDelivery,
+    String trackingUrl,
+    int itemCount,
+    BigDecimal totalAmount
+    // NOT included: seller details, warehouse ID, 40 other fields web uses
+  ) {}
+
+────────────────────────────────────────────────────────────────────────────────
+
+BFF WITH GRAPHQL (WEB BFF)
+============================
+
+GraphQL is a natural fit for web BFF — clients request exactly the fields they need.
+
+  @Configuration
+  public class GraphQLBffConfig {
+    // Spring for GraphQL configuration
+  }
+
+  # schema.graphqls
+  type Query {
+    dashboard(userId: ID!): Dashboard
+    order(orderId: ID!): Order
+    products(query: String!, page: Int, size: Int): ProductPage
+  }
+
+  type Dashboard {
+    user: User
+    recentOrders: [Order]
+    recommendations: [Product]
+    notifications: [Notification]
+  }
+
+  @Controller
+  public class DashboardResolver {
+    @QueryMapping
+    public Dashboard dashboard(@Argument String userId) {
+      return new Dashboard(userId);  // Resolved lazily per field
+    }
+
+    @SchemaMapping(typeName = "Dashboard")
+    public CompletableFuture<User> user(Dashboard dashboard) {
+      return userClient.getUser(dashboard.getUserId());
+    }
+
+    @SchemaMapping(typeName = "Dashboard")
+    public CompletableFuture<List<Order>> recentOrders(Dashboard dashboard) {
+      return orderClient.getRecentOrders(dashboard.getUserId(), 5);
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+BFF vs API GATEWAY
+===================
+
+                   │ API Gateway            │ BFF
+───────────────────┼────────────────────────┼──────────────────────────
+Purpose            │ Routing, auth, rate    │ Client-specific data
+                   │ limiting, SSL          │ aggregation and shaping
+───────────────────┼────────────────────────┼──────────────────────────
+Client-specific    │ Generic (one for all)  │ One per client type
+───────────────────┼────────────────────────┼──────────────────────────
+Business logic     │ None                   │ Aggregation, transformation
+───────────────────┼────────────────────────┼──────────────────────────
+Used together?     │ API Gateway → BFF → Services is a common architecture
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is the BFF pattern and when do you use it?
+A: Backends for Frontends creates separate backend services for each client type
+   (mobile, web, partner). Each BFF is optimized for its client: different data
+   shapes, aggregation strategies, protocols, and auth flows. Use when different
+   clients have significantly different API needs, causing over-fetching or
+   complex client-side aggregation.
+
+Q: What is the relationship between API Gateway and BFF?
+A: API Gateway handles cross-cutting concerns at the edge (auth, rate limiting,
+   routing, SSL). BFF handles client-specific business logic (aggregation, data
+   shaping). Common architecture: Client → API Gateway (auth, routing) → BFF
+   (aggregation) → Backend services. They're complementary, not alternatives.
+
+Q: What are the downsides of BFF?
+A: Multiple BFFs to maintain (mobile, web, partner). Logic duplication between
+   BFFs. Teams need ownership of their BFF. Risk of BFF becoming a fat controller
+   with excessive business logic. Mitigate by keeping BFF focused on orchestration/
+   aggregation, not business rules.
+
+================================================================================

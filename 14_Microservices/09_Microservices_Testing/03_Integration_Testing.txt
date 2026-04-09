@@ -1,0 +1,250 @@
+================================================================================
+INTEGRATION TESTING WITH TESTCONTAINERS
+================================================================================
+
+WHAT IS TESTCONTAINERS?
+------------------------
+TestContainers is a Java library that provides throwaway Docker containers for
+integration tests. Replaces H2/HSQLDB with the real database your service uses.
+
+Benefits:
+  ✓ Tests run against real PostgreSQL, MySQL, Redis, Kafka, etc.
+  ✓ Catches database-specific bugs (JSONB, stored procedures, specific queries)
+  ✓ Tests are reproducible (same container version, same behavior)
+  ✓ No need to maintain test database servers
+  ✓ Containers start/stop per test class (or shared across all tests)
+
+  pom.xml:
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-testcontainers</artifactId>
+    <scope>test</scope>
+  </dependency>
+  <dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>junit-jupiter</artifactId>
+    <scope>test</scope>
+  </dependency>
+  <dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>postgresql</artifactId>
+    <scope>test</scope>
+  </dependency>
+  <dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>kafka</artifactId>
+    <scope>test</scope>
+  </dependency>
+
+────────────────────────────────────────────────────────────────────────────────
+
+TESTCONTAINERS CONFIGURATION
+================================
+
+Base test configuration (shared via static containers for performance):
+
+  @TestConfiguration(proxyBeanMethods = false)
+  public class TestcontainersConfig {
+
+    @Bean
+    @ServiceConnection  // Spring Boot 3.1+ auto-wires connection properties
+    static PostgreSQLContainer<?> postgresContainer() {
+      return new PostgreSQLContainer<>("postgres:16-alpine")
+        .withDatabaseName("orders_test")
+        .withUsername("test")
+        .withPassword("test")
+        .withReuse(true);  // Reuse container between test runs (faster)
+    }
+
+    @Bean
+    @ServiceConnection
+    static KafkaContainer kafkaContainer() {
+      return new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.5.0"))
+        .withReuse(true);
+    }
+
+    @Bean
+    @ServiceConnection
+    static GenericContainer<?> redisContainer() {
+      return new GenericContainer<>("redis:7-alpine")
+        .withExposedPorts(6379)
+        .withReuse(true);
+    }
+  }
+
+Integration test using shared containers:
+  @SpringBootTest(webEnvironment = RANDOM_PORT)
+  @Import(TestcontainersConfig.class)
+  @Sql("/test-data/orders.sql")  // Load test data
+  @Transactional
+  class OrderServiceIntegrationTest {
+
+    @Autowired private TestRestTemplate restTemplate;
+    @Autowired private OrderRepository orderRepository;
+
+    @Test
+    void shouldCreateOrderAndPersistToDatabase() {
+      CreateOrderRequest request = CreateOrderRequest.builder()
+        .userId(1L)
+        .items(List.of(new OrderItem(100L, 2)))
+        .build();
+
+      ResponseEntity<OrderDTO> response = restTemplate.postForEntity(
+        "/api/orders", request, OrderDTO.class);
+
+      assertThat(response.getStatusCode()).isEqualTo(CREATED);
+      assertThat(response.getBody().getId()).isNotNull();
+
+      // Verify actually persisted to REAL PostgreSQL
+      Optional<Order> order = orderRepository.findById(response.getBody().getId());
+      assertThat(order).isPresent();
+      assertThat(order.get().getStatus()).isEqualTo(OrderStatus.PENDING);
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+KAFKA INTEGRATION TESTING
+============================
+
+  @SpringBootTest
+  @Import(TestcontainersConfig.class)
+  class OrderEventKafkaIntegrationTest {
+
+    @Autowired private OrderService orderService;
+    @Autowired private KafkaConsumer<String, String> testConsumer;
+
+    @BeforeEach
+    void setUp(@Autowired KafkaContainer kafkaContainer) {
+      testConsumer = new KafkaConsumer<>(Map.of(
+        BOOTSTRAP_SERVERS_CONFIG, kafkaContainer.getBootstrapServers(),
+        KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+        VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+        GROUP_ID_CONFIG, "test-group-" + UUID.randomUUID(),
+        AUTO_OFFSET_RESET_CONFIG, "earliest"
+      ));
+      testConsumer.subscribe(List.of("order-events"));
+    }
+
+    @Test
+    void shouldPublishOrderCreatedEventToKafka() throws Exception {
+      // When
+      OrderDTO order = orderService.createOrder(validRequest());
+
+      // Then — poll Kafka for the event (with timeout)
+      await()
+        .atMost(10, SECONDS)
+        .untilAsserted(() -> {
+          ConsumerRecords<String, String> records = testConsumer.poll(Duration.ofSeconds(1));
+          List<ConsumerRecord<String, String>> orderEvents = new ArrayList<>();
+          records.forEach(orderEvents::add);
+
+          assertThat(orderEvents).isNotEmpty();
+          String eventJson = orderEvents.get(0).value();
+          assertThat(eventJson).contains("OrderCreatedEvent");
+          assertThat(eventJson).contains(order.getId().toString());
+        });
+    }
+
+    @AfterEach
+    void tearDown() {
+      testConsumer.close();
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+WIREMOCK FOR STUBBING HTTP DEPENDENCIES
+==========================================
+
+When your service calls other services via HTTP, stub them with WireMock:
+
+  @SpringBootTest(webEnvironment = RANDOM_PORT)
+  @Import(TestcontainersConfig.class)
+  class OrderServiceWithDependenciesTest {
+
+    @RegisterExtension
+    static WireMockExtension inventoryWireMock = WireMockExtension.newInstance()
+      .options(wireMockConfig().dynamicPort())
+      .build();
+
+    @DynamicPropertySource
+    static void configureProperties(DynamicPropertyRegistry registry) {
+      // Point order service to WireMock instead of real inventory service
+      registry.add("clients.inventory-service.base-url",
+        inventoryWireMock::baseUrl);
+    }
+
+    @Test
+    void shouldCreateOrderWhenInventoryAvailable() {
+      // Stub inventory service response
+      inventoryWireMock.stubFor(
+        get(urlEqualTo("/inventory/items/100"))
+          .willReturn(aResponse()
+            .withStatus(200)
+            .withHeader("Content-Type", "application/json")
+            .withBody("""
+              {"productId": 100, "available": true, "quantity": 50}
+              """)
+          )
+      );
+
+      // Test order creation
+      ResponseEntity<OrderDTO> response = restTemplate.postForEntity(
+        "/api/orders",
+        CreateOrderRequest.of(1L, List.of(new OrderItem(100L, 2))),
+        OrderDTO.class
+      );
+
+      assertThat(response.getStatusCode()).isEqualTo(CREATED);
+
+      // Verify WireMock received the expected call
+      inventoryWireMock.verify(
+        getRequestedFor(urlEqualTo("/inventory/items/100"))
+          .withHeader("Authorization", matching("Bearer .*"))
+      );
+    }
+
+    @Test
+    void shouldHandleInventoryServiceDown() {
+      inventoryWireMock.stubFor(
+        get(anyUrl())
+          .willReturn(aResponse().withStatus(503))
+      );
+
+      ResponseEntity<ErrorResponse> response = restTemplate.postForEntity(
+        "/api/orders",
+        anyRequest(),
+        ErrorResponse.class
+      );
+
+      assertThat(response.getStatusCode()).isEqualTo(SERVICE_UNAVAILABLE);
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is TestContainers and why is it preferred over H2 for tests?
+A: TestContainers spins up real Docker containers for tests (real PostgreSQL,
+   Kafka, Redis). H2 is an in-memory SQL database that doesn't support
+   PostgreSQL-specific features (JSONB, CTEs, custom functions, stored procs).
+   Tests against real databases catch real bugs and give higher confidence.
+
+Q: How do you test Kafka producers and consumers?
+A: Use TestContainers' KafkaContainer. For producer tests: publish message,
+   create a test KafkaConsumer pointed at the test Kafka, poll with Awaitility
+   timeout to verify the message was published. For consumer tests: use
+   KafkaTemplate to publish a test message, verify the consumer processed it
+   correctly (check DB state or captured side effects).
+
+Q: What is WireMock and when do you use it?
+A: WireMock is an HTTP stub server. Use it when your service calls other
+   services via HTTP and you want to test how your service behaves under
+   different provider responses (success, 404, 503, slow responses). More
+   realistic than Mockito mocks (tests actual HTTP client code). WireMock
+   also verifies expected calls were made.
+
+================================================================================

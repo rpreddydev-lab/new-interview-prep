@@ -1,0 +1,292 @@
+================================================================================
+  KAFKA DEAD LETTER QUEUE (DLQ)
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHAT IS A DEAD LETTER QUEUE?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A Dead Letter Queue (DLQ) is a destination for messages that cannot be processed
+successfully after exhausting all retry attempts. Instead of blocking the main
+processing pipeline or silently dropping the message, it is forwarded to a
+special "dead letter" topic for later inspection and remediation.
+
+Why DLQ is important:
+  - Poison pill messages: malformed/unexpected data that crashes the consumer
+  - Without DLQ: consumer retries indefinitely → entire partition is blocked
+  - With DLQ: bad record is removed from the main flow → healthy records continue
+
+DLQ in Kafka vs traditional MQ:
+  - In RabbitMQ/SQS: DLQ is built-in and messages move there automatically
+  - In Kafka: DLQ must be EXPLICITLY implemented (no built-in DLQ mechanism)
+  - Consumer is responsible for catching errors and routing failed records
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. POISON PILL PROBLEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A poison pill is a message that consistently causes the consumer to crash or
+throw a non-retriable exception. Since Kafka maintains ordered delivery within
+a partition, the consumer will repeatedly fail on the same message and can
+NEVER advance to the next offset.
+
+  Partition 0: [OK][OK][POISON][OK][OK][OK]
+                         ↑
+                Consumer crashes here every time → entire partition blocked!
+
+Without DLQ:
+  - Consumer re-reads the same bad record indefinitely
+  - All downstream records are blocked (Kafka is an ordered log)
+  - Consumer group lag grows unbounded
+  - The bad record holds the partition hostage
+
+With DLQ:
+  - Consumer catches the error after N retries
+  - Writes the failed record to a DLQ topic (with metadata about the failure)
+  - Commits the offset past the bad record → processing resumes normally
+  - Dead record available for inspection/replay later
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. MANUAL DLQ IMPLEMENTATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  private static final String DLQ_TOPIC = "orders.DLT";
+  private final KafkaProducer<String, String> dlqProducer = buildDlqProducer();
+
+  while (true) {
+    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+    for (ConsumerRecord<String, String> record : records) {
+      try {
+        processRecord(record);
+      } catch (NonRetriableException e) {
+        // Non-retriable: send to DLQ immediately
+        sendToDlq(record, e);
+      } catch (RetriableException e) {
+        if (retryCount(record) >= MAX_RETRIES) {
+          // Exhausted retries: send to DLQ
+          sendToDlq(record, e);
+        } else {
+          // Retry later (using retry topic pattern — see section 5)
+          sendToRetryTopic(record, retryCount(record) + 1);
+        }
+      }
+    }
+    consumer.commitSync();
+  }
+
+  private void sendToDlq(ConsumerRecord<String, String> record, Exception e) {
+    ProducerRecord<String, String> dlqRecord = new ProducerRecord<>(
+      DLQ_TOPIC,
+      null,          // null key → round-robin
+      record.value()
+    );
+    // Add failure metadata as headers
+    dlqRecord.headers()
+      .add("original-topic", record.topic().getBytes())
+      .add("original-partition", String.valueOf(record.partition()).getBytes())
+      .add("original-offset", String.valueOf(record.offset()).getBytes())
+      .add("failure-reason", e.getMessage().getBytes())
+      .add("failure-timestamp", String.valueOf(System.currentTimeMillis()).getBytes())
+      .add("consumer-group", GROUP_ID.getBytes());
+    
+    dlqProducer.send(dlqRecord);
+    log.warn("Record sent to DLQ. topic={} partition={} offset={}",
+      record.topic(), record.partition(), record.offset());
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. SPRING KAFKA DLQ — DeadLetterPublishingRecoverer
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Spring Kafka provides built-in DLQ support via DeadLetterPublishingRecoverer
+combined with DefaultErrorHandler (Kafka 2.8+ / Spring Kafka 2.7+):
+
+  @Bean
+  public DeadLetterPublishingRecoverer deadLetterPublishingRecoverer(
+      KafkaTemplate<Object, Object> template) {
+    // Default: routes to <original-topic>.DLT on the same partition
+    return new DeadLetterPublishingRecoverer(template);
+  }
+
+  @Bean
+  public DefaultErrorHandler errorHandler(
+      DeadLetterPublishingRecoverer recoverer) {
+    // Retry 3 times with 1-second backoff, then send to DLT
+    FixedBackOff backOff = new FixedBackOff(1000L, 3);
+    return new DefaultErrorHandler(recoverer, backOff);
+  }
+
+  @Bean
+  public ConcurrentKafkaListenerContainerFactory<String, String> kafkaListenerContainerFactory(
+      ConsumerFactory<String, String> consumerFactory,
+      DefaultErrorHandler errorHandler) {
+    ConcurrentKafkaListenerContainerFactory<String, String> factory =
+      new ConcurrentKafkaListenerContainerFactory<>();
+    factory.setConsumerFactory(consumerFactory);
+    factory.setCommonErrorHandler(errorHandler);
+    return factory;
+  }
+
+  // Listener — throws on bad messages:
+  @KafkaListener(topics = "orders")
+  public void processOrder(String message) {
+    orderService.process(message); // throws on poison pill
+    // Spring Kafka catches exception → retries 3x → then sends to orders.DLT
+  }
+
+Spring Kafka DLT headers added automatically:
+  - kafka_dlt-original-topic
+  - kafka_dlt-original-partition
+  - kafka_dlt-original-offset
+  - kafka_dlt-original-timestamp
+  - kafka_dlt-exception-message
+  - kafka_dlt-exception-stacktrace
+
+ExponentialBackOff (preferred for production):
+  ExponentialBackOffWithMaxRetries backOff = new ExponentialBackOffWithMaxRetries(5);
+  backOff.setInitialInterval(1_000L);  // 1s
+  backOff.setMultiplier(2.0);          // doubling
+  backOff.setMaxInterval(30_000L);     // cap at 30s
+  // Retry intervals: 1s, 2s, 4s, 8s, 16s → then DLT
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. RETRY TOPICS PATTERN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For scenarios requiring delayed retries without blocking the main consumer:
+
+  Main topic  → orders
+  Retry T1    → orders-retry-1 (retry after 1s delay)
+  Retry T2    → orders-retry-2 (retry after 5s delay)
+  Retry T3    → orders-retry-3 (retry after 30s delay)
+  DLT         → orders.DLT    (final failure)
+
+Flow:
+  1. Consume from orders
+  2. Processing fails → produce to orders-retry-1 (with retry metadata in headers)
+  3. A retry-consumer reads orders-retry-1 after 1s delay
+  4. If still fails → produce to orders-retry-2
+  5. ... (escalate through retry chain)
+  6. After all retries → produce to orders.DLT
+
+Delay implementation options:
+  a) Consumer sleeps before processing retry records (simple but blocks the thread)
+  b) Store retry delay timestamp in message headers; skip until timestamp reached
+  c) Use Kafka Streams to delay records (schedule forward in time)
+
+Spring Kafka @RetryableTopic (Kafka 2.7+ / Spring Kafka 2.7+):
+  @RetryableTopic(
+    attempts = "4",           // 1 initial + 3 retries
+    backoff = @Backoff(delay = 1000, multiplier = 2.0),
+    dltTopicSuffix = ".DLT"
+  )
+  @KafkaListener(topics = "orders")
+  public void processOrder(String message) {
+    // Spring Kafka creates orders-retry-1, orders-retry-2, orders-retry-3, orders.DLT
+    // automatically handles routing, retries, and DLT forwarding
+  }
+
+  @DltHandler
+  public void handleDlt(String message,
+                        @Header(KafkaHeaders.RECEIVED_TOPIC) String topic) {
+    log.error("Record permanently failed, topic={}: {}", topic, message);
+    // alert / persist to error store / trigger manual review
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. DLQ TOPIC NAMING CONVENTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Common naming patterns:
+  <topic>.DLT          → orders.DLT              (Spring Kafka default suffix)
+  <topic>-dead         → orders-dead             (simple)
+  <topic>-dlq          → orders-dlq              (explicit)
+  dlq.<topic>          → dlq.orders              (prefix-based, easy to glob)
+  <group>.<topic>.dlq  → order-svc.orders.dlq    (group-scoped, multi-consumer)
+
+Recommendations:
+  - Include the original topic name for traceability
+  - Use consistent suffix/prefix across the platform for monitoring
+  - Consider scoping by consumer group if multiple groups need different DLTs
+  - Keep DLQ topics SEPARATE from operational topics (different retention policy)
+
+DLQ topic configuration:
+  - Retention: longer than main topic (e.g., 7-30 days for investigation)
+  - Replication factor: same as main topic (3 for production)
+  - Compaction: usually NOT compacted (want full history of all failures)
+  - Partition count: can be lower (DLQ traffic is rare)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. DLQ PROCESSING AND REPLAY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Dead records in the DLQ should not rot — they need a lifecycle:
+
+  1. ALERT: Alert/page on any DLQ records (lag > 0 on DLT topic)
+  2. INSPECT: Read the record + headers to understand the failure reason
+  3. CATEGORIZE: Permanent failure (data bug) vs transient failure (downstream outage)
+  4. FIX: Deploy fix if code issue; fix if data issue
+  5. REPLAY: Optionally replay fixed records back to the main topic
+
+Replay pattern:
+  // Read from DLT, fix/transform, write back to original topic
+  KafkaConsumer<String, String> dltConsumer = buildConsumer("orders.DLT");
+  KafkaProducer<String, String> replayProducer = buildProducer();
+  
+  while (!finished) {
+    var records = dltConsumer.poll(Duration.ofMillis(100));
+    for (var record : records) {
+      String fixed = fixRecord(record.value()); // apply fix/transformation
+      replayProducer.send(new ProducerRecord<>("orders", record.key(), fixed));
+    }
+    dltConsumer.commitSync();
+  }
+
+Skip-and-discard (when record is permanently unprocessable):
+  - Simply commit the offset past the bad record in the DLQ consumer
+  - Log the skipped record with full details for audit
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is a poison pill in Kafka and how do you handle it?
+A: A poison pill is a message that consistently fails to process (e.g., corrupted
+   data, schema mismatch, unexpected null). Because Kafka delivers messages in
+   order within a partition, the consumer will retry it indefinitely and NEVER
+   advance. The fix is to implement a Dead Letter Queue (DLQ): after N retries,
+   route the bad record to a DLQ topic with failure metadata in headers, commit
+   the offset past it, and continue processing healthy records.
+
+Q: Does Kafka have a native Dead Letter Queue like RabbitMQ or SQS?
+A: No. Kafka has no built-in DLQ mechanism. Developers must explicitly implement
+   it: catch exceptions in the consumer, send failed records to a designated DLT
+   topic, and commit the offset. Spring Kafka simplifies this with
+   DeadLetterPublishingRecoverer and DefaultErrorHandler, which handle retries and
+   DLT routing automatically.
+
+Q: What is the retry topics pattern and how does it differ from in-place retries?
+A: In-place retries retry the record immediately (or with a thread sleep), blocking
+   the consumer thread during the delay. Retry topics are dedicated Kafka topics
+   (e.g., orders-retry-1, orders-retry-2) where failed records are routed for
+   delayed retry. A separate consumer reads each retry topic after the intended
+   delay. This avoids blocking the main consumer, enables independent scaling of
+   retry processing, and supports different backoff intervals per retry level.
+   Spring Kafka's @RetryableTopic creates and manages these automatically.
+
+Q: What metadata should you include in DLQ records?
+A: At minimum: original topic, original partition, original offset, failure
+   exception message and stacktrace, failure timestamp, consumer group ID, and
+   number of retry attempts. This lets you trace back to the exact original record,
+   understand why it failed, and replay or fix it. Spring Kafka's
+   DeadLetterPublishingRecoverer adds kafka_dlt-* headers with this information
+   automatically.
+
+Q: How do you decide between in-place retries and retry topics?
+A: In-place retries (sleep between attempts in the consumer) are simpler but block
+   the consumer thread — appropriate when retry delays are short (< 1s) and traffic
+   is low. Retry topics are preferred when: delays should be longer (seconds to
+   minutes), blocking the main consumer is unacceptable, retries need independent
+   scalability, or you need different retry policies per failure type. For production
+   at scale, retry topics + DLT is the standard pattern.

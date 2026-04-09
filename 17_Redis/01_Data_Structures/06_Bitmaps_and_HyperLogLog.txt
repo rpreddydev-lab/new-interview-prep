@@ -1,0 +1,289 @@
+================================================================================
+REDIS BITMAPS & HYPERLOGLOG — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+═══════════════════════════════════════════════════════════════════════════════
+PART 1: BITMAPS
+═══════════════════════════════════════════════════════════════════════════════
+
+1. WHAT ARE REDIS BITMAPS?
+───────────────────────────
+Bitmaps are NOT a separate Redis data type. They are a set of bit-level
+operations applied to a String value. A Redis String can hold up to 512 MB,
+which is 512 * 1024 * 1024 * 8 = 4,294,967,296 bits (over 4 billion bits).
+
+Each bit is addressed by an OFFSET (0-based, from left to right):
+  "A" = 0x41 = 01000001
+  bit 0 = 0, bit 1 = 1, bit 6 = 0, bit 7 = 1
+
+Bitmaps are ideal for representing boolean per-item flags with an integer ID.
+Example: "Did user N log in today?" → bit N in the bitmap.
+
+
+2. CORE BITMAP COMMANDS
+────────────────────────
+  SETBIT key offset value      → set bit at offset to 0 or 1
+                                  Returns old bit value. O(1).
+                                  Automatically extends string if offset > length.
+
+  GETBIT key offset            → get bit value at offset. O(1).
+                                  Returns 0 for non-existing bits.
+
+  BITCOUNT key [start end [BYTE|BIT]]
+                               → count number of set bits (1s) in range.
+                                  start/end are byte ranges by default.
+                                  O(N) where N = number of bytes inspected.
+
+  BITPOS key bit [start [end [BYTE|BIT]]]
+                               → find first bit with value 0 or 1 in range.
+
+  BITOP operation dst key [key …]
+                               → bitwise operation (AND, OR, XOR, NOT) across keys.
+                                  Result stored in dst key.
+
+  BITFIELD key [GET type offset] [SET type offset value]
+             [INCRBY type offset increment] [OVERFLOW WRAP|SAT|FAIL]
+                               → operate on arbitrary bit-width integers within key.
+
+
+3. BITMAP USE CASES
+────────────────────
+
+3a. Daily Active Users (DAU):
+  # User with ID 42 logged in on Jan 15
+  SETBIT dau:2024-01-15 42 1
+  SETBIT dau:2024-01-15 99 1
+  SETBIT dau:2024-01-15 1000000 1
+
+  # Total DAU
+  BITCOUNT dau:2024-01-15   → 3
+
+  # Did user 42 log in?
+  GETBIT dau:2024-01-15 42   → 1
+
+  Memory: 1 million users = 1,000,000 bits = 125 KB (!)
+  Compare to Set: 1M user IDs as strings = ~50 MB
+  Bitmap is ~400x more memory efficient.
+
+3b. Weekly Active Users (WAU):
+  # Users active in at least 1 day of the week
+  BITOP OR wau:2024-W03 dau:2024-01-15 dau:2024-01-16 dau:2024-01-17 ...
+  BITCOUNT wau:2024-W03   → WAU count
+
+  # Users active on BOTH Monday AND Wednesday (retained users)
+  BITOP AND active_both dau:2024-01-15 dau:2024-01-17
+  BITCOUNT active_both
+
+3c. Feature Flags / A-B Testing:
+  # Assign users to experiment group
+  SETBIT experiment:ab_test:new_checkout 42 1    # user 42 in new checkout group
+  SETBIT experiment:ab_test:new_checkout 99 0    # user 99 in control group
+
+  # Check assignment
+  GETBIT experiment:ab_test:new_checkout 42
+
+3d. User Onboarding Checklist (per user):
+  # Bit 0 = email verified, bit 1 = profile completed, bit 2 = first purchase
+  SETBIT onboarding:user:42 0 1   # email verified
+  SETBIT onboarding:user:42 1 1   # profile completed
+  GETBIT onboarding:user:42 2     # has made first purchase?
+  BITCOUNT onboarding:user:42     # steps completed
+
+3e. Real-Time Analytics / Unique Visitors per Page per Day:
+  SETBIT page:home:2024-01-15 user_id 1
+  BITCOUNT page:home:2024-01-15   → unique visitors
+
+  (For very high user IDs, HyperLogLog may be better — see Part 2)
+
+
+4. BITFIELD — PACKED INTEGERS
+───────────────────────────────
+BITFIELD allows you to store multiple integers of arbitrary bit-widths within
+a single string. Like a C struct packed into a Redis string.
+
+  BITFIELD user:42 SET u8 0 25          # set 8-bit unsigned int at offset 0 to 25
+  BITFIELD user:42 GET u8 0             # get 8-bit uint at offset 0 → 25
+  BITFIELD user:42 INCRBY u8 0 5       # increment → 30
+  BITFIELD user:42 INCRBY u8 0 230     # would overflow u8 (max 255)
+
+  Overflow modes:
+    WRAP (default): wraps around (256 → 0 for u8)
+    SAT:  saturates at max/min (255 stays at 255)
+    FAIL: returns nil if overflow would occur
+
+  Types: u8, u16, u32, u64 (unsigned), i8, i16, i32, i64 (signed)
+
+  Use case: game state (store health=u8, mana=u8, level=u8 packed in one key):
+    BITFIELD player:42 SET u8 0 100    # health=100
+    BITFIELD player:42 SET u8 8 50     # mana=50 (at bit offset 8)
+    BITFIELD player:42 SET u8 16 5     # level=5 (at bit offset 16)
+    BITFIELD player:42 GET u8 0        # → 100
+
+    # Get all stats:
+    BITFIELD player:42 GET u8 0 GET u8 8 GET u8 16   → [100, 50, 5]
+
+
+5. BITPOS — FIND FIRST BIT
+────────────────────────────
+  BITPOS key 1           → offset of first set bit (1)
+  BITPOS key 0           → offset of first unset bit (0)
+  BITPOS key 1 2         → first 1 starting from byte 2
+  BITPOS key 1 2 5       → first 1 in bytes 2-5
+
+  Use case: find first available slot in a bitmap (e.g., parking spaces):
+    BITPOS parking:floor-1 0    → first available (0-bit) space
+
+  Bit unit (Redis 7.0+):
+    BITPOS key 1 10 20 BIT   → first 1 between bit 10 and bit 20
+
+
+6. BITMAP COMPLEXITY
+─────────────────────
+  Command     │ Complexity
+  ────────────┼─────────────────────────────────────────
+  SETBIT      │ O(1)
+  GETBIT      │ O(1)
+  BITCOUNT    │ O(N) where N = number of bytes in range
+  BITPOS      │ O(N)
+  BITOP       │ O(N) where N = size of longest string
+  BITFIELD    │ O(1) per subcommand
+
+
+═══════════════════════════════════════════════════════════════════════════════
+PART 2: HYPERLOGLOG
+═══════════════════════════════════════════════════════════════════════════════
+
+7. WHAT IS HYPERLOGLOG?
+────────────────────────
+HyperLogLog (HLL) is a probabilistic data structure for estimating cardinality
+(the number of distinct elements in a set). 
+
+Key insight:
+  - Exact counting of unique elements requires O(N) memory (must remember all)
+  - HLL uses at most 12 KB of memory to estimate cardinality for ANY size set
+  - Error rate: ≤ 0.81% standard error (usually much less)
+
+Redis implements HLL using 16,384 registers (2^14), each storing a 6-bit value.
+Total memory: 12 KB REGARDLESS of how many elements are added.
+
+Redis HLL is technically stored as a String key.
+
+
+8. HLL COMMANDS
+────────────────
+  PFADD key element [element …]    → add elements to HLL. Returns 1 if estimate
+                                      changed, 0 if not. O(1) amortized.
+
+  PFCOUNT key [key …]              → get cardinality estimate. O(1) for single
+                                      key. O(N) for multiple (merges HLLs).
+
+  PFMERGE dst src [src …]          → merge multiple HLLs into dst. O(N).
+
+
+9. HOW HYPERLOGLOG WORKS (CONCEPTUALLY)
+─────────────────────────────────────────
+  1. Hash each element deterministically (using MurmurHash)
+  2. Look at the LONGEST RUN OF LEADING ZEROS in the hash
+     (longer run = more unique elements have been seen, probabilistically)
+  3. Track the max leading zeros seen for different "buckets" (registers)
+  4. Use harmonic mean of all registers to estimate cardinality
+
+  Example intuition:
+    If you flip coins until you get heads, and the max consecutive tails seen
+    is K, you'd estimate ~2^K flips occurred. HLL generalizes this idea.
+
+  With 16K registers and harmonic mean: error ≤ 1.04 / sqrt(16384) ≈ 0.81%
+
+
+10. HYPERLOGLOG USE CASES
+──────────────────────────
+
+10a. Unique Visitors per Page per Day:
+  PFADD visitors:home:2024-01-15 user1 user2 user3
+  PFADD visitors:home:2024-01-15 user2 user3 user4   # duplicates ignored
+  PFCOUNT visitors:home:2024-01-15   → ~4 (or exactly 4 for small sets)
+
+  Memory: 12 KB per key regardless of how many users!
+  Compare to Set: 1 billion distinct users * ~20 bytes = 20 GB
+
+10b. Monthly Unique Visitors (merge daily HLLs):
+  PFMERGE visitors:home:2024-01 visitors:home:2024-01-01 visitors:home:2024-01-02 ...
+  PFCOUNT visitors:home:2024-01   → ~monthly unique visitors
+
+10c. Unique Search Terms:
+  PFADD searches:2024-01-15 "redis tutorial" "java streams" "kafka vs redis"
+  PFCOUNT searches:2024-01-15
+
+10d. Unique API Callers:
+  PFADD api:endpoint:/users:callers req-id-1 req-id-2
+  PFCOUNT api:endpoint:/users:callers
+
+10e. Real-Time Cardinality Monitoring:
+  PFADD errors:user-service error-trace-1 error-trace-2
+  PFCOUNT errors:user-service   → unique error types (not total count)
+
+
+11. HLL vs SET vs BITMAP FOR UNIQUE COUNTING
+──────────────────────────────────────────────
+  Method       │ Memory        │ Accuracy   │ When to use
+  ─────────────┼───────────────┼────────────┼───────────────────────────────
+  Set          │ O(N) exact    │ 100%       │ N is small or you need exact
+  Bitmap       │ O(max_id/8)   │ 100%       │ IDs are dense integers
+  HyperLogLog  │ 12 KB constant│ ±0.81%     │ N is huge, approx ok
+  ─────────────┴───────────────┴────────────┴───────────────────────────────
+
+  Example: 100 million unique user IDs
+    Set:         ~100M * 20 bytes = ~2 GB
+    Bitmap:      ~100M bits = ~12.5 MB (if IDs are ≤ 100M)
+    HyperLogLog: 12 KB always
+
+  Choose HyperLogLog when:
+    - Cardinality > millions
+    - Memory is a concern
+    - 1% error is acceptable (e.g., "approximately 1.2M unique visitors")
+
+
+12. HLL INTERNALS
+──────────────────
+  Redis HLL exists in two encodings:
+  - sparse:  used when few elements added (< ~10K elements)
+             Very compact: uses run-length encoding for empty registers
+  - dense:   used when more elements added
+             Fixed 12,293 bytes (12 KB)
+
+  Automatic upgrade: sparse → dense when sparse gets large.
+  Both accessed transparently via PFADD/PFCOUNT.
+
+  OBJECT ENCODING phll_key → "raw" (HLL is stored as a String with "HYLL" magic bytes)
+
+
+13. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: What is HyperLogLog and when would you use it?
+  A: HyperLogLog is a probabilistic data structure for counting unique elements
+     with constant 12 KB memory usage regardless of cardinality, with a ±0.81%
+     error rate. Use it when you need approximate unique counts at massive scale
+     (unique page visitors, unique searches) where exact accuracy isn't required
+     and memory efficiency matters.
+
+  Q: What is the error rate of Redis HyperLogLog?
+  A: ≤ 0.81% standard error. For small cardinalities (< ~100 elements), it
+     may return an exact count. For large cardinalities, the error is very low.
+
+  Q: What's the memory usage of a bitmap vs HyperLogLog for 1 billion users?
+  A: Bitmap: ~125 MB (1 billion bits = 125 MB). HyperLogLog: 12 KB.
+     But bitmap gives EXACT counts; HLL gives ±0.81% approximate count.
+     If user IDs are sparse (e.g., UUID), bitmap isn't feasible; use HLL.
+
+  Q: Can you get the list of users from a HyperLogLog?
+  A: No. HLL only stores statistical summary information (register values),
+     NOT the actual elements. You can only get the count (PFCOUNT), not the
+     members. Use a Set if you need to retrieve elements.
+
+  Q: What is BITFIELD used for?
+  A: BITFIELD allows storing multiple small integers in a single string at
+     arbitrary bit offsets. Useful for compact game state storage, multi-
+     attribute counters with fixed ranges, or any packed data structure.
+     Supports overflow modes: WRAP (circular), SAT (clamp to max), FAIL (error).
+
+================================================================================

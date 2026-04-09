@@ -1,0 +1,366 @@
+================================================================
+REAL-TIME UI UPDATES IN REACT
+================================================================
+
+Real-time UI patterns determine how to handle incoming WebSocket/SSE
+data and update the UI efficiently without causing excessive re-renders
+or memory leaks.
+
+================================================================
+1. STATE MANAGEMENT FOR REAL-TIME DATA
+================================================================
+
+Three approaches for storing live data:
+
+A) Local state (useState) — simplest, component-scoped:
+   Good for: single component features (chat room)
+
+B) Context/Zustand — shared across component tree:
+   Good for: notifications, user presence across app
+
+C) React Query + invalidation — for data that starts from REST:
+   Good for: live comments on a post, live dashboard metrics
+
+================================================================
+2. LIVE NOTIFICATION SYSTEM
+================================================================
+
+  // store/notificationStore.js (Zustand)
+  import { create } from 'zustand';
+
+  export const useNotificationStore = create((set) => ({
+    notifications: [],
+    unreadCount: 0,
+    addNotification: (notif) =>
+      set((state) => ({
+        notifications: [notif, ...state.notifications].slice(0, 100),
+        unreadCount: state.unreadCount + 1,
+      })),
+    markAllRead: () => set({ unreadCount: 0 }),
+    clear: () => set({ notifications: [], unreadCount: 0 }),
+  }));
+
+  // WebSocketProvider.jsx
+  function WebSocketProvider({ children }) {
+    const addNotification = useNotificationStore(s => s.addNotification);
+
+    useEffect(() => {
+      const client = new Client({ /* STOMP config */ });
+      client.onConnect = () => {
+        client.subscribe('/user/queue/notifications', (msg) => {
+          addNotification(JSON.parse(msg.body));
+        });
+      };
+      client.activate();
+      return () => client.deactivate();
+    }, [addNotification]);
+
+    return <>{children}</>;
+  }
+
+  // NotificationBell.jsx (anywhere in the tree)
+  function NotificationBell() {
+    const { unreadCount, notifications, markAllRead } =
+      useNotificationStore();
+
+    return (
+      <div>
+        <button onClick={markAllRead}>
+          🔔 {unreadCount > 0 && <span>{unreadCount}</span>}
+        </button>
+        {/* Dropdown list */}
+      </div>
+    );
+  }
+
+================================================================
+3. LIVE CHAT WITH VIRTUALIZATION
+================================================================
+
+For chat rooms with thousands of messages, use react-window or
+react-virtual to virtualize the list. Render only visible items.
+
+  import { VariableSizeList as List } from 'react-window';
+  import AutoSizer from 'react-virtualized-auto-sizer';
+
+  function VirtualizedChatList({ messages }) {
+    const listRef = useRef();
+
+    // Auto-scroll to bottom when new messages arrive
+    useEffect(() => {
+      listRef.current?.scrollToItem(messages.length - 1, 'end');
+    }, [messages.length]);
+
+    const getItemSize = (index) => {
+      // Estimate height based on message length
+      const msg = messages[index];
+      return msg.text.length > 100 ? 80 : 48;
+    };
+
+    return (
+      <AutoSizer>
+        {({ height, width }) => (
+          <List
+            ref={listRef}
+            height={height}
+            width={width}
+            itemCount={messages.length}
+            itemSize={getItemSize}
+            itemData={messages}
+          >
+            {({ index, style, data }) => (
+              <div style={style}>
+                <ChatMessage message={data[index]} />
+              </div>
+            )}
+          </List>
+        )}
+      </AutoSizer>
+    );
+  }
+
+================================================================
+4. LIVE DASHBOARD — METRICS CHART
+================================================================
+
+  function LiveMetricsDashboard() {
+    const [metrics, setMetrics] = useState([]);
+    const MAX_POINTS = 60; // Keep last 60 data points
+
+    useEffect(() => {
+      const ws = new WebSocket('wss://api.example.com/ws/metrics');
+
+      ws.onmessage = (event) => {
+        const point = JSON.parse(event.data);
+        setMetrics(prev => {
+          const updated = [...prev, point];
+          // Keep only the last MAX_POINTS entries
+          return updated.slice(-MAX_POINTS);
+        });
+      };
+
+      return () => ws.close(1000);
+    }, []);
+
+    return (
+      <LineChart width={600} height={300} data={metrics}>
+        <CartesianGrid strokeDasharray="3 3" />
+        <XAxis dataKey="timestamp" />
+        <YAxis />
+        <Tooltip />
+        <Line
+          type="monotone"
+          dataKey="cpu"
+          stroke="#007bff"
+          dot={false}
+          isAnimationActive={false} // disable animation for live data
+        />
+      </LineChart>
+    );
+  }
+
+================================================================
+5. OPTIMISTIC UPDATES WITH WEBSOCKET
+================================================================
+
+Send the message optimistically to the UI before server confirms,
+then replace with the server-confirmed version (which has an id, timestamp).
+
+  function OptimisticChat({ roomId }) {
+    const [messages, setMessages] = useState([]);
+    const clientRef = useRef(null);
+
+    const sendMessage = (text) => {
+      // Create a temporary optimistic message
+      const tempId = `temp-${Date.now()}`;
+      const optimistic = {
+        id: tempId,
+        text,
+        sender: 'me',
+        timestamp: new Date().toISOString(),
+        pending: true,
+      };
+
+      // Show immediately
+      setMessages(prev => [...prev, optimistic]);
+
+      // Send to server
+      clientRef.current?.publish({
+        destination: '/app/chat.send',
+        body: JSON.stringify({ roomId, text, clientId: tempId }),
+      });
+    };
+
+    // When server confirms or broadcasts, replace temp message
+    const handleIncoming = (msg) => {
+      if (msg.clientId) {
+        // Replace optimistic message
+        setMessages(prev =>
+          prev.map(m => m.id === msg.clientId ? msg : m)
+        );
+      } else {
+        setMessages(prev => [...prev, msg]);
+      }
+    };
+  }
+
+================================================================
+6. USER PRESENCE (WHO'S ONLINE)
+================================================================
+
+  // React side
+  function usePresence(roomId) {
+    const [onlineUsers, setOnlineUsers] = useState(new Set());
+
+    useEffect(() => {
+      const client = new Client({ /* config */ });
+
+      client.onConnect = () => {
+        // Subscribe to presence updates
+        client.subscribe(`/topic/presence/${roomId}`, (msg) => {
+          const { userId, status } = JSON.parse(msg.body);
+          setOnlineUsers(prev => {
+            const next = new Set(prev);
+            if (status === 'ONLINE') next.add(userId);
+            else next.delete(userId);
+            return next;
+          });
+        });
+
+        // Announce presence
+        client.publish({
+          destination: '/app/presence.join',
+          body: JSON.stringify({ roomId }),
+        });
+      };
+
+      client.activate();
+
+      return () => {
+        // Announce departure
+        client.publish({
+          destination: '/app/presence.leave',
+          body: JSON.stringify({ roomId }),
+        });
+        client.deactivate();
+      };
+    }, [roomId]);
+
+    return onlineUsers;
+  }
+
+================================================================
+7. REACT QUERY + WEBSOCKET INTEGRATION
+================================================================
+
+Use React Query for initial data fetch, WebSocket to keep it fresh:
+
+  function useComments(postId) {
+    const queryClient = useQueryClient();
+
+    // Initial load via REST
+    const query = useQuery({
+      queryKey: ['comments', postId],
+      queryFn: () => apiClient.get(`/posts/${postId}/comments`).then(r => r.data),
+    });
+
+    // WebSocket for live updates
+    useEffect(() => {
+      const ws = new WebSocket(`wss://api.example.com/ws/comments/${postId}`);
+
+      ws.onmessage = (event) => {
+        const { type, comment } = JSON.parse(event.data);
+
+        if (type === 'NEW_COMMENT') {
+          // Append to cached query data
+          queryClient.setQueryData(['comments', postId], (old) => ({
+            ...old,
+            items: [...(old?.items || []), comment],
+          }));
+        }
+
+        if (type === 'DELETE_COMMENT') {
+          queryClient.setQueryData(['comments', postId], (old) => ({
+            ...old,
+            items: old.items.filter(c => c.id !== comment.id),
+          }));
+        }
+      };
+
+      return () => ws.close(1000);
+    }, [postId, queryClient]);
+
+    return query;
+  }
+
+================================================================
+8. PREVENTING RE-RENDERS IN REAL-TIME COMPONENTS
+================================================================
+
+  // Use useCallback to stabilize message handler
+  const handleMessage = useCallback((data) => {
+    setMessages(prev => [...prev, data]);
+  }, []); // no dependencies — no recreations
+
+  // Use React.memo for message items that don't change
+  const ChatMessage = React.memo(function ChatMessage({ message }) {
+    return <div>{message.text}</div>;
+  });
+
+  // Use a ref for data that doesn't need to trigger re-renders
+  const bufferRef = useRef([]);
+
+  // Batch updates — flush every 100ms instead of per-message
+  useEffect(() => {
+    const flush = setInterval(() => {
+      if (bufferRef.current.length > 0) {
+        setMessages(prev => [...prev, ...bufferRef.current]);
+        bufferRef.current = [];
+      }
+    }, 100);
+    return () => clearInterval(flush);
+  }, []);
+
+  // WebSocket onmessage
+  ws.onmessage = (event) => {
+    bufferRef.current.push(JSON.parse(event.data));
+  };
+
+================================================================
+9. INTERVIEW QUESTIONS
+================================================================
+
+Q: How do you update React state from a WebSocket message?
+A: Attach an onmessage handler inside a useEffect with proper cleanup.
+   Call the state setter inside the handler. Use functional updates
+   (setMessages(prev => [...prev, newMsg])) to avoid stale closure
+   issues. The onmessage handler captures the setter reference, not
+   the state value, so it stays current.
+
+Q: How do you prevent performance issues with high-frequency WebSocket data?
+A: (1) Buffer messages in a ref and flush to state every 100-500ms
+   using setInterval, instead of setting state on every message.
+   (2) Use React.memo on list items so unchanged items don't re-render.
+   (3) Virtualize long lists with react-window. (4) Disable chart
+   animations for live-updating data.
+
+Q: How would you integrate React Query with real-time WebSocket updates?
+A: Use React Query's queryClient.setQueryData to imperatively update
+   the cache when a WebSocket message arrives. The component using
+   useQuery automatically re-renders because the cache changed. This
+   gives you the caching/staleness benefits of React Query plus
+   real-time freshness from WebSocket.
+
+Q: How do you implement optimistic updates for chat?
+A: When the user sends a message, immediately add a temporary version
+   (with pending: true and a temp ID) to the state. When the server
+   broadcasts the confirmed message (including the temp clientId),
+   replace the optimistic entry with the real one. If the send fails,
+   remove the optimistic entry and show an error.
+
+Q: How does user presence tracking work?
+A: Subscribe to a presence topic on connect, publish a JOIN event.
+   The server maintains a session → user mapping. On WebSocket session
+   close (Spring's SessionDisconnectEvent), the server publishes
+   a LEAVE event to the presence topic. Subscribers update their
+   onlineUsers state accordingly.

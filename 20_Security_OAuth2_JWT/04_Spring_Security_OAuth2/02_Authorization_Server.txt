@@ -1,0 +1,493 @@
+========================================================
+SPRING AUTHORIZATION SERVER
+========================================================
+
+Spring Authorization Server (SAS) is the official Spring-ecosystem project
+for building OAuth2 Authorization Servers. It implements:
+  - RFC 6749: OAuth 2.0
+  - RFC 7519: JWT
+  - RFC 7517: JWKS
+  - RFC 8693: Token Exchange
+  - OpenID Connect Core 1.0
+  - OpenID Connect Discovery 1.0
+
+Repository: https://github.com/spring-projects/spring-authorization-server
+Docs: https://docs.spring.io/spring-authorization-server/reference/
+
+WHEN TO USE SPRING AUTHORIZATION SERVER:
+  - Building your own OAuth2/OIDC identity provider
+  - Need fine-grained control over token content and flow
+  - Enterprise/white-label auth scenarios
+  - Learning/reference implementation
+
+ALTERNATIVES:
+  - Keycloak: Feature-rich, production-ready IAM
+  - Auth0 / Okta: SaaS identity providers
+  - AWS Cognito: Cloud IAM
+
+========================================================
+1. DEPENDENCY SETUP
+========================================================
+
+<dependency>
+    <groupId>org.springframework.security</groupId>
+    <artifactId>spring-security-oauth2-authorization-server</artifactId>
+</dependency>
+<!-- Also need: spring-boot-starter-security, spring-boot-starter-web -->
+
+========================================================
+2. MINIMUM WORKING AUTHORIZATION SERVER
+========================================================
+
+@Configuration
+@EnableWebSecurity
+public class AuthorizationServerConfig {
+
+    // 1. Protocol endpoint security (OAuth2 endpoints)
+    @Bean
+    @Order(1)
+    public SecurityFilterChain authorizationServerSecurityFilterChain(
+            HttpSecurity http) throws Exception {
+
+        OAuth2AuthorizationServerConfiguration.applyDefaultSecurity(http);
+
+        // Enable OIDC
+        http.getConfigurer(OAuth2AuthorizationServerConfigurer.class)
+            .oidc(Customizer.withDefaults());
+
+        // Redirect to login for unauthenticated requests to auth endpoints
+        http.exceptionHandling(ex -> ex
+            .defaultAuthenticationEntryPointFor(
+                new LoginUrlAuthenticationEntryPoint("/login"),
+                new MediaTypeRequestMatcher(MediaType.TEXT_HTML)
+            )
+        );
+
+        return http.build();
+    }
+
+    // 2. Default security for the rest of the app
+    @Bean
+    @Order(2)
+    public SecurityFilterChain defaultSecurityFilterChain(
+            HttpSecurity http) throws Exception {
+        http
+            .authorizeHttpRequests(auth -> auth.anyRequest().authenticated())
+            .formLogin(Customizer.withDefaults());
+        return http.build();
+    }
+
+    // 3. Registered clients (client registry)
+    @Bean
+    public RegisteredClientRepository registeredClientRepository() {
+        RegisteredClient webApp = RegisteredClient.withId(UUID.randomUUID().toString())
+            .clientId("web-app")
+            .clientSecret("{bcrypt}" + new BCryptPasswordEncoder().encode("secret"))
+            .clientAuthenticationMethod(ClientAuthenticationMethod.CLIENT_SECRET_BASIC)
+            .authorizationGrantType(AuthorizationGrantType.AUTHORIZATION_CODE)
+            .authorizationGrantType(AuthorizationGrantType.REFRESH_TOKEN)
+            .redirectUri("https://web.example.com/callback")
+            .postLogoutRedirectUri("https://web.example.com/logout")
+            .scope(OidcScopes.OPENID)
+            .scope(OidcScopes.PROFILE)
+            .scope("orders:read")
+            .scope("orders:write")
+            .clientSettings(ClientSettings.builder()
+                .requireProofKey(true)              // Require PKCE
+                .requireAuthorizationConsent(true)  // Show consent screen
+                .build()
+            )
+            .tokenSettings(TokenSettings.builder()
+                .accessTokenTimeToLive(Duration.ofMinutes(15))
+                .refreshTokenTimeToLive(Duration.ofDays(30))
+                .reuseRefreshTokens(false)          // Refresh token rotation
+                .build()
+            )
+            .build();
+
+        return new InMemoryRegisteredClientRepository(webApp);
+    }
+
+    // 4. Authorization code and token persistence
+    @Bean
+    public OAuth2AuthorizationService authorizationService() {
+        return new InMemoryOAuth2AuthorizationService();
+        // For production: JdbcOAuth2AuthorizationService with a DataSource
+    }
+
+    // 5. Consent (scope approval) persistence
+    @Bean
+    public OAuth2AuthorizationConsentService authorizationConsentService() {
+        return new InMemoryOAuth2AuthorizationConsentService();
+        // For production: JdbcOAuth2AuthorizationConsentService
+    }
+
+    // 6. JWK source (signing keys)
+    @Bean
+    public JWKSource<SecurityContext> jwkSource() {
+        KeyPair keyPair = generateRsaKey();
+        RSAPublicKey publicKey = (RSAPublicKey) keyPair.getPublic();
+        RSAPrivateKey privateKey = (RSAPrivateKey) keyPair.getPrivate();
+        RSAKey rsaKey = new RSAKey.Builder(publicKey)
+            .privateKey(privateKey)
+            .keyID(UUID.randomUUID().toString())
+            .build();
+        JWKSet jwkSet = new JWKSet(rsaKey);
+        return new ImmutableJWKSet<>(jwkSet);
+    }
+
+    private static KeyPair generateRsaKey() {
+        try {
+            KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance("RSA");
+            keyPairGenerator.initialize(2048);
+            return keyPairGenerator.generateKeyPair();
+        } catch (NoSuchAlgorithmException ex) {
+            throw new IllegalStateException(ex);
+        }
+    }
+
+    // 7. JWT encoder (uses JWKSource to sign)
+    @Bean
+    public JwtEncoder jwtEncoder(JWKSource<SecurityContext> jwkSource) {
+        return new NimbusJwtEncoder(jwkSource);
+    }
+
+    // 8. JWT decoder for introspection/resource server co-location
+    @Bean
+    public JwtDecoder jwtDecoder(JWKSource<SecurityContext> jwkSource) {
+        return OAuth2AuthorizationServerConfiguration.jwtDecoder(jwkSource);
+    }
+
+    // 9. Authorization server settings
+    @Bean
+    public AuthorizationServerSettings authorizationServerSettings() {
+        return AuthorizationServerSettings.builder()
+            .issuer("https://auth.example.com")    // Must match iss claim in tokens
+            // Custom endpoint paths (optional):
+            // .authorizationEndpoint("/oauth2/authorize")
+            // .tokenEndpoint("/oauth2/token")
+            // .jwkSetEndpoint("/oauth2/jwks")
+            // .tokenIntrospectionEndpoint("/oauth2/introspect")
+            // .tokenRevocationEndpoint("/oauth2/revoke")
+            // .oidcUserInfoEndpoint("/userinfo")
+            .build();
+    }
+}
+
+========================================================
+3. REGISTERED CLIENT — DETAILED BREAKDOWN
+========================================================
+
+RegisteredClient = The OAuth2 client registration.
+Each field maps to OAuth2/OIDC spec parameters.
+
+RegisteredClient client = RegisteredClient
+    .withId("unique-db-id")                   // Internal ID (UUID)
+    .clientId("my-client")                    // client_id in OAuth2 requests
+    .clientSecret("{bcrypt}$2a$...")           // Encoded client secret
+    .clientName("My Web Application")         // Human-readable name
+    
+    // How client authenticates to the AS:
+    .clientAuthenticationMethod(
+        ClientAuthenticationMethod.CLIENT_SECRET_BASIC)   // Authorization header
+    .clientAuthenticationMethod(
+        ClientAuthenticationMethod.CLIENT_SECRET_POST)    // Body parameters
+    .clientAuthenticationMethod(
+        ClientAuthenticationMethod.PRIVATE_KEY_JWT)       // JWT assertion
+    .clientAuthenticationMethod(
+        ClientAuthenticationMethod.NONE)                  // Public client (PKCE)
+    
+    // Allowed grant types:
+    .authorizationGrantType(AuthorizationGrantType.AUTHORIZATION_CODE)
+    .authorizationGrantType(AuthorizationGrantType.REFRESH_TOKEN)
+    .authorizationGrantType(AuthorizationGrantType.CLIENT_CREDENTIALS)
+    
+    // Allowed redirect URIs:
+    .redirectUri("https://app.example.com/callback")
+    .postLogoutRedirectUri("https://app.example.com/")
+    
+    // Allowed scopes:
+    .scope(OidcScopes.OPENID)     // "openid"
+    .scope(OidcScopes.PROFILE)    // "profile"
+    .scope(OidcScopes.EMAIL)      // "email"
+    .scope("orders:read")
+    .scope("orders:write")
+    
+    // Client-level settings:
+    .clientSettings(ClientSettings.builder()
+        .requireProofKey(true)             // PKCE required (public clients)
+        .requireAuthorizationConsent(true) // User must approve scopes
+        .jwkSetUrl("https://client.example.com/jwks")  // For private_key_jwt
+        .tokenEndpointAuthenticationSigningAlgorithm(SignatureAlgorithm.RS256)
+        .build()
+    )
+    
+    // Token settings:
+    .tokenSettings(TokenSettings.builder()
+        .idTokenSignatureAlgorithm(SignatureAlgorithm.RS256)
+        .accessTokenFormat(OAuth2TokenFormat.SELF_CONTAINED)  // JWT (default)
+        // OR: OAuth2TokenFormat.REFERENCE for opaque tokens
+        .accessTokenTimeToLive(Duration.ofMinutes(15))
+        .refreshTokenTimeToLive(Duration.ofDays(7))
+        .reuseRefreshTokens(false)  // Rotate refresh tokens (security best practice)
+        .build()
+    )
+    .build();
+
+========================================================
+4. TOKEN CUSTOMIZATION
+========================================================
+
+Adding custom claims to access tokens and ID tokens:
+
+@Bean
+public OAuth2TokenCustomizer<JwtEncodingContext> tokenCustomizer(
+        UserRepository userRepository) {
+
+    return context -> {
+        // For access tokens
+        if (OAuth2TokenType.ACCESS_TOKEN.equals(context.getTokenType())) {
+            Authentication principal = context.getPrincipal();
+            String username = principal.getName();
+
+            User user = userRepository.findByUsername(username).orElseThrow();
+
+            // Add custom claims
+            context.getClaims()
+                .claim("user_id", user.getId().toString())
+                .claim("tenant_id", user.getTenantId())
+                .claim("roles", user.getRoles())
+                .claim("permissions", user.getPermissions())
+                .claim("email", user.getEmail());
+
+            // Check if client_credentials grant (no user)
+            if (context.getAuthorizationGrantType()
+                    .equals(AuthorizationGrantType.CLIENT_CREDENTIALS)) {
+                context.getClaims()
+                    .claim("service_name", context.getRegisteredClient().getClientName());
+            }
+        }
+
+        // For ID tokens (OIDC)
+        if (OidcParameterNames.ID_TOKEN.equals(context.getTokenType().getValue())) {
+            Authentication principal = context.getPrincipal();
+            // Add OIDC standard claims to ID token
+            context.getClaims()
+                .claim("preferred_username", principal.getName())
+                .claim("email_verified", true);
+        }
+    };
+}
+
+Accessing Principal info in token customizer:
+
+// For Authorization Code flow (user is authenticated):
+if (principal instanceof OAuth2AuthenticationToken oauthToken) {
+    // User authenticated via social provider
+    OidcUser oidcUser = (OidcUser) oauthToken.getPrincipal();
+    context.getClaims().claim("external_sub", oidcUser.getSubject());
+} else if (principal instanceof UsernamePasswordAuthenticationToken) {
+    // User authenticated via form login
+    UserDetails userDetails = (UserDetails) principal.getPrincipal();
+}
+
+========================================================
+5. JDBC-BACKED PERSISTENCE (PRODUCTION)
+========================================================
+
+For production, use JDBC persistence instead of in-memory:
+
+// Schema — Spring Authorization Server ships SQL scripts for:
+// org/springframework/security/oauth2/server/authorization/client/oauth2-registered-client-schema.sql
+// org/springframework/security/oauth2/server/authorization/oauth2-authorization-schema.sql
+// org/springframework/security/oauth2/server/authorization/oauth2-authorization-consent-schema.sql
+
+@Bean
+public RegisteredClientRepository registeredClientRepository(JdbcTemplate jdbcTemplate) {
+    return new JdbcRegisteredClientRepository(jdbcTemplate);
+}
+
+@Bean
+public OAuth2AuthorizationService authorizationService(
+        JdbcTemplate jdbcTemplate,
+        RegisteredClientRepository clientRepository) {
+    return new JdbcOAuth2AuthorizationService(jdbcTemplate, clientRepository);
+}
+
+@Bean
+public OAuth2AuthorizationConsentService authorizationConsentService(
+        JdbcTemplate jdbcTemplate,
+        RegisteredClientRepository clientRepository) {
+    return new JdbcOAuth2AuthorizationConsentService(jdbcTemplate, clientRepository);
+}
+
+========================================================
+6. AUTHORIZATION SERVER ENDPOINTS
+========================================================
+
+All endpoints are automatically registered. Default paths:
+
+Endpoint                                  URL
+----------------------------------------  ----------------------------------------
+Authorization Endpoint                    /oauth2/authorize
+Token Endpoint                            /oauth2/token
+Token Revocation Endpoint                 /oauth2/revoke
+Token Introspection Endpoint              /oauth2/introspect
+JWK Set Endpoint                          /oauth2/jwks
+OpenID Connect Discovery                  /.well-known/openid-configuration
+OpenID Connect UserInfo Endpoint          /userinfo
+OpenID Connect Client Registration        /connect/register
+
+Discovery document example (GET /.well-known/openid-configuration):
+{
+  "issuer": "https://auth.example.com",
+  "authorization_endpoint": "https://auth.example.com/oauth2/authorize",
+  "token_endpoint": "https://auth.example.com/oauth2/token",
+  "jwks_uri": "https://auth.example.com/oauth2/jwks",
+  "scopes_supported": ["openid", "profile", "email"],
+  "response_types_supported": ["code"],
+  "grant_types_supported": ["authorization_code", "client_credentials", "refresh_token"],
+  "token_endpoint_auth_methods_supported": [
+    "client_secret_basic", "client_secret_post", "private_key_jwt"
+  ]
+}
+
+========================================================
+7. CUSTOM CONSENT PAGE
+========================================================
+
+Replace default consent page with custom UI:
+
+// Custom consent controller
+@Controller
+public class ConsentController {
+
+    @GetMapping("/oauth2/consent")
+    public String consent(Principal principal,
+                          Model model,
+                          @RequestParam(OAuth2ParameterNames.CLIENT_ID) String clientId,
+                          @RequestParam(OAuth2ParameterNames.SCOPE) String scope,
+                          @RequestParam(OAuth2ParameterNames.STATE) String state) {
+
+        RegisteredClient client = clientRepository.findByClientId(clientId);
+        model.addAttribute("clientName", client.getClientName());
+        model.addAttribute("scopes", scope.split(" "));
+        model.addAttribute("state", state);
+        return "consent";
+    }
+}
+
+// Wire custom consent page:
+http.getConfigurer(OAuth2AuthorizationServerConfigurer.class)
+    .authorizationEndpoint(endpoint -> endpoint
+        .consentPage("/oauth2/consent")
+    );
+
+========================================================
+8. FEDERATION WITH EXTERNAL IDENTITY PROVIDERS
+========================================================
+
+Allow users to authenticate via Google/GitHub/etc:
+
+// Add to defaultSecurityFilterChain:
+.oauth2Login(oauth2 -> oauth2
+    .loginPage("/login")
+    .userInfoEndpoint(userInfo -> userInfo
+        .oidcUserService(oidcUserService())  // Custom user mapping
+    )
+)
+
+// Custom user service: maps external OIDC user to local principal
+@Bean
+public OidcUserService oidcUserService() {
+    OidcUserService delegate = new OidcUserService();
+    return new OidcUserService() {
+        @Override
+        public OidcUser loadUser(OidcUserRequest request) throws OAuth2AuthenticationException {
+            OidcUser oidcUser = delegate.loadUser(request);
+            // Map external user to local user, provision if first login
+            return mergeWithLocalUser(oidcUser);
+        }
+    };
+}
+
+========================================================
+9. PRODUCTION CONSIDERATIONS
+========================================================
+
+Key Management:
+  - NEVER use auto-generated in-memory keys for production
+  - Use HSM or KMS for private key storage
+  - Or load from environment variable / Vault:
+
+@Bean
+public JWKSource<SecurityContext> jwkSource(
+        @Value("${auth.rsa.private-key}") RSAPrivateKey privateKey,
+        @Value("${auth.rsa.public-key}") RSAPublicKey publicKey) {
+    RSAKey rsaKey = new RSAKey.Builder(publicKey)
+        .privateKey(privateKey)
+        .keyID("key-2024-01")
+        .build();
+    return new ImmutableJWKSet<>(new JWKSet(rsaKey));
+}
+
+Scalability:
+  - Use JDBC persistence (JdbcOAuth2AuthorizationService) for multi-instance
+  - Redis for authorization code/token caching (short-lived)
+  - Load balance behind a reverse proxy
+
+Security hardening:
+  - Set secure issuer URL (HTTPS only)
+  - Configure PKCE requirement for all public clients
+  - Rotate signing keys periodically
+  - Rate limit token endpoint
+  - Monitor for unusual token issuance patterns
+
+========================================================
+10. COMMON INTERVIEW QUESTIONS
+========================================================
+
+Q: What is Spring Authorization Server?
+A: An official Spring Security subproject that implements OAuth2.1 and OIDC
+   specifications. Used to build your own Authorization Server. It manages
+   client registrations, issues access/refresh/ID tokens, exposes JWKS, and
+   provides consent screens.
+
+Q: How do you add custom claims to JWT tokens in Spring Authorization Server?
+A: Implement OAuth2TokenCustomizer<JwtEncodingContext> bean. Inside, check
+   context.getTokenType() to distinguish access_token vs id_token, then call
+   context.getClaims().claim(key, value) to add custom claims.
+
+Q: What is RegisteredClient?
+A: The Spring Authorization Server representation of an OAuth2 client. It stores
+   client_id, client_secret, allowed grant types, redirect URIs, scopes, and
+   token settings (TTL, rotation policy). Analogous to Keycloak's "Client".
+
+Q: How does token refresh rotation work in Spring Authorization Server?
+A: Set reuseRefreshTokens(false) in TokenSettings. On each refresh token grant,
+   SAS issues a NEW refresh token and invalidates the old one. If an attacker
+   uses a stolen refresh token that was already rotated, the AS can detect the
+   reuse and revoke all tokens for that authorization.
+
+Q: What is the difference between OAuth2TokenFormat.SELF_CONTAINED and REFERENCE?
+A: SELF_CONTAINED (default): Issues JWT access tokens that resource servers can
+   validate locally. REFERENCE: Issues opaque tokens that require introspection
+   calls to the AS. Use REFERENCE when you need instant revocation or don't want
+   to expose claims in the token.
+
+Q: How do you persist OAuth2 authorization data in production?
+A: Replace in-memory implementations with JDBC variants:
+   JdbcRegisteredClientRepository, JdbcOAuth2AuthorizationService,
+   JdbcOAuth2AuthorizationConsentService. Spring Authorization Server ships
+   DDL scripts for creating the required tables.
+
+Q: What endpoints does Spring Authorization Server expose?
+A: /oauth2/authorize (auth code), /oauth2/token (all grants), /oauth2/revoke
+   (revocation), /oauth2/introspect (introspection), /oauth2/jwks (public keys),
+   /.well-known/openid-configuration (OIDC discovery), /userinfo (OIDC userinfo).
+
+Q: How do you federate Spring Authorization Server with external IdPs like Google?
+A: Add spring-boot-starter-oauth2-client, configure Google as a client registration
+   in application.yml, and add .oauth2Login() to the default security filter chain.
+   When users click "Login with Google", SAS delegates auth to Google and issues
+   its own tokens to the requesting client.

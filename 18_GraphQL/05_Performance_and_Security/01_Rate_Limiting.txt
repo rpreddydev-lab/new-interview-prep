@@ -1,0 +1,329 @@
+================================================================
+RATE LIMITING IN GRAPHQL — IN DEPTH
+================================================================
+
+1. WHY RATE LIMITING IN GRAPHQL
+---------------------------------
+Rate limiting prevents:
+  - Abuse and DoS attacks
+  - Excessive resource consumption by a single client
+  - Cost overruns on cloud infrastructure
+  - Degraded service for other users
+
+GraphQL specific challenges:
+  - One POST /graphql endpoint serves all operations → can't rate limit by URL
+  - Clients can send any number of fields → one request can do enormous work
+  - Subscriptions can hold connections open indefinitely
+  - Introspection queries can expose full schema to bots
+
+2. RATE LIMITING STRATEGIES
+-----------------------------
+  a) Per-request count limits (request per window)
+  b) Complexity-based limits (complexity points per window)
+  c) Field-level limits (specific expensive fields per window)
+  d) Connection limits (max concurrent WebSocket connections)
+
+3. RATE LIMITING AT API GATEWAY LEVEL
+---------------------------------------
+Best practice: rate limit BEFORE requests reach your Spring application.
+Use an API gateway (nginx, Kong, AWS API Gateway, Cloudflare):
+
+  nginx example:
+  ```nginx
+  http {
+    limit_req_zone $binary_remote_addr zone=graphql:10m rate=30r/m;
+
+    server {
+      location /graphql {
+        limit_req zone=graphql burst=10 nodelay;
+        proxy_pass http://localhost:8080;
+      }
+    }
+  }
+  ```
+
+  AWS API Gateway:
+  - Set Usage Plans with throttling rates
+  - API keys for per-client limits
+  - Integration with WAF for advanced protection
+
+4. RATE LIMITING IN SPRING (Bucket4j)
+---------------------------------------
+Bucket4j is a Java rate limiting library based on the Token Bucket algorithm.
+
+  4.1 Maven Dependency
+  ---------------------
+  ```xml
+  <dependency>
+    <groupId>com.bucket4j</groupId>
+    <artifactId>bucket4j-core</artifactId>
+    <version>8.7.0</version>
+  </dependency>
+  <!-- Optional: Redis-backed distributed rate limiting -->
+  <dependency>
+    <groupId>com.bucket4j</groupId>
+    <artifactId>bucket4j-redis</artifactId>
+    <version>8.7.0</version>
+  </dependency>
+  ```
+
+  4.2 Per-IP Rate Limiter
+  ------------------------
+  ```java
+  @Component
+  public class RateLimitInterceptor implements WebGraphQlInterceptor {
+
+    // In-memory rate limit storage per IP (use Redis for distributed systems)
+    private final ConcurrentHashMap<String, Bucket> buckets = new ConcurrentHashMap<>();
+
+    private Bucket createBucket() {
+      return Bucket.builder()
+        .addLimit(Bandwidth.classic(
+          30,                                   // 30 requests
+          Refill.intervally(30, Duration.ofMinutes(1))  // per minute
+        ))
+        .build();
+    }
+
+    @Override
+    public Mono<WebGraphQlResponse> intercept(WebGraphQlRequest request, Chain chain) {
+      String clientIp = getClientIp(request);
+      Bucket bucket = buckets.computeIfAbsent(clientIp, k -> createBucket());
+
+      ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+      if (!probe.isConsumed()) {
+        long waitSeconds = TimeUnit.NANOSECONDS.toSeconds(probe.getNanosToWaitForRefill());
+        return Mono.error(new RateLimitExceededException(
+          "Rate limit exceeded. Try again in " + waitSeconds + " seconds."
+        ));
+      }
+      return chain.next(request);
+    }
+
+    private String getClientIp(WebGraphQlRequest request) {
+      String forwardedFor = request.getHeaders().getFirst("X-Forwarded-For");
+      if (forwardedFor != null) return forwardedFor.split(",")[0].trim();
+      return request.getRemoteAddress().getHostString();
+    }
+  }
+  ```
+
+  4.3 Per-User Rate Limiting
+  ---------------------------
+  ```java
+  @Override
+  public Mono<WebGraphQlResponse> intercept(WebGraphQlRequest request, Chain chain) {
+    String userId = extractUserId(request);  // from JWT in context
+    if (userId == null) userId = "anonymous:" + getClientIp(request);
+
+    Bucket bucket = buckets.computeIfAbsent(userId, id -> {
+      if (isPremiumUser(id)) {
+        return Bucket.builder()
+          .addLimit(Bandwidth.classic(200, Refill.intervally(200, Duration.ofMinutes(1))))
+          .build();
+      }
+      return createDefaultBucket();
+    });
+
+    if (!bucket.tryConsume(1)) {
+      throw new RateLimitExceededException("Too many requests");
+    }
+    return chain.next(request);
+  }
+  ```
+
+5. COMPLEXITY-AWARE RATE LIMITING
+-----------------------------------
+Instead of counting requests, count complexity points:
+
+```java
+@Component
+public class ComplexityRateLimitInterceptor implements WebGraphQlInterceptor {
+
+  private final ConcurrentHashMap<String, Bucket> budgetBuckets = new ConcurrentHashMap<>();
+
+  // 1000 complexity points per minute per user
+  private Bucket createComplexityBucket() {
+    return Bucket.builder()
+      .addLimit(Bandwidth.classic(1000, Refill.intervally(1000, Duration.ofMinutes(1))))
+      .build();
+  }
+
+  @Override
+  public Mono<WebGraphQlResponse> intercept(WebGraphQlRequest request, Chain chain) {
+    String userId = getUserId(request);
+    Bucket bucket = budgetBuckets.computeIfAbsent(userId, k -> createComplexityBucket());
+
+    // Compute query complexity
+    int cost = computeQueryComplexity(request.getDocument());
+
+    if (!bucket.tryConsume(cost)) {
+      return Mono.error(new RateLimitExceededException(
+        "Complexity budget exceeded. Cost: " + cost
+      ));
+    }
+    return chain.next(request);
+  }
+}
+```
+
+6. DISTRIBUTED RATE LIMITING WITH REDIS
+-----------------------------------------
+For multi-instance deployments, rate limits must be shared across instances:
+
+```java
+@Configuration
+public class RedisRateLimitConfig {
+
+  @Bean
+  public ProxyManager<String> redisProxyManager(RedisTemplate<String, byte[]> redisTemplate) {
+    return Bucket4jRedis.casBasedBuilder(redisTemplate).build();
+  }
+}
+
+@Component
+public class RedisRateLimitInterceptor implements WebGraphQlInterceptor {
+
+  private final ProxyManager<String> proxyManager;
+
+  @Override
+  public Mono<WebGraphQlResponse> intercept(WebGraphQlRequest request, Chain chain) {
+    String key = "ratelimit:" + getUserId(request);
+
+    BucketConfiguration config = BucketConfiguration.builder()
+      .addLimit(Bandwidth.classic(100, Refill.intervally(100, Duration.ofMinutes(1))))
+      .build();
+
+    Bucket bucket = proxyManager.builder().build(key, config);
+    if (!bucket.tryConsume(1)) {
+      return Mono.error(new RateLimitExceededException("Rate limit exceeded"));
+    }
+    return chain.next(request);
+  }
+}
+```
+
+7. RATE LIMIT HEADERS (STANDARD RESPONSE)
+--------------------------------------------
+Include rate limit info in response headers for clients:
+
+```java
+@Override
+public Mono<WebGraphQlResponse> intercept(WebGraphQlRequest request, Chain chain) {
+  Bucket bucket = getBucket(getUserId(request));
+  ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+
+  return chain.next(request)
+    .doOnNext(response -> {
+      response.getHeaders().set("X-RateLimit-Limit", "100");
+      response.getHeaders().set("X-RateLimit-Remaining",
+        String.valueOf(probe.getRemainingTokens()));
+      response.getHeaders().set("X-RateLimit-Reset",
+        String.valueOf(System.currentTimeMillis() / 1000 + 60));
+    });
+}
+```
+
+8. SUBSCRIPTION RATE LIMITING
+--------------------------------
+WebSocket subscriptions have different concerns:
+  - Max concurrent subscriptions per user
+  - Rate limit subscription CREATE events
+  - Throttle high-frequency event streams
+
+```java
+@Component
+public class SubscriptionLimitInterceptor implements WebSocketGraphQlInterceptor {
+
+  private final ConcurrentHashMap<String, AtomicInteger> activeSubscriptions =
+    new ConcurrentHashMap<>();
+  private static final int MAX_SUBS_PER_USER = 5;
+
+  @Override
+  public Mono<Void> handleConnectionInitialization(WebSocketSessionInfo info,
+                                                    Map<String, Object> payload) {
+    String userId = extractUserId(payload);
+    int active = activeSubscriptions
+      .computeIfAbsent(userId, k -> new AtomicInteger(0))
+      .incrementAndGet();
+
+    if (active > MAX_SUBS_PER_USER) {
+      activeSubscriptions.get(userId).decrementAndGet();
+      return Mono.error(new TooManyConnectionsException(
+        "Max " + MAX_SUBS_PER_USER + " subscriptions per user"
+      ));
+    }
+    return Mono.empty();
+  }
+
+  @Override
+  public void handleConnectionClosed(WebSocketSessionInfo info, int statusCode) {
+    String userId = (String) info.getAttributes().get("userId");
+    if (userId != null) {
+      activeSubscriptions.computeIfPresent(userId,
+        (k, v) -> { v.decrementAndGet(); return v; }
+      );
+    }
+  }
+}
+```
+
+9. RATE LIMIT ERROR RESPONSE
+------------------------------
+```json
+{
+  "errors": [{
+    "message": "Rate limit exceeded. Try again in 42 seconds.",
+    "extensions": {
+      "code": "RATE_LIMIT_EXCEEDED",
+      "retryAfterSeconds": 42,
+      "limit": 30,
+      "window": "1 minute"
+    }
+  }],
+  "data": null
+}
+```
+
+10. INTERVIEW QUESTIONS & ANSWERS
+-----------------------------------
+
+Q: Why is URL-based rate limiting insufficient for GraphQL?
+A: GraphQL has a single endpoint (/graphql) for all operations. URL-based
+   rate limiting at the infrastructure level would apply the same limit
+   to cheap queries (field check) and expensive queries (large data fetch).
+   GraphQL needs operation-aware rate limiting — either by request count
+   with complexity factored in, or by tracking which operations the client
+   runs.
+
+Q: What is the Token Bucket algorithm for rate limiting?
+A: Each client has a "bucket" that holds tokens. Each request consumes
+   N tokens (1 for simple, more for expensive requests). Tokens refill at
+   a fixed rate (e.g., 30 per minute). When the bucket is empty, requests
+   are rejected. Bucket4j is a popular Java implementation. It allows
+   bursting (using accumulated tokens for a spike) then rate limiting.
+
+Q: How do you implement distributed rate limiting across multiple instances?
+A: Store the rate limit state in Redis instead of in-memory. Use atomic
+   Redis operations (INCR with TTL, or Bucket4j with Redis ProxyManager)
+   so all application instances share the same counter for each client.
+   Without shared state, clients could bypass limits by hitting different
+   instances.
+
+Q: What should you return when a rate limit is exceeded?
+A: HTTP 429 Too Many Requests with a GraphQL error body. Include:
+   X-RateLimit-Limit header, X-RateLimit-Remaining header,
+   X-RateLimit-Reset header (Unix timestamp when limit resets), and
+   Retry-After header. In the GraphQL error extensions, include the error
+   code, retry delay, and window information.
+
+Q: How do you rate limit GraphQL subscriptions differently from queries?
+A: Subscriptions are long-lived WebSocket connections, not individual
+   requests. Rate limiting strategies for subscriptions: (1) Limit max
+   concurrent subscriptions per user. (2) Limit how frequently a user can
+   start new subscriptions. (3) Throttle the event rate on high-frequency
+   streams (e.g., backpressure with Flux.sample or debounce).
+
+================================================================
+END OF FILE
+================================================================

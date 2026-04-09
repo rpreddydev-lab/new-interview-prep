@@ -1,0 +1,220 @@
+================================================================================
+  KAFKA INTERVIEW QUESTIONS — PRODUCERS AND CONSUMERS
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PRODUCER QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q1: What do acks=0, acks=1, and acks=all mean? What are the trade-offs?
+
+A: acks=0: Producer fires and forgets. Doesn't wait for broker ACK. Maximum throughput,
+   zero durability. Messages can be silently lost on broker failure.
+
+   acks=1: Producer waits for the partition LEADER to write to its local log.
+   Leader ACKs without waiting for followers. If the leader crashes before replication,
+   the message is lost. Good balance of throughput and basic durability.
+
+   acks=all (acks=-1): Producer waits for ALL ISR replicas to acknowledge.
+   Combined with min.insync.replicas=2, guarantees no data loss as long as at
+   least 2 replicas are alive. Required for idempotent and transactional producers.
+   Lower throughput (waits for slowest ISR replica).
+
+   Key interaction: acks=all is only meaningful when RF ≥ min.insync.replicas + 1.
+   If ISR shrinks below min.insync.replicas, produces fail with NotEnoughReplicasException.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q2: What is an idempotent producer? How does it work?
+
+A: enable.idempotence=true (default in Kafka 3.0+) prevents duplicate records from
+   producer retries.
+
+   Mechanism:
+   - Broker assigns each producer a unique PID (Producer ID) on initialization.
+   - Each message carries a (PID, sequence_number) pair per partition.
+   - Sequence numbers are monotonically increasing per partition.
+   - If broker receives a message with the same (PID, seq) it already has,
+     it deduplicates (returns success without re-writing).
+   - If a message with seq = expected - 1 or earlier arrives, it's a duplicate → ignored.
+   - If a message arrives with seq > expected + 1, it's out-of-order → error.
+
+   Guarantees exactly-once delivery per partition within a single producer session.
+   Limitations: doesn't survive producer restart (new PID on restart), doesn't span
+   multiple topics (use transactions for that). Requires acks=all, retries>0,
+   max.in.flight.requests.per.connection≤5.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q3: What is the producer's internal buffer and how does batching work?
+
+A: The producer accumulates records in a RecordAccumulator (in-memory buffer pool,
+   default 32 MB controlled by buffer.memory). Records destined for the same
+   partition are grouped into a ProducerBatch.
+
+   Batch is sent when:
+   - batch.size (default 16KB) is reached, OR
+   - linger.ms (default 0) expires
+   linger.ms=0 → sends immediately; linger.ms=20 → waits up to 20ms to fill a batch.
+
+   For high throughput: set batch.size=131072 (128KB) + linger.ms=20.
+   For low latency: keep linger.ms=0 and small batch.size.
+
+   max.in.flight.requests.per.connection (default 5): max outstanding unacknowledged
+   requests. More in-flight = higher throughput. If >1 and retries enabled without
+   idempotence, ordering can break (retry of batch 1 may arrive after batch 2).
+   Solution: either enable.idempotence=true, or set max.in.flight=1 (safer, slower).
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q4: How does a producer choose which partition to send a record to?
+
+A: Partition selection order:
+   1. If partition is explicitly specified in ProducerRecord → use that partition.
+   2. If a key is provided AND no custom partitioner:
+      - DefaultPartitioner: murmur2(key) % numPartitions
+      - Sticky Partitioner (Kafka 2.4+, default): sticks to one partition until
+        batch.size or linger.ms reached, then jumps. Reduces # of batches.
+   3. If no key: UniformStickyPartitioner → round-robin across partitions,
+      sticky within a batch (maximizes batching efficiency).
+   4. Custom partitioner: implement Partitioner interface, configure via
+      partitioner.class property.
+
+   Key insight: same key → same partition (unless partition count changes).
+   This guarantees ordering per key (e.g., all events for user-123 in order).
+   Changing partition count breaks key-partition affinity for existing data.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q5: What is the difference between compression types in Kafka?
+    (none, gzip, snappy, lz4, zstd)
+
+A: Compression happens at the producer (batch level), and consumers decompress.
+   Brokers store compressed data as-is (no recompression, unless config mismatch).
+
+   none: no overhead, largest wire/disk size.
+   gzip: best compression ratio (~80% reduction), but slow CPU. Use for
+         write-once, read-rarely archive topics.
+   snappy: medium compression (~50%), fast. Google's algorithm, good for
+           mixed workloads.
+   lz4: fastest compression/decompression, moderate ratio. Best default for
+        high-throughput producers.
+   zstd: Zstandard (Kafka 2.1+). Best combination of ratio and speed. Modern
+         choice for most production deployments.
+
+   Recommendation: lz4 for low latency + high throughput; zstd for best
+   compression with acceptable CPU overhead.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONSUMER QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q6: Explain consumer groups. How are partitions assigned to consumers?
+
+A: A consumer group is a set of consumers sharing a group.id. Kafka's guarantee:
+   each partition is assigned to exactly ONE consumer in the group at any time.
+   Multiple consumers can read the same partition by being in different groups.
+
+   Assignment process (simplified JoinGroup/SyncGroup protocol):
+   1. Consumers send JoinGroup to the group coordinator broker.
+   2. The first consumer to join becomes the group leader.
+   3. Coordinator sends full member list + metadata to group leader.
+   4. Leader runs the partition assignor algorithm and sends assignment back to coordinator.
+   5. Coordinator distributes assignments via SyncGroup response to all members.
+
+   Strategies:
+   - Range: assigns contiguous partition ranges per consumer. Can be uneven.
+   - RoundRobin: distributes evenly across all consumers/topics.
+   - Sticky: minimizes partition movements on rebalance (keeps old assignments where possible).
+   - CooperativeStickyAssignor: like Sticky but uses incremental rebalancing (no stop-the-world).
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q7: What is a rebalance and what problems can it cause?
+
+A: A rebalance is triggered when the consumer group membership changes:
+   - New consumer joins
+   - Consumer leaves gracefully (close())
+   - Consumer fails heartbeat (session.timeout.ms expired)
+   - Topic partition count changes
+   - @KafkaListener concurrency changes
+
+   Problems with EAGER (stop-the-world) rebalancing:
+   - All consumers revoke ALL partitions simultaneously
+   - Processing stops for all partitions for the rebalance duration
+   - Can cause consumer lag spikes, duplicate processing (uncommitted offsets re-read)
+   - Duration: seconds to minutes for large groups
+
+   Solutions:
+   - CooperativeStickyAssignor: incremental rebalance — only affected partitions move,
+     others keep processing. Multiple smaller rebalance rounds.
+   - Static group membership (group.instance.id): a restarting consumer with the same
+     instance ID reclaims its partitions without a full rebalance (within
+     session.timeout.ms window).
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q8: What is the difference between commitSync() and commitAsync()?
+
+A: commitSync(): blocks until the broker confirms the offset commit.
+   - PROS: reliable — if commit fails, it retries until success or exception propagates.
+   - CONS: slows down processing (blocked thread per commit), lower throughput.
+
+   commitAsync(): fires the commit request and returns immediately.
+   - PROS: non-blocking, higher throughput.
+   - CONS: no automatic retry (retrying async commits can break ordering if a later
+     commit already succeeded). If it fails, the offset may not be committed.
+
+   Best practice — combine both:
+   - Use commitAsync() after each poll cycle (high throughput, non-blocking).
+   - On shutdown (finally block) or rebalance (ConsumerRebalanceListener.onPartitionsRevoked):
+     call commitSync() to ensure the final offsets are durably committed before the
+     consumer stops or partitions are reassigned.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q9: What is auto.offset.reset and when does it apply?
+
+A: auto.offset.reset applies when a consumer starts and has NO committed offset for
+   a partition (new group, or committed offset expired/deleted).
+
+   earliest: start from the beginning of the partition. Good for reprocessing all data.
+   latest (default): start from the latest offset. Good for real-time streams where
+     historical data is not needed.
+   none: throw OffsetOutOfRangeException if no committed offset exists. Forces
+     explicit handling — useful in strict environments.
+
+   WHEN IT APPLIES:
+   1. Brand new consumer group (no offset in __consumer_offsets)
+   2. The committed offset no longer exists (data was deleted/compacted)
+   3. The partition was reassigned and old offset is invalid
+
+   WHEN IT DOES NOT APPLY:
+   - Consumer group already has a committed offset → uses that offset regardless
+     of auto.offset.reset value.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q10: How would you implement a consumer that maintains exactly-once semantics
+     when writing to a relational database?
+
+A: Pure Kafka EOS (transactions) only covers Kafka-to-Kafka. For Kafka-to-DB:
+
+   Option 1 — Idempotent write + at-least-once:
+   - enable.auto.commit=false; use manual offset commit after DB write.
+   - Make the DB write idempotent: INSERT ... ON CONFLICT DO UPDATE (upsert).
+   - Use message key or business ID as the DB primary key.
+   - On duplicate delivery → upsert overwrites with same data → no visible change.
+
+   Option 2 — Offset table in same DB transaction:
+   - Store consumed offset in a DB table in the SAME transaction as the business write.
+   - On startup, read stored offset from DB and call consumer.seek() to that position.
+   - BEGIN TX → write business data + write offset → COMMIT TX.
+   - Crash safety: if TX aborts, offset is not advanced; on restart, re-reads same message.
+   - Implements exactly-once via local DB transactionality.
+
+   Option 3 — Outbox pattern (if producing from DB to Kafka):
+   - Write to DB outbox table in same TX as business data.
+   - Separate relay reads outbox → publishes to Kafka → deletes outbox row.
+   - Guarantees at-least-once Kafka delivery; idempotent consumer handles deduplication.

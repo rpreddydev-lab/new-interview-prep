@@ -1,0 +1,193 @@
+================================================================
+DISTRIBUTED TRANSACTIONS
+================================================================
+
+WHAT ARE DISTRIBUTED TRANSACTIONS?
+------------------------------------
+A transaction that spans multiple services, databases, or nodes,
+where all operations must succeed or all must roll back.
+
+The problem: Each service has its own database. You can't use
+a single database transaction to coordinate them.
+
+Example: E-commerce order placement
+  1. Deduct inventory (Inventory Service DB)
+  2. Charge credit card (Payment Service DB)
+  3. Create order record (Order Service DB)
+  
+  These span 3 separate databases.
+  All 3 must succeed, or all 3 must be rolled back.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TWO-PHASE COMMIT (2PC)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Classic protocol for distributed atomic commit.
+
+PARTICIPANTS:
+  Coordinator: Orchestrates the commit protocol (usually the initiating service)
+  Participants: All services involved in the transaction
+
+PHASE 1 — PREPARE:
+  Coordinator sends PREPARE to all participants.
+  Each participant:
+    - Executes its local operations (but doesn't commit)
+    - Writes undo and redo logs (can commit OR rollback later)
+    - Responds VOTE-COMMIT (ready) or VOTE-ABORT (failed)
+    - Locks all resources for this transaction (holds them!)
+
+PHASE 2 — COMMIT/ABORT:
+  If all participants voted COMMIT:
+    Coordinator sends COMMIT to all.
+    Participants: commit, release locks, ACK.
+  
+  If any participant voted ABORT (or timed out):
+    Coordinator sends ROLLBACK to all.
+    Participants: rollback, release locks, ACK.
+
+Timeline:
+  Coordinator ──PREPARE──→ Part1, Part2, Part3
+  Coordinator ←──VOTE────  Part1(COMMIT), Part2(COMMIT), Part3(COMMIT)
+  Coordinator ──COMMIT───→ Part1, Part2, Part3
+  Coordinator ←──ACK─────  Part1, Part2, Part3
+  → Transaction complete
+
+PROBLEMS WITH 2PC:
+  1. BLOCKING PROTOCOL:
+     If coordinator fails after sending PREPARE but before COMMIT,
+     participants are stuck holding locks forever.
+     They can't unilaterally decide (they voted COMMIT and must wait for coordinator).
+     Fix: Timeout + coordinator recovery from WAL. But still blocks during recovery.
+  
+  2. SLOW:
+     Two network round-trips + disk writes for logging.
+     Latency = 2 × network round-trip + 2 × fsync
+     For cross-region: 100ms × 2 = 200ms minimum.
+  
+  3. COORDINATOR SPOF:
+     If coordinator crashes, participants are blocked.
+     Need coordinator recovery and HA.
+
+2PC IN PRACTICE:
+  Used by: PostgreSQL distributed transactions (via extension), XA transactions
+  (Java JTA), Google Spanner (but with TrueTime to reduce blocking)
+  
+  Avoid 2PC for: High-throughput systems, cross-region transactions
+  Acceptable for: Low-volume critical transactions within a single DC
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+THREE-PHASE COMMIT (3PC)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Adds a pre-commit phase to make 2PC non-blocking.
+
+Phase 1: canCommit? (like 2PC prepare)
+Phase 2: preCommit (coordinator tells participants to get ready to commit)
+Phase 3: doCommit (actually commit)
+
+If coordinator fails during phase 2, participants can safely commit
+after timeout (they know coordinator had all yes votes).
+
+Problem: Introduces risk of inconsistency during network partitions
+(partition can cause some to commit, some to abort).
+Rarely used in practice due to complexity and CAP issues.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SAGA PATTERN (Modern Alternative)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Breaks a distributed transaction into a sequence of local transactions.
+Each local transaction publishes an event/message to trigger the next step.
+If a step fails, execute compensating transactions to undo previous steps.
+
+KEY CONCEPT: Compensating Transactions
+  Each operation has a corresponding "undo" operation.
+  
+  Operation:     Reserve seat on flight A
+  Compensation:  Release reserved seat on flight A
+  
+  Operation:     Charge credit card
+  Compensation:  Refund credit card
+
+SAGA TYPES:
+
+1. CHOREOGRAPHY SAGA:
+   No central coordinator. Each service listens for events and reacts.
+   
+   Order Service → publishes: OrderCreated
+   Inventory Service hears: OrderCreated → reserves inventory → publishes: InventoryReserved
+   Payment Service hears: InventoryReserved → charges payment → publishes: PaymentProcessed
+   Shipping Service hears: PaymentProcessed → ships order → publishes: OrderShipped
+   
+   If Payment fails:
+   Payment Service → publishes: PaymentFailed
+   Inventory Service hears: PaymentFailed → releases reservation → publishes: InventoryReleased
+   Order Service hears: InventoryReleased → marks order as failed
+   
+   Pros: Simple, no central bottleneck
+   Cons: Hard to track overall state (where is this saga?), cascading events complex
+
+2. ORCHESTRATION SAGA:
+   A central saga orchestrator tells each participant what to do.
+   Orchestrator tracks overall state.
+   
+   SagaOrchestrator:
+     1. Tell InventoryService: reserve item 123
+        Response: success/failure
+     2. If success → Tell PaymentService: charge $50
+        Response: success/failure
+     3. If failure → Tell InventoryService: release item 123 (compensation)
+   
+   Pros:
+   ✓ Easy to track overall state (orchestrator has full picture)
+   ✓ Compensations are explicit and centralized
+   ✓ Easier to debug and monitor
+   
+   Cons:
+   ✗ Orchestrator is a central bottleneck/SPOF
+   ✗ More coupling (services depend on orchestrator)
+
+SAGA GUARANTEES:
+  Atomicity-like: Either all succeed or compensations run (best-effort atomicity)
+  Isolation MISSING: Other transactions can see partial state (no ACID isolation)
+                     Must design for this: use "pending" status, not committed
+  Eventual consistency: All compensations eventually run
+
+IDEMPOTENCY CRITICAL:
+  Network failures may cause retries of any step.
+  All operations and compensations MUST be idempotent.
+  Use idempotency keys: record which saga steps have already been executed.
+
+OUTBOX PATTERN (ensures saga step + event publish is atomic):
+  Don't publish events directly from saga steps.
+  Instead: Write to a local "outbox" table in the same DB transaction.
+  A separate process reads the outbox and publishes to message broker.
+  Guarantees: If DB write succeeds → event will eventually be published.
+  (See Messaging section for full detail.)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMPARISON: 2PC vs SAGA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌───────────────────┬──────────────────────┬──────────────────────┐
+│ Property          │ 2PC                  │ Saga                 │
+├───────────────────┼──────────────────────┼──────────────────────┤
+│ Atomicity         │ True ACID atomicity  │ Best-effort (compensate)│
+│ Isolation         │ Full isolation       │ NO isolation         │
+│ Consistency       │ Strong               │ Eventual             │
+│ Latency           │ High (2 RTTs + fsync)│ Low (async events)   │
+│ Throughput        │ Low                  │ High                 │
+│ Blocking          │ Yes (on failure)     │ No                   │
+│ Partial failures  │ Locks held           │ Compensations run    │
+│ Complexity        │ Lower (single txn)   │ Higher (compensations)│
+│ Suitable for      │ Financial, low vol.  │ Microservices, scale │
+└───────────────────┴──────────────────────┴──────────────────────┘
+
+INTERVIEW ANSWER:
+  "For transactions spanning multiple services, I avoid 2PC because
+   it's blocking and slow. Instead, I use the Saga pattern with an
+   orchestrator. Each step executes a local transaction and publishes
+   an event. If a step fails, compensating transactions undo previous
+   steps. I combine this with the Outbox Pattern to ensure events are
+   reliably published. The trade-off is losing isolation — I design
+   around this by using 'pending' states and idempotent operations."

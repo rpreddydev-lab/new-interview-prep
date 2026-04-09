@@ -1,0 +1,289 @@
+================================================================
+DEADLINES AND CANCELLATION IN gRPC
+================================================================
+
+----------------------------------------------------------------
+1. WHY DEADLINES MATTER
+----------------------------------------------------------------
+
+In a distributed system, every RPC must have a deadline.
+Without deadlines:
+  - A slow upstream service blocks threads indefinitely
+  - Thread pools exhaust, causing cascades of timeouts
+  - Memory fills with pending requests
+  - Debugging becomes impossible ("the request is just... hanging")
+
+Deadlines in gRPC:
+  - Client sets an absolute deadline (wall-clock time, not a timeout duration)
+  - Deadline propagates automatically to child calls (with some configuration)
+  - Server checks Context.current().isCancelled() to stop early
+  - If exceeded: client gets Status.DEADLINE_EXCEEDED
+
+Distinction:
+  Timeout: a relative duration ("5 seconds from now")
+  Deadline: an absolute point in time ("by 14:00:03.123")
+  
+  gRPC uses deadlines internally, but the Java API exposes withDeadlineAfter()
+  (sets deadline = now + duration) for convenience.
+
+----------------------------------------------------------------
+2. SETTING DEADLINES ON THE CLIENT
+----------------------------------------------------------------
+
+// ── Method 1: withDeadlineAfter ───────────────────────────────
+OrderServiceGrpc.OrderServiceBlockingStub stub = ...;
+
+// Creates a deadline 5 seconds from now
+CreateOrderResponse response = stub
+    .withDeadlineAfter(5, TimeUnit.SECONDS)
+    .createOrder(request);
+
+// ── Method 2: withDeadline (explicit Deadline object) ─────────
+Deadline deadline = Deadline.after(5, TimeUnit.SECONDS);
+
+stub.withDeadline(deadline).createOrder(request);
+
+// ── Method 3: Propagate parent deadline ──────────────────────
+// In a server method receiving a request:
+@Override
+public void createOrder(CreateOrderRequest request,
+                        StreamObserver<CreateOrderResponse> responseObserver) {
+  
+  Deadline parentDeadline = Context.current().getDeadline();
+  
+  // Create a downstream stub with the SAME deadline
+  InventoryServiceGrpc.InventoryServiceBlockingStub inventoryStub = ...;
+  
+  InventoryCheckResponse inv = inventoryStub
+      .withDeadline(parentDeadline != null
+          ? parentDeadline
+          : Deadline.after(2, TimeUnit.SECONDS))
+      .checkInventory(inventoryRequest);
+}
+
+// ── Method 4: Default deadline per channel ────────────────────
+// Using grpc-spring-boot-starter
+// grpc.client.order-service.deadline=5000ms
+
+// Or manually:
+CallOptions defaultOptions = CallOptions.DEFAULT
+    .withDeadlineAfter(5, TimeUnit.SECONDS);
+stub = stub.withOption(CallOptions.Key.create("default-deadline"), ...);
+// Note: gRPC Java doesn't have a direct "set default deadline on channel"
+// option — use a client interceptor instead:
+
+@GrpcGlobalClientInterceptor
+public class DefaultDeadlineInterceptor implements ClientInterceptor {
+  @Override
+  public <Req, Resp> ClientCall<Req, Resp> interceptCall(
+      MethodDescriptor<Req, Resp> method, CallOptions callOptions, Channel next) {
+    
+    // Only set default deadline if none was set by the caller
+    if (callOptions.getDeadline() == null) {
+      callOptions = callOptions.withDeadlineAfter(5, TimeUnit.SECONDS);
+    }
+    return next.newCall(method, callOptions);
+  }
+}
+
+----------------------------------------------------------------
+3. SERVER-SIDE DEADLINE HANDLING
+----------------------------------------------------------------
+
+The server MUST check for cancellation/deadline, especially in:
+  - Long-running unary methods
+  - Server streaming loops
+  - Client streaming handlers
+
+// ── Check in unary method ─────────────────────────────────────
+@Override
+public void processLargeData(ProcessRequest request,
+                             StreamObserver<ProcessResponse> responseObserver) {
+  
+  // Check before starting expensive work
+  if (Context.current().isCancelled()) {
+    responseObserver.onError(Status.CANCELLED.asException());
+    return;
+  }
+  
+  // Check periodically during processing
+  for (DataChunk chunk : data.chunks()) {
+    if (Context.current().isCancelled()) {
+      log.info("Client cancelled or deadline exceeded — stopping processing");
+      responseObserver.onError(
+          Context.current().cancellationCause() instanceof DeadlineExceededException
+              ? Status.DEADLINE_EXCEEDED.asException()
+              : Status.CANCELLED.asException());
+      return;
+    }
+    processChunk(chunk);
+  }
+  
+  responseObserver.onNext(result);
+  responseObserver.onCompleted();
+}
+
+// ── Check in server streaming loop ───────────────────────────
+@Override
+public void streamResults(StreamRequest request,
+                          StreamObserver<Result> responseObserver) {
+  
+  ServerCallStreamObserver<Result> serverObserver =
+      (ServerCallStreamObserver<Result>) responseObserver;
+  
+  // Register cancel handler (called when client cancels or deadline passes)
+  serverObserver.setOnCancelHandler(() ->
+      log.info("Stream cancelled for request: {}", request.getId()));
+  
+  for (Result result : computeResults(request)) {
+    if (serverObserver.isCancelled()) {
+      return;  // Stop streaming; don't call onCompleted or onError
+    }
+    serverObserver.onNext(result);
+  }
+  
+  serverObserver.onCompleted();
+}
+
+// ── Listen for cancellation asynchronously ───────────────────
+Context ctx = Context.current();
+ctx.addListener(context -> {
+  if (context.isCancelled()) {
+    // triggered when deadline passes OR client cancels
+    log.info("Context cancelled: {}", context.cancellationCause());
+    // trigger cleanup (release locks, stop background tasks)
+    releaseResources();
+  }
+}, executor);
+
+----------------------------------------------------------------
+4. CLIENT CANCELLATION
+----------------------------------------------------------------
+
+Client-side cancellation (manual):
+  ManagedChannel channel = ...;
+  OrderServiceGrpc.OrderServiceStub asyncStub = ...;
+  
+  // For streaming RPCs, cast to ClientCallStreamObserver
+  StreamObserver<Order> requestObserver = asyncStub.listOrders(
+      request, responseStreamObserver);
+  
+  ClientCallStreamObserver<ListOrdersRequest> callObserver =
+      (ClientCallStreamObserver<ListOrdersRequest>) requestObserver;
+  
+  // Cancel the call (sends RST_STREAM to server)
+  callObserver.cancel("User closed the stream", null);
+
+Context-based cancellation:
+  Context ctx = Context.current().withCancellation();
+  CancellableContext cancellableCtx = (CancellableContext) ctx;
+  
+  // Run RPC within cancellable context
+  ctx.run(() -> {
+    stub.listOrders(request, responseObserver);
+  });
+  
+  // Later, cancel it:
+  cancellableCtx.cancel(new RuntimeException("User cancelled"));
+
+What the server sees when client cancels:
+  - Server's StreamObserver.onError() is called with Status.CANCELLED
+  - Or ServerCallStreamObserver.isCancelled() returns true
+  - RST_STREAM frame is sent on the HTTP/2 stream
+
+----------------------------------------------------------------
+5. DEADLINE PROPAGATION PATTERN
+----------------------------------------------------------------
+
+In a chain of microservices, always propagate deadlines:
+
+  Client (deadline: t0 + 10s)
+    ↓
+  OrderService (receives deadline, has ~9.5s left)
+    ↓ sets deadline on outbound call
+  InventoryService (receives deadline, has ~9s left)
+    ↓ sets deadline on outbound call
+  DatabaseService (receives deadline, has ~8.5s left)
+
+Without propagation (WRONG):
+  OrderService creates a NEW 5s deadline for InventoryService
+  Even if the client already has only 1s left
+  → InventoryService thinks it has 5s
+  → Client gets DEADLINE_EXCEEDED after 1s
+  → InventoryService continues working for 4 more seconds (wasted work)
+
+Automatic propagation in gRPC Java:
+  gRPC propagates the deadline automatically when you pass
+  Context.current().getDeadline() to the outbound stub.
+  
+  The safest pattern:
+    Deadline outboundDeadline = Context.current().getDeadline();
+    if (outboundDeadline == null || outboundDeadline.isExpired()) {
+      // Set a reasonable max for this hop
+      outboundDeadline = Deadline.after(maxHopSeconds, TimeUnit.SECONDS);
+    }
+    inventoryStub.withDeadline(outboundDeadline).checkInventory(req);
+
+----------------------------------------------------------------
+6. DEADLINE vs TIMEOUT CHEAT SHEET
+----------------------------------------------------------------
+
+┌─────────────────────────────────────────────────────────────────┐
+│                     Deadline Quick Reference                     │
+├──────────────────────────┬──────────────────────────────────────┤
+│ Set deadline from client │ stub.withDeadlineAfter(5, SECONDS)   │
+│ Set explicit deadline    │ stub.withDeadline(deadline)          │
+│ Check on server          │ Context.current().isCancelled()      │
+│ Get cancellation cause   │ Context.current().cancellationCause()│
+│ Check in streaming loop  │ serverObserver.isCancelled()         │
+│ Register cancel callback │ context.addListener(...)             │
+│ Client cancel streaming  │ callObserver.cancel(msg, cause)      │
+│ Status code on expiry    │ DEADLINE_EXCEEDED                    │
+│ Status code on cancel    │ CANCELLED                            │
+└──────────────────────────┴──────────────────────────────────────┘
+
+----------------------------------------------------------------
+7. INTERVIEW KEY POINTS
+----------------------------------------------------------------
+
+Q: What is the difference between a timeout and a deadline in gRPC?
+A: A timeout is relative (e.g., "5 seconds"). A deadline is absolute
+   (e.g., "expire at 14:00:03.123 UTC"). gRPC uses deadlines internally
+   and propagates them across service hops. Using absolute deadlines
+   makes propagation correct: if 3 seconds have already elapsed by the
+   time a request reaches a downstream service, the downstream correctly
+   knows it has only 2 seconds left — not a fresh 5 seconds. The Java
+   API offers withDeadlineAfter() which converts a timeout to an absolute
+   deadline by adding the duration to the current time.
+
+Q: How does the server know when a client has cancelled or the deadline
+   has passed?
+A: In a unary RPC, call Context.current().isCancelled() periodically
+   during long-running work. In streaming RPCs, cast the responseObserver
+   to ServerCallStreamObserver and check isCancelled() or register an
+   onCancelHandler(). The server can also use context.addListener() to
+   receive an async notification when the context is cancelled. The
+   underlying mechanism is HTTP/2 RST_STREAM (for cancellation) or the
+   gRPC timeout header (for deadlines).
+
+Q: What happens to server-side work when a client cancels?
+A: The server receives a cancelled context event. It's up to the server
+   to check for this and stop processing. The server DOES NOT automatically
+   stop running code — this is intentional. The server developer must
+   add cancellation checks. If the server doesn't check, it completes
+   the work, tries to call responseObserver.onNext(), gets an exception
+   (stream is closed), and discards the result. This wastes resources
+   but doesn't corrupt state.
+
+Q: How do you propagate deadlines across microservice calls?
+A: In each gRPC server method, read the current deadline with
+   Context.current().getDeadline() and pass it to outbound stubs using
+   stub.withDeadline(deadline). If no deadline is set by the caller,
+   create a reasonable maximum deadline for that hop. Never create a
+   longer deadline than the parent — that would violate the intent of
+   the original caller. With grpc-spring-boot-starter, you can use a
+   client interceptor to automatically set deadlines based on context.
+
+================================================================
+END OF FILE
+================================================================

@@ -1,0 +1,271 @@
+================================================================================
+API GATEWAY SECURITY
+================================================================================
+
+THE API GATEWAY AS SECURITY ENFORCEMENT POINT
+-----------------------------------------------
+The API Gateway is the front door to your microservices ecosystem.
+It's the ideal place to enforce security centrally rather than in every service.
+
+Security responsibilities of API Gateway:
+  1. Authentication (JWT validation)
+  2. Authorization (coarse-grained — route-level)
+  3. Rate limiting (protect against abuse/DDoS)
+  4. Input validation / sanitization
+  5. SSL/TLS termination
+  6. API key management
+  7. Bot detection / WAF integration
+  8. CORS policy enforcement
+  9. Request/response transformation (mask sensitive data)
+  10. Audit logging
+
+────────────────────────────────────────────────────────────────────────────────
+
+JWT AUTHENTICATION AT API GATEWAY
+====================================
+
+Spring Cloud Gateway JWT Filter:
+  @Component
+  @Slf4j
+  public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
+
+    @Autowired private JwtDecoder jwtDecoder;
+
+    private static final List<String> OPEN_PATHS = List.of(
+      "/api/v1/auth/login", "/api/v1/auth/register",
+      "/api/v1/products", "/actuator/health"
+    );
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+      String path = exchange.getRequest().getPath().toString();
+
+      if (isOpenPath(path)) {
+        return chain.filter(exchange);
+      }
+
+      String authHeader = exchange.getRequest().getHeaders().getFirst("Authorization");
+      if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+        return unauthorized(exchange, "Missing or invalid Authorization header");
+      }
+
+      String token = authHeader.substring(7);
+      try {
+        Jwt jwt = jwtDecoder.decode(token);
+
+        // Validate audience
+        List<String> audience = jwt.getAudience();
+        if (!audience.contains("api-gateway") && !audience.contains("microservices")) {
+          return unauthorized(exchange, "Invalid audience");
+        }
+
+        // Inject verified user context as downstream headers
+        ServerHttpRequest mutatedRequest = exchange.getRequest().mutate()
+          .header("X-User-Id", jwt.getSubject())
+          .header("X-User-Roles", String.join(",", jwt.getClaimAsStringList("roles")))
+          .header("X-User-Email", jwt.getClaimAsString("email"))
+          .header("X-Token-Scopes", String.join(",", jwt.getClaimAsStringList("scope")))
+          .build();
+
+        return chain.filter(exchange.mutate().request(mutatedRequest).build());
+
+      } catch (JwtException e) {
+        log.warn("JWT validation failed: {}", e.getMessage());
+        return unauthorized(exchange, "Invalid or expired token");
+      }
+    }
+
+    private Mono<Void> unauthorized(ServerWebExchange exchange, String message) {
+      exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+      exchange.getResponse().getHeaders()
+        .add(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE);
+      String body = """
+        {"error": "UNAUTHORIZED", "message": "%s"}
+        """.formatted(message);
+      return exchange.getResponse().writeWith(
+        Mono.just(exchange.getResponse().bufferFactory().wrap(body.getBytes()))
+      );
+    }
+
+    @Override
+    public int getOrder() { return -100; }  // High priority
+
+    private boolean isOpenPath(String path) {
+      return OPEN_PATHS.stream().anyMatch(path::startsWith);
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+RATE LIMITING AT API GATEWAY
+================================
+
+Spring Cloud Gateway Rate Limiter (Redis-backed):
+
+  # application.yml
+  spring:
+    cloud:
+      gateway:
+        routes:
+        - id: order-service
+          uri: lb://order-service
+          predicates:
+          - Path=/api/v1/orders/**
+          filters:
+          - name: RequestRateLimiter
+            args:
+              redis-rate-limiter.replenishRate: 20    # 20 requests/second steady state
+              redis-rate-limiter.burstCapacity: 50    # Allow burst up to 50
+              redis-rate-limiter.requestedTokens: 1
+              key-resolver: "#{@userKeyResolver}"
+
+  @Bean
+  public KeyResolver userKeyResolver() {
+    return exchange -> {
+      // Rate limit per user
+      String userId = exchange.getRequest().getHeaders().getFirst("X-User-Id");
+      if (userId != null) return Mono.just(userId);
+
+      // Fallback to IP
+      InetSocketAddress remoteAddress = exchange.getRequest().getRemoteAddress();
+      return Mono.just(remoteAddress != null ? remoteAddress.getAddress().getHostAddress() : "unknown");
+    };
+  }
+
+  // API key-based rate limit
+  @Bean
+  public KeyResolver apiKeyResolver() {
+    return exchange -> Mono.just(
+      Objects.requireNonNullElse(
+        exchange.getRequest().getHeaders().getFirst("X-API-Key"),
+        "anonymous"
+      )
+    );
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+CORS POLICY
+============
+
+  # application.yml — global CORS
+  spring:
+    cloud:
+      gateway:
+        globalcors:
+          cors-configurations:
+            '[/**]':
+              allowedOriginPatterns:
+                - "https://*.example.com"
+                - "https://app.example.com"
+              allowedMethods:
+                - GET
+                - POST
+                - PUT
+                - DELETE
+                - OPTIONS
+              allowedHeaders:
+                - Authorization
+                - Content-Type
+                - X-Requested-With
+              allowCredentials: true
+              maxAge: 3600
+
+  Note: Using allowedOriginPatterns instead of allowedOrigins "*" with credentials.
+  allowedOrigins "*" + allowCredentials: true is a security misconfiguration.
+
+────────────────────────────────────────────────────────────────────────────────
+
+API KEY MANAGEMENT
+===================
+
+For external API consumers (partners, third-party integrations):
+
+  @Component
+  public class ApiKeyFilter implements GlobalFilter {
+    @Autowired private ApiKeyRepository apiKeyRepository;
+
+    private static final Set<String> API_KEY_REQUIRED_PATHS = Set.of(
+      "/api/v1/external/", "/api/partner/"
+    );
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+      String path = exchange.getRequest().getPath().toString();
+      if (!requiresApiKey(path)) return chain.filter(exchange);
+
+      String apiKey = exchange.getRequest().getHeaders().getFirst("X-API-Key");
+      if (apiKey == null) {
+        return setStatus(exchange, HttpStatus.UNAUTHORIZED);
+      }
+
+      return apiKeyRepository.findByKey(apiKey)
+        .flatMap(key -> {
+          if (!key.isActive() || key.isExpired()) {
+            return setStatus(exchange, HttpStatus.UNAUTHORIZED);
+          }
+          // Log API key usage
+          apiKeyRepository.recordUsage(key.getId()).subscribe();
+          // Add partner info to downstream headers
+          ServerHttpRequest mutated = exchange.getRequest().mutate()
+            .header("X-Partner-Id", key.getPartnerId())
+            .header("X-Partner-Tier", key.getTier())
+            .build();
+          return chain.filter(exchange.mutate().request(mutated).build());
+        })
+        .switchIfEmpty(setStatus(exchange, HttpStatus.UNAUTHORIZED));
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+RESPONSE SECURITY HEADERS
+===========================
+
+Add security headers to ALL responses:
+  @Component
+  public class SecurityHeadersFilter implements GlobalFilter {
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+      return chain.filter(exchange).then(Mono.fromRunnable(() -> {
+        HttpHeaders headers = exchange.getResponse().getHeaders();
+        headers.add("X-Content-Type-Options", "nosniff");
+        headers.add("X-Frame-Options", "DENY");
+        headers.add("X-XSS-Protection", "1; mode=block");
+        headers.add("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+        headers.add("Cache-Control", "no-store");
+        headers.remove("Server");  // Remove server version info
+        headers.remove("X-Powered-By");
+      }));
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What security responsibilities should the API Gateway handle?
+A: JWT/OAuth2 authentication, rate limiting, CORS enforcement, TLS termination,
+   input validation, API key management, security header injection, and
+   audit logging. The gateway acts as the centralized enforcement point
+   so individual services don't need to duplicate this logic.
+
+Q: How do you implement rate limiting per user at the API Gateway?
+A: Use Spring Cloud Gateway's RequestRateLimiter filter with Redis. Extract the
+   user identity from the JWT (or IP for anonymous users) as the rate limit key.
+   Configure replenishRate (steady state) and burstCapacity (burst allowance)
+   per the user/API key tier.
+
+Q: What is the CORS misconfiguration with credentials?
+A: Setting allowedOrigins: "*" with allowCredentials: true is rejected by browsers
+   and is also a security vulnerability (any origin could make credentialed
+   requests). Use allowedOriginPatterns with specific domains instead.
+
+Q: How does the API Gateway inject user context for downstream services?
+A: After validating the JWT, the gateway extracts verified claims (userId, roles,
+   email) and injects them as HTTP headers (X-User-Id, X-User-Roles). Downstream
+   services trust these headers because they can only come from the gateway,
+   not from external clients (internal network trust boundary).
+
+================================================================================

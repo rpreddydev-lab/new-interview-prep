@@ -1,0 +1,184 @@
+================================================================
+Connection Pooling with HikariCP
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHY CONNECTION POOLING?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Opening a DB connection is expensive:
+  - TCP handshake
+  - DB authentication
+  - Session setup
+  ~10–50ms per connection
+
+A connection pool pre-creates N connections and reuses them.
+Request → borrows connection → executes → returns → pool reuses.
+
+HikariCP is the default connection pool in Spring Boot.
+It is the fastest Java connection pool (ultra-low overhead).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. KEY HIKARICP CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# application.properties
+spring.datasource.url=jdbc:postgresql://localhost:5432/mydb
+spring.datasource.username=app
+spring.datasource.password=secret
+spring.datasource.driver-class-name=org.postgresql.Driver
+
+# HikariCP pool settings
+spring.datasource.hikari.maximum-pool-size=10        # max connections (default: 10)
+spring.datasource.hikari.minimum-idle=5              # min idle connections kept alive
+spring.datasource.hikari.idle-timeout=600000         # 10 min — remove idle connections
+spring.datasource.hikari.max-lifetime=1800000        # 30 min — max connection lifetime
+spring.datasource.hikari.connection-timeout=30000    # 30s — max wait to get connection
+spring.datasource.hikari.keepalive-time=60000        # 1 min — test idle connections
+spring.datasource.hikari.pool-name=MyAppHikariPool
+spring.datasource.hikari.connection-test-query=SELECT 1   # optional (auto-detected for most DBs)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. POOL SIZING FORMULA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+HikariCP's own recommendation (Brandan's formula):
+  pool size = (core_count * 2) + effective_spindle_count
+
+For a 4-core CPU with SSD:
+  pool_size = (4 * 2) + 1 = 9  (round to 10)
+
+Common misconception: bigger pool = better performance.
+Reality: More connections = more lock contention on the DB.
+         The DB itself is the bottleneck, not the app.
+
+If each app instance has 10 connections and you have 5 replicas:
+  Total connections to DB = 50
+  Ensure your DB can handle (max_connections × overhead per connection)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. TIMEOUT PARAMETERS EXPLAINED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Parameter              | Default  | Description
+───────────────────────|──────────|──────────────────────────────────────────────────
+connectionTimeout      | 30000ms  | Max time to wait for a connection from the pool
+idleTimeout            | 600000ms | How long an idle connection is kept before removal
+maxLifetime            | 1800000ms| Max lifetime of a connection (avoids stale/zombie conns)
+keepaliveTime          | disabled | How often idle connections are tested (vs DB firewall drops)
+validationTimeout      | 5000ms   | Max time to test a connection for validity
+leakDetectionThreshold | disabled | Log a warning if a connection is held > threshold
+
+Set leakDetectionThreshold during development to detect connection leaks:
+  spring.datasource.hikari.leak-detection-threshold=60000  # 1 minute
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. CONNECTION POOL EXHAUSTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Symptoms:
+  java.sql.SQLTransientConnectionException: HikariPool-1 - Connection is not available,
+  request timed out after 30000ms.
+
+Causes:
+1. Slow queries holding connections too long
+2. @Transactional method calling an external API (long hold!)
+3. spring.jpa.open-in-view=true holding connections across HTTP request
+4. Insufficient pool size for load
+5. Connection leaks (connection not returned to pool)
+
+Fixes:
+1. Disable open-in-view: spring.jpa.open-in-view=false
+2. Keep @Transactional scopes short — no external calls inside transactions
+3. Check for leaks with leakDetectionThreshold
+4. Increase pool size or scale horizontally
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. MULTIPLE DATASOURCES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For read replica routing or multi-DB setups:
+
+@Configuration
+public class DataSourceConfig {
+    @Bean
+    @Primary
+    public DataSource primaryDataSource() {
+        HikariDataSource ds = new HikariDataSource();
+        ds.setJdbcUrl("jdbc:postgresql://primary:5432/mydb");
+        ds.setMaximumPoolSize(10);
+        return ds;
+    }
+
+    @Bean("readOnlyDataSource")
+    public DataSource readOnlyDataSource() {
+        HikariDataSource ds = new HikariDataSource();
+        ds.setJdbcUrl("jdbc:postgresql://replica:5432/mydb");
+        ds.setMaximumPoolSize(20);  // read replicas can handle more
+        ds.setReadOnly(true);
+        return ds;
+    }
+}
+
+// Route to read replica for @Transactional(readOnly=true):
+public class RoutingDataSource extends AbstractRoutingDataSource {
+    @Override
+    protected Object determineCurrentLookupKey() {
+        return TransactionSynchronizationManager.isCurrentTransactionReadOnly()
+            ? "readOnly" : "primary";
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. HIKARICP METRICS WITH MICROMETER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Spring Boot auto-configures Micrometer metrics for HikariCP:
+
+Key metrics to monitor:
+  hikaricp.connections.active    — connections currently in use
+  hikaricp.connections.idle      — connections available in pool
+  hikaricp.connections.pending   — threads waiting for a connection
+  hikaricp.connections.timeout   — connection acquisition timeouts
+  hikaricp.connections.creation  — time to create new connections
+
+Monitor in Grafana/Prometheus to detect:
+  - Pool saturation (active ≈ max)
+  - Growing pending count (need more connections)
+  - Connection creation spikes (pool too small, connections dying)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. INTERVIEW QUICK HITS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is HikariCP and why is it used?
+A: HikariCP is a high-performance JDBC connection pool and the default
+   in Spring Boot. It maintains a pool of pre-opened DB connections that
+   are reused across requests, avoiding the overhead of opening/closing
+   DB connections per request. It is faster than older pools like C3P0
+   and DBCP due to minimal locking and bytecode-level optimizations.
+
+Q: What happens when the connection pool is exhausted?
+A: New requests waiting for a connection block until connectionTimeout
+   milliseconds. If no connection becomes available, HikariCP throws
+   SQLTransientConnectionException. This typically means the pool size
+   is too small, queries are running too long, or connections are leaking.
+
+Q: What is spring.jpa.open-in-view and how does it affect connection pooling?
+A: open-in-view=true (the Spring Boot default) keeps a Hibernate Session
+   (and its DB connection) open for the entire HTTP request duration —
+   so connections are held even while rendering JSON/HTML responses.
+   This shrinks the effective connection pool under load. Set it to false.
+
+Q: How should you size a HikariCP pool?
+A: HikariCP recommends (num_cores × 2) + effective_spindle_count.
+   For a 4-core app on SSD, that's about 9–10 connections. Bigger is
+   NOT always better — more connections increase lock contention in the DB.
+   Monitor pool metrics and tune based on actual connection wait times.
+
+Q: What is max-lifetime and why is it important?
+A: max-lifetime limits how long a connection can live before being replaced.
+   DB servers and network firewalls often terminate long-lived connections
+   silently. Without max-lifetime, the pool may hold "zombie" connections
+   that fail on first use. Set it slightly below the DB server's connection
+   timeout (e.g., 30 min if DB closes after 60 min).

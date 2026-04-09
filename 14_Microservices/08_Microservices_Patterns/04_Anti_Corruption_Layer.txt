@@ -1,0 +1,235 @@
+================================================================================
+ANTI-CORRUPTION LAYER (ACL) PATTERN
+================================================================================
+
+WHAT IS AN ANTI-CORRUPTION LAYER?
+-----------------------------------
+The Anti-Corruption Layer (ACL) is a translation layer between your service's
+domain model and an external system's domain model.
+
+Without ACL:
+  External system's messy domain concepts "corrupt" your clean domain model.
+  Your code becomes littered with external concepts (CustomerRecord, LegacyOrder).
+  Changing the external system requires changing your domain model.
+
+With ACL:
+  The ACL translates between your clean domain and the external domain.
+  Your domain model stays pure and focused on your bounded context.
+  Changes to the external system only require updating the ACL, not your domain.
+
+The term comes from Domain-Driven Design (Eric Evans, "Domain-Driven Design" 2003).
+
+────────────────────────────────────────────────────────────────────────────────
+
+WHEN TO USE ACL
+================
+
+✓ Integrating with legacy systems with messy or inconsistent domain models
+✓ Integrating with third-party APIs (Stripe, Salesforce, SAP)
+✓ Migrating from monolith — new service talks to monolith via ACL
+✓ When two bounded contexts have different representations of the same concept
+✓ When the external system uses different terminology
+
+Signs you need an ACL:
+  - Your Order class has fields like `sfLeadId` or `legacyCustomerCode`
+  - You're doing `if (externalStatus.equals("CUST_ACT_A")) { ... }` in business logic
+  - External types leak throughout your code
+
+────────────────────────────────────────────────────────────────────────────────
+
+FULL IMPLEMENTATION
+====================
+
+Scenario: Order Service needs customer data from legacy CRM system.
+Legacy CRM uses its own data model (CustomerRecord with archaic field names).
+Order Service should use its own clean User domain model.
+
+Legacy CRM Client (raw external model):
+  // This mirrors the external system's API response exactly
+  public record CrmCustomerRecord(
+    String custId,             // vs id in our domain
+    String custName,           // vs firstName/lastName
+    String emailAddr,          // vs email
+    String statusCd,           // "ACT" | "INACT" | "SUSP" — vs enum in our domain
+    String billingAddr1,       // vs address.line1
+    String billingCity,
+    String billingZipCd,
+    String tierCd              // "PLT" | "GLD" | "STD" — vs CustomerTier enum
+  ) {}
+
+  @Service
+  public class CrmClient {
+    @Autowired private RestClient restClient;
+
+    public CrmCustomerRecord getCustomer(String custId) {
+      return restClient.get()
+        .uri("/crm/customers/{id}", custId)
+        .retrieve()
+        .body(CrmCustomerRecord.class);
+    }
+  }
+
+Your clean domain model:
+  public record User(
+    Long id,
+    String firstName,
+    String lastName,
+    String email,
+    UserStatus status,           // Clean enum: ACTIVE, INACTIVE, SUSPENDED
+    Address billingAddress,
+    CustomerTier tier            // PLATINUM, GOLD, STANDARD
+  ) {}
+
+  public enum UserStatus { ACTIVE, INACTIVE, SUSPENDED }
+  public enum CustomerTier { PLATINUM, GOLD, STANDARD }
+  public record Address(String line1, String city, String zip) {}
+
+The Anti-Corruption Layer:
+  @Component
+  public class CrmUserAcl {  // The ACL — translation layer
+
+    @Autowired private CrmClient crmClient;
+
+    // The only method domain code should call:
+    public User getUserById(Long userId) {
+      CrmCustomerRecord record = crmClient.getCustomer(String.valueOf(userId));
+      return translate(record);
+    }
+
+    // Translation: external model → our domain model
+    private User translate(CrmCustomerRecord record) {
+      return new User(
+        Long.valueOf(record.custId()),
+        extractFirstName(record.custName()),
+        extractLastName(record.custName()),
+        record.emailAddr(),
+        translateStatus(record.statusCd()),
+        new Address(record.billingAddr1(), record.billingCity(), record.billingZipCd()),
+        translateTier(record.tierCd())
+      );
+    }
+
+    private String extractFirstName(String custName) {
+      // "Doe, John" → "John"
+      return custName.contains(",")
+        ? custName.substring(custName.indexOf(",") + 2)
+        : custName;
+    }
+
+    private String extractLastName(String custName) {
+      return custName.contains(",")
+        ? custName.substring(0, custName.indexOf(","))
+        : "";
+    }
+
+    private UserStatus translateStatus(String statusCd) {
+      return switch (statusCd) {
+        case "ACT"  -> UserStatus.ACTIVE;
+        case "INACT"-> UserStatus.INACTIVE;
+        case "SUSP" -> UserStatus.SUSPENDED;
+        default -> {
+          log.warn("Unknown CRM status code: {}", statusCd);
+          yield UserStatus.INACTIVE;
+        }
+      };
+    }
+
+    private CustomerTier translateTier(String tierCd) {
+      return switch (tierCd) {
+        case "PLT" -> CustomerTier.PLATINUM;
+        case "GLD" -> CustomerTier.GOLD;
+        default    -> CustomerTier.STANDARD;
+      };
+    }
+  }
+
+Domain service uses ACL — clean code, no external concepts:
+  @Service
+  public class OrderService {
+
+    @Autowired private CrmUserAcl userAcl;  // Calls ACL, not CRM directly
+
+    public Order createOrder(Long userId, List<OrderItem> items) {
+      User user = userAcl.getUserById(userId);  // Gets clean User, no CRM details
+
+      if (user.status() == UserStatus.SUSPENDED) {
+        throw new OrderException("Cannot create order for suspended user");
+      }
+
+      if (user.tier() == CustomerTier.PLATINUM) {
+        applyPlatinumDiscount(items);
+      }
+
+      // 'user.id()', 'user.email()' — clean domain concepts
+      return Order.create(user.id(), user.email(), items);
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+ACL TESTING
+============
+
+The ACL is a unit-testable translation layer:
+
+  @ExtendWith(MockitoExtension.class)
+  class CrmUserAclTest {
+
+    @Mock CrmClient crmClient;
+    @InjectMocks CrmUserAcl acl;
+
+    @Test
+    void shouldTranslatePlatinumActiveCustomer() {
+      given(crmClient.getCustomer("123")).willReturn(
+        new CrmCustomerRecord("123", "Doe, John", "john@example.com",
+          "ACT", "123 Main St", "Boston", "02101", "PLT")
+      );
+
+      User user = acl.getUserById(123L);
+
+      assertThat(user.firstName()).isEqualTo("John");
+      assertThat(user.lastName()).isEqualTo("Doe");
+      assertThat(user.status()).isEqualTo(UserStatus.ACTIVE);
+      assertThat(user.tier()).isEqualTo(CustomerTier.PLATINUM);
+      assertThat(user.billingAddress().zip()).isEqualTo("02101");
+    }
+
+    @Test
+    void shouldDefaultUnknownStatusToInactive() {
+      given(crmClient.getCustomer("456")).willReturn(
+        new CrmCustomerRecord("456", "Smith, Jane", "jane@example.com",
+          "UNKNOWN_STATUS", "", "", "", "STD")
+      );
+
+      User user = acl.getUserById(456L);
+
+      assertThat(user.status()).isEqualTo(UserStatus.INACTIVE);
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is an Anti-Corruption Layer?
+A: A translation layer between your service's clean domain model and an external
+   system's domain model. It prevents the external system's concepts, naming, and
+   structure from leaking into your domain. Domain code calls the ACL; the ACL
+   calls the external system and translates the response. Changes to the external
+   system only require updating the ACL.
+
+Q: Where does ACL fit in DDD (Domain-Driven Design)?
+A: ACL is used at Context Map boundaries where your Bounded Context integrates with
+   an external or legacy context in a "Conformist" or "Customer-Supplier" relationship
+   where you don't control the external model. It's the standard approach when
+   integrating with third-party systems (Stripe, SAP, Salesforce) or legacy systems.
+
+Q: What are the signs that you need an ACL?
+A: External system types leaking into your domain classes (fields named
+   `sfLeadId`, `legacyCustomerCode`). String-based status codes from external
+   systems in your business logic. External API response objects being passed
+   directly to domain services. Any of these indicate the external model is
+   "corrupting" your domain.
+
+================================================================================

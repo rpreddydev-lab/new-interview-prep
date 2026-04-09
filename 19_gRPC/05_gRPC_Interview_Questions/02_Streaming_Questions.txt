@@ -1,0 +1,329 @@
+================================================================
+STREAMING gRPC INTERVIEW QUESTIONS
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q1: When would you choose streaming over unary RPCs?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Use server streaming when:
+  - Response is too large for a single message (paging with thousands of items)
+  - Client wants results incrementally as they become available
+  - Real-time pushes: stock prices, event feeds, log tailing
+  - You want the client to process results while the server is still computing
+  Example: rpc StreamEvents(Filter) returns (stream Event)
+
+Use client streaming when:
+  - Input is large and known only over time (not all available at once)
+  - File upload where the file is read chunk by chunk
+  - Batch write of millions of records without loading all into memory
+  Example: rpc UploadFile(stream FileChunk) returns (UploadFileResponse)
+
+Use bidi streaming when:
+  - Real-time two-way communication: chat, IoT control, trading
+  - Server needs to send feedback per message (per-message ack)
+  - Both sides have independent streams of data
+  Example: rpc Trade(stream TradeOrder) returns (stream TradeEvent)
+
+Use unary when:
+  - Simple request-response pattern
+  - Batch size is small and known upfront
+  - Simplicity is more important than throughput
+  - Client needs to be stateless
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q2: What is back-pressure in gRPC streaming and how does it work?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Back-pressure is a mechanism to prevent fast senders from overwhelming
+slow receivers by signaling when the receiver is ready for more data.
+
+gRPC back-pressure uses HTTP/2 flow control:
+  - Each HTTP/2 stream has a flow control window (default 64KB)
+  - Server can only send data while the window is > 0
+  - Client sends WINDOW_UPDATE frames to increase the window
+  - If window = 0, server blocks until the client reads data
+
+In Java, use ServerCallStreamObserver to interact with back-pressure:
+
+  // SERVER SIDE: Check if client is ready before sending
+  @Override
+  public void listOrders(ListOrdersRequest request,
+                         StreamObserver<Order> responseObserver) {
+    
+    ServerCallStreamObserver<Order> serverObserver =
+        (ServerCallStreamObserver<Order>) responseObserver;
+    
+    // Wait for the client to be ready before each send
+    for (Order order : getAllOrders()) {
+      if (!serverObserver.isReady()) {
+        // Flow control: wait until ready (or use onReadyHandler callback)
+        Thread.sleep(10);
+      }
+      serverObserver.onNext(order);
+    }
+    serverObserver.onCompleted();
+  }
+
+Better async approach (onReadyHandler):
+  serverObserver.setOnReadyHandler(() -> {
+    // Called when client window opens up again
+    resumeSendingOrders();
+  });
+
+Without back-pressure:
+  Server sends 1M orders at 10GB/s
+  Client reads at 100MB/s
+  Buffer overflows → OutOfMemoryError or data loss
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q3: How does cancellation work in gRPC streaming?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Client-initiated cancellation:
+  // Cast the requestObserver to cancel it
+  ClientCallStreamObserver<Request> callObserver =
+      (ClientCallStreamObserver<Request>) requestObserver;
+  callObserver.cancel("User requested cancel", null);
+  
+  // HTTP/2 RST_STREAM frame is sent to server
+
+Server sees cancellation:
+  // Option 1: Check flag in streaming loop
+  if (serverObserver.isCancelled()) {
+    log.info("Client cancelled — stopping stream");
+    return;
+  }
+  
+  // Option 2: Register callback
+  serverObserver.setOnCancelHandler(() -> {
+    log.info("Client cancelled");
+    cleanupResources();
+  });
+  
+  // Option 3: Check gRPC context
+  if (Context.current().isCancelled()) { return; }
+
+Deadline expiry vs client cancel:
+  Both look similar to the server (context is cancelled).
+  Check the cause:
+    Context.current().cancellationCause() instanceof DeadlineExceededException
+      → deadline expired
+    Status.CANCELLED without DeadlineExceededException
+      → client explicitly cancelled
+
+Server DOES NOT automatically stop running code.
+  The developer must check for cancellation proactively.
+  Without checks: server completes work, tries to send response,
+  gets an error (stream closed), discards result. Wasted CPU.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q4: What is the half-close concept in bidirectional streaming?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+In bidi streaming, either side can close its sending direction
+without closing the receiving direction. This is called half-close.
+
+Client half-close:
+  requestObserver.onCompleted()
+  → Sends HTTP/2 DATA [END_STREAM] to server
+  → Server's StreamObserver.onCompleted() is called
+  → Server CAN STILL send more messages after this
+
+Server half-close:
+  responseObserver.onCompleted()
+  → Sends HTTP/2 TRAILERS [END_STREAM] to client
+  → Client's response observer onCompleted() is called
+  → Once server sends TRAILERS, the HTTP/2 stream is done
+
+Typical pattern for "streaming request, streaming response":
+  Client sends N orders, then calls onCompleted()
+  Server receives all orders and continues sending fills
+  Client processes fills until server calls onCompleted()
+  
+  Timeline:
+    Client: order1 → order2 → [END_STREAM]
+    Server:     ← fill1 ← fill2 ← fill3 ← [TRAILERS+END_STREAM]
+
+Full close (onError on either side):
+  Terminates the entire stream immediately in both directions.
+  The other side receives onError() on their observer.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q5: How would you implement a chat application with gRPC?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Proto definition:
+  service ChatService {
+    rpc Chat(stream ChatMessage) returns (stream ChatMessage);
+  }
+  message ChatMessage {
+    string sender_id = 1;
+    string room_id = 2;
+    string text = 3;
+    int64 timestamp = 4;
+  }
+
+Server (fan-out broadcast):
+  ConcurrentHashMap<String, Set<StreamObserver<ChatMessage>>> rooms = new CHM<>();
+  
+  @Override
+  public StreamObserver<ChatMessage> chat(StreamObserver<ChatMessage> responseObserver) {
+    AtomicReference<String> roomRef = new AtomicReference<>();
+    
+    return new StreamObserver<ChatMessage>() {
+      @Override
+      public void onNext(ChatMessage msg) {
+        rooms.computeIfAbsent(msg.getRoomId(), k -> ConcurrentHashMap.newKeySet())
+             .add(responseObserver);
+        roomRef.set(msg.getRoomId());
+        
+        // Broadcast to all others in room
+        rooms.get(msg.getRoomId()).stream()
+             .filter(o -> o != responseObserver)
+             .forEach(o -> {
+               try { o.onNext(msg); }
+               catch (Exception e) { rooms.get(msg.getRoomId()).remove(o); }
+             });
+      }
+      @Override
+      public void onError(Throwable t) { leaveRoom(roomRef.get()); }
+      @Override
+      public void onCompleted() { leaveRoom(roomRef.get()); responseObserver.onCompleted(); }
+    };
+  }
+
+Key considerations:
+  - StreamObserver is NOT thread-safe → synchronize before calling onNext()
+  - Handle disconnected observers (remove on exception)
+  - Store room membership in server state
+  - Consider presence tracking (who is online)
+  - Handle reconnects: client gets a new stream, re-joins room
+  - Scale-out: use a message broker (Kafka/Redis Pub/Sub) between chat servers
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q6: Why is there no BlockingStub for client streaming or bidi streaming?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The BlockingStub is designed for request-response patterns
+where you make ONE call and get ONE result back synchronously.
+
+For client streaming, you need to:
+  1. Open a stream
+  2. Send message 1
+  3. Send message 2
+  4. ...
+  5. Close the stream
+  6. Receive one response
+
+This is fundamentally asynchronous — you send messages over time,
+and you get a response at some future point after you close.
+
+A blocking API would look like:
+  OutputStream<Request> stream = stub.upload(...);  // hypothetical
+  stream.send(chunk1);
+  stream.send(chunk2);
+  stream.close();
+  Response r = stream.getResponse();  // blocks here
+
+The gRPC Java API instead uses:
+  StreamObserver<Request> requestObserver = asyncStub.upload(responseObserver);
+  requestObserver.onNext(chunk1);
+  requestObserver.onNext(chunk2);
+  requestObserver.onCompleted();
+  // responseObserver.onNext() called by framework when response arrives
+
+For bidi streaming, there's no natural synchronization point —
+both streams are independent and can interleave in any order.
+A blocking API can't express this without complex thread management.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q7: How do you handle ordering in bidirectional streaming?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+gRPC DOES guarantee message ordering within a single stream:
+  - Client messages arrive at the server in the order sent
+  - Server messages arrive at the client in the order sent
+
+But there is NO guaranteed 1:1 pairing between request and response:
+  Client: send order1 → (server processes for 500ms) → send order2
+  Server: response for order2 (processed first) → response for order1
+
+This is by design — the server doesn't have to respond in order.
+
+Solution: Correlation IDs
+  Each TradeOrder has a unique order_id.
+  Each TradeEvent references the same order_id.
+  
+  // Client tracks pending requests
+  Map<String, CompletableFuture<TradeEvent>> pending = new ConcurrentHashMap<>();
+  
+  // Before sending:
+  String orderId = UUID.randomUUID().toString();
+  CompletableFuture<TradeEvent> future = new CompletableFuture<>();
+  pending.put(orderId, future);
+  requestObserver.onNext(order.toBuilder().setOrderId(orderId).build());
+  
+  // In response handler:
+  @Override
+  public void onNext(TradeEvent event) {
+    CompletableFuture<TradeEvent> f = pending.remove(event.getOrderId());
+    if (f != null) f.complete(event);
+  }
+
+For ping-pong style (strict ordering):
+  Only send the next message after receiving the response to the previous one.
+  This serializes the stream but simplifies the logic.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q8: How do you implement heartbeats in a long-lived gRPC stream?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Problem: A long-lived bidi/server-streaming connection may appear
+alive at the TCP level (due to TCP keepalive) but be logically dead
+(server crashed, network is blackholing packets).
+
+Solution: Application-level heartbeats using oneof in the message:
+
+  message DeviceMessage {
+    oneof payload {
+      SensorReading reading = 1;
+      Heartbeat heartbeat = 2;      // ← heartbeat variant
+    }
+  }
+  message Heartbeat { int64 timestamp_ms = 1; }
+
+Client sends heartbeat every 30s:
+  scheduler.scheduleAtFixedRate(() -> {
+    requestObserver.onNext(DeviceMessage.newBuilder()
+        .setHeartbeat(Heartbeat.newBuilder()
+            .setTimestampMs(System.currentTimeMillis()))
+        .build());
+  }, 0, 30, TimeUnit.SECONDS);
+
+Server uses a watchdog:
+  @Override
+  public void onNext(DeviceMessage msg) {
+    watchdog.reset();  // reset timer on ANY message
+    
+    if (msg.hasHeartbeat()) {
+      // Send ack back to client
+      responseObserver.onNext(ServerCommand.newBuilder()
+          .setAck(AckMessage.newBuilder()
+              .setTimestampMs(msg.getHeartbeat().getTimestampMs()))
+          .build());
+    }
+  }
+  
+  // Watchdog: if no message for 90s, close the stream
+  // scheduleAtFixedRate: if watchdog.isExpired() → responseObserver.onError(DEADLINE)
+
+Why not rely on TCP keepalive alone?
+  - TCP keepalive only detects network disconnects (not app crashes)
+  - TCP keepalive intervals are typically OS-level (minutes)
+  - Application heartbeats work at any granularity and detect
+    logical failures, not just network failures
+
+================================================================
+END OF FILE
+================================================================

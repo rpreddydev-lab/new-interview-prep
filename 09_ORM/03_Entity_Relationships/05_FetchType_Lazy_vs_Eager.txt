@@ -1,0 +1,209 @@
+================================================================
+FetchType: LAZY vs EAGER
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FetchType controls WHEN associated data is loaded from the database.
+
+  LAZY  — "Load on demand": association is loaded only when accessed.
+  EAGER — "Load immediately": association is loaded in the same query as the owner.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. DEFAULT FETCH TYPES BY ANNOTATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Annotation      | Default FetchType | Notes
+────────────────|───────────────────|────────────────────────────────────────
+@OneToMany      | LAZY              | Collection — always LAZY by default
+@ManyToMany     | LAZY              | Collection — always LAZY by default
+@ManyToOne      | EAGER             | Single entity — EAGER by default (BAD)
+@OneToOne       | EAGER             | Single entity — EAGER by default (BAD)
+
+Rule: ALWAYS explicitly set FetchType.LAZY on @ManyToOne and @OneToOne!
+The JPA default of EAGER for single associations is a performance trap.
+
+@ManyToOne(fetch = FetchType.LAZY)   // ALWAYS override the EAGER default
+@JoinColumn(name = "user_id")
+private User user;
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. HOW LAZY LOADING WORKS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Hibernate uses proxy objects (Javassist/ByteBuddy bytecode proxies) for
+LAZY single associations, and PersistentBag/PersistentSet for collections.
+
+When you access the lazy association:
+  Order order = orderRepo.findById(1L).get();
+  // At this point: order.getUser() is a Hibernate proxy (not yet loaded)
+
+  String email = order.getUser().getEmail();
+  // Now Hibernate fires: SELECT * FROM users WHERE id = ?
+
+For collections:
+  List<Order> orders = user.getOrders();
+  // orders is a PersistentBag proxy (empty placeholder)
+
+  int size = orders.size();  // triggers: SELECT * FROM orders WHERE user_id = ?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. LAZYINITIALIZATIONEXCEPTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Thrown when a LAZY association is accessed outside an active Session/transaction.
+
+@Service
+public class OrderService {
+    @Transactional
+    public Order getOrder(Long id) {
+        return orderRepo.findById(id).get();
+        // Transaction closes here — session ends
+    }
+}
+
+@RestController
+public class OrderController {
+    public String handle(Long id) {
+        Order order = orderService.getOrder(id);
+        return order.getUser().getEmail();  // LazyInitializationException!
+    }
+}
+
+Common causes:
+1. Accessing lazy field after @Transactional method returns
+2. spring.jpa.open-in-view=true masked it before — now it's disabled
+3. Detached entity passed between services/layers
+
+Fixes:
+
+Fix 1: JOIN FETCH (fetch when loading the entity)
+  @Query("SELECT o FROM Order o JOIN FETCH o.user WHERE o.id = :id")
+  Optional<Order> findByIdWithUser(@Param("id") Long id);
+
+Fix 2: @EntityGraph (declarative JOIN FETCH)
+  @EntityGraph(attributePaths = {"user", "items"})
+  Optional<Order> findById(Long id);
+
+Fix 3: DTO projection (no entity loading at all)
+  @Query("SELECT new com.example.OrderDto(o.id, o.total, u.email) " +
+         "FROM Order o JOIN o.user u WHERE o.id = :id")
+  Optional<OrderDto> findOrderDtoById(@Param("id") Long id);
+
+Fix 4: Initialize inside transaction
+  @Transactional
+  public OrderDto getOrderWithUser(Long id) {
+      Order order = orderRepo.findById(id).get();
+      Hibernate.initialize(order.getUser());  // force-load proxy
+      return mapper.toDto(order);
+  }
+
+Fix 5: spring.jpa.open-in-view=true (NOT recommended)
+  // Keeps session open for entire HTTP request — hides the problem,
+  // causes resource leaks, and hidden N+1 queries.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. EAGER LOADING PROBLEMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Problem 1: Loads data you don't need
+  User user = userRepo.findById(1L).get();
+  // With EAGER @OneToMany on orders:
+  // SELECT * FROM users WHERE id=1
+  // SELECT * FROM orders WHERE user_id=1
+  // All orders loaded even if you only needed the user's email!
+
+Problem 2: N+1 with findAll()
+  List<User> users = userRepo.findAll();
+  // 1 SELECT for users
+  // N SELECTs for each user's orders (EAGER loading per entity in 1LC miss)
+
+Problem 3: "Cannot simultaneously fetch multiple bags"
+  // With two EAGER @OneToMany collections, Hibernate throws:
+  // org.hibernate.loader.MultipleBagFetchException
+
+Problem 4: Cartesian product with JOIN
+  // EAGER + findAll causes a JOIN that multiplies rows:
+  // 10 users × 100 orders = 1000 rows returned from DB
+
+Rule: Make ALL associations LAZY and fetch eagerly with JOIN FETCH only
+when you explicitly need the data.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. WHEN TO USE EAGER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Rarely. Consider EAGER only when:
+- The associated data is ALWAYS needed (100% of use cases)
+- It is a @ManyToOne to a small, frequently accessed reference table
+  (e.g., a Role or Status lookup table)
+- The association is a single entity (not a collection)
+
+Even then, a JOIN FETCH query is usually cleaner and more explicit
+than relying on EAGER fetch type.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. @ENTITYGRAPH — CONTROLLED EAGER LOADING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Define on entity:
+  @Entity
+  @NamedEntityGraph(
+    name = "Order.withUserAndItems",
+    attributeNodes = {
+      @NamedAttributeNode("user"),
+      @NamedAttributeNode("items")
+    }
+  )
+  public class Order { ... }
+
+Use in repository:
+  @EntityGraph(value = "Order.withUserAndItems", type = EntityGraph.EntityGraphType.FETCH)
+  Optional<Order> findById(Long id);
+
+Inline @EntityGraph (no @NamedEntityGraph needed):
+  @EntityGraph(attributePaths = {"user", "items"})
+  List<Order> findByStatus(String status);
+
+  // FETCH type: associations in attributePaths = EAGER, rest = LAZY
+  // LOAD type: associations in attributePaths = EAGER, rest = keep default
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. INTERVIEW QUICK HITS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the default FetchType for @ManyToOne and why is it a problem?
+A: The default is EAGER. This means every time you load an Order,
+   Hibernate also issues a SQL SELECT for the User. If you load 100 orders,
+   that's up to 100 extra queries (N+1). Always override to LAZY.
+
+Q: What is a LazyInitializationException?
+A: It's thrown when a LAZY proxy is accessed after the Hibernate Session
+   has been closed (typically outside a @Transactional boundary).
+   Fix by fetching the data within the transaction using JOIN FETCH,
+   @EntityGraph, or DTO projections.
+
+Q: What is open-in-view and why is it bad?
+A: spring.jpa.open-in-view=true keeps a Hibernate Session open for
+   the entire duration of an HTTP request. It hides LazyInitializationExceptions
+   but causes resource leaks (holding DB connections longer) and silent
+   N+1 queries in view templates. Disable it: spring.jpa.open-in-view=false.
+
+Q: What is the difference between JOIN FETCH and @EntityGraph?
+A: Both perform an eager JOIN at the SQL level for that specific query.
+   JOIN FETCH is written in JPQL inline. @EntityGraph is annotation-based
+   and reusable across multiple repository methods. Both are good; @EntityGraph
+   is cleaner for Spring Data JPA repositories.
+
+Q: Can you change FetchType at the query level?
+A: Not directly via FetchType annotation, but you can override with
+   JOIN FETCH in JPQL or @EntityGraph. @EntityGraph with EntityGraphType.FETCH
+   makes listed attributes EAGER and all others LAZY for that query only.
+
+Q: What is the "MultipleBagFetchException" in Hibernate?
+A: Hibernate cannot JOIN FETCH (or EAGER load) two List (bag) collections
+   in the same query because it would produce a Cartesian product.
+   Fix: use Set instead of List, or fetch one collection per query,
+   or use @BatchSize to load collections separately.

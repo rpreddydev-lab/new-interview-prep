@@ -1,0 +1,147 @@
+================================================================
+GRAPHQL PERFORMANCE INTERVIEW QUESTIONS — IN DEPTH
+================================================================
+
+Q1: What is the N+1 problem in GraphQL and how do you solve it?
+A: When a list resolver returns N items and each item's nested field
+   resolver fires an individual DB query, you get 1 (list) + N (nested)
+   queries. Example: 100 posts × 1 author query each = 101 queries.
+   Solutions:
+   (1) DataLoader: batch all N author IDs into a single SELECT IN query.
+   (2) @BatchMapping (Spring): same as DataLoader, declarative.
+   (3) JOIN FETCH: eagerly load the relation in the root query.
+   (4) Look-ahead + JOIN: inspect selection set and JOIN only if needed.
+   DataLoader/BatchMapping is the canonical solution in GraphQL.
+
+Q2: Explain how DataLoader works.
+A: DataLoader works via two mechanisms:
+   Batching: collects all `load(key)` calls in the current execution tick,
+   then fires a single batch function with all keys at once. Instead of
+   N separate DB calls, one `SELECT WHERE id IN (...)`.
+   Caching (per-request): once a key is loaded, the same key in the same
+   request returns the cached value. If user-1 appears in 50 posts in one
+   query, it's loaded exactly once.
+   DataLoader instances MUST be created fresh per request — sharing across
+   requests causes stale data and memory leaks.
+
+Q3: What is the difference between DataLoader caching and application-level caching?
+A: DataLoader: per-request memoization. Cache lives for the duration of ONE
+   GraphQL operation. Not shared across requests or users. Purpose: eliminate
+   redundant loads WITHIN a request.
+   Application caching (Redis, Caffeine): shared across requests, often across
+   users. Survives across requests. Purpose: avoid DB hits for frequently
+   accessed, rarely changing data. TTL or event-based invalidation required.
+   Both complement each other: DataLoader prevents in-request N+1;
+   Redis prevents repeated DB calls across requests.
+
+Q4: What is look-ahead optimization and when would you use it?
+A: Look-ahead is inspecting the client's selection set in a resolver to
+   determine what data will be needed downstream. Instead of loading a
+   Post and then triggering separate author/comments resolvers, you
+   JOIN the related data upfront in one query.
+   ```java
+   @QueryMapping
+   public List<Post> posts(DataFetchingEnvironment env) {
+     boolean needsAuthor = env.getSelectionSet().contains("author/**");
+     if (needsAuthor) {
+       return postRepository.findAllWithAuthor();  // JOIN FETCH author
+     }
+     return postRepository.findAll();
+   }
+   ```
+   Use when: the query shape is predictable and the data can be efficiently
+   JOINed. DataLoader is simpler; look-ahead is more surgical.
+
+Q5: How would you analyze query performance in a GraphQL API?
+A: Multiple tools and techniques:
+   (1) Apollo Tracing: adds execution timing for every resolver to response
+   extensions. Shows which resolvers are slow.
+   (2) DataLoader statistics: track batch sizes and cache hit rates.
+   Small batches (size 1) indicate N+1 still exists.
+   (3) DB slow query log: identify queries taking >100ms. Look for
+   identical queries repeated with different IDs.
+   (4) APM tools (Datadog, New Relic): instrument GraphQL execution,
+   track per-operation p50/p99, alert on regressions.
+   (5) Logging: log operation name + duration + resolver timing in
+   WebGraphQlInterceptor.
+
+Q6: What are query complexity and depth limits and when should you use them?
+A: Complexity: assigns numeric costs to fields, rejects queries exceeding
+   a total cost. Prevents wide queries with thousands of fields.
+   Depth: limits nesting level, rejects queries deeper than N levels.
+   Prevents deeply nested recursive queries (User.friends.friends...).
+   Use both in production. Typical limits: depth=7, complexity=150.
+   Configure via MaxQueryDepthInstrumentation and MaxQueryComplexityInstrumentation
+   in graphql-java. These run at VALIDATION time — no execution overhead.
+
+Q7: How does caching work with GraphQL?
+A: Several layers:
+   (1) HTTP/CDN: Only possible with GET (not POST). Use Persisted Queries
+   to enable GET with hash-based URLs. Add Cache-Control: public for
+   non-authenticated operations. CDN caches by URL.
+   (2) Application-level (Redis): Cache service method results. @Cacheable
+   on service methods. Invalidate on mutations.
+   (3) DataLoader: Per-request memoization.
+   (4) Apollo Client: Normalized client-side cache. Mutations that return
+   updated objects auto-update the cache.
+   POST-based GraphQL is not inherently CDN-cacheable without APQ.
+
+Q8: What is Automatic Persisted Queries (APQ) and how does it improve performance?
+A: APQ is a protocol where clients send a SHA-256 hash of the query instead
+   of the full query string. On first request (cache miss), server asks for
+   the full query. On subsequent requests, only the hash is needed.
+   Benefits: (1) Smaller request payload (hash = ~64 chars vs KB of query).
+   (2) Enables GET requests with hash in URL, making CDN caching possible.
+   (3) Server can cache the parsed query document, avoiding repeated parsing.
+   (4) Can evolve to "trusted documents only" for security.
+
+Q9: How do you handle pagination performance?
+A: Key considerations:
+   (1) Use cursor-based pagination, not offset, for large datasets.
+   Offset pagination requires counting rows up to the offset — O(N) at DB.
+   Cursor-based jumps directly to the cursor's position using an indexed
+   WHERE clause — O(log N).
+   (2) Index the cursor field (usually created_at or ID).
+   (3) Avoid `SELECT COUNT(*)` unless needed — hasNextPage can be determined
+   by fetching N+1 results and checking if N+1 exists.
+   (4) Use DataLoader for nested pagination (e.g., posts per user).
+
+Q10: How do you prevent GraphQL queries from consuming too many database connections?
+A: Strategies:
+   (1) Connection pool tuning: HikariCP with max-pool-size matching your
+   expected concurrency. Each GraphQL request shouldn't hold a connection
+   for its full duration.
+   (2) @Transactional service layer: DB connections are held only during
+   transaction, not for the entire resolver chain.
+   (3) Disable OSIV (Open Session in View): `spring.jpa.open-in-view=false`.
+   OSIV holds the connection open for the entire HTTP request including
+   response writing — wastes connections in GraphQL.
+   (4) Reactive/async resolvers (WebFlux): Non-blocking DB access; connection
+   not held during network I/O.
+   (5) Query result caching: fewer DB hits = fewer connections needed.
+
+Q11: What is subscription scalability and how do you handle it?
+A: WebSocket subscriptions hold persistent connections. At scale:
+   (1) Connections per server are limited by OS file descriptor limits
+   and JVM thread/memory. Reactive (WebFlux + Netty) handles more concurrent
+   connections than blocking (Tomcat with 1 thread per connection).
+   (2) For multi-instance deployments, use Redis Pub/Sub to fan out events
+   across all server instances: one instance receives the mutation, publishes
+   to Redis channel, all instances subscribed to that channel push to
+   connected clients.
+   (3) Limit max subscriptions per user.
+   (4) Use backpressure: `Flux.sample()` or `Flux.debounce()` for
+   high-frequency event streams.
+
+Q12: What is batching at the HTTP level (request batching) vs DataLoader batching?
+A: HTTP request batching: client sends multiple operations in a single HTTP
+   POST as a JSON array. Server processes all and returns array of results.
+   Apollo Client supports this with BatchHttpLink. Reduces HTTP round-trips.
+   DataLoader batching: within ONE GraphQL operation, collects multiple
+   `load(key)` calls from multiple resolvers and fires ONE batch function.
+   Reduces DB round-trips within a single operation.
+   Both can be used together for maximum efficiency.
+
+================================================================
+END OF FILE
+================================================================

@@ -1,0 +1,445 @@
+================================================================
+CACHING STRATEGIES
+================================================================
+
+CACHING LAYERS OVERVIEW
+─────────────────────────
+Modern web applications use multiple caching layers:
+
+  Browser Cache          → Stores responses on user's device
+  Service Worker Cache   → Programmatic cache in the browser
+  CDN / Edge Cache       → Stores at geographically close servers
+  Reverse Proxy Cache    → Nginx/Varnish in front of origin
+  Application Cache      → Redis/Memcached at API layer
+  Database Cache         → Query result caching
+  
+  This file focuses on BROWSER caching and SERVICE WORKERS.
+  CDN caching is covered in 03_CDN.txt.
+
+================================================================
+BROWSER CACHE: HTTP CACHE
+================================================================
+
+CACHE STORAGE LOCATIONS:
+  1. MEMORY CACHE: RAM, extremely fast, cleared when tab closes
+     - Used for resources used multiple times in same session
+  2. DISK CACHE: Persistent, survives browser restart
+     - Used for most cacheable resources (JS, CSS, images)
+  3. PUSH CACHE: HTTP/2 Server Push (being phased out)
+  4. SERVICE WORKER CACHE: JavaScript-controlled Cache API
+
+HOW HTTP CACHE WORKS:
+  1. Browser checks for cached response for the URL
+  2. If found, check if it's still "fresh" (not expired)
+  3. If fresh → serve from cache (no network request!)
+  4. If stale → revalidate with server (conditional request)
+  5. Server returns 304 (use cache) or 200 (new content)
+
+================================================================
+CACHE-CONTROL DIRECTIVES IN DETAIL
+================================================================
+
+// Response Cache-Control headers:
+
+// ─── CACHEABILITY ───
+Cache-Control: public          // Can be cached by browsers AND CDNs
+Cache-Control: private         // Only browser can cache (not shared caches)
+Cache-Control: no-store        // Never cache, always fetch fresh
+Cache-Control: no-cache        // Cache but ALWAYS revalidate before use
+                               // (confusing name: it DOES cache!)
+
+// ─── EXPIRATION ───
+Cache-Control: max-age=3600    // Fresh for 3600 seconds (1 hour)
+Cache-Control: s-maxage=86400  // CDN cache: 1 day (overrides max-age for CDNs)
+Cache-Control: max-stale=300   // Accept stale responses up to 5 min old
+
+// ─── REVALIDATION ───
+Cache-Control: must-revalidate // Must revalidate when stale (don't serve stale)
+Cache-Control: proxy-revalidate // Like must-revalidate but for CDN/proxies only
+Cache-Control: immutable       // Content never changes; skip revalidation
+
+// ─── STALE SERVING ───
+Cache-Control: stale-while-revalidate=60   // Serve stale while fetching fresh
+Cache-Control: stale-if-error=86400        // Serve stale if origin has error
+
+// ─── COMBINED EXAMPLES ───
+
+// Static assets (hashed filename):
+Cache-Control: public, max-age=31536000, immutable
+
+// HTML documents:
+Cache-Control: no-cache
+// OR: max-age=0 with ETag for revalidation
+
+// API data (public, 1 min fresh, serve stale for 5 min):
+Cache-Control: public, max-age=60, stale-while-revalidate=300
+
+// User-specific API data:
+Cache-Control: private, max-age=300
+
+// Security-sensitive (never cache):
+Cache-Control: no-store, private
+
+================================================================
+ETAG AND CONDITIONAL REQUESTS
+================================================================
+
+ETag (Entity Tag) — uniquely identifies a specific version of a resource.
+
+WORKFLOW:
+  // First request:
+  GET /api/products
+  
+  // Response:
+  200 OK
+  ETag: "abc123"
+  Cache-Control: no-cache
+  [Body: product data]
+  
+  // Browser caches response with ETag
+  
+  // Second request (cache is stale per no-cache directive):
+  GET /api/products
+  If-None-Match: "abc123"          // Browser sends ETag it has
+  
+  // If data unchanged — server responds:
+  304 Not Modified                  // No body! Saves bandwidth
+  ETag: "abc123"
+  
+  // If data changed — server responds:
+  200 OK
+  ETag: "def456"
+  [New body]
+  
+  // Net result of 304: only headers downloaded (no body)
+  // Typically saves 95%+ of bandwidth vs full response
+
+STRONG vs WEAK ETAGs:
+  ETag: "abc123"       // Strong: exact byte-for-byte match
+  ETag: W/"abc123"     // Weak: semantically equivalent (not byte-identical)
+
+LAST-MODIFIED (older alternative to ETag):
+  Last-Modified: Thu, 24 Apr 2025 12:00:00 GMT
+  // Browser sends: If-Modified-Since: Thu, 24 Apr 2025 12:00:00 GMT
+
+================================================================
+CONTENT HASHING FOR LONG-TERM CACHING
+================================================================
+
+THE GOLDEN RULE:
+  Static assets should have INFINITE cache lifetime.
+  To safely update them: change the URL.
+  Content-hash filenames = new content always = new URL.
+
+WEBPACK CONTENT HASHING:
+  // webpack.config.js
+  output: {
+    filename: '[name].[contenthash:8].js',    // main.a1b2c3d4.js
+    chunkFilename: '[name].[contenthash:8].js', // vendor.e5f6a7b8.js
+    assetModuleFilename: '[name].[contenthash:8][ext]', // logo.c9d1e2f3.svg
+  }
+  
+  // [contenthash]: hash of the module's content
+  // Changes only when THIS file's content changes
+  // Common mistake: [hash] or [chunkhash] — these change with ANY file
+  
+  // CSS hashing:
+  new MiniCssExtractPlugin({
+    filename: '[name].[contenthash:8].css',
+  })
+
+ENSURING PROPER HASHING (AVOID HASH CHANGES):
+  // Problem: vendor chunk hash changes when app code changes
+  // because webpack's module IDs are unstable
+  
+  // Solution: Stabilize module IDs with deterministic IDs
+  // webpack.config.js
+  optimization: {
+    moduleIds: 'deterministic',   // Stable IDs based on path
+    runtimeChunk: 'single',       // Extract webpack runtime to own chunk
+    splitChunks: {
+      cacheGroups: {
+        vendor: {
+          test: /[\\/]node_modules[\\/]/,
+          name: 'vendors',          // Stable chunk name
+          chunks: 'all',
+        }
+      }
+    }
+  }
+  
+  // Now: vendor chunk only changes hash when vendor code changes!
+  // Your app code changes → only app chunk gets new hash
+  // User re-downloads only changed chunk, not the whole bundle
+
+================================================================
+SERVICE WORKERS AND THE CACHE API
+================================================================
+
+A SERVICE WORKER is a JavaScript file that runs in a background thread,
+separate from the main browser thread. It acts as a programmable network
+proxy — intercepting fetch requests and serving from cache.
+
+KEY CONCEPTS:
+  - Runs in its own thread (not blocking main thread)
+  - No DOM access
+  - Persists across page loads and browser sessions
+  - HTTPS only (or localhost for development)
+  - Lifecycle: Install → Activate → Fetch
+
+SERVICE WORKER LIFECYCLE:
+  1. INSTALL: Cache critical assets for offline use
+  2. ACTIVATE: Clean up old caches
+  3. FETCH: Intercept network requests, serve from cache
+
+BASIC SERVICE WORKER (App Shell Pattern):
+  // public/sw.js
+  
+  const CACHE_VERSION = 'v1';
+  const STATIC_CACHE = `static-${CACHE_VERSION}`;
+  const DYNAMIC_CACHE = `dynamic-${CACHE_VERSION}`;
+  
+  const STATIC_ASSETS = [
+    '/',
+    '/index.html',
+    '/static/js/main.abc123.js',
+    '/static/css/main.def456.css',
+    '/manifest.json',
+  ];
+  
+  // Install: pre-cache static assets
+  self.addEventListener('install', (event) => {
+    event.waitUntil(
+      caches.open(STATIC_CACHE)
+        .then(cache => cache.addAll(STATIC_ASSETS))
+        .then(() => self.skipWaiting()) // Activate immediately
+    );
+  });
+  
+  // Activate: clean up old cache versions
+  self.addEventListener('activate', (event) => {
+    event.waitUntil(
+      caches.keys().then(keys =>
+        Promise.all(
+          keys
+            .filter(key => key !== STATIC_CACHE && key !== DYNAMIC_CACHE)
+            .map(key => caches.delete(key))
+        )
+      ).then(() => self.clients.claim()) // Take control immediately
+    );
+  });
+  
+  // Fetch: serve from cache with network fallback
+  self.addEventListener('fetch', (event) => {
+    event.respondWith(handleFetch(event.request));
+  });
+  
+  async function handleFetch(request) {
+    // Static assets: Cache First
+    const staticCached = await caches.match(request, {
+      cacheName: STATIC_CACHE
+    });
+    if (staticCached) return staticCached;
+    
+    // HTML: Network First (get latest, fall back to cache)
+    if (request.headers.get('accept')?.includes('text/html')) {
+      try {
+        const response = await fetch(request);
+        const cache = await caches.open(DYNAMIC_CACHE);
+        cache.put(request, response.clone());
+        return response;
+      } catch {
+        return caches.match(request);
+      }
+    }
+    
+    // Images: Stale-While-Revalidate
+    const cachedResponse = await caches.match(request);
+    const fetchPromise = fetch(request).then(networkResponse => {
+      caches.open(DYNAMIC_CACHE)
+        .then(cache => cache.put(request, networkResponse.clone()));
+      return networkResponse;
+    });
+    return cachedResponse || fetchPromise;
+  }
+
+REGISTERING SERVICE WORKER:
+  // src/index.js
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker
+        .register('/sw.js')
+        .then(registration => {
+          console.log('SW registered:', registration.scope);
+        })
+        .catch(error => {
+          console.log('SW registration failed:', error);
+        });
+    });
+  }
+
+================================================================
+CACHING STRATEGIES (DESIGN PATTERNS)
+================================================================
+
+1. CACHE FIRST (Cache Falling Back to Network)
+   Best for: Static assets, offline-first apps
+   
+   Request → Check Cache → HIT: return cache
+                         → MISS: fetch network, store in cache, return
+
+2. NETWORK FIRST (Network Falling Back to Cache)
+   Best for: HTML documents, API data that must be fresh
+   
+   Request → Fetch network → SUCCESS: update cache, return
+                           → FAIL: return cache (offline fallback)
+   
+   RISK: Network requests take time. If network is slow, user waits.
+
+3. STALE-WHILE-REVALIDATE
+   Best for: Images, non-critical data where slight staleness is OK
+   
+   Request → Check Cache → HIT: return cache + async fetch to update
+                         → MISS: fetch network, store in cache, return
+   
+   Result: User always gets instant response from cache.
+   Content updates in background, fresh on NEXT visit.
+
+4. CACHE ONLY
+   Best for: Precached app shell, offline-only resources
+   
+   Request → Check Cache → HIT: return
+                         → MISS: network error (no network fallback)
+
+5. NETWORK ONLY
+   Best for: Analytics pings, payment processing, real-time data
+   
+   Request → Always go to network (no caching)
+
+================================================================
+WORKBOX (MODERN SERVICE WORKER LIBRARY)
+================================================================
+
+Google's Workbox handles service worker complexity:
+
+  npm install workbox-webpack-plugin workbox-strategies
+
+  // webpack.config.js
+  const { GenerateSW, InjectManifest } = require('workbox-webpack-plugin');
+  
+  plugins: [
+    new GenerateSW({
+      // Auto-generates service worker with precaching
+      clientsClaim: true,
+      skipWaiting: true,
+      runtimeCaching: [
+        {
+          urlPattern: /^https:\/\/api\.example\.com\//,
+          handler: 'NetworkFirst',
+          options: {
+            cacheName: 'api-cache',
+            expiration: { maxEntries: 50, maxAgeSeconds: 300 },
+            networkTimeoutSeconds: 3,
+          }
+        },
+        {
+          urlPattern: /\.(?:png|jpg|jpeg|svg|gif|webp)$/,
+          handler: 'CacheFirst',
+          options: {
+            cacheName: 'image-cache',
+            expiration: {
+              maxEntries: 100,
+              maxAgeSeconds: 30 * 24 * 60 * 60, // 30 days
+            }
+          }
+        }
+      ]
+    })
+  ]
+
+NEXT.JS PWA WITH WORKBOX:
+  npm install next-pwa
+  
+  // next.config.js
+  const withPWA = require('next-pwa')({
+    dest: 'public',
+    runtimeCaching: [{
+      urlPattern: /^https:\/\/fonts\.googleapis\.com/,
+      handler: 'CacheFirst',
+      options: { cacheName: 'google-fonts', expiration: { maxAgeSeconds: 86400 } }
+    }]
+  });
+  module.exports = withPWA({});
+
+================================================================
+CACHE BUSTING
+================================================================
+
+METHODS TO BUST CACHE (force fresh fetch):
+
+1. CONTENT HASH (recommended — already covered above)
+   main.abc123.js → main.def456.js
+
+2. QUERY STRING VERSION (simple but less effective)
+   /app.js?v=2.1.0
+   /app.js?t=1714060800  // timestamp
+   
+   ISSUE: Some CDNs and proxies may ignore query strings and serve
+   the wrong cached version. Less reliable than hash in URL path.
+
+3. VERSIONED DIRECTORY
+   /v2/app.js  // Move to new directory on deploy
+   /2025-04-25/app.js
+
+================================================================
+INTERVIEW ANSWERS
+================================================================
+
+Q: What is the difference between no-cache and no-store?
+A: no-store means "never cache this — always fetch fresh, don't store
+   anything." Used for sensitive data like bank statements.
+   no-cache means "cache it, but ALWAYS revalidate with the server before
+   using." The browser stores the response but sends a conditional request
+   (If-None-Match with ETag) every time. If server returns 304 Not Modified,
+   use the cache; if 200, download fresh. This saves bandwidth on unchanged
+   resources while ensuring users always see the latest version.
+
+Q: How does content hashing enable long-term caching?
+A: When webpack builds with [contenthash] in filenames, it generates a unique
+   hash based on the file content: main.a1b2c3d4.js. We can safely cache
+   this with max-age=31536000, immutable for one year. When code changes, the
+   hash changes, so the new file has a completely different URL. The old cached
+   file simply never gets requested again because the HTML references the new
+   URL. The key is to NOT cache index.html (or use no-cache), so the HTML
+   always fetches fresh and links to the latest hashed asset URLs.
+
+Q: Explain stale-while-revalidate.
+A: Stale-while-revalidate is a cache strategy where: if a cached response
+   is stale (expired), serve it anyway (immediately) and simultaneously
+   start a background revalidation request. The user gets a fast response
+   from cache; on the next request, they'll get the fresh response that
+   was fetched in the background. It's a great balance between freshness
+   and performance. You can use it via Cache-Control header or in service
+   workers. React Query and SWR implement this pattern for API requests.
+
+Q: What are service workers and what performance advantages do they offer?
+A: Service workers are JavaScript workers that act as programmable network
+   proxies. They intercept fetch requests and can serve responses from cache,
+   even offline. Performance benefits: (1) Offline support — app works without
+   network; (2) Cache-first serving of static assets at near-zero latency;
+   (3) Background sync — queue failed requests and retry when online;
+   (4) Push notifications. The key patterns are Cache First for static assets
+   (instant serving), Network First for dynamic content (latest data with
+   offline fallback), and Stale-While-Revalidate for images and non-critical
+   content. Workbox from Google makes service worker implementation much easier.
+
+Q: How do you invalidate a CDN cache after a deployment?
+A: My preferred approach is to avoid cache invalidation entirely by using
+   content-hash filenames — when content changes, the URL changes, so CDN
+   caches naturally serve the correct version. For HTML files I use no-cache
+   headers, so CDN passes requests through to origin (or uses short TTL).
+   When I do need emergency invalidation (e.g., a security fix that doesn't
+   change the filename), I use the CDN's purge API: Cloudflare has a UI and
+   API, AWS CloudFront has create-invalidation CLI command. For complex
+   scenarios, I use time-based versioning with short TTL + stale-while-
+   revalidate for smooth deploys.

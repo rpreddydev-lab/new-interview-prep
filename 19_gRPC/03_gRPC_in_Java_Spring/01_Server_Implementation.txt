@@ -1,0 +1,373 @@
+================================================================
+gRPC SERVER IMPLEMENTATION IN SPRING BOOT
+================================================================
+
+----------------------------------------------------------------
+1. SERVICE IMPLEMENTATION BASICS
+----------------------------------------------------------------
+
+Generated base class pattern:
+  protoc generates: OrderServiceGrpc.OrderServiceImplBase
+  Your class extends it and overrides the RPC methods.
+
+@GrpcService
+public class OrderServiceImpl extends OrderServiceGrpc.OrderServiceImplBase {
+  // Override the methods from OrderServiceImplBase
+}
+
+OrderServiceImplBase default implementations:
+  - Return Status.UNIMPLEMENTED for every method
+  - Calling super.createOrder(...) returns UNIMPLEMENTED to client
+
+The @GrpcService annotation:
+  - Marks the class as a Spring bean
+  - Registers it with the Netty gRPC server automatically
+  - Supports interceptors: @GrpcService(interceptors = {...})
+
+----------------------------------------------------------------
+2. COMPLETE SERVER IMPLEMENTATION EXAMPLE
+----------------------------------------------------------------
+
+Proto file (abbreviated):
+  service OrderService {
+    rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse);
+    rpc ListOrders(ListOrdersRequest)   returns (stream Order);
+    rpc WatchOrder(WatchOrderRequest)   returns (stream OrderEvent);
+  }
+
+// ── UNARY METHOD ──────────────────────────────────────────────
+
+@GrpcService
+@Slf4j
+public class OrderServiceImpl extends OrderServiceGrpc.OrderServiceImplBase {
+  
+  private final OrderRepository orderRepository;
+  private final InventoryClient inventoryClient;
+  
+  public OrderServiceImpl(OrderRepository orderRepository,
+                          InventoryClient inventoryClient) {
+    this.orderRepository = orderRepository;
+    this.inventoryClient = inventoryClient;
+  }
+  
+  // ── UNARY RPC ─────────────────────────────────────────────
+
+  @Override
+  public void createOrder(CreateOrderRequest request,
+                          StreamObserver<CreateOrderResponse> responseObserver) {
+    
+    log.info("Creating order for customer: {}", request.getCustomerId());
+    
+    try {
+      // 1. Validate input
+      validateCreateOrderRequest(request);
+      
+      // 2. Check inventory (calls another gRPC service)
+      boolean available = inventoryClient.checkAvailability(
+          request.getProductId(), request.getQuantity());
+      
+      if (!available) {
+        responseObserver.onError(
+            Status.FAILED_PRECONDITION
+                .withDescription("Product " + request.getProductId() + " not available")
+                .asRuntimeException());
+        return;
+      }
+      
+      // 3. Create the order
+      Order order = orderRepository.create(
+          request.getCustomerId(),
+          request.getProductId(),
+          request.getQuantity());
+      
+      // 4. Send response
+      responseObserver.onNext(CreateOrderResponse.newBuilder()
+          .setOrderId(order.getId())
+          .setStatus("CREATED")
+          .setCreatedAt(Timestamps.fromDate(order.getCreatedAt()))
+          .build());
+      
+      responseObserver.onCompleted();
+      
+    } catch (ValidationException e) {
+      // Translate application exceptions to gRPC status
+      responseObserver.onError(
+          Status.INVALID_ARGUMENT
+              .withDescription(e.getMessage())
+              .asRuntimeException());
+    } catch (Exception e) {
+      log.error("Unexpected error creating order", e);
+      responseObserver.onError(
+          Status.INTERNAL
+              .withDescription("Internal server error")
+              .withCause(e)
+              .asRuntimeException());
+    }
+  }
+  
+  // ── SERVER STREAMING RPC ──────────────────────────────────
+
+  @Override
+  public void listOrders(ListOrdersRequest request,
+                         StreamObserver<Order> responseObserver) {
+    
+    try {
+      // Use ServerCallStreamObserver for cancellation detection
+      ServerCallStreamObserver<Order> serverObserver =
+          (ServerCallStreamObserver<Order>) responseObserver;
+      
+      serverObserver.setOnCancelHandler(() ->
+          log.info("Client cancelled listOrders for customer: {}",
+              request.getCustomerId()));
+      
+      // Stream orders from database
+      try (Stream<OrderEntity> orderStream =
+               orderRepository.streamByCustomerId(request.getCustomerId())) {
+        
+        orderStream.forEach(entity -> {
+          if (serverObserver.isCancelled()) return;  // check before each item
+          
+          serverObserver.onNext(toProto(entity));
+        });
+      }
+      
+      serverObserver.onCompleted();
+      
+    } catch (Exception e) {
+      responseObserver.onError(
+          Status.INTERNAL.withDescription("Failed to list orders").asException());
+    }
+  }
+  
+  // ── VALIDATION HELPER ─────────────────────────────────────
+
+  private void validateCreateOrderRequest(CreateOrderRequest request) {
+    if (request.getCustomerId().isBlank()) {
+      throw new ValidationException("customer_id is required");
+    }
+    if (request.getProductId().isBlank()) {
+      throw new ValidationException("product_id is required");
+    }
+    if (request.getQuantity() <= 0) {
+      throw new ValidationException("quantity must be positive");
+    }
+  }
+  
+  private Order toProto(OrderEntity entity) {
+    return Order.newBuilder()
+        .setOrderId(entity.getId())
+        .setCustomerId(entity.getCustomerId())
+        .setProductId(entity.getProductId())
+        .setQuantity(entity.getQuantity())
+        .setStatus(entity.getStatus().name())
+        .build();
+  }
+}
+
+----------------------------------------------------------------
+3. REGISTERING SERVICE-LEVEL INTERCEPTORS
+----------------------------------------------------------------
+
+Method 1: Per-service interceptors in @GrpcService
+  @GrpcService(interceptors = {AuthInterceptor.class, LoggingInterceptor.class})
+  public class OrderServiceImpl extends OrderServiceGrpc.OrderServiceImplBase { ... }
+
+Method 2: Global interceptors (apply to all services)
+  @GrpcGlobalServerInterceptor
+  public class MetricsInterceptor implements ServerInterceptor { ... }
+
+Method 3: Interceptors with ordering
+  @GrpcGlobalServerInterceptor
+  @Order(10)  // lower number = executed first on the way in
+  public class AuthInterceptor implements ServerInterceptor { ... }
+  
+  @GrpcGlobalServerInterceptor
+  @Order(20)
+  public class LoggingInterceptor implements ServerInterceptor { ... }
+
+Interceptor execution order (LIFO for request):
+  Client Request
+    → LoggingInterceptor (in)
+    → AuthInterceptor (in)
+    → Service method
+    ← AuthInterceptor (out)
+    ← LoggingInterceptor (out)
+  Client Response
+
+----------------------------------------------------------------
+4. ACCESSING gRPC METADATA (HEADERS) IN SERVICE
+----------------------------------------------------------------
+
+Server implementations cannot directly access headers via method
+parameters. Use the interceptor + Context pattern:
+
+// 1. Define a context key
+public class GrpcContextKeys {
+  public static final Context.Key<String> TENANT_ID =
+      Context.key("tenant-id");
+  public static final Context.Key<String> USER_ID =
+      Context.key("user-id");
+}
+
+// 2. Populate it in an interceptor
+@GrpcGlobalServerInterceptor
+public class TenantInterceptor implements ServerInterceptor {
+  
+  static final Metadata.Key<String> TENANT_HEADER =
+      Metadata.Key.of("x-tenant-id", Metadata.ASCII_STRING_MARSHALLER);
+  
+  @Override
+  public <Req, Resp> ServerCall.Listener<Req> interceptCall(
+      ServerCall<Req, Resp> call, Metadata headers, ServerCallHandler<Req, Resp> next) {
+    
+    String tenantId = headers.get(TENANT_HEADER);
+    Context ctx = Context.current()
+        .withValue(GrpcContextKeys.TENANT_ID, tenantId != null ? tenantId : "default");
+    
+    return Contexts.interceptCall(ctx, call, headers, next);
+  }
+}
+
+// 3. Access in service method
+@GrpcService
+public class OrderServiceImpl extends OrderServiceGrpc.OrderServiceImplBase {
+  
+  @Override
+  public void createOrder(CreateOrderRequest request,
+                          StreamObserver<CreateOrderResponse> responseObserver) {
+    
+    String tenantId = GrpcContextKeys.TENANT_ID.get();  // from Context
+    // ... use tenantId in your logic
+  }
+}
+
+----------------------------------------------------------------
+5. SENDING RESPONSE METADATA (TRAILERS)
+----------------------------------------------------------------
+
+To send back metadata with the response:
+
+@Override
+public void createOrder(CreateOrderRequest request,
+                        StreamObserver<CreateOrderResponse> responseObserver) {
+  
+  // Cast to ServerCallStreamObserver to access header/trailer sending
+  if (responseObserver instanceof ServerCallStreamObserver<CreateOrderResponse> serverObserver) {
+    Metadata trailers = new Metadata();
+    trailers.put(
+        Metadata.Key.of("x-request-id", Metadata.ASCII_STRING_MARSHALLER),
+        UUID.randomUUID().toString());
+    serverObserver.sendHeaders(new Metadata()); // send empty initial headers
+  }
+  
+  // NOTE: trailers are sent as part of onCompleted() via StatusProto
+  // Use StatusProto.toStatusRuntimeException() to embed error details
+}
+
+----------------------------------------------------------------
+6. GRACEFUL SHUTDOWN
+----------------------------------------------------------------
+
+grpc-spring-boot-starter handles shutdown via SmartLifecycle.
+But you can customize the shutdown timeout:
+
+grpc:
+  server:
+    shutdown-grace-period: 30s  # wait up to 30s for in-flight RPCs
+
+Manual shutdown (programmatic):
+  @Autowired
+  private GrpcServerLifecycle grpcServerLifecycle;
+  
+  public void triggerGracefulShutdown() {
+    grpcServerLifecycle.stop();  // calls server.shutdown()
+  }
+
+For long-running streaming RPCs, the server calls onCancelHandler
+or the client sees DEADLINE_EXCEEDED when the deadline expires.
+During shutdown, in-flight RPCs receive a CANCELLED status.
+
+----------------------------------------------------------------
+7. SERVER REFLECTION
+----------------------------------------------------------------
+
+Enabling reflection (allows grpcurl to introspect without .proto files):
+
+grpc:
+  server:
+    reflection:
+      enabled: true
+
+Or add ProtoReflectionService programmatically:
+  @Bean
+  public GrpcServerConfigurer reflectionConfigurer() {
+    return builder -> builder.addService(ProtoReflectionService.newInstance());
+  }
+
+Using grpcurl with reflection:
+  # List all services
+  grpcurl -plaintext localhost:9090 list
+  
+  # Describe a service
+  grpcurl -plaintext localhost:9090 describe com.example.OrderService
+  
+  # Call a method
+  grpcurl -plaintext -d '{"customer_id":"c1","product_id":"p1","quantity":2}' \
+    localhost:9090 com.example.OrderService/CreateOrder
+
+----------------------------------------------------------------
+8. CUSTOM SERVER BUILDER CONFIGURATION
+----------------------------------------------------------------
+
+For advanced Netty configuration use GrpcServerConfigurer:
+
+@Bean
+public GrpcServerConfigurer serverConfigurer() {
+  return builder -> {
+    if (builder instanceof NettyServerBuilder nettyBuilder) {
+      nettyBuilder
+          .maxConnectionIdle(60, TimeUnit.SECONDS)
+          .maxConnectionAge(300, TimeUnit.SECONDS)
+          .maxConnectionAgeGrace(60, TimeUnit.SECONDS)
+          .maxInboundMessageSize(16 * 1024 * 1024) // 16MB
+          .executor(Executors.newFixedThreadPool(50));
+    }
+  };
+}
+
+----------------------------------------------------------------
+9. INTERVIEW KEY POINTS
+----------------------------------------------------------------
+
+Q: How does @GrpcService register the service with the gRPC server?
+A: grpc-spring-boot-starter's autoconfiguration creates a
+   GrpcServerConfigurer that iterates all beans annotated with
+   @GrpcService and calls serverBuilder.addService(bindableService).
+   The bean implements BindableService (via the generated ImplBase),
+   so the framework can call bindService() to get the ServerServiceDefinition.
+
+Q: What is the difference between onError(t) and responseObserver.onError(Status)?
+A: onError(Throwable t) on a StreamObserver accepts a Throwable.
+   Calling responseObserver.onError(status.asException()) wraps the
+   Status in a StatusException first. When a StatusRuntimeException
+   or StatusException is passed to onError(), gRPC extracts the Status
+   and sends it to the client. If a non-gRPC exception is passed,
+   gRPC sends Status.UNKNOWN.
+
+Q: What happens if a gRPC service method throws an uncaught exception?
+A: The gRPC framework catches any unchecked exception from the service
+   method and returns Status.UNKNOWN to the client (with no description
+   by default). The exception is logged server-side. Best practice is
+   to always catch exceptions explicitly and translate them to
+   appropriate Status codes before calling responseObserver.onError().
+
+Q: How do you share state between requests in gRPC (like session data)?
+A: Per-request state goes through Context (populated by interceptors).
+   Application-wide state uses Spring beans (singletons). Per-connection
+   state (only relevant for streaming) can be instance variables in the
+   anonymous StreamObserver you return from the streaming method — those
+   are created fresh per RPC call.
+
+================================================================
+END OF FILE
+================================================================

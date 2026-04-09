@@ -1,0 +1,285 @@
+================================================================
+  SPRING SECURITY — JWT AUTHENTICATION
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. JWT OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+JWT = JSON Web Token (RFC 7519)
+A compact, URL-safe token format for transmitting claims.
+
+Structure: header.payload.signature (Base64Url encoded)
+
+Header:  { "alg": "HS256", "typ": "JWT" }
+Payload: {
+    "sub": "user123",          // subject (user ID)
+    "name": "Ray Gapu",
+    "roles": ["ROLE_USER"],
+    "iat": 1713456000,         // issued at (epoch seconds)
+    "exp": 1713459600,         // expiry
+    "jti": "uuid-unique-id"    // JWT ID (for revocation)
+}
+Signature: HMACSHA256(base64(header) + "." + base64(payload), secret)
+
+Types:
+  JWS = Signed JWT (most common — ensures integrity)
+  JWE = Encrypted JWT (ensures confidentiality)
+
+Algorithms:
+  HS256/384/512  → HMAC with SHA (symmetric — same key for sign + verify)
+  RS256/384/512  → RSA (asymmetric — private key signs, public key verifies)
+  ES256/384/512  → ECDSA (smaller key size, good for mobile)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. DEPENDENCY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-api</artifactId>
+    <version>0.12.3</version>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-impl</artifactId>
+    <version>0.12.3</version>
+    <scope>runtime</scope>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-jackson</artifactId>
+    <version>0.12.3</version>
+    <scope>runtime</scope>
+</dependency>
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. JwtService — TOKEN GENERATION AND VALIDATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Service
+public class JwtService {
+
+    @Value("${app.jwt.secret}")
+    private String jwtSecret;
+
+    @Value("${app.jwt.expiration-ms:86400000}")  // 24 hours
+    private long jwtExpirationMs;
+
+    private SecretKey getSigningKey() {
+        byte[] keyBytes = Decoders.BASE64.decode(jwtSecret);
+        return Keys.hmacShaKeyFor(keyBytes);
+    }
+
+    // Generate token
+    public String generateToken(UserDetails userDetails) {
+        return generateToken(new HashMap<>(), userDetails);
+    }
+
+    public String generateToken(Map<String, Object> extraClaims,
+                                 UserDetails userDetails) {
+        return Jwts.builder()
+            .claims(extraClaims)
+            .subject(userDetails.getUsername())
+            .issuedAt(new Date())
+            .expiration(new Date(System.currentTimeMillis() + jwtExpirationMs))
+            .id(UUID.randomUUID().toString())   // jti for revocation
+            .signWith(getSigningKey())
+            .compact();
+    }
+
+    // Extract claims
+    public String extractUsername(String token) {
+        return extractClaim(token, Claims::getSubject);
+    }
+
+    public Date extractExpiration(String token) {
+        return extractClaim(token, Claims::getExpiration);
+    }
+
+    public <T> T extractClaim(String token, Function<Claims, T> resolver) {
+        return resolver.apply(extractAllClaims(token));
+    }
+
+    private Claims extractAllClaims(String token) {
+        return Jwts.parser()
+            .verifyWith(getSigningKey())
+            .build()
+            .parseSignedClaims(token)
+            .getPayload();
+    }
+
+    // Validation
+    public boolean isTokenValid(String token, UserDetails userDetails) {
+        String username = extractUsername(token);
+        return username.equals(userDetails.getUsername()) && !isTokenExpired(token);
+    }
+
+    private boolean isTokenExpired(String token) {
+        return extractExpiration(token).before(new Date());
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. JWT AUTHENTICATION FILTER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Component
+@RequiredArgsConstructor
+public class JwtAuthFilter extends OncePerRequestFilter {
+
+    private final JwtService jwtService;
+    private final UserDetailsService userDetailsService;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain filterChain)
+            throws ServletException, IOException {
+
+        final String authHeader = request.getHeader(HttpHeaders.AUTHORIZATION);
+
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+
+        try {
+            String jwt = authHeader.substring(7);
+            String username = jwtService.extractUsername(jwt);
+
+            if (username != null &&
+                    SecurityContextHolder.getContext().getAuthentication() == null) {
+
+                UserDetails userDetails = userDetailsService.loadUserByUsername(username);
+
+                if (jwtService.isTokenValid(jwt, userDetails)) {
+                    UsernamePasswordAuthenticationToken authToken =
+                        new UsernamePasswordAuthenticationToken(
+                            userDetails, null, userDetails.getAuthorities());
+                    authToken.setDetails(
+                        new WebAuthenticationDetailsSource().buildDetails(request));
+                    SecurityContextHolder.getContext().setAuthentication(authToken);
+                }
+            }
+        } catch (ExpiredJwtException ex) {
+            response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+            response.getWriter().write("{\"error\":\"TOKEN_EXPIRED\"}");
+            return;
+        } catch (JwtException ex) {
+            response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+            response.getWriter().write("{\"error\":\"INVALID_TOKEN\"}");
+            return;
+        }
+
+        filterChain.doFilter(request, response);
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. SECURITY CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Bean
+public SecurityFilterChain filterChain(HttpSecurity http,
+                                        JwtAuthFilter jwtAuthFilter) throws Exception {
+    http
+        .csrf(csrf -> csrf.disable())
+        .cors(cors -> cors.configurationSource(corsConfigSource()))
+        .sessionManagement(s -> s.sessionCreationPolicy(STATELESS))
+        .authorizeHttpRequests(auth -> auth
+            .requestMatchers("/api/auth/**").permitAll()
+            .anyRequest().authenticated())
+        .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class)
+        .exceptionHandling(ex -> ex
+            .authenticationEntryPoint(
+                (req, res, e) -> {
+                    res.setStatus(401);
+                    res.getWriter().write("{\"error\":\"UNAUTHORIZED\"}");
+                })
+        );
+    return http.build();
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. REFRESH TOKEN PATTERN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Access Token:  Short-lived (15 min – 1 hour). Sent in every request.
+Refresh Token: Long-lived (7–30 days). Used ONLY to get new access tokens.
+
+  Login:
+    → Server issues both tokens
+    → Refresh token stored in DB (revocable) + HttpOnly cookie
+
+  Access Token expiry:
+    → Client sends refresh token to /api/auth/refresh
+    → Server validates refresh token, issues new access token
+    → Old refresh token is rotated (new one issued, old one invalidated)
+
+  Logout:
+    → Server deletes/blacklists the refresh token in DB
+    → Access token remains valid until expiry (stateless)
+    → To invalidate access token immediately → use short TTL or token blacklist
+
+@Entity
+public class RefreshToken {
+    @Id private String token;         // UUID
+    private String username;
+    private LocalDateTime expiresAt;
+    private boolean revoked;
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. JWT SECURITY BEST PRACTICES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ✅ Use strong secret (>= 256-bit) or RSA key pair
+  ✅ Short expiry on access token (15–60 minutes)
+  ✅ Include jti (JWT ID) for revocation support
+  ✅ Store refresh tokens in DB (enables server-side revocation)
+  ✅ Use HTTPS — tokens in headers can be intercepted over HTTP
+  ✅ Validate iss, aud, exp, nbf claims
+  ✅ Rotate refresh tokens on each use
+  ❌ Do not store sensitive data in JWT payload (it is Base64 encoded, not encrypted)
+  ❌ Do not store JWT in localStorage (XSS vulnerable) — use HttpOnly cookies
+  ❌ Do not use alg:none (signature bypass vulnerability)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What are the three parts of a JWT?
+A: Header (algorithm + token type), Payload (claims — subject, expiry,
+   roles, custom data), Signature (HMAC or RSA of header+payload).
+   All parts are Base64Url encoded and separated by dots.
+
+Q: What is the difference between HS256 and RS256?
+A: HS256 is symmetric — the same secret key is used to sign and verify.
+   Good for single-service systems. RS256 is asymmetric — private key
+   signs, public key verifies. Preferred in microservices where multiple
+   services verify tokens but only the auth service signs them.
+
+Q: Why is JWT considered stateless?
+A: The server does not need to store session state. All information
+   needed to authenticate the user is encoded in the token itself
+   (subject, roles, expiry). Any service that has the public key or
+   shared secret can independently verify the token.
+
+Q: How do you invalidate a JWT before it expires?
+A: Options: (1) Token blacklist stored in Redis — check jti on each
+   request. (2) Refresh token rotation with server-side storage.
+   (3) Use very short-lived access tokens. Pure JWT cannot be revoked
+   without server-side state.
+
+Q: Why should JWT not be stored in localStorage?
+A: localStorage is accessible to JavaScript, making it vulnerable to
+   XSS attacks. An attacker injecting JavaScript can steal the token.
+   HttpOnly cookies are not accessible to JavaScript and provide
+   better protection against XSS (though they are then CSRF-vulnerable
+   — mitigate with SameSite=Strict/Lax cookie attribute).
+
+Q: What is the purpose of the jti (JWT ID) claim?
+A: jti is a unique identifier for the JWT. It enables token revocation
+   by storing used/blacklisted jti values in a fast store (Redis).
+   During validation, check that the jti hasn't been revoked.

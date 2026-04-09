@@ -1,0 +1,295 @@
+================================================================================
+DISTRIBUTED LOCKS WITH REDISSON — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. WHY DISTRIBUTED LOCKS?
+───────────────────────────
+  In distributed systems, multiple service instances may try to perform the
+  same operation concurrently. Local Java locks (synchronized, ReentrantLock)
+  don't work across JVMs.
+
+  Solution: use a shared external store (Redis) as a locking mechanism.
+
+  Use cases:
+    - Prevent double-processing of a task (cron job on multiple instances)
+    - Inventory reservation (prevent oversell)
+    - Leader election
+    - Rate limiting with precise coordination
+    - One-at-a-time resource access (e.g., write to external API)
+
+
+2. NAIVE IMPLEMENTATION (AND WHY IT FAILS)
+────────────────────────────────────────────
+  SET lock:resource <token> NX EX 30   → lock
+  DEL lock:resource                    → unlock
+
+  Problem 1 — Non-atomic release:
+    Check: GET lock:resource → is it my token?
+    Between GET and DEL, another client may have acquired the lock.
+    → DELETE the wrong client's lock!
+    Fix: use Lua script for atomic check-and-delete.
+
+  Problem 2 — No automatic renewal:
+    If process pauses (GC, network) longer than TTL:
+    → Lock expires, another client acquires it
+    → Two processes hold the lock simultaneously!
+
+  Problem 3 — No blocking/waiting:
+    Naive implementation returns "lock failed" immediately.
+    No mechanism to wait until the lock is available.
+
+  Problem 4 — No reentrance:
+    Same thread calling lock() twice → deadlock.
+
+
+3. REDISSON — PRODUCTION-GRADE DISTRIBUTED LOCK
+──────────────────────────────────────────────────
+  Redisson is a Redis client for Java that provides high-level distributed objects:
+  - Distributed locks (RLock, RReadWriteLock, RFairLock)
+  - Distributed collections (RMap, RSet, RList, RQueue)
+  - Distributed atomic counters (RAtomicLong, RAtomicDouble)
+  - Pub/Sub, Semaphores, CountDownLatch
+
+  Redisson solves ALL naive lock problems:
+    ✓ Atomic acquire + set TTL (Lua internally)
+    ✓ Watchdog: auto-renews lock TTL every 1/3 of leaseTime
+    ✓ Blocking tryLock with timeout
+    ✓ Reentrant: same thread can lock multiple times
+
+
+4. REDISSON SETUP
+──────────────────
+  <dependency>
+    <groupId>org.redisson</groupId>
+    <artifactId>redisson-spring-boot-starter</artifactId>
+    <version>3.24.3</version>
+  </dependency>
+
+  application.yml (uses Spring Redis config automatically):
+    spring:
+      redis:
+        host: localhost
+        port: 6379
+
+  Or explicit Redisson config bean:
+    @Bean
+    public RedissonClient redissonClient() {
+        Config config = new Config();
+        config.useSingleServer()
+              .setAddress("redis://localhost:6379")
+              .setPassword("secret");
+        return Redisson.create(config);
+    }
+
+  Sentinel:
+    config.useSentinelServers()
+          .setMasterName("mymaster")
+          .addSentinelAddress("redis://s1:26379", "redis://s2:26379", "redis://s3:26379");
+
+  Cluster:
+    config.useClusterServers()
+          .addNodeAddress("redis://n1:6379", "redis://n2:6379", "redis://n3:6379");
+
+
+5. RLOCK — BASIC DISTRIBUTED LOCK
+────────────────────────────────────
+  @Autowired RedissonClient redissonClient;
+
+  RLock lock = redissonClient.getLock("lock:inventory:" + itemId);
+
+  // Method 1: lock with leaseTime (no watchdog; lock expires after 30s)
+  lock.lock(30, TimeUnit.SECONDS);
+  try {
+      // critical section
+  } finally {
+      lock.unlock();
+  }
+
+  // Method 2: lock without leaseTime (watchdog renews automatically)
+  lock.lock();  // default leaseTime = 30s, watchdog renews every 10s
+  try {
+      // critical section
+  } finally {
+      if (lock.isHeldByCurrentThread()) {
+          lock.unlock();
+      }
+  }
+
+  // Method 3: tryLock with wait + lease
+  boolean acquired = lock.tryLock(5, 30, TimeUnit.SECONDS);
+  // waitTime=5s (max time to wait), leaseTime=30s (auto-expire)
+  if (acquired) {
+      try {
+          // critical section
+      } finally {
+          lock.unlock();
+      }
+  } else {
+      // couldn't acquire lock in 5 seconds
+      throw new LockAcquisitionException("Could not acquire lock");
+  }
+
+
+6. WATCHDOG MECHANISM
+───────────────────────
+  When you call lock.lock() WITHOUT a leaseTime:
+    Redisson acquires lock with default TTL (30s).
+    Watchdog thread starts in background.
+    Every 10 seconds (leaseTime/3): watchdog calls PEXPIRE to renew TTL.
+    On lock.unlock(): watchdog stops, lock deleted.
+    If JVM crashes: watchdog dies, TTL expires → lock auto-released. ✓
+
+  When you call lock.lock(30, TimeUnit.SECONDS) WITH leaseTime:
+    No watchdog. Lock expires in exactly 30s.
+    If process takes longer: lock expires + another client may acquire.
+    Use leaseTime only when you know exact max execution time.
+
+  Watchdog configuration:
+    Config config = new Config();
+    config.setLockWatchdogTimeout(30000);  // 30s watchdog timeout (default)
+
+
+7. REENTRANT LOCK
+──────────────────
+  Same thread can acquire the lock multiple times.
+  Each lock() increments a counter. Each unlock() decrements.
+  Lock truly released when counter reaches 0.
+
+  RLock lock = redissonClient.getLock("lock:resource");
+  lock.lock();  // counter = 1
+  lock.lock();  // counter = 2 (same thread, reentrant)
+  lock.unlock(); // counter = 1
+  lock.unlock(); // counter = 0 → lock released
+
+
+8. READ-WRITE LOCK
+───────────────────
+  Multiple readers can hold the lock simultaneously.
+  Only one writer can hold it, and no readers can hold it during write.
+
+  RReadWriteLock rwLock = redissonClient.getReadWriteLock("lock:data:42");
+
+  // Read lock (multiple threads can hold concurrently)
+  RLock readLock = rwLock.readLock();
+  readLock.lock();
+  try {
+      // read data
+  } finally {
+      readLock.unlock();
+  }
+
+  // Write lock (exclusive)
+  RLock writeLock = rwLock.writeLock();
+  writeLock.lock();
+  try {
+      // write data
+  } finally {
+      writeLock.unlock();
+  }
+
+
+9. FAIR LOCK
+─────────────
+  Guarantees locks are acquired in request order (FIFO).
+  Prevents starvation of waiting threads.
+
+  RLock fairLock = redissonClient.getFairLock("lock:fair:resource");
+  fairLock.lock();
+  try {
+      // critical section
+  } finally {
+      fairLock.unlock();
+  }
+
+
+10. REDLOCK ALGORITHM
+───────────────────────
+  Problem with single Redis: if Redis node fails, lock is lost.
+  Algorithm for higher reliability with N independent Redis nodes.
+
+  RedLock (Redis recommendation, but debated):
+    1. Get current time T1.
+    2. Try to acquire lock on all N Redis nodes with TTL.
+    3. Lock is considered acquired if: majority (N/2+1) of nodes granted it
+       AND total acquisition time < TTL.
+    4. Effective TTL = TTL - (T2 - T1) - clock drift
+    5. Release by deleting lock from ALL nodes.
+
+  Redisson implementation:
+    RedissonRedLock lock = new RedissonRedLock(lock1, lock2, lock3);
+    lock.lock();
+    try { ... } finally { lock.unlock(); }
+
+  Controversy (Martin Kleppmann critique):
+    RedLock doesn't handle: process pauses (GC) + clock drift correctly.
+    For critical distributed coordination: ZooKeeper or etcd is safer.
+    For most use cases: single Redis node with watchdog is sufficient.
+
+
+11. COMMON PATTERNS
+────────────────────
+  11a. Inventory Reservation (prevent oversell):
+    RLock lock = redissonClient.getLock("lock:inventory:" + itemId);
+    if (lock.tryLock(100, 5000, TimeUnit.MILLISECONDS)) {
+        try {
+            int stock = getStock(itemId);
+            if (stock > 0) {
+                reserveStock(itemId, quantity);
+                return true;
+            }
+            return false;
+        } finally {
+            lock.unlock();
+        }
+    }
+    throw new StockReservationException("Failed to acquire lock");
+
+  11b. Idempotent Task (prevent duplicate execution):
+    String lockKey = "task:" + taskId;
+    RLock lock = redissonClient.getLock(lockKey);
+    if (lock.tryLock(0, 30, TimeUnit.SECONDS)) {  // 0 = non-blocking
+        try {
+            processTask(taskId);
+        } finally {
+            lock.unlock();
+        }
+    } else {
+        log.info("Task {} already being processed", taskId);
+    }
+
+
+12. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: What are the problems with a simple SET NX EX distributed lock?
+  A: Three main problems:
+     (1) Non-atomic release: check-value + delete is not atomic → race condition.
+         Fix with Lua script.
+     (2) Lock expiry while held: if the process pauses (GC stop-the-world) longer
+         than TTL, the lock expires and another process can acquire it.
+         Fix with Redisson's watchdog (auto-renewal).
+     (3) Non-reentrant: the same thread calling lock twice will deadlock.
+         Fix with a reentrant implementation that tracks call count.
+
+  Q: How does Redisson's watchdog work?
+  A: When you call lock.lock() without a leaseTime, Redisson acquires the lock
+     with a 30-second TTL and starts a background watchdog thread. Every 10
+     seconds (1/3 of leaseTime), the watchdog calls PEXPIRE to extend the TTL.
+     This ensures the lock stays alive as long as the JVM is running. When
+     unlock() is called, the watchdog stops. If the JVM crashes, the watchdog
+     dies and the TTL expires naturally, releasing the lock.
+
+  Q: When would you NOT use Redisson distributed locks?
+  A: For safety-critical distributed coordination (financial transactions,
+     distributed consensus), where split-brain or clock drift could cause two
+     processes to hold the lock simultaneously. In those cases, use ZooKeeper,
+     etcd, or a database-based lock with row-level locking. Redis locks are
+     appropriate for advisory locks where occasional duplicate execution is
+     acceptable or can be handled idempotently.
+
+  Q: What is the difference between RLock, RFairLock, and RReadWriteLock?
+  A: RLock: standard reentrant lock, no ordering guarantee for waiting threads.
+     RFairLock: FIFO ordering — threads acquire in request order, preventing starvation.
+     RReadWriteLock: allows multiple concurrent readers OR one exclusive writer,
+     useful for read-heavy resources where you want concurrent reads but exclusive writes.
+
+================================================================================

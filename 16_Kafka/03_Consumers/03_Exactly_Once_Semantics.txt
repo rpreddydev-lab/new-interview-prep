@@ -1,0 +1,244 @@
+================================================================================
+  KAFKA EXACTLY ONCE SEMANTICS (EOS)
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. DELIVERY SEMANTICS OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+AT-MOST-ONCE:
+  - Messages may be lost, never duplicated
+  - Producer: acks=0 (fire-and-forget)
+  - Consumer: auto-commit before processing
+  - Acceptable for: metrics, analytics, low-priority logging
+  - Producer fails → message gone; consumer crashes after commit → message skipped
+
+AT-LEAST-ONCE:
+  - Messages are never lost, but may be duplicated
+  - Producer: acks=all + retries > 0
+  - Consumer: manual commit AFTER processing
+  - If producer retries after broker ack lost in transit → duplicate written
+  - If consumer crashes after processing but before commit → reprocesses on restart
+  - Most common pattern; handle duplicates with idempotent processing
+
+EXACTLY-ONCE:
+  - Messages delivered and processed exactly once — no loss, no duplicates
+  - Requires: idempotent producer + Kafka transactions + read_committed consumer
+  - OR: application-level exactly-once via external transactional store
+  - Higher latency, lower throughput; use only when correctness is critical
+
+  ┌─────────────────┬──────────────┬─────────────┬───────────────────────────────┐
+  │ Semantic        │ Loss?        │ Duplicates? │ Use Case                      │
+  ├─────────────────┼──────────────┼─────────────┼───────────────────────────────┤
+  │ At-most-once    │ Possible     │ Never       │ Metrics, low-priority events  │
+  │ At-least-once   │ Never        │ Possible    │ Most business events          │
+  │ Exactly-once    │ Never        │ Never       │ Financial, billing, inventory │
+  └─────────────────┴──────────────┴─────────────┴───────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. IDEMPOTENT PRODUCER (SINGLE-PRODUCER EOS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The idempotent producer ensures no duplicate within a single session,
+even if the network drops the ack and the producer retries.
+
+Mechanism:
+  - Broker assigns a Producer ID (PID) per producer session
+  - Producer assigns a monotonically increasing Sequence Number per partition
+  - Broker deduplicates: if (PID, partition, seqNum) already seen → discard the retry
+  - Guarantees exactly-once delivery per partition per producer session
+  - Scope: within ONE producer instance, one Kafka cluster, one session
+
+Config:
+  enable.idempotence=true           → auto-sets acks=all, retries=MAX_INT, max.in.flight=5
+
+Limitations:
+  - Does NOT span broker restarts (PID is ephemeral)
+  - Does NOT cover multiple producers writing to same topic
+  - Does NOT address consumer-side duplicates
+  - Does NOT span multiple partitions atomically (use transactions for that)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. KAFKA TRANSACTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Kafka transactions extend idempotence to span:
+  - Multiple partitions (write to partitions A and B atomically)
+  - Multiple topics
+  - Consumer offset commits (tie offset commit to the write atomically)
+
+A transaction is an atomic batch of writes across partitions.
+Either ALL succeed (committed) or ALL are invisible to read_committed consumers (aborted).
+
+Transaction Coordinator:
+  - A special Kafka broker (manages __transaction_state topic)
+  - Determined by: partition = abs(hash(transactional.id)) % 50
+  - Persists transaction state: ongoing / prepare_commit / prepare_abort / complete
+
+Enabling transactions:
+  props.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "order-processor-1");
+  props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true); // auto-set
+
+  KafkaProducer<String, String> producer = new KafkaProducer<>(props);
+  producer.initTransactions(); // registers with transaction coordinator
+
+Transaction flow:
+  producer.beginTransaction();
+  try {
+    producer.send(new ProducerRecord<>("output-topic", key, value));
+    producer.send(new ProducerRecord<>("audit-topic", key, auditValue));
+    producer.commitTransaction(); // all writes visible atomically
+  } catch (Exception e) {
+    producer.abortTransaction();  // all writes discarded
+    throw e;
+  }
+
+What commitTransaction() does internally:
+  1. Producer flushes all pending records to brokers
+  2. Producer sends EndTransaction(commit=true) to transaction coordinator
+  3. Transaction coordinator writes PREPARE_COMMIT to __transaction_state
+  4. Transaction coordinator sends WriteTxnMarker to each partition leader
+     → adds a COMMIT marker record to each partition's log
+  5. Transaction coordinator writes COMPLETE_COMMIT
+  6. Committed records are now visible to read_committed consumers
+
+What abortTransaction() does:
+  Same flow but with ABORT markers → records hidden from read_committed consumers
+  (records are physically written but ignored until the ABORT marker arrives)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. READ-PROCESS-WRITE (EXACTLY-ONCE PIPELINE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Classic pattern: read from topic A, process, write to topic B, commit offset — atomically.
+This is how Kafka Streams achieves EOS internally.
+
+Without EOS:
+  1. Read records from orders-topic (offsets 100-199)
+  2. Write results to processed-orders-topic
+  3. Crash here (before committing offset!)
+  4. Restart → re-read offsets 100-199 → write duplicates to processed-orders-topic
+
+With EOS using sendOffsetsToTransaction:
+  consumer.poll(Duration.ofMillis(100));
+  
+  producer.beginTransaction();
+  try {
+    for (ConsumerRecord<String, String> record : records) {
+      String result = process(record.value());
+      producer.send(new ProducerRecord<>("processed-orders", record.key(), result));
+    }
+    
+    // Include the consumer offset commit INSIDE the transaction
+    Map<TopicPartition, OffsetAndMetadata> offsets = getOffsets(records);
+    producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());
+    
+    producer.commitTransaction(); // atomic: writes + offset commit
+  } catch (Exception e) {
+    producer.abortTransaction(); // rolls back writes AND offset advance
+    // consumer will re-read from last committed offset
+  }
+
+How sendOffsetsToTransaction works:
+  - Sends the offset map to the GROUP COORDINATOR via the TRANSACTION COORDINATOR
+  - Offset is NOT visible to offset queries until the transaction commits
+  - If transaction aborts → offset NOT advanced → consumer re-reads those records
+  - If transaction commits → offset advanced → records processed exactly once
+
+Requirement on the consumer side:
+  props.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. isolation.level (Consumer Side)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  isolation.level=read_uncommitted (default):
+    - Reads all records including those in open/aborted transactions
+    - Higher throughput (no need to track transaction state)
+    - Can see "dirty" records that may be aborted later
+    - Use for: non-transactional consumers, eventually-consistent use cases
+
+  isolation.level=read_committed:
+    - Only returns records that are part of a COMMITTED transaction
+    - Or records written WITHOUT a transaction (non-transactional producers)
+    - Consumer's Last Stable Offset (LSO) cannot advance past an open transaction
+      → If a transaction is open for a long time, LAG will appear even if the
+         consumer is caught up — watch for false lag alerts!
+    - Use for: EOS pipelines, financial systems
+
+  LSO vs HW:
+    - High Watermark (HW): highest offset fully replicated across ISR
+    - Last Stable Offset (LSO): highest offset where no open transaction exists
+    - For read_committed consumers: Kafka delivers up to LSO (not HW)
+    - Stalled transactions → LSO stalls → consumer can't advance
+    - transaction.timeout.ms (default: 60s) auto-aborts stalled transactions
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. KAFKA STREAMS EOS (exactly-once-v2)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Kafka Streams wraps the read-process-write pattern automatically.
+
+  props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, StreamsConfig.EXACTLY_ONCE_V2);
+
+exactly-once-v2 (Kafka 2.5+):
+  - Each Streams task has its own transactional producer (no producer sharing)
+  - Uses the new producer epoch fencing to prevent zombie producers
+    (old Streams instance that crashed continues sending → epoch prevents commits)
+  - Faster than the original exactly-once (which shared a producer per Streams thread)
+  - Overhead: ~20-30% throughput reduction compared to at-least-once
+
+How Kafka Streams EOS works internally:
+  1. Each task reads records from input partition
+  2. Processes them through the topology
+  3. Wraps output writes + input offset commit in a single transaction
+  4. Commits atomically → exactly once end-to-end
+
+Zombie fencing:
+  - Problem: a Streams instance crashes but its producer continues sending (zombie)
+  - Solution: when new producer initializes with same transactional.id,
+    it increments the producer EPOCH
+  - Broker rejects writes from old epoch (ProducerFencedException)
+  - Only ONE producer per transactional.id can write at any time
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the difference between idempotent producer and transactional producer?
+A: An idempotent producer eliminates duplicate writes for a SINGLE producer to a
+   SINGLE partition — retries don't create duplicates. A transactional producer
+   extends this to atomically span MULTIPLE partitions/topics. It also lets you
+   include consumer offset commits inside the transaction (sendOffsetsToTransaction),
+   making the full read-process-write cycle atomic. Transactions require
+   transactional.id config and initTransactions() call.
+
+Q: What is sendOffsetsToTransaction and why is it key to exactly-once?
+A: It ties a consumer's offset commit to an ongoing producer transaction.
+   If the transaction commits → the processed messages are visible AND the offsets
+   advance atomically. If the transaction aborts → the output messages are hidden
+   AND the offsets do NOT advance, so the consumer will re-read the same records.
+   This makes the read-process-write cycle truly atomic.
+
+Q: What is the Last Stable Offset (LSO) and how does it affect consumers?
+A: LSO is the highest offset with no open (uncommitted/unaborted) transaction above it.
+   A read_committed consumer can only receive records up to the LSO. If a producer
+   starts a transaction and takes a long time to commit or abort, the LSO stalls,
+   causing consumer lag even though data exists beyond LSO. transaction.timeout.ms
+   auto-aborts lingering open transactions.
+
+Q: What is zombie fencing in Kafka transactions?
+A: Zombie fencing prevents a crashed and restarted producer from having a stale
+   "zombie" instance also writing. When a new transactional producer initializes
+   with the same transactional.id, the transaction coordinator increments the
+   epoch. Brokers reject writes from the old epoch (ProducerFencedException).
+   This ensures only one active producer per transactional.id at any time.
+
+Q: How does exactly-once-v2 differ from exactly-once in Kafka Streams?
+A: The original exactly-once (Kafka 2.0) shared transactional producers across
+   tasks within a Streams thread, leading to performance bottlenecks and complex
+   fencing. exactly-once-v2 (Kafka 2.5+) assigns one producer per Streams task
+   and uses the new producer epoch fencing mechanism for zombie protection. It
+   achieves stronger isolation with simpler semantics and roughly 20-30% lower
+   overhead vs the original EOS implementation.

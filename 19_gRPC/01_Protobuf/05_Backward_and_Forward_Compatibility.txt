@@ -1,0 +1,406 @@
+================================================================
+BACKWARD AND FORWARD COMPATIBILITY IN PROTOBUF
+================================================================
+
+----------------------------------------------------------------
+1. WHY COMPATIBILITY MATTERS
+----------------------------------------------------------------
+
+In distributed systems, you CANNOT update all services simultaneously.
+During rolling deployments:
+  - New server version deployed on some nodes
+  - Old server version still running on other nodes
+  - Clients of different versions sending requests
+
+Compatibility requirements:
+  - Backward compatibility: New code can read old data
+    (New server can handle messages sent by old client)
+  - Forward compatibility: Old code can read new data
+    (Old server can handle messages sent by new client)
+
+Real scenario:
+  Week 1: OrderService v1 deployed (fields: order_id, status)
+  Week 2: Client starts sending order_id, status, priority (new field)
+  Week 3: OrderService v1 still receiving messages with "priority"
+          → Must handle gracefully (not crash!)
+
+----------------------------------------------------------------
+2. THE GOLDEN RULES OF PROTOBUF COMPATIBILITY
+----------------------------------------------------------------
+
+SAFE CHANGES (backward + forward compatible):
+  ✅ Add a new field with a new field number
+  ✅ Delete an optional field (mark it reserved!)
+  ✅ Add a new enum value
+  ✅ Add a new RPC method to a service
+  ✅ Change a field name (name is NOT on the wire, only field number)
+  ✅ Change a singular field to repeated (reader treats it as list with 1 element if singular received)
+
+UNSAFE CHANGES (BREAKING):
+  ❌ Change a field number
+  ❌ Change a field type (int32 → string, string → message)
+  ❌ Remove a field without marking it reserved (allow number reuse)
+  ❌ Change proto2 optional → required (can never require what was optional)
+  ❌ Change the syntax from proto2 to proto3 (different defaults!)
+  ❌ Remove an RPC method (clients calling it get UNIMPLEMENTED error)
+  ❌ Change the package name or message name (affects JSON serialization, reflection)
+  ❌ Renumber enum values
+
+CONDITIONALLY SAFE:
+  ⚠️  Change int32 → int64 (wire compatible for positive values)
+  ⚠️  Change string → bytes (same wire type, language semantics differ)
+  ⚠️  Change repeated → singular (receiver takes last value)
+  ⚠️  Change singular → oneof (wire compatible if no other fields added to oneof)
+
+----------------------------------------------------------------
+3. FORWARD COMPATIBILITY IN PRACTICE
+----------------------------------------------------------------
+
+Scenario: Old client sends message with UNKNOWN fields to new server
+  - New server sees fields it doesn't have in its .proto
+  - Proto3 behavior: unknown fields are PRESERVED
+  - If server passes the message to another service, unknown fields survive
+
+Scenario: New client sends message with NEW fields to old server
+  - Old server parses message, encounters unknown field numbers
+  - Proto3 behavior: old server IGNORES unknown fields (doesn't crash)
+  - Old server processes known fields normally
+  - If old server re-serializes the message, unknown fields are kept
+
+Code example (Java) — showing unknown fields are preserved:
+  // Old Order message only has: order_id, status
+  // New Order message adds: priority
+  
+  // New client serializes:
+  Order newOrder = Order.newBuilder()
+      .setOrderId("ORD-001")
+      .setStatus(OrderStatus.ORDER_STATUS_PENDING)
+      .setPriority(5)  // new field, field number 10
+      .build();
+  byte[] bytes = newOrder.toByteArray();
+  
+  // Old server parses (doesn't know about "priority"):
+  OldOrder oldOrder = OldOrder.parseFrom(bytes);
+  // oldOrder.getOrderId() → "ORD-001" ✅
+  // oldOrder.getStatus() → PENDING ✅
+  // priority is in oldOrder.getUnknownFields() — preserved!
+  
+  // If old server re-serializes:
+  byte[] reSerialized = oldOrder.toByteArray();
+  // priority (field 10) is STILL in the bytes!
+  
+  // Another new service can parse and recover priority:
+  Order recovered = Order.parseFrom(reSerialized);
+  // recovered.getPriority() → 5 ✅
+
+----------------------------------------------------------------
+4. RESERVED KEYWORD (THE FIELD GRAVEYARD)
+----------------------------------------------------------------
+
+When you delete a field, ALWAYS reserve its number AND name:
+
+message Order {
+  string order_id    = 1;
+  string customer_id = 2;
+  // DELETED fields:
+  //   string legacy_status = 3;  (replaced by status enum)
+  //   bool   is_express    = 4;  (moved to delivery_options)
+  
+  OrderStatus status           = 5;
+  DeliveryOptions delivery     = 6;
+  
+  reserved 3, 4;                    // field numbers never to reuse
+  reserved "legacy_status", "is_express";  // field names never to reuse
+}
+
+What happens if you DON'T reserve and reuse field number 3?
+  - Old binary data: field 3 = "PENDING" (string)
+  - New code: field 3 = DeliveryAddress (message)
+  - Parsing new code with old data: misinterprets "PENDING" bytes as
+    a message → likely corrupt data or parsing error
+  - This is a SILENT DATA CORRUPTION bug!
+
+Reserved ranges:
+  reserved 100 to 199;    // reserve a range
+  reserved 200 to max;    // reserve to maximum possible field number
+
+Reserved enum values:
+  enum OrderStatus {
+    reserved 10, 11;
+    reserved "ORDER_STATUS_LEGACY_COMPLETED";
+    
+    ORDER_STATUS_UNSPECIFIED = 0;
+    ORDER_STATUS_PENDING     = 1;
+    ORDER_STATUS_CONFIRMED   = 2;
+  }
+
+----------------------------------------------------------------
+5. FIELD NUMBER REUSE DANGERS - DETAILED EXAMPLE
+----------------------------------------------------------------
+
+Wire type determines how data is decoded:
+  int32  (wire type 0 = varint)
+  string (wire type 2 = length-delimited)
+  float  (wire type 5 = 32-bit)
+
+Danger scenario:
+  // Version 1: field 2 is an int32
+  message Product {
+    string name  = 1;
+    int32  count = 2;   // wire type 0
+  }
+  
+  // Version 2: field 2 REUSED for a different type
+  message Product {
+    string name    = 1;
+    string description = 2;  // wire type 2 — SAME field number, different type!
+  }
+  
+  Old data: [0x08 0x0A 0x10 0x2A]   // name="..." count=42
+  //        ^ tag for field 1       ^ tag for field 2 (wire type 0, varint)
+  
+  Parsed by new code: field 2 is now string (length-delimited)
+  // Wire type 0 received for field that expects wire type 2
+  // Result: parse error or garbage data!
+
+If wire types happen to match (STILL DANGEROUS):
+  // Version 1: field 3 is string (wire type 2)
+  message Config { string api_url = 3; }
+  
+  // Version 2: field 3 REUSED for bytes (wire type 2 — same wire type!)
+  message Config { bytes encrypted_token = 3; }
+  
+  // No parse error, but bytes interpreted as string or vice versa
+  // String validation (UTF-8 check) may fail on binary data!
+
+----------------------------------------------------------------
+6. ENUM COMPATIBILITY
+----------------------------------------------------------------
+
+Adding new enum values is SAFE in proto3:
+  // v1:
+  enum Status { UNSPECIFIED=0; PENDING=1; CONFIRMED=2; }
+  
+  // v2: added PROCESSING
+  enum Status { UNSPECIFIED=0; PENDING=1; CONFIRMED=2; PROCESSING=3; }
+  
+  Old code receiving value 3 (PROCESSING):
+  - Java: generates Status.UNRECOGNIZED with numerical value 3
+  - getStatusValue() returns 3 (raw integer preserved)
+  - Switching on Status.UNRECOGNIZED → falls to default case
+
+Removing enum values is UNSAFE:
+  // v1: CONFIRMED = 2
+  // v2: removed CONFIRMED
+  // Old data with value 2 → v2 sees UNRECOGNIZED
+  // Must mark reserved: reserved 2; reserved "CONFIRMED";
+
+Changing enum values (reordering numbers) is UNSAFE:
+  // v1: PENDING=1, CONFIRMED=2
+  // v2: PENDING=2, CONFIRMED=1  ← SWAPPED NUMBERS
+  // Old data: value 1 was PENDING, now reads as CONFIRMED!
+
+----------------------------------------------------------------
+7. SERVICE EVOLUTION
+----------------------------------------------------------------
+
+Adding new RPC methods — SAFE:
+  service OrderService {
+    rpc GetOrder(GetOrderRequest) returns (Order);
+    // v2: new method added — old clients just can't call it
+    rpc GetOrderWithTracking(GetOrderRequest) returns (OrderWithTracking);
+  }
+
+Removing existing RPC methods — BREAKING:
+  // Old clients calling deleted method → UNIMPLEMENTED status error
+  // MUST deprecate first, monitor usage, then remove
+  // Mark deprecated:
+  rpc LegacyGetOrder(GetOrderRequest) returns (Order) {
+    option deprecated = true;
+  }
+
+Changing request/response types — BREAKING:
+  // Cannot change without version bump
+  rpc GetOrder(GetOrderRequest) returns (Order);
+  // → rpc GetOrder(GetOrderRequestV2) returns (OrderV2);  // BREAKING
+
+Changing streaming semantics — BREAKING:
+  // Cannot change unary to streaming or vice versa without version bump
+  rpc GetOrder(GetOrderRequest) returns (Order);
+  // → rpc GetOrder(GetOrderRequest) returns (stream Order);  // BREAKING
+
+----------------------------------------------------------------
+8. VERSION BUMP STRATEGIES
+----------------------------------------------------------------
+
+Strategy 1: Package versioning (RECOMMENDED)
+  // order/v1/order.proto
+  package com.example.order.v1;
+  service OrderService { ... }  // original
+  
+  // order/v2/order.proto (when breaking changes needed)
+  package com.example.order.v2;
+  service OrderService { ... }  // new version
+  
+  Both run simultaneously. Clients migrate at their own pace.
+  Old v1 service deprecated with sunset date.
+
+Strategy 2: Field evolution within same version (for non-breaking)
+  // Same package, just add new fields and mark old ones deprecated
+  message Order {
+    string order_id = 1;
+    // Deprecated: use status_enum instead
+    string status   = 2 [deprecated=true];  // kept for compatibility
+    OrderStatus status_enum = 10;           // new strongly-typed field
+  }
+
+Strategy 3: Oneof for variant evolution
+  message OrderV2 {
+    string order_id = 1;
+    oneof status_variant {
+      string legacy_status = 2;         // old string status
+      OrderStatus status_enum = 3;      // new enum status
+    }
+  }
+
+----------------------------------------------------------------
+9. FIELD COMPATIBILITY MATRIX
+----------------------------------------------------------------
+
+Wire type compatibility:
+  ┌────────────────┬────────────────────────────────────────────┐
+  │ Old type       │ Compatible new type (same wire type)       │
+  ├────────────────┼────────────────────────────────────────────┤
+  │ int32/uint32/  │ int32, uint32, int64, uint64, bool, enum  │
+  │ bool/enum      │ (all use varint wire type 0)               │
+  ├────────────────┼────────────────────────────────────────────┤
+  │ int64/uint64   │ int32, uint32, int64, uint64, bool, enum  │
+  │                │ (truncated if value exceeds int32 range)   │
+  ├────────────────┼────────────────────────────────────────────┤
+  │ sint32/sint64  │ NOT compatible with int32/int64!           │
+  │                │ (different ZigZag encoding)                │
+  ├────────────────┼────────────────────────────────────────────┤
+  │ string         │ bytes (same wire type 2, but may fail      │
+  │                │ UTF-8 validation if bytes are not UTF-8)   │
+  ├────────────────┼────────────────────────────────────────────┤
+  │ bytes          │ string (same caveat)                       │
+  ├────────────────┼────────────────────────────────────────────┤
+  │ embedded msg   │ bytes (same wire type 2)                   │
+  ├────────────────┼────────────────────────────────────────────┤
+  │ fixed32/float  │ fixed32, sfixed32, float (all 32-bit)     │
+  ├────────────────┼────────────────────────────────────────────┤
+  │ fixed64/double │ fixed64, sfixed64, double (all 64-bit)    │
+  └────────────────┴────────────────────────────────────────────┘
+
+Special case — int32 to int64:
+  message Counts {
+    int32 item_count = 1;  // old: max 2B items
+  }
+  →
+  message Counts {
+    int64 item_count = 1;  // new: larger range
+  }
+  
+  Wire compatible? YES — both use varint encoding.
+  Old client sends int32 value 100 → new server reads int64 value 100 ✅
+  New client sends int64 value 100 → old server reads int32 value 100 ✅
+  But: new client sends int64 value 5 billion → old server truncates to int32!
+
+----------------------------------------------------------------
+10. TOOLING FOR COMPATIBILITY CHECKS
+----------------------------------------------------------------
+
+buf breaking (CLI tool):
+  # Check current branch against main branch for breaking changes
+  buf breaking --against .git#branch=main
+  
+  # Check against a specific tag
+  buf breaking --against .git#tag=v1.0.0
+  
+  # Check against Buf Schema Registry
+  buf breaking --against buf.build/company/protos:main
+
+What buf breaking detects:
+  ✅ Field number change
+  ✅ Field type change
+  ✅ Field deleted without reserved
+  ✅ Enum value deleted without reserved
+  ✅ RPC method signature changed
+  ✅ Oneof field added (could break parsers)
+  ✅ Service method removed
+
+CI/CD integration:
+  # In GitHub Actions:
+  - name: Check proto breaking changes
+    run: |
+      buf breaking \
+        --against "https://github.com/company/protos.git#branch=main"
+
+----------------------------------------------------------------
+11. PRACTICAL MIGRATION EXAMPLE
+----------------------------------------------------------------
+
+Scenario: Migrate from string status to enum status
+
+Step 1: Add new field with NEW field number (keep old field)
+  message Order {
+    string order_id       = 1;
+    string status_string  = 2;   // KEEP old field (deprecated)
+    OrderStatus status    = 3;   // ADD new field with NEW number
+    
+    // Mark status_string deprecated
+    reserved 2;  // Don't do this yet! Need to keep field during migration
+  }
+
+Step 2: Server writes BOTH fields:
+  Order order = Order.newBuilder()
+      .setOrderId("ORD-001")
+      .setStatusString("PENDING")    // for old clients
+      .setStatus(OrderStatus.ORDER_STATUS_PENDING)  // for new clients
+      .build();
+
+Step 3: After ALL clients have migrated to read new field:
+  message Order {
+    string order_id = 1;
+    reserved 2;               // field 2 (status_string) is deleted
+    reserved "status_string"; // name is reserved too
+    OrderStatus status = 3;   // only this field now
+  }
+
+Step 4: Verify no old clients still reading field 2 in logs/metrics.
+
+----------------------------------------------------------------
+12. INTERVIEW KEY POINTS
+----------------------------------------------------------------
+
+Q: What is the difference between backward and forward compatibility?
+A: Backward compatibility: new code can read old data (new server handles
+   messages from old clients). Forward compatibility: old code can read
+   new data (old server handles messages from new clients, ignoring unknown
+   fields). Protobuf achieves forward compatibility by preserving unknown
+   field numbers during parsing.
+
+Q: Can you ever change a field's type in protobuf?
+A: You can change between types that share the same wire type
+   (e.g., int32 → int64 both use varint wire type 0), but even
+   then there are range truncation risks. Changing between different
+   wire types (int32 → string) is a hard breaking change — parsing
+   will fail. The safest approach is always to add a new field with
+   a new field number and deprecate the old one.
+
+Q: What happens if you forget to reserve a deleted field number?
+A: Another developer could reuse that field number for a new field.
+   Old binary data with the old field type would then be misinterpreted
+   by new code as the new field type. This can cause silent data
+   corruption, parse errors, or security vulnerabilities. Always
+   mark both field numbers AND names as reserved when deleting fields.
+
+Q: How do you version a gRPC API for breaking changes?
+A: Use package versioning: create order.v1 and order.v2 packages.
+   Deploy both versions simultaneously. Clients migrate from v1 to v2
+   at their own pace. Sunset v1 only after monitoring confirms zero usage.
+   This enables independent deployment and gradual migration.
+
+================================================================
+END OF FILE
+================================================================

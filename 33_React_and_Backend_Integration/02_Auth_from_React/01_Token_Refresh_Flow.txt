@@ -1,0 +1,368 @@
+================================================================
+TOKEN REFRESH FLOW — SILENT REFRESH & AXIOS INTERCEPTOR
+================================================================
+
+================================================================
+1. THE PROBLEM — TOKEN EXPIRY
+================================================================
+
+Access tokens are short-lived (5-15 minutes) for security.
+When they expire:
+  - Every API call returns 401 Unauthorized
+  - User is effectively logged out
+
+The solution is the Token Refresh Flow:
+  1. Use the long-lived refresh token to get a new access token
+  2. Do this transparently, without interrupting the user
+  3. Retry the original failed request with the new token
+
+================================================================
+2. FLOW DIAGRAM
+================================================================
+
+  React Component calls API
+       │
+       ▼
+  Axios Request (with expired access token)
+       │
+       ▼
+  Backend returns 401 Unauthorized
+       │
+       ▼
+  Axios Response Interceptor catches 401
+       │
+       ├── Is currently refreshing? ──YES──► Queue request, wait
+       │                                           │
+       │                                           ◄──────────────────┐
+       │                                                               │
+       ▼                                                               │
+  POST /auth/refresh (with httpOnly refresh token cookie)             │
+       │                                                               │
+       ├── Success: new access token ──────────────────────────────────┤
+       │     ├── Store new access token in memory                     │
+       │     ├── Process queued requests with new token               │
+       │     └── Retry original request → return to component         │
+       │                                                               │
+       └── Failure (refresh token expired)                            │
+             ├── Clear all tokens                                      │
+             └── Redirect to /login
+
+================================================================
+3. COMPLETE IMPLEMENTATION
+================================================================
+
+FILE: src/services/tokenService.js
+  let _accessToken = null;
+
+  export const getAccessToken = () => _accessToken;
+  export const setAccessToken = (token) => { _accessToken = token; };
+  export const clearAccessToken = () => { _accessToken = null; };
+
+FILE: src/api/axiosConfig.js
+  import axios from 'axios';
+  import {
+    getAccessToken,
+    setAccessToken,
+    clearAccessToken,
+  } from '../services/tokenService';
+
+  const apiClient = axios.create({
+    baseURL: import.meta.env.VITE_API_BASE_URL,
+    timeout: 10_000,
+    headers: { 'Content-Type': 'application/json' },
+  });
+
+  // Shared refresh client (different instance to avoid interceptor loops)
+  const authClient = axios.create({
+    baseURL: import.meta.env.VITE_API_BASE_URL,
+    withCredentials: true, // send httpOnly cookie
+  });
+
+  // State management for concurrent 401s
+  let isRefreshing = false;
+  let failedRequestsQueue = [];
+
+  const processQueue = (error, token = null) => {
+    failedRequestsQueue.forEach(({ resolve, reject }) => {
+      error ? reject(error) : resolve(token);
+    });
+    failedRequestsQueue = [];
+  };
+
+  // REQUEST INTERCEPTOR: attach current access token
+  apiClient.interceptors.request.use(
+    (config) => {
+      const token = getAccessToken();
+      if (token) {
+        config.headers.Authorization = `Bearer ${token}`;
+      }
+      return config;
+    },
+    (error) => Promise.reject(error)
+  );
+
+  // RESPONSE INTERCEPTOR: handle 401 with token refresh
+  apiClient.interceptors.response.use(
+    (response) => response,
+    async (error) => {
+      const originalRequest = error.config;
+
+      // Only handle 401, skip if already retried
+      if (error.response?.status !== 401 || originalRequest._retry) {
+        return Promise.reject(error);
+      }
+
+      // Queue this request while refresh is in progress
+      if (isRefreshing) {
+        return new Promise((resolve, reject) => {
+          failedRequestsQueue.push({ resolve, reject });
+        }).then((newToken) => {
+          originalRequest.headers.Authorization = `Bearer ${newToken}`;
+          return apiClient(originalRequest);
+        }).catch(Promise.reject);
+      }
+
+      // Start refresh flow
+      originalRequest._retry = true;
+      isRefreshing = true;
+
+      try {
+        // Call refresh endpoint — httpOnly cookie is sent automatically
+        const { data } = await authClient.post('/auth/refresh');
+        const newAccessToken = data.accessToken;
+
+        setAccessToken(newAccessToken);
+        processQueue(null, newAccessToken);
+
+        originalRequest.headers.Authorization = `Bearer ${newAccessToken}`;
+        return apiClient(originalRequest); // retry original request
+
+      } catch (refreshError) {
+        processQueue(refreshError, null);
+        clearAccessToken();
+
+        // Notify app to redirect to login
+        window.dispatchEvent(new CustomEvent('auth:logout'));
+        return Promise.reject(refreshError);
+
+      } finally {
+        isRefreshing = false;
+      }
+    }
+  );
+
+  export default apiClient;
+
+================================================================
+4. AUTH PROVIDER — REACT CONTEXT
+================================================================
+
+FILE: src/context/AuthContext.jsx
+  import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+  import axios from 'axios';
+  import { setAccessToken, clearAccessToken, getAccessToken } from '../services/tokenService';
+
+  const AuthContext = createContext(null);
+
+  export function AuthProvider({ children }) {
+    const [user, setUser] = useState(null);
+    const [loading, setLoading] = useState(true); // loading during silent refresh
+
+    const login = useCallback(async (email, password) => {
+      const { data } = await axios.post(
+        `${import.meta.env.VITE_API_BASE_URL}/auth/login`,
+        { email, password },
+        { withCredentials: true }
+      );
+      setAccessToken(data.accessToken);
+      setUser(data.user);
+    }, []);
+
+    const logout = useCallback(async () => {
+      await axios.post(
+        `${import.meta.env.VITE_API_BASE_URL}/auth/logout`,
+        {},
+        { withCredentials: true }
+      ).catch(() => {}); // ignore errors on logout
+      clearAccessToken();
+      setUser(null);
+    }, []);
+
+    // Silent refresh on startup
+    const silentRefresh = useCallback(async () => {
+      try {
+        const { data } = await axios.post(
+          `${import.meta.env.VITE_API_BASE_URL}/auth/refresh`,
+          {},
+          { withCredentials: true }
+        );
+        setAccessToken(data.accessToken);
+        setUser(data.user);
+      } catch {
+        // Refresh token expired — user must log in
+        clearAccessToken();
+        setUser(null);
+      } finally {
+        setLoading(false);
+      }
+    }, []);
+
+    useEffect(() => {
+      silentRefresh();
+    }, [silentRefresh]);
+
+    // Listen for forced logout from interceptor
+    useEffect(() => {
+      const handler = () => {
+        setUser(null);
+        clearAccessToken();
+      };
+      window.addEventListener('auth:logout', handler);
+      return () => window.removeEventListener('auth:logout', handler);
+    }, []);
+
+    return (
+      <AuthContext.Provider value={{ user, loading, login, logout }}>
+        {children}
+      </AuthContext.Provider>
+    );
+  }
+
+  export const useAuth = () => {
+    const ctx = useContext(AuthContext);
+    if (!ctx) throw new Error('useAuth must be used inside AuthProvider');
+    return ctx;
+  };
+
+FILE: src/main.jsx
+  import { AuthProvider } from './context/AuthContext';
+
+  root.render(
+    <AuthProvider>
+      <App />
+    </AuthProvider>
+  );
+
+================================================================
+5. PROACTIVE TOKEN REFRESH (Before Expiry)
+================================================================
+
+Instead of waiting for a 401, check token expiry proactively:
+
+  import { jwtDecode } from 'jwt-decode';
+  import { getAccessToken, setAccessToken } from './tokenService';
+
+  let refreshTimer = null;
+
+  export const scheduleTokenRefresh = (accessToken) => {
+    const { exp } = jwtDecode(accessToken);
+    const expiresInMs = exp * 1000 - Date.now();
+    const refreshAt = expiresInMs - 60_000; // refresh 1 minute before expiry
+
+    if (refreshAt <= 0) {
+      // Token already expired or about to
+      performRefresh();
+      return;
+    }
+
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => {
+      performRefresh();
+    }, refreshAt);
+  };
+
+  const performRefresh = async () => {
+    try {
+      const { data } = await axios.post('/auth/refresh', {}, {
+        withCredentials: true,
+      });
+      setAccessToken(data.accessToken);
+      scheduleTokenRefresh(data.accessToken); // schedule next refresh
+    } catch {
+      clearAccessToken();
+      window.location.href = '/login';
+    }
+  };
+
+  // Call after login and silent refresh:
+  const { data } = await login(email, password);
+  setAccessToken(data.accessToken);
+  scheduleTokenRefresh(data.accessToken);
+
+================================================================
+6. SPRING BOOT BACKEND — REFRESH TOKEN ENDPOINT
+================================================================
+
+  @RestController
+  @RequestMapping("/api/auth")
+  public class AuthController {
+
+      @PostMapping("/refresh")
+      public ResponseEntity<TokenResponse> refresh(
+          @CookieValue(name = "refreshToken", required = false) String refreshToken,
+          HttpServletResponse response
+      ) {
+          if (refreshToken == null || !tokenService.isValid(refreshToken)) {
+              return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+          }
+
+          String userId = tokenService.extractUserId(refreshToken);
+          String newAccessToken = tokenService.generateAccessToken(userId);
+          String newRefreshToken = tokenService.generateRefreshToken(userId);
+
+          // Rotate refresh token
+          ResponseCookie cookie = ResponseCookie.from("refreshToken", newRefreshToken)
+              .httpOnly(true)
+              .secure(true)
+              .sameSite("Strict")
+              .path("/api/auth/refresh")
+              .maxAge(Duration.ofDays(30))
+              .build();
+          response.addHeader(HttpHeaders.SET_COOKIE, cookie.toString());
+
+          return ResponseEntity.ok(new TokenResponse(newAccessToken));
+      }
+  }
+
+  Note: Refresh token rotation — every refresh generates a new refresh token.
+  This limits the damage if a refresh token is somehow stolen.
+
+================================================================
+7. INTERVIEW QUESTIONS
+================================================================
+
+Q: Explain the token refresh flow in React.
+A: When an API call returns 401 (expired access token), a response
+   interceptor catches it. It calls /auth/refresh using the httpOnly
+   cookie containing the refresh token. On success, the new access
+   token is stored in memory, and the original request is retried.
+   If multiple requests return 401 simultaneously, they are queued
+   and all replayed once refresh completes.
+
+Q: What is the failedQueue pattern in token refresh?
+A: When the token refresh is in progress (isRefreshing=true), any new
+   401 requests are not retried immediately — they are queued as
+   {resolve, reject} promise callbacks. When refresh completes,
+   processQueue() is called to resolve/reject all queued promises,
+   allowing all queued requests to proceed with the new token.
+
+Q: What is proactive token refresh and when is it better?
+A: Proactive refresh schedules a setTimeout to refresh the token
+   ~60 seconds before it expires, rather than waiting for a 401.
+   This is better for UX-critical paths (e.g., file uploads that
+   span the token's lifetime), where a 401 mid-operation would be
+   disruptive. The downside is added complexity.
+
+Q: What is refresh token rotation?
+A: Each time a refresh token is used to obtain a new access token,
+   a NEW refresh token is also issued and the old one is invalidated.
+   This limits the window of abuse if a refresh token is stolen —
+   using a stolen token will invalidate the user's legitimate token,
+   alerting to a security breach.
+
+Q: Why use a custom event (auth:logout) instead of directly calling
+   navigate('/login') in the Axios interceptor?
+A: Axios interceptors are outside the React component tree and React
+   Router context. Direct navigation is not possible from outside React.
+   Dispatching a custom DOM event lets the React AuthProvider or a
+   top-level component listen and trigger navigation properly.

@@ -1,0 +1,225 @@
+================================================================
+  SPRING BATCH — JOB, STEP, AND TASKLET
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. JOB DEFINITION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A Job is the top-level batch concept. It is composed of Steps executed
+in order (or conditionally based on exit status).
+
+@Configuration
+@EnableBatchProcessing  // Spring Boot 3.x: auto-configured, not needed
+public class ImportJobConfig {
+
+    @Bean
+    public Job importOrdersJob(JobRepository jobRepository,
+                               Step validateFileStep,
+                               Step processOrdersStep,
+                               Step sendNotificationStep) {
+        return new JobBuilder("importOrdersJob", jobRepository)
+            .start(validateFileStep)
+            .next(processOrdersStep)
+            .next(sendNotificationStep)
+            .incrementer(new RunIdIncrementer())    // auto-increment run.id param
+            .listener(new JobCompletionListener())  // optional lifecycle listener
+            .build();
+    }
+}
+
+// JobExecutionListener — runs before/after the entire job
+@Component
+public class JobCompletionListener implements JobExecutionListener {
+
+    @Override
+    public void beforeJob(JobExecution jobExecution) {
+        log.info("Job starting: {}", jobExecution.getJobInstance().getJobName());
+    }
+
+    @Override
+    public void afterJob(JobExecution jobExecution) {
+        if (jobExecution.getStatus() == BatchStatus.COMPLETED) {
+            log.info("Job COMPLETED. Items written: {}",
+                jobExecution.getStepExecutions().stream()
+                    .mapToLong(StepExecution::getWriteCount).sum());
+        } else {
+            log.error("Job FAILED: {}", jobExecution.getAllFailureExceptions());
+        }
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. CONDITIONAL FLOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Bean
+public Job conditionalJob(JobRepository repo, Step step1, Step step2, Step step3) {
+    return new JobBuilder("conditionalJob", repo)
+        .start(step1)
+            .on("FAILED").to(step3)     // if step1 fails, go to step3
+            .from(step1).on("*").to(step2)  // otherwise go to step2
+        .from(step2).next(step3)
+        .end()
+        .build();
+}
+
+// Exit codes: COMPLETED, FAILED, STOPPED, UNKNOWN
+// Custom exit code:
+@Override
+public ExitStatus afterStep(StepExecution stepExecution) {
+    if (stepExecution.getSkipCount() > 100) {
+        return new ExitStatus("TOO_MANY_SKIPS");
+    }
+    return stepExecution.getExitStatus();
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. STEP TYPES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Spring Batch provides two main step types:
+
+1. Tasklet Step — run arbitrary code once; return CONTINUABLE (loop) or FINISHED
+2. Chunk-oriented Step — read/process/write N items per transaction (most common)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. TASKLET
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Tasklet is ideal for:
+  - File preparation (move, rename, validate input file exists)
+  - Sending a notification after job completes
+  - Cleaning up temp tables
+  - Simple DDL operations
+
+@Component
+public class FileValidationTasklet implements Tasklet {
+
+    @Value("${batch.input.file}")
+    private String inputFile;
+
+    @Override
+    public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext)
+        throws Exception {
+
+        Path path = Path.of(inputFile);
+
+        if (!Files.exists(path)) {
+            throw new FileNotFoundException("Input file not found: " + inputFile);
+        }
+
+        long lineCount = Files.lines(path).count();
+        log.info("File validated. Lines: {}", lineCount);
+
+        // Put data in step execution context for downstream steps
+        chunkContext.getStepContext()
+            .getStepExecution()
+            .getJobExecution()
+            .getExecutionContext()
+            .putLong("input.line.count", lineCount);
+
+        return RepeatStatus.FINISHED;  // CONTINUABLE keeps calling execute() in a loop
+    }
+}
+
+// Wire as a step:
+@Bean
+public Step validateFileStep(JobRepository jobRepository,
+                              PlatformTransactionManager txManager,
+                              FileValidationTasklet tasklet) {
+    return new StepBuilder("validateFileStep", jobRepository)
+        .tasklet(tasklet, txManager)
+        .listener(new StepExecutionListener() {
+            @Override
+            public void beforeStep(StepExecution se) {
+                log.info("Step starting: {}", se.getStepName());
+            }
+        })
+        .build();
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. EXECUTION CONTEXT — SHARING DATA BETWEEN STEPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ExecutionContext is a key-value store that flows through job/step execution.
+Two scopes:
+  - JobExecutionContext: shared across all steps within a job
+  - StepExecutionContext: private to a single step
+
+// Writing to Job context (from a Step or Tasklet)
+jobExecution.getExecutionContext().put("processedFile", "/tmp/orders.csv");
+
+// Reading in a later step
+@BeforeStep
+public void retrieveContext(StepExecution stepExecution) {
+    JobExecution job = stepExecution.getJobExecution();
+    this.inputFile = job.getExecutionContext().getString("processedFile");
+}
+
+// @BeforeStep requires the bean to be STEP-scoped or use ExecutionContextPromotionListener
+@Bean
+public ExecutionContextPromotionListener promotionListener() {
+    ExecutionContextPromotionListener listener = new ExecutionContextPromotionListener();
+    listener.setKeys(new String[]{"processedFile"});  // promote these keys from step → job context
+    return listener;
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. JOB PARAMETERS IN BEANS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+To access job parameters in a tasklet or reader, use @JobScope + @Value:
+
+@Bean
+@JobScope
+public FileValidationTasklet fileValidationTasklet(
+    @Value("#{jobParameters['input.file']}") String inputFile) {
+    return new FileValidationTasklet(inputFile);
+}
+
+@Bean
+@StepScope
+public FlatFileItemReader<Order> orderReader(
+    @Value("#{jobParameters['input.file']}") String filePath) {
+    // reader that uses the runtime parameter
+    ...
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is a Tasklet and when would you use it over a chunk-oriented step?
+A: A Tasklet is a simple interface with one execute() method. Use it for
+   one-shot operations that don't fit read-process-write: file validation,
+   sending a notification, truncating a staging table, running DDL, or any
+   code that executes once. Use chunk-oriented steps when processing a large
+   collection of items that benefit from chunked commit, skip, and retry.
+
+Q: What does RepeatStatus.CONTINUABLE vs RepeatStatus.FINISHED mean?
+A: RepeatStatus.FINISHED tells the step that the tasklet is done — the step
+   completes. RepeatStatus.CONTINUABLE tells the step to call execute() again
+   in a loop. Use CONTINUABLE when you want the tasklet to act like a mini
+   reader/processor (e.g., process a small batch, return CONTINUABLE until
+   the source is exhausted, then return FINISHED).
+
+Q: How do you pass data from one step to the next?
+A: Use ExecutionContext. Write to the JobExecutionContext (accessible by all
+   steps) from within a step or tasklet. Read it in subsequent steps using
+   @BeforeStep. Alternatively use ExecutionContextPromotionListener to
+   automatically promote step-level keys to job level after step completion.
+
+Q: What is @JobScope and @StepScope?
+A: These Spring Batch proxy scopes delay bean creation until the job/step
+   starts. This allows injection of late-bound values from JobParameters
+   (#{jobParameters['key']}) and ExecutionContext. Without @StepScope,
+   parameters would be resolved at application startup when they don't exist.
+   @StepScope beans are created fresh per step execution.
+
+Q: Can the same Job be run multiple times with the same parameters?
+A: No. Spring Batch prevents re-running a completed JobInstance (same Job +
+   JobParameters). To force a re-run, either change the parameters (e.g., add
+   a timestamp), or use RunIdIncrementer which automatically adds a run.id
+   parameter that increments with each launch.

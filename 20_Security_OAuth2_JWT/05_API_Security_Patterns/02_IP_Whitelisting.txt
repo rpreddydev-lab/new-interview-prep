@@ -1,0 +1,371 @@
+========================================================
+IP WHITELISTING
+========================================================
+
+IP Whitelisting (allowlisting) restricts API access to a specific set of
+known, trusted IP addresses or CIDR ranges. All traffic from non-whitelisted
+IPs is denied, regardless of credentials.
+
+This is a network-level access control mechanism used as a defense-in-depth
+layer on top of other authentication.
+
+========================================================
+1. WHEN TO USE IP WHITELISTING
+========================================================
+
+Good use cases:
+  ✓ Internal microservices (known IP ranges)
+  ✓ B2B integrations where partner has static IPs
+  ✓ Admin panels, management APIs
+  ✓ Database access from app servers only
+  ✓ CI/CD pipelines from fixed infrastructure IPs
+  ✓ Financial APIs with regulatory requirements
+
+NOT suitable when:
+  ✗ Clients have dynamic IPs (home users, mobile)
+  ✗ SaaS applications with public user base
+  ✗ Cloud environments with ephemeral IPs (auto-scaling)
+  ✗ Clients behind NAT/CGNAT (shared IP)
+
+========================================================
+2. IP WHITELISTING IN SPRING SECURITY
+========================================================
+
+2.1 Simple IP Whitelist in SecurityFilterChain
+
+@Configuration
+@EnableWebSecurity
+public class IpWhitelistSecurityConfig {
+
+    private static final List<String> ALLOWED_IPS = List.of(
+        "192.168.1.100",
+        "10.0.0.0/8",       // CIDR notation — needs custom matcher
+        "203.0.113.45"
+    );
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .authorizeHttpRequests(auth -> auth
+                // Only allow from specific IPs
+                .requestMatchers(IpAddressMatcher.forAddress("203.0.113.45"))
+                    .permitAll()
+                // Admin endpoint — IP whitelist + role
+                .requestMatchers("/admin/**")
+                    .access(new WebExpressionAuthorizationManager(
+                        "hasIpAddress('10.0.0.0/8') and hasRole('ADMIN')"
+                    ))
+                .anyRequest().denyAll()
+            );
+        return http.build();
+    }
+}
+
+2.2 hasIpAddress() in SpEL
+
+.authorizeHttpRequests(auth -> auth
+    .requestMatchers("/api/**")
+        .access(new WebExpressionAuthorizationManager(
+            "hasIpAddress('192.168.1.0/24') or " +
+            "hasIpAddress('10.0.0.0/8')"
+        ))
+    .anyRequest().denyAll()
+)
+
+2.3 Custom IP Filter (more control, better logging)
+
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class IpWhitelistFilter extends OncePerRequestFilter {
+
+    private final IpWhitelistService whitelistService;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                     HttpServletResponse response,
+                                     FilterChain filterChain)
+            throws ServletException, IOException {
+
+        String clientIp = extractClientIp(request);
+
+        if (!whitelistService.isAllowed(clientIp)) {
+            log.warn("Blocked request from unauthorized IP: {} → {}",
+                clientIp, request.getRequestURI());
+            response.setStatus(HttpServletResponse.SC_FORBIDDEN);
+            response.setContentType("application/json");
+            response.getWriter().write(
+                "{\"error\": \"Access denied from IP: " + clientIp + "\"}");
+            return;
+        }
+
+        filterChain.doFilter(request, response);
+    }
+
+    private String extractClientIp(HttpServletRequest request) {
+        // Handle X-Forwarded-For header (load balancer/proxy)
+        String xForwardedFor = request.getHeader("X-Forwarded-For");
+        if (xForwardedFor != null && !xForwardedFor.isBlank()) {
+            // X-Forwarded-For can be: "client, proxy1, proxy2"
+            return xForwardedFor.split(",")[0].trim();
+        }
+
+        // X-Real-IP (Nginx)
+        String xRealIp = request.getHeader("X-Real-IP");
+        if (xRealIp != null && !xRealIp.isBlank()) {
+            return xRealIp.trim();
+        }
+
+        return request.getRemoteAddr();
+    }
+}
+
+2.4 CIDR Range Matching
+
+Spring Security's IpAddressMatcher supports CIDR notation:
+
+@Service
+public class IpWhitelistService {
+
+    private final List<IpAddressMatcher> allowedMatchers;
+
+    public IpWhitelistService(@Value("${security.allowed-ips}") List<String> allowedIps) {
+        this.allowedMatchers = allowedIps.stream()
+            .map(IpAddressMatcher::new)
+            .collect(Collectors.toList());
+    }
+
+    public boolean isAllowed(String ip) {
+        IpAddressMatcher matcher;
+        try {
+            // Create temporary matcher to test against each whitelist entry
+            return allowedMatchers.stream()
+                .anyMatch(m -> m.matches(ip));
+        } catch (IllegalArgumentException e) {
+            log.error("Invalid IP address: {}", ip);
+            return false;
+        }
+    }
+}
+
+// application.yml
+security:
+  allowed-ips:
+    - "192.168.1.0/24"    # Office network
+    - "10.0.0.0/8"        # Internal network
+    - "203.0.113.45"      # Partner A static IP
+    - "198.51.100.0/28"   # Partner B IP range
+
+========================================================
+3. DYNAMIC IP WHITELISTING
+========================================================
+
+Store IPs in a database for runtime updates without redeployment:
+
+@Entity
+public class IpWhitelist {
+    @Id
+    @GeneratedValue
+    private Long id;
+    private String cidr;          // e.g., "192.168.1.0/24"
+    private String description;   // "Office Network"
+    private boolean active;
+    private LocalDateTime createdAt;
+    private LocalDateTime expiresAt;
+}
+
+@Service
+@CacheEvict(cacheNames = "ip-whitelist", allEntries = true, condition = "#evict")
+public class DynamicIpWhitelistService {
+
+    private final IpWhitelistRepository repository;
+
+    @Cacheable("ip-whitelist")
+    public List<IpAddressMatcher> getAllowedMatchers() {
+        return repository.findByActiveTrue().stream()
+            .filter(entry -> entry.getExpiresAt() == null ||
+                entry.getExpiresAt().isAfter(LocalDateTime.now()))
+            .map(entry -> new IpAddressMatcher(entry.getCidr()))
+            .collect(Collectors.toList());
+    }
+
+    public boolean isAllowed(String ip) {
+        return getAllowedMatchers().stream()
+            .anyMatch(matcher -> {
+                try {
+                    return matcher.matches(ip);
+                } catch (Exception e) {
+                    return false;
+                }
+            });
+    }
+}
+
+// Admin API to manage whitelist
+@RestController
+@RequestMapping("/admin/ip-whitelist")
+@PreAuthorize("hasRole('ADMIN')")
+public class IpWhitelistController {
+
+    @PostMapping
+    public IpWhitelist addIp(@RequestBody @Valid IpWhitelistRequest request) {
+        return ipWhitelistService.add(request);
+    }
+
+    @DeleteMapping("/{id}")
+    public void removeIp(@PathVariable Long id) {
+        ipWhitelistService.remove(id);
+    }
+}
+
+========================================================
+4. X-FORWARDED-FOR AND PROXY TRUST
+========================================================
+
+CRITICAL SECURITY ISSUE: Trusting X-Forwarded-For blindly
+
+When your application sits behind a load balancer/reverse proxy:
+  - The actual client IP seen by your app is the load balancer's IP
+  - The real client IP is in X-Forwarded-For header
+
+X-Forwarded-For: client, proxy1, proxy2
+  → The LEFTMOST IP is the original client
+  → But clients can FORGE this header!
+
+Correct approach: Trust only headers from KNOWN proxies
+
+@Bean
+public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http
+        // Tell Spring Security to trust X-Forwarded-For from your load balancer only
+        .requiresChannel(channel -> channel.anyRequest().requiresSecure())
+        .remoteIpHeader("X-Forwarded-For")
+        // OR use Spring's ForwardedHeaderFilter (handles X-Forwarded-For, X-Forwarded-Proto):
+        ;
+    return http.build();
+}
+
+// Configure ForwardedHeaderFilter in Spring Boot:
+@Bean
+public FilterRegistrationBean<ForwardedHeaderFilter> forwardedHeaderFilter() {
+    FilterRegistrationBean<ForwardedHeaderFilter> bean =
+        new FilterRegistrationBean<>(new ForwardedHeaderFilter());
+    bean.setOrder(Ordered.HIGHEST_PRECEDENCE);
+    return bean;
+}
+
+// In application.yml:
+server:
+  forward-headers-strategy: NATIVE  # or FRAMEWORK
+  # NATIVE: Uses container-native forwarded header handling
+  # FRAMEWORK: Uses Spring's ForwardedHeaderFilter
+
+Safe IP extraction (only trust proxies in your known range):
+@Component
+public class SafeIpExtractor {
+    // Only trust proxy headers from your load balancer range
+    private final List<IpAddressMatcher> trustedProxies = List.of(
+        new IpAddressMatcher("10.0.0.0/8"),   // Internal LB
+        new IpAddressMatcher("172.16.0.0/12") // Another internal range
+    );
+
+    public String extractClientIp(HttpServletRequest request) {
+        String remoteAddr = request.getRemoteAddr();
+
+        // Only process X-Forwarded-For if request comes from a trusted proxy
+        boolean fromTrustedProxy = trustedProxies.stream()
+            .anyMatch(m -> m.matches(remoteAddr));
+
+        if (fromTrustedProxy) {
+            String xForwardedFor = request.getHeader("X-Forwarded-For");
+            if (xForwardedFor != null) {
+                return xForwardedFor.split(",")[0].trim();
+            }
+        }
+
+        return remoteAddr;
+    }
+}
+
+========================================================
+5. IP WHITELISTING LIMITATIONS
+========================================================
+
+Limitations to be aware of:
+  1. Dynamic IPs: Most residential/mobile IPs change (DHCP)
+  2. IPv6: Many devices have multiple IPv6 addresses
+  3. VPN/Proxy: Clients may route through different IPs
+  4. Cloud Auto-scaling: Container IPs change on restarts
+  5. Header Spoofing: X-Forwarded-For can be forged
+  6. NAT: Many users behind a single IP
+  7. No user identity: Only limits origin, not who the user is
+
+Mitigations:
+  - Combine with authentication (IP + valid credential)
+  - Use CIDR ranges for cloud environments
+  - Use VPN to give dynamic clients a fixed IP
+  - Use mTLS for stronger client identity (see Mutual TLS notes)
+
+========================================================
+6. CLOUD/KUBERNETES IP WHITELISTING
+========================================================
+
+AWS:
+  - Security Groups: Allow inbound on port 443 only from specific IPs
+  - WAF IP Set: Managed IP-based rules
+  - Network ACLs: VPC-level IP filtering
+
+Kubernetes:
+  # NetworkPolicy — restrict ingress to specific CIDR
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: allow-specific-ips
+  spec:
+    podSelector:
+      matchLabels:
+        app: order-service
+    policyTypes:
+      - Ingress
+    ingress:
+      - from:
+          - ipBlock:
+              cidr: 10.0.0.0/8      # Allow internal network
+              except:
+                - 10.1.2.3/32       # Except specific blocked IP
+
+Nginx Ingress:
+  nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,192.168.1.0/24"
+
+========================================================
+7. COMMON INTERVIEW QUESTIONS
+========================================================
+
+Q: What is the main limitation of IP whitelisting?
+A: IPs are not reliable identifiers. They can be spoofed via X-Forwarded-For,
+   shared among many users (NAT), change frequently (DHCP, cloud auto-scaling),
+   or be from compromised machines. IP whitelisting is a defense-in-depth measure,
+   not a complete authentication solution.
+
+Q: How do you handle X-Forwarded-For in Spring Security for IP whitelisting?
+A: Only trust X-Forwarded-For from KNOWN proxy IP ranges (your load balancers).
+   Configure Spring Boot's ForwardedHeaderFilter with forward-headers-strategy: NATIVE
+   or FRAMEWORK. Never trust X-Forwarded-For blindly — attackers can forge it.
+
+Q: How is IP whitelisting different from RBAC?
+A: IP whitelisting controls WHICH ORIGIN can access the API (network-level).
+   RBAC controls WHAT actions an authenticated user can perform (application-level).
+   They are complementary — IP whitelisting adds a network perimeter, RBAC adds
+   authorization logic within that perimeter.
+
+Q: When would you prefer mTLS over IP whitelisting for service-to-service auth?
+A: mTLS provides cryptographic client identity (certificate pinned to a service),
+   which is more reliable and secure than IP addresses. Use mTLS when:
+   - Services run in cloud environments with dynamic IPs
+   - You need strong non-repudiation
+   - The environment already has a PKI infrastructure
+   IP whitelisting is simpler to implement but weaker.
+
+Q: How do you implement IP whitelisting in a Kubernetes environment?
+A: Use Kubernetes NetworkPolicies (ipBlock CIDR rules) to restrict pod-to-pod traffic.
+   For ingress traffic, use nginx.ingress.kubernetes.io/whitelist-source-range annotation.
+   At the cloud level, use Security Groups (AWS) or Firewall Rules (GCP/Azure).

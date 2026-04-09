@@ -1,0 +1,833 @@
+================================================================================
+KUBERNETES AUTOSCALING — HPA, VPA, CLUSTER AUTOSCALER, KEDA
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Autoscaling Overview and Types
+2. Horizontal Pod Autoscaler (HPA)
+3. HPA with Custom and External Metrics
+4. Vertical Pod Autoscaler (VPA)
+5. HPA vs VPA — When to Use Each
+6. Cluster Autoscaler
+7. KEDA — Kubernetes Event-Driven Autoscaling
+8. PodDisruptionBudget (PDB)
+9. Autoscaling Best Practices
+10. Common Interview Questions & Answers
+11. Quick Reference Cheat Sheet
+
+================================================================================
+1. AUTOSCALING OVERVIEW AND TYPES
+================================================================================
+
+Why Autoscaling?
+  Traffic is dynamic. Static sizing leads to:
+  - Under-provisioning → service degradation/outages during peaks
+  - Over-provisioning → wasted cost during off-peak hours
+  
+  K8s autoscaling goal: Right-size resources dynamically based on demand.
+
+Three Dimensions of Autoscaling:
+  
+  ┌─────────────────────────────────────────────────────────────┐
+  │  HPA   Horizontal Pod Autoscaler                            │
+  │        Scale OUT/IN: Add/remove pod replicas                │
+  │        Best for: Stateless services, web apps               │
+  ├─────────────────────────────────────────────────────────────┤
+  │  VPA   Vertical Pod Autoscaler                              │
+  │        Scale UP/DOWN: Increase/decrease pod CPU/memory      │
+  │        Best for: Stateful apps, unknown resource needs      │
+  ├─────────────────────────────────────────────────────────────┤
+  │  CA    Cluster Autoscaler                                   │
+  │        Scale nodes: Add/remove nodes from cluster           │
+  │        Best for: Node capacity management                   │
+  ├─────────────────────────────────────────────────────────────┤
+  │  KEDA  Event-Driven Autoscaler                              │
+  │        Scale on external signals: queues, streams, cron     │
+  │        Best for: Event-driven workloads, scale-to-zero      │
+  └─────────────────────────────────────────────────────────────┘
+
+  Typical combination: HPA + Cluster Autoscaler
+  HPA scales pods (horizontal). CA adds nodes when pods can't schedule.
+
+Prerequisites: metrics-server
+  HPA requires metrics-server to read CPU/memory from pods.
+  
+  # Install metrics-server:
+  kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+  
+  # Verify:
+  kubectl top pods
+  kubectl top nodes
+
+================================================================================
+2. HORIZONTAL POD AUTOSCALER (HPA)
+================================================================================
+
+How HPA Works:
+  
+  ┌─────────┐   1. Fetch metrics   ┌─────────────────┐
+  │  HPA    │◄─────────────────────│  metrics-server  │
+  │Controller│                     └─────────────────┘
+  └────┬────┘                           │ (scrapes from kubelet)
+       │                           ┌────▼────┐
+       │ 2. Calculate desired      │  Pods   │
+       │    replica count          └─────────┘
+       │
+       │ 3. Update Deployment
+       ▼
+  ┌─────────────┐
+  │  Deployment  │
+  │  replicas: N │
+  └─────────────┘
+  
+  Formula:
+  desiredReplicas = ceil(currentReplicas * (currentMetricValue / desiredMetricValue))
+  
+  Example:
+  Current: 4 pods, avg CPU 80%, target 50%
+  desiredReplicas = ceil(4 * (80 / 50)) = ceil(6.4) = 7 pods
+
+HPA v2 API (current):
+  
+  apiVersion: autoscaling/v2
+  kind: HorizontalPodAutoscaler
+  metadata:
+    name: my-app-hpa
+    namespace: production
+  spec:
+    scaleTargetRef:
+      apiVersion: apps/v1
+      kind: Deployment
+      name: my-app
+    minReplicas: 2        # Never scale below this
+    maxReplicas: 20       # Never scale above this
+    metrics:
+    # CPU metric:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization          # Percentage of request
+          averageUtilization: 60     # Target 60% CPU utilization
+    # Memory metric:
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: AverageValue
+          averageValue: 512Mi        # Average absolute value
+    
+    # Scale behavior:
+    behavior:
+      scaleDown:
+        stabilizationWindowSeconds: 300      # Wait 5 min before scaling down
+        policies:
+        - type: Percent
+          value: 20                          # Max 20% of pods per period
+          periodSeconds: 60
+        - type: Pods
+          value: 2                           # Or max 2 pods per period
+          periodSeconds: 60
+        selectPolicy: Min                    # Use most conservative policy
+      scaleUp:
+        stabilizationWindowSeconds: 30       # Wait 30s before scaling up
+        policies:
+        - type: Percent
+          value: 100                         # Max 100% of pods per period
+          periodSeconds: 15
+        - type: Pods
+          value: 4                           # Or max 4 pods per period
+          periodSeconds: 15
+        selectPolicy: Max                    # Use most aggressive policy
+
+Scale Behavior Details:
+  
+  scaleDown.stabilizationWindowSeconds (default 300s):
+    HPA looks back this window. Scales down only if desired < actual for
+    the entire window. Prevents thrashing from transient load drops.
+  
+  scaleUp.stabilizationWindowSeconds (default 0s):
+    Scale up is immediate by default (no stabilization). Quick response.
+  
+  policies:
+    Multiple policies can be defined. selectPolicy determines which to use:
+    - Max: Use the policy that allows the MOST scaling (aggressive)
+    - Min: Use the policy that allows the LEAST scaling (conservative)
+    - Disabled: Disable scaling in this direction
+
+HPA kubectl Commands:
+  kubectl get hpa
+  kubectl describe hpa my-app-hpa
+  kubectl get hpa my-app-hpa -o yaml  # See current metrics
+  
+  Example output:
+  NAME        REFERENCE        TARGETS   MINPODS MAXPODS REPLICAS  AGE
+  my-app-hpa  Deployment/app   65%/60%   2       20      5         10m
+  
+  # Conditions when HPA can't scale:
+  kubectl describe hpa my-app-hpa
+  # Look for Conditions section:
+  # AbleToScale, ScalingActive, ScalingLimited
+
+Common HPA Issues:
+  
+  "unknown" metrics:
+  - metrics-server not installed or not healthy
+  - Resource requests NOT set on pods (HPA can't calculate utilization without requests)
+  
+  Not scaling down:
+  - stabilizationWindowSeconds too high
+  - minReplicas too high
+  - PodDisruptionBudget blocking pod removal
+  
+  Not scaling up:
+  - maxReplicas reached
+  - Cluster out of capacity (need Cluster Autoscaler)
+  - Metrics not being collected
+
+================================================================================
+3. HPA WITH CUSTOM AND EXTERNAL METRICS
+================================================================================
+
+Custom Metrics (app-level):
+  Requires Prometheus Adapter or similar.
+  Allows HPA to scale on application-specific metrics.
+  
+  # Scale on requests per second:
+  metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: http_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: 1000    # Target 1000 req/s per pod
+
+External Metrics (from outside cluster):
+  
+  # Scale on SQS queue depth:
+  metrics:
+  - type: External
+    external:
+      metric:
+        name: sqs_queue_depth
+        selector:
+          matchLabels:
+            queue: my-app-queue
+      target:
+        type: AverageValue
+        averageValue: 10    # Target 10 messages per pod
+
+Prometheus Adapter Setup:
+  Prometheus Adapter bridges Prometheus metrics to K8s custom metrics API.
+  
+  # values.yaml for prometheus-adapter:
+  rules:
+    custom:
+    - seriesQuery: 'http_requests_total{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace: {resource: namespace}
+          pod: {resource: pod}
+      name:
+        matches: "^(.*)_total"
+        as: "${1}_per_second"
+      metricsQuery: 'sum(rate(<<.Series>>[2m])) by (<<.GroupBy>>)'
+
+================================================================================
+4. VERTICAL POD AUTOSCALER (VPA)
+================================================================================
+
+What is VPA?
+  VPA adjusts CPU and memory requests/limits for running pods.
+  Solves: "We don't know what resource values to set for our app."
+  VPA observes actual usage and provides/applies recommendations.
+
+VPA Components:
+  - Recommender: Monitors usage, calculates recommendations
+  - Admission Plugin: Sets requests on new pods
+  - Updater: Evicts pods that need different requests
+
+VPA Update Modes:
+  
+  MODE        BEHAVIOR
+  ────────────────────────────────────────────────────────────────
+  Off         Only provide recommendations. No changes applied.
+              Use for: Understanding what values you SHOULD set.
+  Initial     Set resources on pod creation only. No restarts.
+              Use for: New pods get right-sized, existing unchanged.
+  Recreate    Evict and recreate pods to apply new recommendations.
+              Can cause brief downtime.
+  Auto        Same as Recreate currently (may change in future).
+  ────────────────────────────────────────────────────────────────
+  
+  Start with "Off" to see recommendations without disruption.
+
+VPA Resource YAML:
+  
+  apiVersion: autoscaling.k8s.io/v1
+  kind: VerticalPodAutoscaler
+  metadata:
+    name: my-app-vpa
+    namespace: production
+  spec:
+    targetRef:
+      apiVersion: apps/v1
+      kind: Deployment
+      name: my-app
+    updatePolicy:
+      updateMode: "Off"    # Start with Off to review recommendations
+    resourcePolicy:
+      containerPolicies:
+      - containerName: my-app
+        minAllowed:
+          cpu: 100m
+          memory: 128Mi
+        maxAllowed:
+          cpu: 4
+          memory: 8Gi
+        controlledResources: ["cpu", "memory"]
+        controlledValues: RequestsAndLimits   # Update both
+      - containerName: sidecar
+        mode: "Off"    # Exclude sidecar from VPA
+
+Checking VPA Recommendations:
+  kubectl describe vpa my-app-vpa
+  
+  # Look for:
+  Status:
+    Recommendation:
+      Container Recommendations:
+        Container Name:  my-app
+        Lower Bound:
+          Cpu:     200m
+          Memory:  262144k
+        Target:
+          Cpu:     500m         ← Recommended requests
+          Memory:  536870912
+        Upper Bound:
+          Cpu:     2
+          Memory:  2Gi
+        Uncapped Target:
+          Cpu:     450m
+          Memory:  512Mi
+
+VPA Limitations:
+  ✗ Cannot be used with HPA on the SAME metric (CPU/memory)
+  ✗ Evicts pods (may cause brief downtime in Recreate/Auto mode)
+  ✗ Does NOT work well with StatefulSets (disrupts storage)
+  ✗ VPA recommendations are based on historical usage
+  ✗ Minimum 2 pods needed for VPA to be safe (with PDB)
+
+================================================================================
+5. HPA vs VPA — WHEN TO USE EACH
+================================================================================
+
+Decision Framework:
+  
+  ┌─────────────────────┬──────────────────────┬──────────────────────┐
+  │                     │ HPA                  │ VPA                  │
+  ├─────────────────────┼──────────────────────┼──────────────────────┤
+  │ Scale direction      │ Horizontal (replicas)│ Vertical (resources) │
+  │ Best for            │ Stateless apps        │ Stateful/batch apps  │
+  │ Pod restarts        │ No (adds new pods)   │ Yes (in most modes)  │
+  │ Fast response       │ Yes                  │ Slower               │
+  │ Scale to zero       │ Only with KEDA       │ No                   │
+  │ Example workloads   │ Web APIs, workers     │ ML training, DBs     │
+  └─────────────────────┴──────────────────────┴──────────────────────┘
+
+Combined Strategy:
+  HPA + VPA in "Off" or "Initial" mode:
+  - VPA recommends right-sized resource values → you set them manually
+  - HPA scales horizontally based on load
+  
+  VPA with HPA on same metric: NOT recommended
+  If both HPA and VPA control CPU, they fight each other.
+  Solution: HPA on custom/external metrics + VPA on CPU/memory.
+
+================================================================================
+6. CLUSTER AUTOSCALER
+================================================================================
+
+What is Cluster Autoscaler (CA)?
+  Automatically adds or removes NODES from the cluster.
+  Works with cloud provider auto-scaling groups (ASGs).
+  Triggered by: unschedulable pods (scale up), underutilized nodes (scale down).
+
+Scale-Up Trigger:
+  Pod becomes Unschedulable (cannot fit on any node).
+  CA simulates adding a new node, checks if pod would schedule.
+  If yes, requests cloud provider to add node.
+  
+  Timeline:
+  Pod Unschedulable → CA detects (within ~10s) → requests cloud node
+  → Node joins cluster (~1-5 min for cloud) → Pod schedules
+
+Scale-Down Trigger:
+  Node CPU + Memory utilization < threshold (default 50%)
+  for --scale-down-unneeded-time (default 10 min).
+  CA checks: can all pods on this node fit on other nodes?
+  If yes: drains the node (evicts pods), removes it.
+  
+  Scale-down delays:
+  --scale-down-unneeded-time: 10m (node must be underutilized for 10 min)
+  --scale-down-delay-after-add: 10m (don't scale down right after adding)
+
+CA Deployment (EKS example):
+  
+  # Annotate Deployment with IRSA role:
+  spec:
+    template:
+      spec:
+        serviceAccountName: cluster-autoscaler
+        containers:
+        - image: k8s.gcr.io/autoscaling/cluster-autoscaler:v1.27.0
+          command:
+          - ./cluster-autoscaler
+          - --v=4
+          - --stderrthreshold=info
+          - --cloud-provider=aws
+          - --skip-nodes-with-local-storage=false
+          - --expander=least-waste
+          - --node-group-auto-discovery=asg:tag=k8s.io/cluster-autoscaler/enabled,k8s.io/cluster-autoscaler/my-cluster
+          - --balance-similar-node-groups
+          - --skip-nodes-with-system-pods=false
+
+CA Node Group Expanders:
+  Decides which node group to expand when multiple options exist:
+  
+  least-waste    Choose node group with least wasted resources after scheduling
+  random         Random selection (default)
+  most-pods      Group that fits most pending pods
+  priority       User-defined priority via ConfigMap
+
+CA Preventing Scale-Down:
+  Nodes NOT scaled down if they have:
+  - Pods with local storage (emptyDir with data) — can configure to override
+  - Pods with restrictive PDB (PodDisruptionBudget)
+  - Pods with "cluster-autoscaler.kubernetes.io/safe-to-evict: false" annotation
+  - System pods (kube-system) — can configure to override
+
+Node Selector for Scaling:
+  # Place pods on specific node groups:
+  spec:
+    nodeSelector:
+      node.kubernetes.io/instance-type: t3.large
+
+================================================================================
+7. KEDA — KUBERNETES EVENT-DRIVEN AUTOSCALING
+================================================================================
+
+What is KEDA?
+  Kubernetes Event-Driven Autoscaling.
+  CNCF graduated project.
+  Extends HPA to scale on EXTERNAL event sources.
+  Key feature: SCALE TO ZERO (and back from zero).
+  
+  Without KEDA: HPA minimum is 1 replica. Can't go to zero.
+  With KEDA: ScaledObject can have minReplicaCount: 0.
+
+Install KEDA:
+  helm repo add kedacore https://kedacore.github.io/charts
+  helm install keda kedacore/keda --namespace keda --create-namespace
+
+KEDA Components:
+  - ScaledObject: Defines scaling for a Deployment/StatefulSet
+  - ScaledJob: Defines scaling for batch Jobs
+  - TriggerAuthentication: Credentials for external systems
+  - KEDA Operator: Manages the scaling logic
+  - Metrics Adapter: Exposes KEDA metrics to HPA
+
+ScaledObject YAML:
+  
+  apiVersion: keda.sh/v1alpha1
+  kind: ScaledObject
+  metadata:
+    name: my-worker-scaledobject
+    namespace: production
+  spec:
+    scaleTargetRef:
+      apiVersion: apps/v1
+      kind: Deployment
+      name: my-worker
+    minReplicaCount: 0       # Scale to zero when no messages!
+    maxReplicaCount: 50
+    cooldownPeriod: 300      # Seconds before scaling down to zero
+    pollingInterval: 30      # Check trigger every 30s
+    
+    triggers:
+    # SQS Queue depth:
+    - type: aws-sqs-queue
+      authenticationRef:
+        name: keda-trigger-auth-aws
+      metadata:
+        queueURL: https://sqs.us-east-1.amazonaws.com/123456789/my-queue
+        queueLength: "10"       # Target messages per pod
+        awsRegion: us-east-1
+    
+    advanced:
+      restoreToOriginalReplicaCount: false   # After scale-down, go to minReplicaCount
+      horizontalPodAutoscalerConfig:
+        behavior:
+          scaleDown:
+            stabilizationWindowSeconds: 60
+
+Kafka ScaledObject:
+  
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker:9092
+      consumerGroup: my-consumer-group
+      topic: my-topic
+      lagThreshold: "100"        # Scale up when lag > 100
+      offsetResetPolicy: latest
+
+Prometheus Trigger:
+  
+  triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      metricName: http_requests
+      threshold: "100"
+      query: sum(rate(http_requests_total{app="my-app"}[2m]))
+
+Cron Trigger (scheduled scaling):
+  
+  triggers:
+  - type: cron
+    metadata:
+      timezone: America/New_York
+      start: "0 8 * * MON-FRI"    # 8 AM weekdays: scale up
+      end: "0 18 * * MON-FRI"     # 6 PM weekdays: scale down
+      desiredReplicas: "10"
+
+TriggerAuthentication (for AWS, secret management):
+  
+  apiVersion: keda.sh/v1alpha1
+  kind: TriggerAuthentication
+  metadata:
+    name: keda-trigger-auth-aws
+    namespace: production
+  spec:
+    podIdentity:
+      provider: aws    # Use IRSA (IAM Roles for Service Accounts)
+
+ScaledJob (for batch processing):
+  
+  apiVersion: keda.sh/v1alpha1
+  kind: ScaledJob
+  metadata:
+    name: batch-processor
+  spec:
+    jobTargetRef:
+      template:
+        spec:
+          containers:
+          - name: processor
+            image: my-processor:latest
+          restartPolicy: Never
+    triggers:
+    - type: aws-sqs-queue
+      metadata:
+        queueURL: https://sqs.../my-batch-queue
+        queueLength: "1"    # 1 Job per message
+
+KEDA Scalers (popular):
+  aws-sqs-queue      AWS SQS queue message count
+  kafka              Kafka consumer group lag
+  redis              Redis list length
+  prometheus         Custom Prometheus query
+  rabbitmq           RabbitMQ queue depth
+  azure-servicebus   Azure Service Bus
+  pubsub             Google Cloud Pub/Sub
+  mysql / postgres   DB query results
+  cron               Time-based scaling
+  cpu / memory       CPU/Memory (like HPA)
+
+================================================================================
+8. PODDISRUPTIONBUDGET (PDB)
+================================================================================
+
+What is a PodDisruptionBudget?
+  Guarantees minimum availability during VOLUNTARY disruptions:
+  - kubectl drain (node maintenance)
+  - Cluster Autoscaler scale-down
+  - Deployment rolling updates
+  - Node upgrades
+  
+  Does NOT protect from involuntary disruptions (node crash, OOM kill).
+
+PDB YAML:
+  
+  apiVersion: policy/v1
+  kind: PodDisruptionBudget
+  metadata:
+    name: my-app-pdb
+    namespace: production
+  spec:
+    selector:
+      matchLabels:
+        app: my-app
+    
+    # Option 1: Minimum available pods (absolute or percentage):
+    minAvailable: 2       # Always keep at least 2 pods
+    # OR:
+    minAvailable: "80%"   # Always keep at least 80% of pods
+    
+    # Option 2: Maximum unavailable pods:
+    # maxUnavailable: 1       # Allow at most 1 pod unavailable
+    # maxUnavailable: "20%"   # Allow at most 20% pods unavailable
+
+PDB and Cluster Autoscaler:
+  If a node's pods are protected by PDB, CA cannot drain the node.
+  CA marks node as "not removable" due to PDB.
+  
+  Common issue: PDB set too strictly blocks CA scale-down entirely.
+  Solution: Set reasonable values (minAvailable: 1 for low-priority apps).
+
+PDB and HPA:
+  HPA respects PDB during scale-down.
+  HPA won't delete pods if it would violate PDB.
+  
+  Best practice: Always create PDB for production Deployments with >1 replica.
+
+================================================================================
+9. AUTOSCALING BEST PRACTICES
+================================================================================
+
+HPA Best Practices:
+  ✓ Always set resource requests on pods (required for HPA)
+  ✓ Set minReplicas >= 2 for production (availability)
+  ✓ Use stabilizationWindowSeconds for scaleDown (prevent thrashing)
+  ✓ Test scaling behavior under load (k6, locust)
+  ✓ Set maxReplicas to a safe upper bound (prevent runaway scaling)
+  ✓ Use KEDA for event-driven workloads
+  ✓ Combine with PDB for safe scale-down
+
+VPA Best Practices:
+  ✓ Start with "Off" mode to learn recommendations without disruption
+  ✓ Move to "Initial" before "Auto/Recreate"
+  ✓ Set minAllowed/maxAllowed to prevent extreme recommendations
+  ✓ Don't use VPA on same metric as HPA (fight each other)
+  ✓ Use for stateful workloads that can't scale horizontally
+
+Cluster Autoscaler Best Practices:
+  ✓ Use multiple node groups (spot + on-demand)
+  ✓ Use node labels for pod affinity to specific node types
+  ✓ Set appropriate PDB to avoid blocking scale-down
+  ✓ Use least-waste expander to minimize waste
+  ✓ Pre-warm node pools for predictable traffic spikes
+
+KEDA Best Practices:
+  ✓ Start with conservative maxReplicaCount
+  ✓ Test scale-from-zero (cold start latency)
+  ✓ Use TriggerAuthentication with IRSA/Workload Identity
+  ✓ Set appropriate cooldownPeriod to avoid thrashing
+
+================================================================================
+10. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: Explain how HPA works and what it needs to function.
+A: HPA (HorizontalPodAutoscaler) automatically adjusts replica count based on metrics.
+   
+   How it works:
+   1. HPA controller runs a control loop (default every 15s).
+   2. Fetches current metric values from Metrics API.
+   3. Calculates desired replicas:
+      desiredReplicas = ceil(current * (currentValue / targetValue))
+   4. Updates Deployment/StatefulSet replicas field.
+   
+   What it needs:
+   1. metrics-server: Must be installed. Provides CPU/memory from kubelet.
+      kubectl top pods won't work without it.
+   
+   2. Resource REQUESTS on containers: HPA calculates CPU utilization as:
+      (actual CPU used) / (requested CPU) × 100%
+      Without requests set, HPA shows "unknown" metrics and can't scale.
+   
+   3. Autoscaling target (Deployment, ReplicaSet, StatefulSet).
+   
+   4. For custom/external metrics: Prometheus Adapter or KEDA.
+   
+   Scale behavior:
+   - Scale up: Fast (stabilizationWindowSeconds: 0 by default)
+   - Scale down: Slow (stabilizationWindowSeconds: 300s by default)
+     This prevents thrashing when load briefly dips.
+
+Q2: What's the difference between HPA and VPA? When would you use each?
+A: 
+   HPA (Horizontal): Adds/removes PODS. Best for stateless apps.
+   VPA (Vertical): Adjusts pod CPU/memory requests. Best for stateful apps.
+   
+   Use HPA when:
+   - App is stateless (web APIs, workers, microservices)
+   - You can run multiple identical instances
+   - Load varies and you need fast scaling response
+   - You know the right resource sizes but traffic fluctuates
+   
+   Use VPA when:
+   - App can't easily scale horizontally (databases, some stateful apps)
+   - You don't know the right CPU/memory values to set
+   - You want right-sizing recommendations (VPA "Off" mode)
+   - Batch jobs with varying resource needs
+   
+   Don't use both on same metric:
+   If HPA scales on CPU AND VPA adjusts CPU requests, they conflict.
+   VPA changes the denominator of HPA's calculation, causing oscillation.
+   
+   Safe combination:
+   - HPA on custom metrics (HTTP requests, queue depth)
+   - VPA on CPU/memory in "Off" or "Initial" mode
+
+Q3: How does Cluster Autoscaler work and what are its limitations?
+A: Cluster Autoscaler (CA) scales the NUMBER OF NODES in the cluster.
+   
+   Scale-up trigger:
+   - Pods are in Pending state (Unschedulable — insufficient node resources)
+   - CA simulates adding a node from each node group
+   - Picks the best node group and requests cloud provider to add a node
+   
+   Scale-down trigger:
+   - Node utilization (CPU + memory) < --scale-down-utilization-threshold (default 50%)
+   - For --scale-down-unneeded-time (default 10 min)
+   - All pods on the node can be scheduled elsewhere
+   - CA cordons and drains the node, then requests cloud to terminate it
+   
+   Limitations:
+   1. Scale-up takes time: Cloud provider must provision EC2/VM (1-5 min)
+      Not suitable for handling sudden burst traffic
+   2. Respects PDB: If PDB prevents pod eviction, CA can't drain the node
+   3. Local storage: Pods with emptyDir (local storage) block scale-down
+   4. System pods: kube-system pods require explicit permission to evict
+   5. Node affinity: If pending pod requires specific node (nodeSelector),
+      CA must find/create that specific node type
+   
+   Work with CA:
+   - Set reasonable PDB (not too strict)
+   - Annotate pods that can be evicted: cluster-autoscaler.kubernetes.io/safe-to-evict: "true"
+   - Use multiple node groups (different sizes for different workloads)
+   - Don't set too many pods with restrictive node affinity
+
+Q4: What is KEDA and when would you use it over regular HPA?
+A: KEDA (Kubernetes Event-Driven Autoscaling) extends HPA to scale on
+   external event sources, with the ability to scale to ZERO.
+   
+   Regular HPA limitations:
+   - Only scales on CPU, memory, or Prometheus metrics exposed via adapter
+   - Minimum replicas = 1 (can't scale to zero)
+   - Complex setup for queue-depth or event-driven scaling
+   
+   KEDA advantages:
+   - 50+ built-in scalers: SQS, Kafka, RabbitMQ, Redis, Prometheus, cron...
+   - Scale-to-ZERO: Saves costs when no events (great for batch workers)
+   - ScaledJob: Creates individual Jobs per event (not pods)
+   - Simple configuration: YAML-based, no custom metrics adapter needed
+   
+   Use KEDA when:
+   - Workers that process queue messages (SQS, Kafka, RabbitMQ)
+   - Scale to zero during off-hours (cron trigger)
+   - Event-driven microservices
+   - Batch processing (ScaledJob — one Job per message)
+   
+   Example: Video processing service
+   - Messages go to SQS queue when video uploaded
+   - KEDA ScaledObject: minReplicas=0, maxReplicas=100, queueLength=5
+   - During night: 0 pods (scale to zero)
+   - User uploads 50 videos: KEDA scales to 10 pods (50/5)
+   - All processed: scales back to 0
+
+Q5: What is a PodDisruptionBudget and why is it important?
+A: A PodDisruptionBudget (PDB) guarantees minimum availability during
+   VOLUNTARY (planned) disruptions.
+   
+   Without PDB:
+   During kubectl drain (node maintenance), Kubernetes can terminate all
+   pods of an app simultaneously → downtime.
+   
+   With PDB (minAvailable: 2):
+   kubectl drain respects the PDB. It won't delete pods below the minimum.
+   If app has 3 pods, only 1 can be disrupted at a time. Process takes longer,
+   but application stays available.
+   
+   What counts as voluntary disruptions:
+   - kubectl drain (node maintenance/upgrade)
+   - Cluster Autoscaler scale-down
+   - Deployment rolling updates (partially)
+   - API-initiated evictions
+   
+   What PDB does NOT protect against:
+   - Node crash (hardware failure)
+   - OOM kill
+   - Pod crash (your app dying)
+   
+   YAML:
+   spec:
+     minAvailable: 2         # Always have at least 2 pods
+     # OR
+     maxUnavailable: 1       # Allow at most 1 pod down at once
+     selector:
+       matchLabels:
+         app: my-app
+   
+   Important interaction with CA:
+   If PDB requires minAvailable: 2 and you only have 2 pods,
+   CA can NEVER drain that node (would violate PDB).
+   Always ensure potential replicas > minAvailable for CA to work.
+   
+   Best practice: Create PDB for every production Deployment with >1 replica.
+
+================================================================================
+11. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+HPA COMMANDS:
+  kubectl get hpa [-n namespace]
+  kubectl describe hpa my-app-hpa
+  kubectl autoscale deployment my-app --min=2 --max=10 --cpu-percent=60
+
+HPA FORMULA:
+  desiredReplicas = ceil(currentReplicas * (currentMetric / targetMetric))
+
+HPA METRICS:
+  Resource.cpu        averageUtilization (% of request) or AverageValue
+  Resource.memory     AverageValue (Mi/Gi) — not % utilization
+  Pods                Custom per-pod metric
+  External            Queue depth, external service metric
+
+VPA MODES:
+  Off        Recommendations only, no changes
+  Initial    Apply on pod creation only
+  Recreate   Evict pods to apply new values
+  Auto       Same as Recreate (currently)
+
+KEDA SCALERS:
+  aws-sqs-queue      SQS queue message count
+  kafka              Consumer group lag
+  redis              List/stream length
+  prometheus         PromQL query result
+  cron               Time-based scheduled scaling
+  cpu/memory         CPU/memory (like HPA)
+
+CA KEY FLAGS:
+  --scale-down-utilization-threshold: 0.5  (50% utilization → scale down)
+  --scale-down-unneeded-time: 10m          (must be underutilized for 10m)
+  --scale-down-delay-after-add: 10m        (wait after adding nodes)
+  --max-node-provision-time: 15m           (timeout for node to join)
+
+PDB:
+  minAvailable: 2       Keep at least 2 pods
+  maxUnavailable: 1     Allow at most 1 pod down
+  Only protects voluntary disruptions (drain, eviction, CA)
+
+COMBINATION STRATEGIES:
+  HPA + CA          HPA scales pods → CA scales nodes when pods can't schedule
+  VPA (Off) + HPA   VPA recommends sizes → you set them → HPA scales horizontally
+  KEDA + CA         KEDA scales workers for queue depth → CA adds nodes if needed
+
+================================================================================
+END OF FILE
+================================================================================

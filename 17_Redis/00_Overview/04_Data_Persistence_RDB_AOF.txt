@@ -1,0 +1,285 @@
+================================================================================
+REDIS DATA PERSISTENCE: RDB & AOF — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. WHY PERSISTENCE MATTERS
+────────────────────────────
+Redis is in-memory by default. Without persistence, a restart = complete data
+loss. For caches that's acceptable; for primary stores and message queues, it's
+not.
+
+Redis offers two persistence mechanisms:
+  1. RDB (Redis Database): point-in-time snapshots
+  2. AOF (Append Only File): a log of every write command
+
+They can be used independently or together (hybrid mode since Redis 4.0).
+
+
+2. RDB — REDIS DATABASE SNAPSHOTS
+────────────────────────────────────
+
+2a. How it works:
+  Redis forks the process (copy-on-write fork). The child process writes a
+  compact binary snapshot of all data to a .rdb file on disk. The parent
+  continues serving requests.
+
+  Fork + CoW mechanism:
+    - fork() creates a child with shared memory pages
+    - Parent continues writing (copy-on-write creates new pages for modified data)
+    - Child writes the snapshot (sees pre-fork consistent state)
+    - When done: rename(temp.rdb, dump.rdb) — atomic replace
+    - Child exits
+
+  This means: snapshot is always a consistent point-in-time view.
+
+2b. Configuration:
+  save 900 1       # snapshot if ≥1 key changed in last 900 seconds
+  save 300 10      # snapshot if ≥10 keys changed in last 300 seconds
+  save 60 10000    # snapshot if ≥10000 keys changed in last 60 seconds
+
+  dbfilename dump.rdb
+  dir /var/lib/redis/
+
+  # Manual trigger
+  BGSAVE        # async (background save, returns immediately)
+  SAVE          # sync (blocks all clients until done — DANGEROUS in production)
+  LASTSAVE      # Unix timestamp of last successful save
+
+2c. RDB file format:
+  Binary, compressed with LZF. Very compact.
+  Contains: magic string, RDB version, databases, key-value pairs with TTL,
+            EOF marker, CRC64 checksum.
+
+2d. Advantages:
+  ✓ Very compact file (good for backups)
+  ✓ Fast restarts: loading RDB is much faster than replaying AOF
+  ✓ Good for backups (can copy dump.rdb off-server periodically)
+  ✓ Minimal performance impact (fork + CoW, parent not blocked)
+  ✓ Ideal for disaster recovery: restore a specific point in time
+
+2e. Disadvantages:
+  ✗ Data loss: you can lose up to minutes of data (last snapshot window)
+  ✗ Fork can be expensive on large datasets (RAM doubled momentarily via CoW)
+  ✗ If dataset is large (e.g., 50 GB), fork latency can cause jitter
+  ✗ Not suitable when RPO (Recovery Point Objective) < 1 minute
+
+2f. When to use RDB:
+  - Cache warm restarts (acceptable to lose some data)
+  - Backups and archival (daily snapshots)
+  - Disaster recovery with acceptable data loss window
+  - When restart speed is critical (RDB loads in seconds vs AOF replay minutes)
+
+
+3. AOF — APPEND ONLY FILE
+───────────────────────────
+
+3a. How it works:
+  Every write command executed by Redis is appended to the AOF file in Redis
+  Serialization Protocol (RESP) format. On restart, Redis replays the AOF file
+  to reconstruct the dataset.
+
+  Write flow:
+  Client sends SET key value
+  → Redis executes command
+  → Redis appends "SET key value\r\n" to AOF buffer
+  → Buffer flushed to disk based on fsync policy
+
+3b. fsync policies (appendfsync):
+  always:   fsync after EVERY command. Maximum durability (data loss = 0 cmds).
+            Slowest: ~1000 writes/sec (disk-bound).
+
+  everysec: fsync once per second (default, recommended).
+            Data loss = up to 1 second of writes.
+            Fast: background fsync, minimal latency impact.
+
+  no:       Never explicitly fsync (OS decides when to flush).
+            Fastest, but can lose up to OS buffer (30 seconds typically).
+            Rarely recommended.
+
+  Comparison:
+    Policy     │ Data safety          │ Performance
+    ───────────┼──────────────────────┼──────────────────
+    always     │ Max (0 cmds lost)    │ Slow
+    everysec   │ Good (≤1 sec lost)   │ Fast (recommended)
+    no         │ Low (OS-dependent)   │ Fastest
+
+3c. AOF Rewrite (Compaction):
+  Problem: AOF grows forever. 1 million INCRs to counter → 1M lines in AOF.
+  Solution: AOF rewrite compacts the AOF to the current state.
+
+  BGREWRITEAOF command (or automatic when aof-use-rdb-preamble yes):
+    - Redis forks a child
+    - Child writes a NEW compact AOF representing current data state
+    - While child writes, parent logs NEW commands to AOF buffer
+    - When child finishes, append buffer to new AOF → rename atomically
+
+  Auto-trigger:
+  auto-aof-rewrite-percentage 100   # trigger when AOF doubles in size
+  auto-aof-rewrite-min-size 64mb    # minimum size before auto-rewrite
+
+3d. AOF file format:
+  RESP (Redis Serialization Protocol) format. Human-readable.
+  *3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n
+  → This is: "SET foo bar"
+
+3e. Advantages:
+  ✓ Durable: can achieve 0 data loss (appendfsync always)
+  ✓ Human-readable: can inspect/edit the AOF file
+  ✓ Atomic append: even a partial write at crash won't corrupt (redis-check-aof)
+  ✓ Precise replay: recover exact state up to last written command
+
+3f. Disadvantages:
+  ✗ Larger file size than RDB (especially before rewrite)
+  ✗ Slower restart: must replay all commands (vs binary RDB load)
+  ✗ Can be slower than RDB under high write load (appendfsync always)
+  ✗ AOF bugs historically: rare cases of AOF replay producing different state
+    than the original (fixed in modern Redis)
+
+3g. When to use AOF:
+  - When Redis is a primary DB and data loss is unacceptable
+  - Financial data, session tokens, shopping carts
+  - When RPO must be ≤ 1 second (use appendfsync everysec)
+
+
+4. HYBRID MODE (RDB + AOF) — RECOMMENDED FOR MOST CASES
+─────────────────────────────────────────────────────────
+
+4a. How it works (Redis 4.0+):
+  aof-use-rdb-preamble yes  (default in Redis 7.x)
+
+  The AOF file starts with an RDB snapshot (fast load), followed by incremental
+  AOF commands since the last snapshot.
+
+  On restart:
+    1. Load the RDB preamble (fast binary load)
+    2. Replay only the incremental AOF portion (small)
+    → Fast startup + high durability
+
+4b. Configuration:
+  appendonly yes
+  aof-use-rdb-preamble yes
+  appendfsync everysec
+
+  # Also keep RDB for backups
+  save 900 1
+  save 300 10
+
+4c. Why hybrid is best practice:
+  - Fast restarts (RDB section loads quickly)
+  - Low data loss (AOF covers the gap since last RDB)
+  - Compact storage (RDB portion is compressed binary)
+
+
+5. COMPARING RDB vs AOF
+────────────────────────
+  Feature              │ RDB              │ AOF
+  ─────────────────────┼──────────────────┼────────────────────────
+  Data loss risk       │ Minutes          │ ≤1 second (everysec)
+  Restart speed        │ Fast             │ Slow (replay all cmds)
+  File size            │ Small (compact)  │ Larger (text commands)
+  Human readable       │ No (binary)      │ Yes (RESP format)
+  Corruption recovery  │ redis-check-rdb  │ redis-check-aof
+  Impact on perf       │ Fork jitter      │ Background fsync
+  Best for             │ Backups, caches  │ Primary store, durability
+  Replay accuracy      │ Exact (snapshot) │ Exact (command replay)
+
+
+6. PERSISTENCE AND REPLICATION
+────────────────────────────────
+  - Replicas receive data via replication, NOT by loading the same AOF/RDB
+  - On new replica joining: master does BGSAVE, sends RDB to replica, then
+    streams all new commands
+  - Replicas can have their own persistence settings (often AOF on replicas,
+    RDB disabled on master to avoid fork latency)
+
+  Best practice for HA + persistence:
+    Master:  appendonly no, save ""    (no persistence — avoid fork latency)
+    Replica: appendonly yes            (AOF on replica for durability)
+
+
+7. PERSISTENCE FAILURE SCENARIOS
+──────────────────────────────────
+  Scenario A: Redis crashes mid-write to AOF
+  → Only last partial command may be truncated
+  → redis-check-aof --fix appendonly.aof truncates the corrupt tail
+  → Data loss: only the last partially written command
+
+  Scenario B: OS crash (power cut)
+  → appendfsync always: no data loss (every command fsynced)
+  → appendfsync everysec: up to 1 second of writes lost
+  → appendfsync no: up to OS buffer lost (could be seconds to minutes)
+
+  Scenario C: Disk full during RDB save
+  → BGSAVE fails, old dump.rdb remains untouched
+  → Alerts via keyspace notifications or monitoring LASTSAVE
+
+  Scenario D: RDB load failure (corrupted file)
+  → Redis refuses to start (safety measure)
+  → Fix: redis-check-rdb dump.rdb
+  → Or start with crashlog-enabled no to skip corrupted entries
+
+
+8. MULTI-PART AOF (Redis 7.0+)
+────────────────────────────────
+  Redis 7.0 introduced a new AOF format that splits AOF into:
+    - Base AOF: the RDB or AOF preamble
+    - Incremental AOF: changes since the last base
+
+  Stored in a manifest file: appendonly.aof.manifest
+  This makes AOF rewrites more efficient and atomic:
+    - New base written in background
+    - Incremental files accumulated
+    - Manifest atomically updated to point to new base
+
+  Directory: aof-use-rdb-preamble yes + appenddirname "appendonlydir"
+
+
+9. EVICTION vs EXPIRATION vs PERSISTENCE
+──────────────────────────────────────────
+  Expiration (TTL):
+    - Key expires at a set time → removed from memory AND from AOF/RDB
+    - EXPIRE sets a TTL; Redis lazily expires (on access) or actively expires
+      (background scan of volatile keys)
+
+  Eviction (maxmemory-policy):
+    - When Redis reaches maxmemory, evicts keys based on policy
+    - Evicted keys are GONE (even if they had TTL remaining)
+    - AOF does NOT record evictions (they're implicit)
+
+  Persistence:
+    - Snapshots data at a point in time
+    - TTL values are also persisted (so keys expire correctly after restart)
+
+
+10. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: What is the difference between RDB and AOF?
+  A: RDB is a periodic binary snapshot (fast load, can lose minutes of data).
+     AOF is a log of every write command (slower load, can achieve ≤1s data loss).
+     Use both together (hybrid mode) for the best of both worlds.
+
+  Q: How do you ensure zero data loss in Redis?
+  A: Enable AOF with appendfsync always. Every command is fsynced to disk before
+     the client gets a response. This guarantees 0 data loss but reduces write
+     throughput significantly (~1K ops/sec on spinning disk).
+
+  Q: What happens if the AOF file gets corrupted?
+  A: Run redis-check-aof --fix appendonly.aof. It finds and truncates the
+     corrupt portion. Some data at the tail may be lost, but the rest is safe.
+
+  Q: How does Redis handle the fork() overhead for RDB saves?
+  A: fork() uses copy-on-write. The child gets a snapshot of the memory pages.
+     On active workloads, modified pages are copied → temporarily up to 2x memory
+     usage. This is why Redis requires at least 2x working set RAM for RDB saves.
+     Large datasets (50+ GB) can cause fork latency spikes.
+
+  Q: Can you disable persistence entirely?
+  A: Yes: save "" and appendonly no. Redis becomes a pure in-memory store.
+     Data is lost on restart. Suitable for pure cache workloads.
+
+  Q: What is the recommended persistence setup for production?
+  A: Hybrid mode: appendonly yes + aof-use-rdb-preamble yes +
+     appendfsync everysec. This gives fast restarts, durable writes, and
+     acceptable performance. Also configure periodic RDB saves for backups.
+
+================================================================================

@@ -1,0 +1,333 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HEALTH CHECKS AND HEARTBEATS — COMPLETE GUIDE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROBLEM STATEMENT:
+  In distributed systems, components fail silently. An unresponsive service
+  looks the same as a slow service — neither sends you a "help, I'm dead" message.
+  You need a systematic way to:
+    1. Detect failures quickly (reduce MTTD)
+    2. Route traffic away from unhealthy instances
+    3. Restart or replace failed components automatically
+
+HEALTH CHECK TYPES OVERVIEW:
+  Shallow check:  Is the process running? Can it accept a TCP connection?
+  Deep check:     Can it actually do its job? (DB connected, dependencies healthy)
+  Synthetic check: Can it complete a real transaction end-to-end?
+
+
+2. KUBERNETES PROBE TYPES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+LIVENESS PROBE
+  Question: "Is this container alive? Should Kubernetes restart it?"
+  Failure action: Kubernetes RESTARTS the container
+  
+  What it checks:
+    - Is the process still running and responsive?
+    - Is it NOT in a deadlock or infinite loop?
+    - Is it NOT stuck in an unrecoverable error state?
+  
+  What it should NOT check:
+    - External dependencies (database, other services)
+    - If DB is down, killing your service makes it worse
+    - Should only reflect the process's OWN health
+  
+  Example checks:
+    - HTTP GET /healthz returns 200
+    - TCP connection to port 8080 succeeds
+    - Simple computation: return 200 if running
+
+  Kubernetes config:
+    livenessProbe:
+      httpGet:
+        path: /healthz
+        port: 8080
+      initialDelaySeconds: 30    # Wait 30s after start before checking
+      periodSeconds: 10           # Check every 10 seconds
+      failureThreshold: 3         # Restart after 3 consecutive failures
+      successThreshold: 1         # 1 success = healthy
+
+  Correct liveness endpoint (/healthz):
+    - Returns 200 OK if process is alive
+    - Does NOT check external dependencies
+    - Must respond in < 1 second
+    - Thread-safe (can be called while serving traffic)
+
+READINESS PROBE
+  Question: "Is this container ready to receive traffic?"
+  Failure action: Kubernetes REMOVES the pod from Service endpoints (no traffic)
+                  Pod is NOT restarted — just isolated from traffic
+  
+  What it checks:
+    - Is the database connection pool established?
+    - Has the service finished loading its caches / configuration?
+    - Are critical downstream dependencies healthy?
+    - Is the service warm (not processing a large batch job)?
+  
+  Use cases:
+    - Slow startup: Service needs 30s to load ML model — not ready until done
+    - Dependency recovery: DB went down briefly — pod becomes ready again
+                           once connection re-established
+    - Graceful shutdown: Pod sets readiness = false before shutdown,
+                         allowing in-flight requests to complete
+
+  Kubernetes config:
+    readinessProbe:
+      httpGet:
+        path: /ready
+        port: 8080
+      initialDelaySeconds: 10
+      periodSeconds: 5
+      failureThreshold: 3         # Remove from LB after 3 failures
+      successThreshold: 2         # 2 successes to be re-added to LB
+
+  Correct readiness endpoint (/ready):
+    - Checks DB connection (can execute "SELECT 1")
+    - Checks critical caches loaded
+    - Returns 503 if any critical dependency is unavailable
+    - Returns 200 if ready to serve traffic
+
+STARTUP PROBE
+  Question: "Has this container finished starting up?"
+  Failure action: Kubernetes KILLS the container if startup probe fails
+                  after the configured timeout
+  
+  Problem it solves:
+    - Liveness probe would kill a slow-starting container before it's ready
+    - Startup probe gives extra time for startup, then hands off to liveness
+  
+  Example: JVM application takes 60-120 seconds to start
+    startupProbe:
+      httpGet:
+        path: /healthz
+        port: 8080
+      failureThreshold: 30        # 30 × 10s = 300s allowed for startup
+      periodSeconds: 10
+    
+    After startup succeeds: livenessProbe takes over
+
+PROBE INTERACTION FLOW:
+  Pod starts
+    → Startup probe runs until success (or kills pod if timeout)
+    → Both liveness and readiness probes begin
+    → Readiness: controls traffic routing (in/out of service endpoints)
+    → Liveness: controls container restarts
+
+
+3. SHALLOW vs DEEP HEALTH CHECKS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SHALLOW HEALTH CHECK:
+  What: "Is the process up and accepting connections?"
+  Implementation: TCP connect check, or trivial HTTP ping
+  
+  Examples:
+    - AWS ELB: TCP connect to port 80 succeeds → healthy
+    - Kubernetes: HTTP GET /healthz returns 200
+    - Load balancer: Can connect on port 443
+  
+  Pros: Fast, no false positives, won't fail due to dependency issues
+  Cons: Process can be "up" but totally broken (can't access DB, returning 500s)
+  Use for: LIVENESS probe
+
+DEEP HEALTH CHECK:
+  What: "Can this service actually handle requests successfully?"
+  Implementation: Check all critical dependencies
+  
+  Deep health check implementation:
+    GET /health/deep
+    
+    {
+      "status": "healthy",
+      "checks": {
+        "database": {
+          "status": "healthy",
+          "latency_ms": 2,
+          "detail": "SELECT 1 succeeded"
+        },
+        "redis": {
+          "status": "healthy",
+          "latency_ms": 1
+        },
+        "payment_service": {
+          "status": "degraded",
+          "latency_ms": 450,
+          "detail": "High latency, circuit breaker half-open"
+        }
+      },
+      "version": "2.1.4",
+      "uptime_seconds": 86400
+    }
+  
+  Status codes:
+    200 OK: All critical checks pass
+    207 Multi-Status: Some checks degraded (non-critical)
+    503 Service Unavailable: Critical check failed
+  
+  Pros: True picture of service health
+  Cons: Risk of cascading failures if deep check is used for liveness
+        (DB down → all instances fail liveness → mass restarts → thundering herd)
+  Use for: READINESS probe, monitoring dashboards, load balancer health
+
+HEALTH CHECK ENDPOINTS CONVENTION:
+  /healthz or /health/live:  Liveness (shallow — process alive?)
+  /readyz or /health/ready:  Readiness (can serve traffic?)
+  /health or /health/deep:   Deep check (full dependency status)
+  /metrics:                  Prometheus metrics (includes health indicators)
+
+
+4. HEARTBEAT PATTERNS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+HEARTBEAT:
+  Periodic signal from a service to indicate it's alive
+  "I'm alive" sent every N seconds
+  Failure: No heartbeat received within timeout → declare failure
+
+PUSH HEARTBEAT (service pushes to monitor):
+  Service sends heartbeat to central store (ZooKeeper, etcd, Consul)
+  
+  Flow:
+    Service A → PUT /services/A/heartbeat (timestamp) every 5s
+    Monitor checks: last heartbeat < 15s ago? → healthy
+    After 15s with no heartbeat → declare Service A dead
+  
+  Implementation (ZooKeeper ephemeral node):
+    Service creates ephemeral znode /services/A on startup
+    Znode disappears automatically when session expires (ZooKeeper detects disconnect)
+    This is how ZooKeeper-based leader election and service discovery works
+
+  Consul health checks:
+    Service registers with Consul and sends heartbeats
+    Consul's built-in TTL check: service must call /agent/check/pass every N seconds
+    curl http://localhost:8500/v1/agent/check/pass/service:my-service
+
+PULL HEARTBEAT (monitor polls service):
+  Monitor actively calls service endpoint periodically
+  
+  Flow:
+    Monitor → GET /healthz every 30s
+    Timeout = 5s
+    If no response or non-200: mark unhealthy
+    After N consecutive failures: remove from load balancer / alert
+  
+  This is what Kubernetes probes, ELB health checks do
+
+GOSSIP PROTOCOL FOR DISTRIBUTED HEALTH (e.g., Cassandra, Serf):
+  Problem: Central health monitor is a SPOF
+  Solution: Each node periodically contacts random peers
+  
+  Algorithm (SWIM protocol):
+    1. Every T seconds, node A picks random peer B
+    2. A sends PING to B
+    3. If no ACK: A asks 3 other nodes to PING B (indirect probe)
+    4. If still no ACK: B marked as SUSPECTED
+    5. After timeout: B marked as FAILED
+    6. Failure propagation: gossip spreads to all nodes within O(log N) rounds
+  
+  Why gossip?
+    - No SPOF (no central monitor)
+    - Scales to thousands of nodes
+    - Failure detection time: O(log N) rounds × probe interval
+    - Used by: Cassandra, DynamoDB, HashiCorp Consul/Serf
+
+
+5. LOAD BALANCER HEALTH CHECKS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+AWS APPLICATION LOAD BALANCER (ALB):
+  Protocol: HTTP or HTTPS
+  Path: /health (configurable)
+  Healthy threshold: 2 consecutive successes → mark healthy
+  Unhealthy threshold: 5 consecutive failures → mark unhealthy, remove
+  Interval: 30 seconds
+  Timeout: 5 seconds
+  
+  With these defaults:
+    Detection time: 5 × 30s = 2.5 minutes (after first failure)
+    For faster detection: interval=10s, unhealthy threshold=2
+    Fastest: interval=5s, threshold=2 → detect failure in 10s
+
+  ALB health check flow:
+    [ Instance becomes unhealthy ]
+    → ALB sees 2 consecutive health check failures
+    → Instance removed from target group (no new requests)
+    → Existing connections drain (connection draining timeout: 300s default)
+    → Instance fully removed
+
+NGINX UPSTREAM HEALTH:
+  upstream backend {
+    server server1:8080;
+    server server2:8080;
+    
+    # nginx_upstream_check_module (Tengine)
+    check interval=3000 rise=2 fall=3 timeout=1000 type=http;
+    check_http_send "HEAD /healthz HTTP/1.0\r\n\r\n";
+    check_http_expect_alive http_2xx;
+  }
+  
+  fall=3: 3 consecutive failures → mark down
+  rise=2: 2 consecutive successes → mark up
+
+HAPROXY HEALTH CHECKS:
+  backend myapp
+    server app1 10.0.0.1:8080 check interval 5s fall 3 rise 2
+    server app2 10.0.0.2:8080 check interval 5s fall 3 rise 2
+    
+    option httpchk GET /healthz
+    http-check expect status 200
+
+
+6. SYNTHETIC MONITORING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROBLEM WITH PASSIVE HEALTH CHECKS:
+  Only detects failures AFTER real users are affected
+  A health check that just pings /healthz doesn't test real functionality
+
+SYNTHETIC MONITORING:
+  Continuously run real-world test transactions against production
+  Simulate actual user flows
+  Alert if transaction fails or exceeds latency threshold
+
+EXAMPLES:
+  - E-commerce: Synthetic user browses → adds to cart → checks out every 5min
+  - API service: Synthetic API calls to key endpoints with expected response validation
+  - Login flow: Synthetic login with test account, verify JWT token returned
+
+TOOLS:
+  - AWS CloudWatch Synthetics (Canary scripts)
+  - Datadog Synthetic Monitoring
+  - New Relic Synthetics
+  - Pingdom / UptimeRobot (simpler, external monitoring)
+  - Custom: Lambda function scheduled every 5 minutes
+
+EXTERNAL vs INTERNAL:
+  External synthetic monitoring: From outside your infrastructure (detect DNS/CDN issues)
+  Internal synthetic monitoring: From within (detect internal routing issues)
+  Use BOTH: External failures may not appear in internal monitoring
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWER — "What's the difference between liveness and readiness probes?"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"Liveness probe answers: 'Is this container alive, or should Kubernetes restart it?'
+ It should only check the process itself — not external dependencies.
+ If liveness fails, Kubernetes restarts the container.
+
+ Readiness probe answers: 'Is this container ready to receive traffic?'
+ It checks critical dependencies like database connectivity.
+ If readiness fails, the pod is removed from the load balancer —
+ it's NOT restarted, just temporarily taken out of rotation.
+
+ The key distinction: if your database goes down, you want readiness
+ to fail (stop sending traffic to services that can't serve it),
+ but NOT liveness — restarting the service won't fix the database
+ and risks a restart storm.
+
+ I also use startup probes for slow-starting apps (like JVM services)
+ to give them extra time before the liveness probe starts checking."

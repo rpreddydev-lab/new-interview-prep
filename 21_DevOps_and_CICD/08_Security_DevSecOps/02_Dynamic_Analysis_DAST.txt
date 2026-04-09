@@ -1,0 +1,403 @@
+================================================================================
+DYNAMIC ANALYSIS (DAST) — DEEP DIVE
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. DAST Deep Dive
+2. OWASP ZAP Advanced Usage
+3. Burp Suite
+4. Automating DAST in CI/CD
+5. DAST for APIs
+6. Common Interview Questions & Answers
+7. Quick Reference Cheat Sheet
+
+================================================================================
+(This file is a companion to 01_Static_Analysis_SAST.txt, which covers DAST overview
+and ZAP basics in the combined SAST+DAST file. This file focuses on DAST deep dive
+and Burp Suite, which could not be covered there due to file length constraints.)
+================================================================================
+
+1. DAST DEEP DIVE
+================================================================================
+
+DAST Testing Categories:
+
+  Active Scanning:
+    Sends malicious payloads to find exploitable vulnerabilities.
+    Examples: SQL injection attempts, XSS payloads, path traversal strings.
+    ONLY run against test/staging environments. Can cause data corruption.
+  
+  Passive Scanning:
+    Observes application responses. No attack payloads sent.
+    Safe to run against any environment (even production via proxy).
+    Finds: missing headers, information disclosure, insecure cookies.
+  
+  Spider / Discovery:
+    Crawls the application to map all endpoints.
+    Traditional: follows HTML links (doesn't handle SPAs well)
+    Ajax Spider: executes JavaScript to discover dynamically loaded content.
+
+Common DAST Findings (with examples):
+
+  Missing Security Headers:
+    X-Frame-Options: DENY            (prevents clickjacking)
+    X-Content-Type-Options: nosniff  (prevents MIME type sniffing)
+    Content-Security-Policy: ...     (prevents XSS)
+    Strict-Transport-Security: ...   (forces HTTPS)
+  
+  Cookie Security:
+    Set-Cookie: session=abc123; Secure; HttpOnly; SameSite=Strict
+    Missing Secure flag → transmitted over HTTP
+    Missing HttpOnly → accessible via JavaScript (XSS can steal it)
+    Missing SameSite → CSRF vulnerability
+  
+  Server Information Disclosure:
+    Server: Apache/2.4.52           (don't reveal version)
+    X-Powered-By: Express 4.18.2   (don't reveal framework)
+    Stack traces in error responses (reveals code structure)
+
+DAST Authentication Challenges:
+  Modern apps use token-based auth (JWT, OAuth2).
+  DAST tool must authenticate before testing protected endpoints.
+  
+  Approaches:
+  1. Pass Bearer token as header (API testing with static token)
+  2. Form-based login script (ZAP/Burp can record a login sequence)
+  3. Cookie-based: record session cookie, re-use in scanner
+
+================================================================================
+2. OWASP ZAP ADVANCED USAGE
+================================================================================
+
+ZAP Context Configuration:
+  Context defines authentication + scope for a scan.
+  
+  # Create context with authentication (via ZAP API):
+  # Or use .context file:
+  context.name=MyApp
+  context.start=https://staging.myapp.com
+  context.inScope=https://staging.myapp.com.*
+  context.excludeFromScan=.*/logout.*
+  
+  # Authentication:
+  context.auth.type=form
+  context.auth.loginurl=https://staging.myapp.com/login
+  context.auth.loginrequestdata=username={%username%}&password={%password%}
+  context.auth.usernameField=username
+  context.auth.passwordField=password
+
+ZAP Automation Framework:
+  ZAP has a YAML-based automation framework (modern approach):
+  
+  # zap-automation.yaml:
+  env:
+    contexts:
+    - name: myapp
+      urls:
+      - https://staging.myapp.com
+      authentication:
+        method: json
+        parameters:
+          loginPageUrl: https://staging.myapp.com/auth/login
+          loginRequestData: '{"username":"{%username%}","password":"{%password%}"}'
+          loginPageWait: 0
+        verification:
+          method: response
+          loggedInRegex: '"token":'
+          loggedOutRegex: '401'
+      sessionManagement:
+        method: headers
+        parameters:
+          Authorization: "Bearer {%json:token%}"
+    
+    parameters:
+      users:
+      - name: test-user
+        credentials:
+          username: testuser@example.com
+          password: ${DAST_TEST_PASSWORD}
+  
+  jobs:
+  - type: spider
+    parameters:
+      context: myapp
+      user: test-user
+      maxDuration: 5
+  
+  - type: activeScan
+    parameters:
+      context: myapp
+      user: test-user
+      policy: api
+      maxRuleDurationInMins: 5
+  
+  - type: report
+    parameters:
+      template: traditional-html
+      reportDir: /zap/reports/
+      reportFile: zap-report.html
+
+  # Run:
+  docker run --rm -v $(pwd):/zap/wrk ghcr.io/zaproxy/zaproxy:stable \
+    zap.sh -cmd -autorun /zap/wrk/zap-automation.yaml
+
+ZAP Alerts and Risk Levels:
+  Risk:    High / Medium / Low / Informational
+  Confidence: Confirmed / High / Medium / Low
+  
+  Focus on: High Risk, High/Confirmed Confidence findings.
+  Ignore:  Informational (noise) and Low Confidence unless High Risk.
+
+================================================================================
+3. BURP SUITE
+================================================================================
+
+What is Burp Suite?
+  Most comprehensive web security testing tool.
+  Industry standard for manual and automated penetration testing.
+  
+  Editions:
+  Community:   Free, manual testing only (no Scanner)
+  Professional: ~$450/year — full scanner, active scan, repeater, intruder
+  Enterprise:   CI/CD integration, centralized management
+
+Key Features:
+  Proxy:         Intercept and modify HTTP/HTTPS traffic between browser and server.
+  Scanner:       Automated vulnerability scanner (Professional only).
+  Intruder:      Automated customizable attacks (brute force, fuzzing, injection).
+  Repeater:      Manually modify and replay HTTP requests.
+  Decoder:       Encode/decode (base64, URL, HTML, hex).
+  Comparer:      Diff two HTTP responses.
+  Sequencer:     Analyze randomness of session tokens (entropy analysis).
+
+Manual Testing Workflow:
+  1. Configure browser to proxy through Burp (127.0.0.1:8080)
+  2. Browse the application — Burp captures all traffic in HTTP History
+  3. Send interesting requests to Repeater for manual modification
+  4. Look for: SQL injection in parameters, XSS in input fields, IDOR in IDs
+  5. Run active scanner on specific endpoints or the whole app
+  6. Use Intruder for password brute force or parameter fuzzing
+
+Burp Suite in CI/CD (Enterprise):
+  Burp Suite Enterprise has a REST API and CI/CD integrations.
+  
+  # Example (Burp Enterprise API):
+  curl -X POST https://burp-enterprise:8080/api/v0.1/scans \
+    -H "Authorization: Bearer $BURP_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "urls": ["https://staging.myapp.com"],
+      "scan_configurations": [{"name": "Audit checks - light"}],
+      "application_logins": [{
+        "type": "UsernameAndPasswordLogin",
+        "username": "testuser",
+        "password": "testpassword"
+      }]
+    }'
+
+================================================================================
+4. AUTOMATING DAST IN CI/CD
+================================================================================
+
+DAST Pipeline Strategy:
+  
+  Every PR merge to main → Deploy to staging → Run DAST → Gate to production
+  
+  Fast DAST (< 5 min, run every build):
+  - ZAP baseline scan (passive + quick spider)
+  - Check security headers
+  - Basic API endpoint scan
+  
+  Thorough DAST (< 30 min, run nightly or pre-release):
+  - ZAP full scan with active testing
+  - Authenticated scan covering all endpoints
+  - API scan with full OpenAPI coverage
+
+Breaking Builds on DAST Findings:
+  Don't break on EVERY finding — too many false positives.
+  
+  Recommended thresholds:
+  - Block: High risk, High confidence (confirmed active exploits)
+  - Warn: High risk, Medium confidence
+  - Info: Medium/Low risk (for visibility, not blocking)
+  
+  ZAP command line flags:
+  -l FAIL   Exit non-zero if any FAIL (high-risk active finding)
+  -l WARN   Exit non-zero if any WARN or higher
+  -l PASS   Never exit non-zero (report only)
+  
+  Custom rule configuration:
+  # .zap/rules.tsv:
+  # RuleID  Action   Comment
+  10015     IGNORE   # Cache-control header — acceptable for this app
+  10096     IGNORE   # Timestamp disclosure — informational only
+  40018     FAIL     # SQL injection — always block
+
+DAST + Staging Environment:
+  Important: DAST active scan creates noise in staging.
+  - Creates test records (if scanner posts to forms)
+  - Generates error log entries
+  - May trigger alerts in staging monitoring
+  
+  Solutions:
+  - Dedicated "DAST" staging environment (isolated from regular staging)
+  - Reset staging DB after DAST scan
+  - Allowlist DAST scanner IP in WAF (don't block scanner itself)
+
+================================================================================
+5. DAST FOR APIS
+================================================================================
+
+API Security Testing:
+  Modern apps are API-first. Traditional web DAST doesn't cover APIs well.
+  Need API-specific testing.
+
+OWASP API Security Top 10 (2023):
+  API1:  Broken Object Level Authorization (BOLA/IDOR)
+         Accessing /api/users/456 when logged in as user 123
+  API2:  Broken Authentication
+         Weak JWT verification, missing expiration
+  API3:  Broken Object Property Level Authorization
+         Returning fields user shouldn't see (mass assignment)
+  API4:  Unrestricted Resource Consumption
+         No rate limiting → DoS potential
+  API5:  Broken Function Level Authorization
+         Regular user accessing admin endpoints
+  API6:  Unrestricted Access to Sensitive Business Flows
+         Automated cart stuffing, ticket scalping
+  API7:  Server Side Request Forgery (SSRF)
+  API8:  Security Misconfiguration
+  API9:  Improper Inventory Management
+         Old API versions (/api/v1) with less security than /api/v3
+  API10: Unsafe Consumption of APIs
+         Trusting third-party API responses without validation
+
+ZAP API Scan:
+  # Use OpenAPI/Swagger spec to define API surface:
+  docker run --rm -v $(pwd):/zap/wrk ghcr.io/zaproxy/zaproxy:stable \
+    zap-api-scan.py \
+    -t https://staging.myapp.com/api/openapi.json \
+    -f openapi \
+    -r zap-api-report.html \
+    -x zap-api-report.xml
+
+BOLA/IDOR Testing (Manual approach):
+  Test if you can access other users' resources:
+  
+  1. Log in as User A (user_id=100)
+  2. Record your API calls: GET /api/orders/100/details
+  3. Change user ID: GET /api/orders/101/details
+  4. If you get 200 with User 101's data → BOLA vulnerability
+  
+  Automated BOLA testing requires custom scripts (Burp Intruder or custom tools).
+  ZAP doesn't automatically test BOLA.
+
+================================================================================
+6. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: What is DAST and how does it differ from penetration testing?
+A: DAST (Dynamic Application Security Testing) is automated scanning of a running
+   application that sends predefined attack patterns and observes responses.
+   
+   Penetration testing is manual security assessment by a human security expert
+   who tries to think creatively about attack vectors, business logic, and
+   application-specific vulnerabilities.
+   
+   DAST advantages:
+   - Runs automatically in CI/CD (no human needed)
+   - Consistent — same tests every build
+   - Fast — results in minutes
+   - Cheap to run repeatedly
+   
+   DAST limitations:
+   - Fixed ruleset — can't adapt to application context
+   - Misses business logic vulnerabilities
+   - Misses complex authentication flows without configuration
+   - Can miss BOLA/IDOR (logic requires knowing valid vs invalid IDs)
+   
+   Penetration testing advantages:
+   - Human creativity — finds novel attack paths
+   - Context-aware — understands your specific business logic
+   - Finds what automated tools miss
+   
+   Penetration testing limitations:
+   - Expensive (thousands to tens of thousands)
+   - Point-in-time (only tests current code)
+   - Can't run after every code change
+   
+   Recommendation: Use both.
+   DAST: Every build (catches common vulnerabilities automatically).
+   Pen test: Annually or before major releases (deep dive by experts).
+
+Q2: How do you handle DAST scanning for authenticated applications?
+A: Authentication is the biggest challenge for DAST tools.
+   
+   Approaches:
+   
+   1. Static Bearer token:
+      Generate a test user with known credentials.
+      Authenticate via API → get JWT token.
+      Pass token as Authorization header to ZAP.
+      ZAP includes it in all requests.
+      Works for: REST APIs with JWT.
+   
+   2. Form-based authentication (ZAP context):
+      Configure ZAP with login URL and credentials.
+      ZAP performs the login, captures session cookies.
+      Uses session cookie in subsequent requests.
+      Verification: Configure logged-in regex (ZAP checks it's still logged in).
+      Works for: Traditional web apps with form login.
+   
+   3. Script-based authentication:
+      Write Groovy/Python script to handle complex auth flows.
+      OAuth2 code flow, multi-factor auth, etc.
+      Most flexible but requires development effort.
+   
+   Practical implementation:
+   Create a dedicated DAST test user with:
+   - Known, stable credentials
+   - Sufficient permissions to access all endpoints
+   - Reset/cleaned state before each DAST run (don't let DAST data accumulate)
+   
+   In CI/CD:
+   Store DAST_USERNAME and DAST_PASSWORD as CI secrets.
+   Pass to ZAP via environment variables.
+
+================================================================================
+7. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+DAST SCAN TYPES:
+  Passive    Observe responses, no attacks, safe everywhere
+  Spider     Crawl to discover endpoints, no attacks
+  Active     Send attack payloads — STAGING ONLY
+  API        OpenAPI/Swagger spec-based, targeted
+
+ZAP RISK/CONFIDENCE MATRIX:
+  High Risk + High Confidence → Block build
+  High Risk + Low Confidence  → Warning, manual review
+  Medium/Low Risk             → Informational
+
+OWASP API TOP 10 KEY ITEMS:
+  API1   BOLA (IDOR) — accessing other users' resources
+  API2   Broken authentication — weak JWT, no expiry
+  API4   No rate limiting
+  API5   Missing function-level authorization
+
+SECURITY HEADERS TO VERIFY:
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Content-Security-Policy: default-src 'self'
+  Strict-Transport-Security: max-age=31536000; includeSubDomains
+  Set-Cookie: Secure; HttpOnly; SameSite=Strict
+
+ZAP GITHUB ACTION:
+  zaproxy/action-baseline@v0.10.0    Passive scan
+  zaproxy/action-full-scan@v0.9.0    Active scan
+  zaproxy/action-api-scan@v0.6.0     API scan
+
+================================================================================
+END OF FILE
+================================================================================

@@ -1,0 +1,274 @@
+================================================================
+DEPTH LIMITING IN GRAPHQL — IN DEPTH
+================================================================
+
+1. WHAT IS DEPTH LIMITING?
+---------------------------
+Depth limiting rejects GraphQL queries that exceed a maximum nesting level.
+It's a simple but effective defense against:
+  - Deeply nested malicious queries
+  - Accidental infinite recursion in schema (circular references)
+  - Performance attacks that exploit recursive type relationships
+
+Example of an excessively deep query:
+```graphql
+{
+  user(id: "1") {                 # depth: 1
+    friends {                     # depth: 2
+      friends {                   # depth: 3
+        friends {                 # depth: 4
+          friends {               # depth: 5
+            friends { name }      # depth: 6
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+With a max depth of 5, the query above would be rejected at validation time.
+
+2. IMPLEMENTING DEPTH LIMITING IN GRAPHQL-JAVA
+------------------------------------------------
+graphql-java provides MaxQueryDepthInstrumentation:
+
+```java
+@Configuration
+public class GraphQLDepthConfig {
+
+  private static final int MAX_QUERY_DEPTH = 7;
+
+  @Bean
+  public Instrumentation depthLimitingInstrumentation() {
+    return new MaxQueryDepthInstrumentation(MAX_QUERY_DEPTH);
+  }
+}
+```
+
+When the limit is exceeded, the server responds before executing:
+```json
+{
+  "errors": [{
+    "message": "maximum query depth exceeded 7 with actual value 9",
+    "locations": [],
+    "extensions": {
+      "classification": "ValidationError"
+    }
+  }],
+  "data": null
+}
+```
+
+3. COMBINING DEPTH AND COMPLEXITY LIMITING
+--------------------------------------------
+Depth and complexity limits are complementary:
+  - Depth prevents deep recursive queries
+  - Complexity prevents wide (many fields) queries
+  - Use BOTH for full coverage
+
+```java
+@Configuration
+public class GraphQLLimitsConfig {
+
+  @Bean
+  public ChainedInstrumentation chainedInstrumentation() {
+    return new ChainedInstrumentation(List.of(
+      new MaxQueryDepthInstrumentation(7),
+      new MaxQueryComplexityInstrumentation(150)
+    ));
+  }
+}
+```
+
+4. HOW DEPTH IS COUNTED
+------------------------
+Depth is counted differently by different tools. In graphql-java:
+  - The root fields (Query, Mutation, Subscription) count as depth 1
+  - Each nested object type selection adds 1
+  - Scalar fields at the same level don't add depth
+  - Fragment spreads are inlined for depth calculation
+
+```graphql
+{
+  user {        # depth 1
+    name        # depth 2 (scalar)
+    address {   # depth 2
+      city      # depth 3 (scalar)
+      country   # depth 3 (scalar)
+    }
+  }
+}
+# Maximum depth: 3
+```
+
+With fragments:
+```graphql
+fragment userFields on User {
+  name
+  address { city }  # depth 2 within the fragment
+}
+
+{
+  user { ...userFields }  # depth 1 + 2 from fragment = 3
+}
+```
+
+5. HANDLING CIRCULAR SCHEMAS
+------------------------------
+GraphQL schemas can have circular type references:
+```graphql
+type User {
+  friends: [User!]   # User references User recursively
+}
+
+type Post {
+  comments: [Comment!]
+}
+
+type Comment {
+  post: Post!        # Comment references Post which references Comment
+  replies: [Comment!]
+}
+```
+
+These are valid schemas, but enable infinite-depth queries. Depth limiting
+is essential for schemas with circular references.
+
+6. DEPTH LIMITING FOR INTROSPECTION
+--------------------------------------
+Introspection queries can also be deeply nested:
+```graphql
+{
+  __schema {
+    types {
+      fields {
+        type {
+          fields {
+            type {
+              name
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+MaxQueryDepthInstrumentation applies to introspection queries too.
+Note: If clients use schema-aware tools (GraphiQL, Apollo Studio), they
+may need depth 10+ for deep introspection. Consider different limits for
+introspection vs regular queries, or just disable introspection in production.
+
+7. GRAPHQL QUERY DEPTH BEST PRACTICES
+---------------------------------------
+  General guidance (adjust for your schema):
+    Development:   depth 12–15 (room to explore)
+    Staging:       depth 8–10
+    Production:    depth 5–7 (conservative)
+
+  Schema-specific considerations:
+    - Very flat schema (no deep nesting): depth 5 is fine
+    - Schema with recursive types (User.friends): lower depth limit
+    - Schema for analytics/reporting (wide tables, shallow): depth 4
+    - B2B product catalog with hierarchy: depth 8
+
+8. CUSTOM DEPTH CALCULATOR
+----------------------------
+For fine-grained control, implement a custom depth calculator:
+
+```java
+@Bean
+public Instrumentation depthLimitingInstrumentation() {
+  // Override which fields count toward depth
+  return new MaxQueryDepthInstrumentation(7) {
+    @Override
+    protected boolean shouldCountField(DepthAndPathInstrumentationState state,
+                                       DataFetchingEnvironment env) {
+      // Don't count __typename or meta fields toward depth
+      String fieldName = env.getField().getName();
+      if (fieldName.startsWith("__")) return false;
+      return super.shouldCountField(state, env);
+    }
+  };
+}
+```
+
+9. DEPTH LIMIT ERROR RESPONSE CUSTOMIZATION
+---------------------------------------------
+```java
+@Component
+public class DepthLimitExceptionResolver extends DataFetcherExceptionResolverAdapter {
+
+  @Override
+  protected GraphQLError resolveToSingleError(Throwable ex, DataFetchingEnvironment env) {
+    if (ex.getMessage() != null && ex.getMessage().contains("maximum query depth")) {
+      return GraphqlErrorBuilder.newError(env)
+        .message("Query is too deeply nested. Maximum allowed depth is 7.")
+        .errorType(ErrorType.BAD_REQUEST)
+        .extensions(Map.of(
+          "code", "QUERY_TOO_DEEP",
+          "maxAllowedDepth", 7
+        ))
+        .build();
+    }
+    return null;
+  }
+}
+```
+
+10. DEPTH ANALYSIS IN ALIASES
+--------------------------------
+Aliases don't affect depth — they're just renaming:
+```graphql
+{
+  a: user(id: "1") { name }   # depth 2
+  b: user(id: "2") { name }   # depth 2 (parallel, same level)
+}
+```
+
+But batching many aliases IS a complexity concern (width), not a depth concern.
+This is why both depth AND complexity limits are needed.
+
+11. INTERVIEW QUESTIONS & ANSWERS
+-----------------------------------
+
+Q: What is query depth limiting and why is it important?
+A: Depth limiting restricts how deeply nested a GraphQL query can be.
+   Without it, clients can exploit circular schema references (like
+   User.friends.friends.friends...) to build queries requiring exponential
+   amounts of work. Depth limiting rejects such queries at validation time,
+   before any execution begins, preventing DoS-style attacks.
+
+Q: What is the difference between depth limiting and complexity limiting?
+A: Depth limiting counts nesting levels (recursion depth). It catches deeply
+   nested queries but misses very wide, shallow queries that are also expensive.
+   Complexity limiting assigns numeric costs to fields and rejects queries
+   exceeding a total cost. It catches wide queries but a very deep query
+   with few fields might have low complexity. Both are needed for full protection.
+
+Q: How does graphql-java implement depth limiting?
+A: Via MaxQueryDepthInstrumentation registered as an Instrumentation bean.
+   At validation time, it traverses the query AST, counts the maximum nesting
+   level, and returns a validation error if the depth exceeds the configured
+   maximum. Execution never starts for over-depth queries.
+
+Q: What is a circular schema reference and why does it require depth limits?
+A: A circular reference is when a type refers back to itself (directly or
+   indirectly): `type User { friends: [User!] }` or `Post → Comment → Post`.
+   These are valid and useful in GraphQL. However, they allow infinite-depth
+   queries. Depth limiting is the primary guard against clients exploiting
+   these for DoS attacks.
+
+Q: What max depth would you recommend for a production GraphQL API?
+A: Typically 5–7 for production. Most legitimate queries don't need more
+   than 5–6 levels of nesting. Start with 7, monitor for rejected legitimate
+   queries, and adjust. Schema-specific: flat schemas need less (4–5);
+   hierarchical/tree schemas (category → subcategory → product) may need
+   more (8–10). Always test your UI application's deepest queries and set
+   the limit just above that.
+
+================================================================
+END OF FILE
+================================================================

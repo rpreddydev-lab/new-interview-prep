@@ -1,0 +1,557 @@
+========================================================
+JWT INTERVIEW QUESTIONS
+========================================================
+
+Comprehensive Q&A for senior-level interviews on JWT structure,
+signing algorithms, validation, attacks, refresh flows, and storage.
+
+========================================================
+SECTION 1: JWT FUNDAMENTALS
+========================================================
+
+Q1: What is a JWT and what problem does it solve?
+A: JWT (JSON Web Token, RFC 7519) is a compact, URL-safe, self-contained token
+   format used to transmit claims between parties as a JSON object that is digitally
+   signed (JWS) or encrypted (JWE).
+
+   Problem it solves:
+   - Stateless authentication: No server-side session storage needed.
+     The token itself carries all the claims (user identity, roles, expiry).
+   - Distributed systems: Any microservice can validate a JWT independently by
+     verifying the signature — no need to call a central session store.
+   - Interoperability: Standard format (RFC 7519) supported by virtually all
+     languages and frameworks.
+
+Q2: Describe the three parts of a JWT.
+A: A JWT consists of three Base64URL-encoded parts separated by dots:
+   header.payload.signature
+
+   1) Header (algorithm declaration):
+   {
+     "alg": "RS256",   // Signing algorithm
+     "typ": "JWT",     // Token type
+     "kid": "key-1"    // Key ID (which public key to use for verification)
+   }
+
+   2) Payload (claims):
+   {
+     "iss": "https://auth.example.com",    // Issuer
+     "sub": "user123",                      // Subject (user identifier)
+     "aud": ["orders-service"],             // Audience
+     "exp": 1700000000,                     // Expiration (Unix timestamp)
+     "iat": 1699996400,                     // Issued at
+     "jti": "unique-token-id",             // JWT ID (for revocation/blacklist)
+     "roles": ["USER", "ORDER_MANAGER"],   // Custom claim
+     "scope": "orders:read orders:write"   // OAuth2 scopes
+   }
+
+   3) Signature:
+   RSA_SHA256(
+     Base64URL(header) + "." + Base64URL(payload),
+     privateKey
+   )
+
+   IMPORTANT: The payload is only Base64URL-encoded, NOT encrypted.
+   Anyone can read the claims! Never put sensitive data (passwords, PII) in a JWT.
+
+Q3: What are standard JWT claims (registered claims)?
+A:
+  iss (Issuer):     Who created and signed the token
+  sub (Subject):    Who the token is about (user ID)
+  aud (Audience):   Who the token is intended for (may be array)
+  exp (Expiration): Token expires at this Unix timestamp
+  nbf (Not Before): Token is not valid before this time
+  iat (Issued At):  When the token was issued
+  jti (JWT ID):     Unique identifier for this token (enables revocation checks)
+
+Q4: What is the difference between JWS and JWE?
+A:
+  JWS (JSON Web Signature): The token content (payload) is SIGNED but NOT encrypted.
+    The payload is only Base64URL-encoded → anyone can read the claims.
+    Used in 99% of cases: RS256, ES256, HS256.
+
+  JWE (JSON Web Encryption): The payload is ENCRYPTED.
+    Claims cannot be read without the private key.
+    Used when the payload contains sensitive data that must not be visible.
+    Format: header.encrypted_key.iv.ciphertext.tag (5 parts)
+    Rare in practice; most teams use JWS and simply avoid putting secrets in claims.
+
+========================================================
+SECTION 2: SIGNING ALGORITHMS
+========================================================
+
+Q5: Explain the difference between HS256, RS256, and ES256.
+A:
+  Algorithm | Type       | Key Type          | Use Case
+  ----------|------------|-------------------|-----------------------------
+  HS256     | HMAC-SHA256| Shared secret     | Single-service (AS & RS share secret)
+  RS256     | RSA-SHA256 | RSA key pair      | Multi-service (AS signs, RS verifies)
+  ES256     | ECDSA-P256 | EC key pair       | Same as RS256 but smaller + faster
+  RS384/512 | RSA        | RSA key pair      | Higher security requirement
+  ES384/512 | ECDSA      | EC key pair       | Higher security requirement
+  EdDSA     | Ed25519    | EC key pair       | Modern, fast, recommended for new systems
+
+  HS256: Both parties need the same secret. If the secret leaks, anyone can forge tokens.
+         Not suitable for distributed systems.
+  RS256: AS has private key (signs). Any RS can have the public key (verifies only).
+         A compromised RS cannot forge tokens. Industry standard.
+  ES256: Elliptic Curve variant. Smaller keys + signatures than RSA for equivalent security.
+         RS256 with 2048-bit key ≈ ES256 with 256-bit key.
+
+Q6: Why should you never use the 'none' algorithm?
+A: The 'none' algorithm means the JWT has no signature (the signature part is empty).
+   Designed for situations where integrity is guaranteed by other means (transport security).
+
+   Attack: An attacker intercepts a valid JWT, modifies the payload (e.g., changes
+   role to ADMIN), changes the alg header to 'none', removes the signature,
+   and sends it. A vulnerable library that honors the 'none' algorithm would
+   accept this forged token as valid!
+
+   Defense: Always whitelist the expected algorithm. Never allow 'none'.
+   In Spring: NimbusJwtDecoder.withJwkSetUri(uri)
+               .jwsAlgorithm(SignatureAlgorithm.RS256) // ONLY RS256 accepted
+               .build()
+
+Q7: Explain the algorithm confusion (algorithm substitution) attack.
+A: Also called "algorithm switching attack." The attacker exploits a library that
+   trusts the 'alg' claim in the JWT header to select the verification algorithm.
+
+   Scenario (HS256 attack against RS256 system):
+   1) RS256 system: AS signs with RSA private key, RS verifies with RSA public key.
+   2) The RSA public key is PUBLICLY available (from JWKS endpoint).
+   3) Attacker: Change alg to HS256 in the header, resign the payload using the
+      RSA PUBLIC KEY as the HMAC secret.
+   4) Vulnerable library: "alg=HS256, so I'll verify with HMAC-SHA256... the RS's
+      RSA public key is the secret... signature valid!"
+   5) Forged token accepted!
+
+   Defense:
+   - Always specify the expected algorithm explicitly in code
+   - Never let the JWT header alone determine the verification algorithm
+   - Spring Security NimbusJwtDecoder enforces this when properly configured
+
+Q8: When would you choose HS256 over RS256?
+A: HS256 is appropriate only when:
+   - A single service both issues AND validates tokens (same process/secret)
+   - There are no distributed/external verifiers
+   - The shared secret can be securely shared between the parties
+   - Example: internal session tokens within a monolith
+
+   RS256 is required when:
+   - Multiple independent services need to validate tokens
+   - The validation public key needs to be distributed/public
+   - The system needs the property that the verifier cannot also create valid tokens
+
+Q9: How does key rotation work with RS256?
+A:
+  1) Generate new RSA key pair
+  2) Add new public key to JWKS endpoint WITH a new unique kid
+  3) Start signing new tokens with the new private key (and new kid in header)
+  4) Old tokens (signed with old kid) are still valid until they expire
+  5) Resource Servers look up the public key by kid from JWKS URI
+     (Spring NimbusJwtDecoder caches JWKS but re-fetches if unknown kid)
+  6) After all old tokens expire, remove old key from JWKS
+
+  Zero downtime is achieved because both keys coexist during the transition window.
+
+========================================================
+SECTION 3: JWT VALIDATION
+========================================================
+
+Q10: What is the complete validation checklist for a JWT?
+A:
+  Parse and structural validation:
+  □ Three dot-separated parts (header.payload.signature)
+  □ Header is valid JSON after Base64URL decode
+  □ Payload is valid JSON after Base64URL decode
+
+  Algorithm check:
+  □ alg in header matches expected algorithm (never trust blindly)
+  □ alg is NOT 'none'
+  □ alg is in the whitelist
+
+  Signature verification:
+  □ Look up key by kid (if present) from JWKS or known key
+  □ Verify signature with correct key and algorithm
+  □ FAIL if signature invalid
+
+  Claims validation:
+  □ exp: token not expired (allow small clock skew, e.g., 30s)
+  □ nbf: token is now valid (not before)
+  □ iss: issuer matches expected issuer URL
+  □ aud: audience contains this service's identifier
+  □ iat: issued-at is not in the future (sanity check)
+  □ jti: not in the revocation blacklist (if using JTI blacklisting)
+
+  Application-specific:
+  □ Required custom claims are present
+  □ scope includes required permission
+  □ Any additional checks (tenant, MFA level, etc.)
+
+Q11: What happens if JWT's 'aud' claim doesn't match?
+A: The token MUST be rejected with 401 Unauthorized. The audience claim specifies
+   who the token is intended for. If Service B receives a token issued for Service A,
+   it should reject it — even though the signature is valid. This prevents:
+   - Token forwarding attacks: attacker uses a token obtained for one service at another
+   - Confused deputy attacks: a service acting on behalf of another misuses a token
+
+   In Spring Security:
+   NimbusJwtDecoder configured with audience validation:
+   @Bean
+   public JwtDecoder jwtDecoder() {
+       NimbusJwtDecoder decoder = NimbusJwtDecoder.withJwkSetUri(jwksUri).build();
+       decoder.setJwtValidator(new DelegatingOAuth2TokenValidator<>(
+           JwtValidators.createDefaultWithIssuer(issuer),
+           new JwtClaimValidator<List<String>>("aud", aud -> aud.contains("orders-service"))
+       ));
+       return decoder;
+   }
+
+Q12: What is clock skew and how do you handle it?
+A: Clock skew is the difference in system time between the JWT issuer and the validator.
+   If the issuer's clock is slightly ahead, a freshly issued token might appear
+   "not yet valid" or "expired" to the validator.
+
+   Standard tolerance: ±30 seconds to ±5 minutes (vary by system requirements).
+
+   Spring Security: NimbusJwtDecoder + JwtTimestampValidator with Duration.ofSeconds(30)
+   allows 30-second clock skew tolerance.
+
+   Always validate with a small tolerance, but don't make it so large that it
+   defeats the purpose of expiry (e.g., never use 1-hour skew tolerance).
+
+Q13: How do you prevent JWT replay attacks?
+A:
+  Replay attack: An attacker captures a valid JWT and reuses it.
+
+  Mitigations:
+  1) Short expiry: Limits the replay window (access tokens: 5-15 min)
+  2) JTI (JWT ID) + blacklist: Each token has a unique jti. Once used for a
+     sensitive operation, record the jti in Redis. Reject any token with a
+     seen jti. Only practical for specific high-value endpoints.
+  3) Nonce (in OIDC): ID Token includes nonce to prevent replay of auth events
+  4) DPoP (Demonstrating Proof of Possession): Token is bound to client's key pair
+  5) Audience validation: Token only usable by the intended recipient
+
+========================================================
+SECTION 4: JWT ATTACKS
+========================================================
+
+Q14: What are the most common JWT attacks?
+A:
+  1) None Algorithm Attack:
+     Attacker changes alg to "none" and removes signature.
+     Mitigation: Whitelist expected algorithms; reject "none".
+
+  2) Algorithm Confusion Attack (HS256 attack):
+     Attacker switches alg from RS256 to HS256 and resigns with public key.
+     Mitigation: Hardcode expected algorithm; never auto-detect from header.
+
+  3) Weak Secret Attack (HS256):
+     Offline dictionary/brute-force attack against weak HMAC secrets.
+     Mitigation: Use a cryptographically random secret ≥ 256 bits.
+
+  4) Header Parameter Injection (JKU, X5U attacks):
+     Attacker injects a custom "jku" (JWKS URL) or "x5u" (certificate URL) header
+     pointing to their own server. Vulnerable library fetches keys from attacker's URL.
+     Mitigation: Pin JWKS URI in code; never fetch keys from URLs in token headers.
+
+  5) JWT Token Leakage:
+     JWT in URL query parameters → logged in server logs, referrer headers, browser history.
+     Mitigation: Always use Authorization header; never put tokens in URLs.
+
+  6) Claim Tampering (if signature not verified):
+     Attacker modifies claims (e.g., role, userId) and hopes the RS doesn't verify signature.
+     Mitigation: ALWAYS verify signature — this is non-negotiable.
+
+  7) Long-Lived Token Theft:
+     Attacker steals a token with long expiry and uses it until expiration.
+     Mitigation: Short expiry, token binding (DPoP), token revocation.
+
+Q15: Explain the JKU (JSON Web Key URL) injection attack in detail.
+A: The JKU header parameter specifies a URL where the token verifier should fetch
+   the signing keys (as an alternative to embedding the key).
+
+   Attack:
+   1) Attacker generates their own RSA key pair (attacker_private, attacker_public)
+   2) Attacker hosts a JWKS endpoint with attacker_public at https://evil.com/keys
+   3) Attacker crafts a JWT with:
+      header: { "alg": "RS256", "jku": "https://evil.com/keys", "kid": "evil-key" }
+      payload: { "sub": "admin", "role": "ADMIN" }
+   4) Signs it with attacker_private
+   5) Sends to vulnerable service that fetches JWKS from the jku in the header
+   6) Service fetches https://evil.com/keys → attacker_public → signature validates!
+
+   Defense:
+   - Never fetch keys from URLs specified in the JWT header
+   - Pin JWKS URI in your code/config
+   - Spring NimbusJwtDecoder.withJwkSetUri() ignores jku in token header
+
+========================================================
+SECTION 5: REFRESH TOKEN FLOW
+========================================================
+
+Q16: Explain the complete refresh token flow.
+A:
+  Initial login:
+  POST /token (auth code grant)
+  → access_token (short-lived, e.g., 15 min)
+  → refresh_token (long-lived, e.g., 30 days or until revoked)
+
+  When access token expires:
+  POST /token
+  grant_type=refresh_token
+  &refresh_token=<stored_refresh_token>
+  &client_id=myapp
+
+  Response:
+  {
+    "access_token": "new_access_token",
+    "expires_in": 900,
+    "refresh_token": "new_refresh_token",  ← new if rotation enabled
+    "token_type": "Bearer"
+  }
+
+  - Client stores new tokens, discards old ones
+  - If refresh token is expired or revoked → 400 invalid_grant → force re-login
+
+Q17: What is silent refresh / refresh without user interaction?
+A: A technique used in SPAs to renew the access token before it expires, without
+   the user noticing. Approaches:
+
+   1) Hidden iframe (legacy):
+      Open /authorize?prompt=none in a hidden iframe. If SSO session is alive,
+      AS issues new tokens without re-showing login form. Has been deprecated
+      in browsers due to third-party cookie restrictions.
+
+   2) Refresh token via httpOnly cookie:
+      Client stores refresh token in a secure httpOnly cookie. Before access
+      token expires, client calls /token with the cookie automatically included.
+      Works even when SSO iframe fails. Preferred modern approach.
+
+   3) Access token in memory + BFF:
+      Backend for Frontend handles all token storage and refresh.
+      Client just calls BFF; BFF uses httpOnly cookies with its own session.
+
+Q18: How do you detect refresh token theft in production?
+A:
+  With refresh token rotation enabled (each use generates a new RT):
+  1) Legitimate user uses RT1 → gets AT2 + RT2; RT1 is invalidated
+  2) Attacker later tries to use RT1 → AS sees already-used token → ALERT!
+
+  Implementation:
+  - Track "token families" — all RTs issued from the same authorization grant
+  - When an already-used RT is presented:
+    a) Invalidate the ENTIRE token family (force re-login for legitimate user too)
+    b) Log security incident with user ID, IP, timestamp
+    c) Notify user via email/push notification
+    d) Optionally lock account pending review
+
+Q19: Where should refresh tokens be stored in a browser?
+A:
+  Option 1: httpOnly + Secure + SameSite=Strict cookie
+    - Not accessible by JavaScript (XSS-safe)
+    - Only sent over HTTPS
+    - SameSite=Strict prevents CSRF (cookie not sent on cross-origin requests)
+    - Recommended for web applications
+
+  Option 2: Avoid localStorage/sessionStorage for refresh tokens
+    - JavaScript accessible → vulnerable to XSS
+    - Any injected script can steal the token
+
+  Option 3: BFF pattern (Backend for Frontend)
+    - Refresh token stored server-side, associated with a session cookie
+    - Browser only has a session cookie; JS never sees tokens
+    - Most secure option; preferred for high-security applications
+
+========================================================
+SECTION 6: SPRING SECURITY INTEGRATION
+========================================================
+
+Q20: How does NimbusJwtDecoder work in Spring Security?
+A: NimbusJwtDecoder is the primary implementation of JwtDecoder in Spring Security.
+   It wraps Nimbus-JOSE-JWT library to:
+   1) Parse the JWT string
+   2) Fetch public keys from JWKS URI (caches them, refreshes on unknown kid)
+   3) Verify the signature
+   4) Validate standard claims (exp, nbf, iss by default)
+   5) Return a Jwt object with all claims accessible
+
+   Construction options:
+   // From JWKS URI (most common — AS publishes keys):
+   NimbusJwtDecoder.withJwkSetUri("https://as.example.com/.well-known/jwks.json")
+       .jwsAlgorithm(SignatureAlgorithm.RS256)
+       .build()
+
+   // From symmetric secret (HS256):
+   NimbusJwtDecoder.withSecretKey(secretKey).build()
+
+   // From RSA public key (hardcoded):
+   NimbusJwtDecoder.withPublicKey(rsaPublicKey).build()
+
+Q21: How do you add custom JWT validation in Spring Security?
+A: Implement OAuth2TokenValidator<Jwt> and wire it into the decoder:
+
+   public class AudienceValidator implements OAuth2TokenValidator<Jwt> {
+       private final String audience;
+
+       @Override
+       public OAuth2TokenValidatorResult validate(Jwt jwt) {
+           List<String> aud = jwt.getAudience();
+           if (aud != null && aud.contains(audience)) {
+               return OAuth2TokenValidatorResult.success();
+           }
+           return OAuth2TokenValidatorResult.failure(
+               new OAuth2Error("invalid_token", "Missing required audience: " + audience, null)
+           );
+       }
+   }
+
+   @Bean
+   public JwtDecoder jwtDecoder() {
+       NimbusJwtDecoder decoder = NimbusJwtDecoder.withJwkSetUri(jwksUri).build();
+       OAuth2TokenValidator<Jwt> withIssuer = JwtValidators.createDefaultWithIssuer(issuer);
+       OAuth2TokenValidator<Jwt> withAudience = new AudienceValidator("my-service");
+       decoder.setJwtValidator(new DelegatingOAuth2TokenValidator<>(withIssuer, withAudience));
+       return decoder;
+   }
+
+Q22: How do you convert JWT claims to Spring Security GrantedAuthority objects?
+A: Use JwtGrantedAuthoritiesConverter or a custom Converter<Jwt, Collection<GrantedAuthority>>.
+
+   Default behavior: JwtGrantedAuthoritiesConverter reads the 'scope' claim and
+   maps each scope to a SimpleGrantedAuthority with "SCOPE_" prefix.
+
+   Custom converter for Keycloak:
+   @Bean
+   public JwtAuthenticationConverter jwtAuthenticationConverter() {
+       JwtAuthenticationConverter converter = new JwtAuthenticationConverter();
+       converter.setJwtGrantedAuthoritiesConverter(jwt -> {
+           List<GrantedAuthority> authorities = new ArrayList<>();
+           // Scopes → SCOPE_xxx
+           // Roles from realm_access.roles → ROLE_xxx
+           Map<String, Object> realmAccess = jwt.getClaimAsMap("realm_access");
+           if (realmAccess != null) {
+               ((List<String>) realmAccess.getOrDefault("roles", emptyList())).stream()
+                   .map(r -> new SimpleGrantedAuthority("ROLE_" + r))
+                   .forEach(authorities::add);
+           }
+           return authorities;
+       });
+       return converter;
+   }
+
+Q23: What happens in Spring Security when a JWT is invalid?
+A:
+  1) BearerTokenAuthenticationFilter extracts the Bearer token from Authorization header
+  2) Calls JwtDecoder.decode(token)
+  3) If decode throws JwtValidationException (expired, bad sig, etc.):
+     - AuthenticationException is thrown
+     - BearerTokenAuthenticationEntryPoint handles it
+     - Returns 401 Unauthorized with WWW-Authenticate: Bearer error="invalid_token"
+  4) If Authorization header is missing entirely:
+     - BearerTokenAuthenticationEntryPoint returns 401 with
+       WWW-Authenticate: Bearer realm="..." (no error)
+  5) If token is valid but insufficient scope/role (authorization failure):
+     - AccessDeniedException → BearerTokenAccessDeniedHandler
+     - Returns 403 Forbidden with WWW-Authenticate: Bearer error="insufficient_scope"
+
+Q24: How do you test JWT-secured endpoints in Spring?
+A:
+  @Test
+  void getOrder_withValidJwt_returns200() throws Exception {
+      mockMvc.perform(get("/api/orders/1")
+              .with(jwt()
+                  .jwt(jwt -> jwt
+                      .subject("user123")
+                      .claim("roles", List.of("USER"))
+                      .claim("scope", "orders:read"))
+                  .authorities(new SimpleGrantedAuthority("SCOPE_orders:read"),
+                               new SimpleGrantedAuthority("ROLE_USER"))))
+             .andExpect(status().isOk());
+  }
+
+  @Test
+  void getOrder_withoutToken_returns401() throws Exception {
+      mockMvc.perform(get("/api/orders/1"))
+             .andExpect(status().isUnauthorized());
+  }
+
+  @Test
+  void adminEndpoint_withUserRole_returns403() throws Exception {
+      mockMvc.perform(delete("/api/orders/1")
+              .with(jwt().authorities(new SimpleGrantedAuthority("ROLE_USER"))))
+             .andExpect(status().isForbidden());
+  }
+
+========================================================
+SECTION 7: ADVANCED SCENARIOS
+========================================================
+
+Q25: Can a JWT be used without OAuth2?
+A: Yes. OAuth2 defines a framework for issuing tokens; JWT is just a format.
+   You can create and sign JWTs in your own application without an OAuth2 Authorization
+   Server. Example: Generate a JWT after username/password login in a Spring Boot app
+   using io.jsonwebtoken (JJWT library) or Nimbus-JOSE-JWT. The risk: you're
+   reinventing security infrastructure. For production systems with external clients
+   or federation, use a proper AS (Spring Authorization Server, Keycloak, Auth0).
+
+Q26: What is a structured token vs an opaque token?
+A:
+  Structured (JWT): Self-contained; claims are encoded in the token.
+    + No AS call for validation (verify signature locally)
+    + Fast; no network dependency
+    - Cannot be revoked before expiry
+    - Claims visible to anyone who can base64-decode the payload
+    - Size can be large (carried on every request)
+
+  Opaque: A random string (reference token); claims stored server-side.
+    + Fully revocable (delete from store)
+    + No information leakage (just an opaque reference)
+    - Requires introspection call to AS on each request (or caching)
+    - RS has external dependency
+
+  Hybrid: Issue opaque to clients, exchange for JWT at API Gateway
+  (Phantom Token pattern — best of both).
+
+Q27: How large can a JWT get and does it matter?
+A: A typical JWT is 300-600 bytes. JWT with many roles/claims can be 1-3 KB.
+   This matters because:
+   - JWTs are sent as HTTP headers (Authorization: Bearer ...) on EVERY request
+   - HTTP/1.1 headers have soft limits (~8KB); HTTP/2 uses HPACK compression
+   - Cookies have 4KB limit per domain
+   - Large JWTs increase bandwidth and can cause header-too-large errors
+
+   Mitigation:
+   - Don't embed full role lists in JWT — embed role IDs or group IDs
+   - Use short claim names (iss, sub vs issuer, subject)
+   - Use reference tokens for large contexts
+   - Split into access token (small, sent frequently) + ID token (larger, parsed once)
+
+Q28: How would you implement stateless JWT-based logout?
+A:
+  True stateless logout is impossible (the JWT is valid until it expires by definition).
+
+  Practical approaches:
+  1) Client-side only: Delete the token from client storage. Simple, but the token
+     technically remains valid if it was copied.
+
+  2) Short expiry: 5-15 minute access tokens. Even if not "revoked," impact is minimal.
+
+  3) JTI blacklist in Redis:
+     - Each JWT has a unique jti claim
+     - On logout, store jti in Redis with TTL = token's remaining lifetime
+     - On every request, check if jti is in the blacklist
+     - Trade-off: Redis dependency; adds ~1ms latency
+
+  4) Refresh token revocation:
+     - Revoke the refresh token → no new access tokens can be obtained
+     - Existing access token valid until expiry (minutes)
+     - Combined with short AT expiry, this is usually acceptable
+
+  5) Version counter:
+     - Store a "token version" per user in DB (or cache)
+     - Embed version in JWT at issuance
+     - On each request, check DB version == JWT version
+     - On logout (or password change), increment DB version → all old tokens invalid
+     - More stateful but provides immediate revocation with O(1) lookup

@@ -1,0 +1,403 @@
+================================================================================
+SERVER-SENT EVENTS (SSE) — IN DEPTH
+================================================================================
+
+WHAT IS SSE?
+-------------
+Server-Sent Events (SSE) is a unidirectional server-to-client streaming protocol
+over HTTP. The server holds a connection open and pushes events as they occur.
+The client uses the browser's EventSource API to subscribe.
+
+Protocol: plain HTTP (text/event-stream content type)
+Direction: Server → Client only (client sends regular HTTP requests)
+RFC: W3C EventSource specification
+
+Key characteristics:
+  - Uses standard HTTP — works through proxies and firewalls
+  - Browser auto-reconnects if connection drops
+  - Supports named event types
+  - Supports last event ID for resumability
+  - Text only (no binary frames unlike WebSocket)
+  - Built-in browser support via EventSource API
+
+================================================================================
+1. SSE PROTOCOL FORMAT
+================================================================================
+
+SSE is a text stream with messages separated by blank lines.
+Content-Type: text/event-stream
+
+FIELD FORMAT:
+  field: value\n
+
+FIELDS:
+  data  : message payload (required; can span multiple lines)
+  event : named event type (optional; default is "message")
+  id    : event ID (optional; used for Last-Event-ID on reconnect)
+  retry : reconnect interval in ms (optional; client respects this)
+  : comment (colon as first char — used as keep-alive ping)
+
+EXAMPLES:
+
+Simple message:
+  data: Hello world\n\n
+
+JSON data:
+  data: {"userId": 42, "action": "JOINED", "room": "general"}\n\n
+
+Named event:
+  event: priceUpdate\n
+  data: {"symbol": "AAPL", "price": 195.50}\n\n
+
+With ID (for resumability):
+  id: 1001\n
+  event: orderStatus\n
+  data: {"orderId": "order-xyz", "status": "SHIPPED"}\n\n
+
+Retry hint:
+  retry: 3000\n
+  data: {"message": "reconnect after 3 seconds if disconnected"}\n\n
+
+Multi-line data:
+  data: {"line1": "first line",\n
+  data: "line2": "second line"}\n\n
+
+Keep-alive comment:
+  : ping\n\n
+
+================================================================================
+2. BROWSER EventSource API
+================================================================================
+
+// Basic connection
+const es = new EventSource('/api/events');
+
+// Default "message" event
+es.onmessage = (event) => {
+    console.log('Received:', event.data);
+    const payload = JSON.parse(event.data);
+};
+
+// Named events
+es.addEventListener('priceUpdate', (event) => {
+    const price = JSON.parse(event.data);
+    updateUI(price);
+});
+
+es.addEventListener('orderStatus', (event) => {
+    const status = JSON.parse(event.data);
+    showOrderUpdate(status);
+});
+
+// Connection events
+es.onopen = () => console.log('SSE connected');
+es.onerror = (event) => {
+    if (event.target.readyState === EventSource.CLOSED) {
+        console.log('SSE closed');
+    }
+    // Browser auto-reconnects with Last-Event-ID
+};
+
+// Manual close
+es.close();
+
+// With credentials (cookies)
+const es = new EventSource('/api/events', { withCredentials: true });
+
+READYSTATE VALUES:
+  0 = CONNECTING
+  1 = OPEN
+  2 = CLOSED
+
+AUTO-RECONNECT:
+  Browser automatically reconnects after disconnect (default 3s, or retry: value).
+  On reconnect, browser sends: Last-Event-ID: 1001 (the last id it received).
+  Server should replay missed events from that ID.
+
+================================================================================
+3. SPRING BOOT — SSE IMPLEMENTATION
+================================================================================
+
+BASIC SSE WITH SseEmitter:
+
+  @RestController
+  @RequestMapping("/api")
+  public class SseController {
+
+      @GetMapping(value = "/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+      public SseEmitter streamEvents() {
+          SseEmitter emitter = new SseEmitter(60_000L); // 60 second timeout
+
+          executorService.submit(() -> {
+              try {
+                  for (int i = 0; i < 10; i++) {
+                      emitter.send(SseEmitter.event()
+                          .id(String.valueOf(i))
+                          .name("progress")
+                          .data(Map.of("step", i, "total", 10))
+                          .reconnectTime(3000));
+                      Thread.sleep(1000);
+                  }
+                  emitter.complete();
+              } catch (IOException | InterruptedException e) {
+                  emitter.completeWithError(e);
+              }
+          });
+
+          return emitter;
+      }
+  }
+
+PRODUCTION-GRADE SSE WITH REGISTRY (fan-out to multiple clients):
+
+  @Component
+  public class SseNotificationService {
+
+      private final Map<String, SseEmitter> emitters = new ConcurrentHashMap<>();
+
+      public SseEmitter subscribe(String userId) {
+          SseEmitter emitter = new SseEmitter(Long.MAX_VALUE);
+          emitters.put(userId, emitter);
+
+          emitter.onCompletion(() -> emitters.remove(userId));
+          emitter.onTimeout(() -> {
+              emitters.remove(userId);
+              emitter.complete();
+          });
+          emitter.onError(ex -> emitters.remove(userId));
+
+          // Send initial "connected" event
+          try {
+              emitter.send(SseEmitter.event()
+                  .name("connected")
+                  .data(Map.of("message", "Connected", "userId", userId)));
+          } catch (IOException e) {
+              emitters.remove(userId);
+          }
+
+          return emitter;
+      }
+
+      public void sendToUser(String userId, String eventType, Object payload) {
+          SseEmitter emitter = emitters.get(userId);
+          if (emitter != null) {
+              try {
+                  emitter.send(SseEmitter.event()
+                      .id(UUID.randomUUID().toString())
+                      .name(eventType)
+                      .data(payload));
+              } catch (IOException e) {
+                  emitters.remove(userId);
+              }
+          }
+      }
+
+      public void broadcast(String eventType, Object payload) {
+          List<String> failedIds = new ArrayList<>();
+          emitters.forEach((userId, emitter) -> {
+              try {
+                  emitter.send(SseEmitter.event()
+                      .name(eventType)
+                      .data(payload));
+              } catch (IOException e) {
+                  failedIds.add(userId);
+              }
+          });
+          failedIds.forEach(emitters::remove);
+      }
+  }
+
+  @RestController
+  @RequestMapping("/api/notifications")
+  public class NotificationController {
+
+      private final SseNotificationService sseService;
+
+      @GetMapping(value = "/subscribe", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+      public SseEmitter subscribe(@RequestParam String userId) {
+          return sseService.subscribe(userId);
+      }
+  }
+
+================================================================================
+4. SPRING WEBFLUX — REACTIVE SSE
+================================================================================
+
+@RestController
+@RequestMapping("/api")
+public class ReactiveSSEController {
+
+    private final StockPriceService priceService;
+
+    @GetMapping(value = "/prices/{symbol}", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<ServerSentEvent<StockPrice>> streamPrice(@PathVariable String symbol) {
+        return priceService.getPriceStream(symbol)
+            .map(price -> ServerSentEvent.<StockPrice>builder()
+                .id(String.valueOf(System.currentTimeMillis()))
+                .event("priceUpdate")
+                .data(price)
+                .retry(Duration.ofSeconds(3))
+                .build())
+            .doOnError(e -> log.error("Error streaming price for {}", symbol, e));
+    }
+
+    // Keep-alive via heartbeats (every 15s)
+    @GetMapping(value = "/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<ServerSentEvent<Object>> streamWithHeartbeat() {
+        Flux<ServerSentEvent<Object>> heartbeat = Flux.interval(Duration.ofSeconds(15))
+            .map(i -> ServerSentEvent.builder()
+                .comment("heartbeat")
+                .build());
+
+        Flux<ServerSentEvent<Object>> events = eventService.getEventStream()
+            .map(e -> ServerSentEvent.builder()
+                .id(e.getId())
+                .event(e.getType())
+                .data((Object) e.getPayload())
+                .build());
+
+        return Flux.merge(heartbeat, events);
+    }
+}
+
+================================================================================
+5. RESUMABILITY — LAST EVENT ID
+================================================================================
+
+The client sends Last-Event-ID header on reconnect.
+Server should replay all events since that ID.
+
+// Server — store recent events in a circular buffer or Redis Stream
+@Component
+public class EventStore {
+    private final Deque<SseEvent> recentEvents = new ArrayDeque<>(500);
+
+    public synchronized void store(SseEvent event) {
+        if (recentEvents.size() >= 500) recentEvents.removeFirst();
+        recentEvents.addLast(event);
+    }
+
+    public synchronized List<SseEvent> getEventsSince(String lastEventId) {
+        if (lastEventId == null) return Collections.emptyList();
+        boolean found = false;
+        List<SseEvent> missed = new ArrayList<>();
+        for (SseEvent e : recentEvents) {
+            if (found) missed.add(e);
+            if (e.getId().equals(lastEventId)) found = true;
+        }
+        return missed;
+    }
+}
+
+// Controller — replay on reconnect
+@GetMapping(value = "/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+public SseEmitter subscribe(
+        @RequestHeader(value = "Last-Event-ID", required = false) String lastEventId) {
+    SseEmitter emitter = new SseEmitter(Long.MAX_VALUE);
+    
+    // Replay missed events
+    List<SseEvent> missed = eventStore.getEventsSince(lastEventId);
+    for (SseEvent event : missed) {
+        try {
+            emitter.send(SseEmitter.event()
+                .id(event.getId())
+                .name(event.getType())
+                .data(event.getPayload()));
+        } catch (IOException e) {
+            return emitter;
+        }
+    }
+    
+    // Register for future events
+    sseService.register(emitter);
+    return emitter;
+}
+
+================================================================================
+6. SSE NGINX CONFIGURATION
+================================================================================
+
+SSE requires disabling buffering (Nginx buffers responses by default):
+
+  location /api/events {
+      proxy_pass http://backend;
+      proxy_set_header Connection '';
+      proxy_http_version 1.1;
+      proxy_buffering off;               # Critical for SSE
+      proxy_cache off;
+      proxy_read_timeout 86400s;         # Long timeout for persistent connection
+      add_header Cache-Control no-cache;
+      add_header X-Accel-Buffering no;   # Disable Nginx-level buffering
+  }
+
+HTTP/2 and SSE:
+  SSE works with HTTP/2 — even better because H2 multiplexes many streams
+  over one TCP connection. No need for domain sharding for SSE under H2.
+
+================================================================================
+7. SSE vs POLLING vs WEBSOCKET DECISION GUIDE
+================================================================================
+
+Use SSE when:
+  ✓ Need real-time server → client updates
+  ✓ Client is a browser (EventSource API built-in)
+  ✓ Events are text-based
+  ✓ Automatic reconnect with Last-Event-ID is valuable
+  ✓ Working through proxies / corporate firewalls
+  ✗ Do NOT use if client also needs to send data frequently (use WebSocket)
+
+Use WebSocket when:
+  ✓ True bidirectional communication (chat, collaboration, gaming)
+  ✓ Need binary data (audio, video, images)
+  ✓ Sub-100ms latency required
+  ✓ Both client and server send frequently
+
+Use polling when:
+  ✓ Very simple requirements
+  ✓ Events infrequent (>30s intervals)
+  ✓ Compatibility with all clients required
+  ✗ Not suitable for real-time (wastes resources)
+
+================================================================================
+8. INTERVIEW QUESTIONS — SSE
+================================================================================
+
+Q1: How does SSE differ from WebSockets?
+    SSE is unidirectional (server-to-client only) over standard HTTP using
+    text/event-stream content type. WebSocket is bidirectional (full-duplex)
+    using its own ws:// protocol after an HTTP upgrade handshake. SSE is
+    simpler, works through proxies, benefits from HTTP/2 multiplexing, and has
+    built-in browser reconnection. WebSocket supports binary, is bidirectional,
+    but is stateful and harder to scale. SSE is the right choice when only
+    server-to-client streaming is needed; WebSocket when both sides send data.
+
+Q2: What happens when an SSE connection drops?
+    The browser's EventSource automatically reconnects after the retry interval
+    (default 3 seconds, or as specified by the server's retry: field). On
+    reconnect, the browser includes the Last-Event-ID header with the ID of
+    the last event it received. The server should use this ID to replay any
+    missed events. This gives SSE built-in resumability without custom code.
+
+Q3: How many concurrent SSE connections can a browser maintain?
+    Browser limit per origin: HTTP/1.1 allows 6 connections per origin.
+    Since SSE holds one connection open, you can only have 6 SSE connections
+    to the same origin simultaneously in a tab. With HTTP/2, this limit is
+    lifted because streams are multiplexed — many SSE streams can share one
+    TCP connection. Always deploy SSE endpoints over HTTP/2 in production.
+
+Q4: How do you broadcast an SSE event to all connected clients?
+    Maintain a registry of SseEmitter (or Flux subscriber) objects.
+    When an event occurs (from any source — DB trigger, Kafka, another API),
+    iterate the registry and call emitter.send() on each. Remove any emitters
+    that throw IOException (disconnected clients). In a multi-node setup,
+    use Redis Pub/Sub or Kafka to relay events to all application nodes before
+    broadcasting to local subscribers.
+
+Q5: Can SSE be used with Spring WebFlux?
+    Yes — return Flux<ServerSentEvent<T>> from a @GetMapping with
+    produces = MediaType.TEXT_EVENT_STREAM_VALUE. Each item emitted by the
+    Flux becomes an SSE event. This is non-blocking and reactive. The
+    ServerSentEvent builder lets you set id, event name, data, and retry fields.
+    Combine with Flux.interval() to emit heartbeats.
+
+================================================================================

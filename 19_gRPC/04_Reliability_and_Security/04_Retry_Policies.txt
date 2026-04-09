@@ -1,0 +1,319 @@
+================================================================
+gRPC RETRY POLICIES
+================================================================
+
+----------------------------------------------------------------
+1. WHY RETRIES MATTER
+----------------------------------------------------------------
+
+In distributed systems, transient failures are common:
+  - A pod is restarting (UNAVAILABLE for a few seconds)
+  - A database connection pool is briefly exhausted (RESOURCE_EXHAUSTED)
+  - A network glitch causes a temporary disconnect
+  - Optimistic locking conflict (ABORTED)
+
+Without retries: the client immediately sees an error.
+With retries: the client automatically tries again and often succeeds.
+
+Retryable status codes (safe to retry — no side effects):
+  UNAVAILABLE     — server is temporarily unavailable
+  RESOURCE_EXHAUSTED — rate limit or quota exceeded (with backoff)
+  ABORTED         — concurrency conflict (retry with new state)
+  
+NON-retryable (idempotency not guaranteed):
+  INVALID_ARGUMENT — retry won't change the result
+  NOT_FOUND        — same
+  ALREADY_EXISTS   — same
+  PERMISSION_DENIED — same
+
+Key concept: IDEMPOTENCY
+  Only retry if the operation is safe to retry.
+  If a CreateOrder call succeeded but the response was lost in transit,
+  retrying will create a DUPLICATE order — bad!
+  
+  Solutions for non-idempotent operations:
+    1. Idempotency keys: client generates a unique key; server deduplicates
+    2. CHECK before CREATE: check if order already exists first
+    3. Don't retry non-idempotent calls automatically
+
+----------------------------------------------------------------
+2. gRPC BUILT-IN RETRY POLICY (Service Config)
+----------------------------------------------------------------
+
+gRPC Java supports configuring retry policies via the service config JSON.
+This is the PREFERRED approach (no application code changes).
+
+Service config is either:
+  - Baked into the channel (for static config)
+  - Returned from the name resolver/discovery system (dynamic)
+
+// ── Configure retry policy in channel builder ─────────────────
+
+Map<String, Object> retryPolicy = new HashMap<>();
+retryPolicy.put("maxAttempts", 4.0);               // 1 initial + 3 retries
+retryPolicy.put("initialBackoff", "0.1s");          // 100ms initial wait
+retryPolicy.put("maxBackoff", "1s");                // cap at 1 second
+retryPolicy.put("backoffMultiplier", 2.0);          // double each time
+retryPolicy.put("retryableStatusCodes",             // which codes to retry
+    List.of("UNAVAILABLE", "RESOURCE_EXHAUSTED"));
+
+Map<String, Object> methodConfig = new HashMap<>();
+methodConfig.put("name", List.of(Map.of(
+    "service", "com.example.OrderService",         // applies to this service
+    "method", "CreateOrder"                        // specific method (or omit for all)
+)));
+methodConfig.put("retryPolicy", retryPolicy);
+
+// Also configure a deadline
+Map<String, Object> defaultDeadline = new HashMap<>();
+defaultDeadline.put("name", List.of(Map.of("service", "com.example.OrderService")));
+defaultDeadline.put("timeout", "10s");
+
+Map<String, Object> serviceConfig = new HashMap<>();
+serviceConfig.put("methodConfig", List.of(methodConfig));
+
+ManagedChannel channel = ManagedChannelBuilder
+    .forAddress("localhost", 9090)
+    .usePlaintext()
+    .defaultServiceConfig(serviceConfig)
+    .enableRetry()                  // ← MUST explicitly enable
+    .build();
+
+Retry timing with 4 attempts and exponential backoff:
+  Attempt 1: immediately
+  Attempt 2: wait 100ms (initial)
+  Attempt 3: wait 200ms (100ms * 2)
+  Attempt 4: wait 400ms (200ms * 2)
+  
+  All must complete within the original deadline.
+
+----------------------------------------------------------------
+3. HEDGING (SPECULATIVE RETRY)
+----------------------------------------------------------------
+
+Hedging is different from retry:
+  - Retry: wait for failure, then retry
+  - Hedging: proactively send the SAME request to multiple servers
+             concurrently, use the FIRST response received
+
+Useful when:
+  - Server latency is unpredictable (long tail latency problem)
+  - It's cheaper to have parallel requests than to wait for slow ones
+  - Operations are read-only or idempotent
+
+Hedging policy config:
+  Map<String, Object> hedgingPolicy = new HashMap<>();
+  hedgingPolicy.put("maxAttempts", 3.0);            // up to 3 concurrent
+  hedgingPolicy.put("hedgingDelay", "0.5s");         // start second after 500ms
+  hedgingPolicy.put("nonFatalStatusCodes",           // cancel others on these codes
+      List.of("UNAVAILABLE"));
+  
+  Map<String, Object> methodConfig = new HashMap<>();
+  methodConfig.put("name", List.of(Map.of("service", "com.example.ReadService")));
+  methodConfig.put("hedgingPolicy", hedgingPolicy);
+
+Hedging timeline:
+  t=0ms:    attempt 1 sent
+  t=500ms:  attempt 1 still pending → attempt 2 sent
+  t=600ms:  attempt 2 returns response ← USE THIS
+  t=600ms:  attempt 1 is cancelled
+
+Cannot combine retry and hedging — choose one per method.
+
+----------------------------------------------------------------
+4. MANUAL RETRY WITH EXPONENTIAL BACKOFF
+----------------------------------------------------------------
+
+When you need more control, implement retries manually:
+
+public class RetryingOrderClient {
+  
+  private final OrderServiceGrpc.OrderServiceBlockingStub stub;
+  
+  private static final Set<Status.Code> RETRYABLE_CODES = Set.of(
+      Status.Code.UNAVAILABLE,
+      Status.Code.RESOURCE_EXHAUSTED,
+      Status.Code.ABORTED
+  );
+  
+  public CreateOrderResponse createOrderWithRetry(CreateOrderRequest request)
+      throws InterruptedException {
+    
+    int maxAttempts = 4;
+    long backoffMs = 100;
+    
+    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return stub
+            .withDeadlineAfter(5, TimeUnit.SECONDS)
+            .createOrder(request);
+        
+      } catch (StatusRuntimeException e) {
+        boolean isLastAttempt = attempt == maxAttempts;
+        boolean isRetryable = RETRYABLE_CODES.contains(e.getStatus().getCode());
+        
+        if (isLastAttempt || !isRetryable) {
+          throw e;  // give up
+        }
+        
+        // Check retry-after header if server sent one
+        Metadata trailers = e.getTrailers();
+        if (trailers != null) {
+          String retryAfter = trailers.get(
+              Metadata.Key.of("retry-after", Metadata.ASCII_STRING_MARSHALLER));
+          if (retryAfter != null) {
+            backoffMs = Long.parseLong(retryAfter);
+          }
+        }
+        
+        log.warn("Attempt {} failed with {}, retrying in {}ms...",
+            attempt, e.getStatus().getCode(), backoffMs);
+        
+        // Add jitter to avoid thundering herd
+        long jitter = (long) (Math.random() * backoffMs * 0.1);
+        Thread.sleep(backoffMs + jitter);
+        
+        backoffMs = Math.min(backoffMs * 2, 10_000);  // cap at 10s
+      }
+    }
+    
+    throw new IllegalStateException("Should never reach here");
+  }
+}
+
+----------------------------------------------------------------
+5. IDEMPOTENCY KEYS (FOR NON-IDEMPOTENT RETRIES)
+----------------------------------------------------------------
+
+For operations that are NOT idempotent by nature (like CreateOrder),
+use idempotency keys to make them safe to retry:
+
+// ── Proto definition ──────────────────────────────────────────
+message CreateOrderRequest {
+  string idempotency_key = 1;  // client-generated unique ID
+  string customer_id = 2;
+  string product_id = 3;
+  int32 quantity = 4;
+}
+
+// ── Server implementation ─────────────────────────────────────
+@Override
+public void createOrder(CreateOrderRequest request,
+                        StreamObserver<CreateOrderResponse> responseObserver) {
+  
+  String idempotencyKey = request.getIdempotencyKey();
+  
+  if (!idempotencyKey.isBlank()) {
+    // Check idempotency cache
+    Optional<CreateOrderResponse> cached = idempotencyStore.get(idempotencyKey);
+    if (cached.isPresent()) {
+      log.info("Returning cached response for idempotency key: {}", idempotencyKey);
+      responseObserver.onNext(cached.get());
+      responseObserver.onCompleted();
+      return;
+    }
+  }
+  
+  // Process the order
+  CreateOrderResponse response = processOrder(request);
+  
+  // Cache the response before sending
+  if (!idempotencyKey.isBlank()) {
+    idempotencyStore.put(idempotencyKey, response, 24, TimeUnit.HOURS);
+  }
+  
+  responseObserver.onNext(response);
+  responseObserver.onCompleted();
+}
+
+// ── Client with idempotency key ───────────────────────────────
+String idempotencyKey = UUID.randomUUID().toString();
+
+for (int attempt = 0; attempt < maxRetries; attempt++) {
+  try {
+    CreateOrderResponse response = stub.createOrder(
+        CreateOrderRequest.newBuilder()
+            .setIdempotencyKey(idempotencyKey)  // same key on all retries
+            .setCustomerId(customerId)
+            .setProductId(productId)
+            .setQuantity(quantity)
+            .build());
+    return response;
+  } catch (StatusRuntimeException e) {
+    if (RETRYABLE_CODES.contains(e.getStatus().getCode()) && attempt < maxRetries - 1) {
+      Thread.sleep(exponentialBackoff(attempt));
+      // ↑ same idempotencyKey used on next attempt — server deduplicates
+    } else {
+      throw e;
+    }
+  }
+}
+
+----------------------------------------------------------------
+6. RETRY WITH CIRCUIT BREAKER (Resilience4j)
+----------------------------------------------------------------
+
+@Component
+public class OrderClientWithCircuitBreaker {
+  
+  private final OrderServiceGrpc.OrderServiceBlockingStub stub;
+  
+  @Autowired
+  private CircuitBreakerRegistry circuitBreakerRegistry;
+  
+  public CreateOrderResponse createOrder(CreateOrderRequest request) {
+    CircuitBreaker cb = circuitBreakerRegistry.circuitBreaker("order-service");
+    Retry retry = Retry.of("order-retry", RetryConfig.custom()
+        .maxAttempts(3)
+        .waitDuration(Duration.ofMillis(100))
+        .retryOnException(e ->
+            e instanceof StatusRuntimeException sre &&
+            RETRYABLE_CODES.contains(sre.getStatus().getCode()))
+        .build());
+    
+    return Decorators.ofSupplier(() ->
+            stub.withDeadlineAfter(5, TimeUnit.SECONDS).createOrder(request))
+        .withCircuitBreaker(cb)
+        .withRetry(retry)
+        .get();
+  }
+}
+
+----------------------------------------------------------------
+7. INTERVIEW KEY POINTS
+----------------------------------------------------------------
+
+Q: What gRPC status codes are safe to retry?
+A: UNAVAILABLE (server is temporarily down — retry will likely succeed),
+   RESOURCE_EXHAUSTED (rate limit hit — retry with backoff), and ABORTED
+   (concurrency conflict — retry with current state). INTERNAL can sometimes
+   be retried but needs care. INVALID_ARGUMENT, NOT_FOUND, PERMISSION_DENIED
+   are NOT retryable — the same request will always fail.
+
+Q: What is the difference between retry and hedging in gRPC?
+A: Retry is sequential: send, wait for failure, then send again.
+   Hedging is concurrent: send the request, if no response arrives within
+   the hedging delay, send another parallel copy, use the first response.
+   Retry reduces errors; hedging reduces tail latency at the cost of
+   duplicate server load. You cannot configure both for the same method.
+
+Q: How do you retry a non-idempotent gRPC call safely?
+A: Use an idempotency key — a client-generated UUID that uniquely identifies
+   this logical operation. Send the same key on all retry attempts. The
+   server checks if it has already processed a request with that key; if
+   so, it returns the cached response without reprocessing. This prevents
+   duplicate operations (e.g., two orders created from one client intent).
+
+Q: How does gRPC's built-in retry differ from application-level retry?
+A: gRPC's built-in retry (via service config) operates at the transport
+   layer before the request reaches the application. It retries only if
+   the server returns a retryable status code AND the operation has not
+   yet been committed (i.e., the server rejected it before any side effects).
+   The service config retry is safer because it ensures at-most-once delivery
+   for non-idempotent calls — it won't retry if the server sent any response
+   (including partial data). Application-level retry doesn't have this
+   guarantee and requires explicit idempotency keys.
+
+================================================================
+END OF FILE
+================================================================

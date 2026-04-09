@@ -1,0 +1,259 @@
+================================================================================
+REDIS SENTINEL — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. WHAT IS REDIS SENTINEL?
+────────────────────────────
+  Redis Sentinel is a high-availability solution for standalone Redis.
+  It runs as separate processes that monitor Redis primary and replicas.
+  On failure, Sentinels automatically elect a new primary (failover).
+
+  Sentinel provides:
+    - Monitoring: continuously check primary + replicas are alive
+    - Notification: alert ops teams on failure via Pub/Sub / scripts
+    - Automatic failover: promote a replica to primary on primary failure
+    - Configuration provider: clients ask Sentinel for current primary address
+
+
+2. SENTINEL ARCHITECTURE
+─────────────────────────
+  Minimum deployment:
+    3 Sentinel processes (for quorum voting — odd number recommended)
+    1 Primary
+    1+ Replicas
+
+    ┌──────────┐    ┌──────────┐    ┌──────────┐
+    │Sentinel 1│    │Sentinel 2│    │Sentinel 3│
+    └────┬─────┘    └────┬─────┘    └────┬─────┘
+         │               │               │
+         └───────────────┴───────────────┘
+                         │
+              ┌──────────┴───────────┐
+              │                      │
+         ┌────▼─────┐          ┌─────▼────┐
+         │  Primary  │◄─────── │ Replica  │
+         │  :6379    │ replic.  │  :6380   │
+         └───────────┘          └──────────┘
+
+  Sentinels discover each other via the PRIMARY:
+    - Each Sentinel subscribes to __sentinel__:hello channel on primary
+    - Sentinels broadcast their own address there
+    - All Sentinels find each other automatically
+
+  Sentinels also discover replicas:
+    - Via INFO replication command on primary
+    - Each Sentinel then monitors all replicas directly
+
+
+3. SENTINEL CONFIGURATION
+───────────────────────────
+  sentinel.conf:
+    port 26379
+    daemonize yes
+    logfile "/var/log/sentinel.log"
+    dir /tmp
+
+    # Monitor a primary named "mymaster" at 127.0.0.1:6379
+    # Quorum: 2 sentinels must agree before declaring it down
+    sentinel monitor mymaster 127.0.0.1 6379 2
+
+    # How many ms before considering primary SUBJECTIVELY down
+    sentinel down-after-milliseconds mymaster 5000
+
+    # Max time allowed for failover (ms)
+    sentinel failover-timeout mymaster 60000
+
+    # How many replicas can be reconfigured in parallel during failover
+    # 1 = one at a time (slower but safe; replicas readable during sync)
+    sentinel parallel-syncs mymaster 1
+
+    # Optional: require password on monitored primary
+    sentinel auth-pass mymaster <password>
+
+    # Optional: notify script on failover/crash
+    sentinel notification-script mymaster /var/redis/notify.sh
+    sentinel client-reconfig-script mymaster /var/redis/reconfig.sh
+
+  Start Sentinel:
+    redis-sentinel /path/to/sentinel.conf
+    # OR
+    redis-server /path/to/sentinel.conf --sentinel
+
+
+4. FAILURE DETECTION: SDOWN vs ODOWN
+──────────────────────────────────────
+  SDOWN (Subjectively Down):
+    A single Sentinel has not received a valid reply from the primary
+    within down-after-milliseconds.
+    → Local judgment, not sufficient for failover.
+
+  ODOWN (Objectively Down):
+    The quorum number of Sentinels all independently report SDOWN.
+    → Triggers failover.
+
+  quorum (2 in example):
+    2 Sentinels must agree on SDOWN → ODOWN.
+
+  Failover authorization quorum:
+    Majority of ALL Sentinels (not just quorum) must vote for the
+    failover leader Sentinel. This is separate from the down quorum.
+    Example: 3 Sentinels total → need 2 for election (majority).
+
+
+5. FAILOVER PROCESS (STEP-BY-STEP)
+────────────────────────────────────
+  T=0    Primary stops responding
+  T=5s   Sentinels mark primary SDOWN (down-after-milliseconds)
+  T=6s   Quorum of Sentinels agree → ODOWN
+  T=7s   Sentinel leader election (Raft-like): one Sentinel wins the right to do failover
+  T=8s   Leader Sentinel picks best replica to promote:
+           - Most up-to-date replication offset (replication_offset)
+           - Lowest slave-priority (0 = never promote)
+           - Smallest Run ID (tiebreaker)
+  T=9s   Leader Sentinel sends REPLICAOF NO ONE to chosen replica
+  T=10s  Chosen replica becomes new primary
+  T=11s  Other replicas and clients notified of new primary address
+  T=12s  Other replicas start replicating from new primary
+  T=12s  Old primary (if it recovers) is reconfigured as replica of new primary
+
+  Total: ~10–30 seconds downtime (configurable via down-after-milliseconds)
+
+
+6. CLIENT INTEGRATION
+──────────────────────
+  Clients must be Sentinel-aware. They ask Sentinel for current primary.
+  On failover, clients get new primary address from Sentinel.
+
+  Jedis (Java):
+    Set<String> sentinels = new HashSet<>();
+    sentinels.add("sentinel1:26379");
+    sentinels.add("sentinel2:26379");
+    sentinels.add("sentinel3:26379");
+
+    JedisSentinelPool pool = new JedisSentinelPool(
+        "mymaster",     // master name
+        sentinels,
+        jedisPoolConfig,
+        timeout,
+        password
+    );
+
+    try (Jedis jedis = pool.getResource()) {
+        jedis.set("key", "value");
+    }
+
+  Lettuce (Spring Boot preferred):
+    RedisClient client = RedisClient.create(
+        RedisURI.Builder.sentinel("sentinel1", 26379, "mymaster")
+            .withSentinel("sentinel2", 26379)
+            .withSentinel("sentinel3", 26379)
+            .build()
+    );
+
+  Spring Boot application.properties:
+    spring.redis.sentinel.master=mymaster
+    spring.redis.sentinel.nodes=sentinel1:26379,sentinel2:26379,sentinel3:26379
+
+
+7. SENTINEL PUB/SUB EVENTS
+────────────────────────────
+  Clients can subscribe to Sentinel's own Pub/Sub for monitoring:
+
+  Channels (subscribe on Sentinel port 26379):
+    +sdown                 → instance entered SDOWN
+    -sdown                 → instance left SDOWN
+    +odown                 → instance entered ODOWN
+    +failover-triggered    → failover started
+    +elected-leader        → Sentinel elected as failover leader
+    +promoted-slave        → replica promoted to primary
+    +slave-reconf-sent     → SLAVEOF command sent to replica
+    +slave-reconf-done     → replica reconfiguration complete
+    +failover-end          → failover completed
+    -failover-end-for-timeout → failover timed out
+    +reset-master          → master reset by Sentinel
+
+  Subscribe example:
+    redis-cli -p 26379 SUBSCRIBE +failover-triggered +promoted-slave +failover-end
+
+
+8. SENTINEL COMMANDS
+─────────────────────
+  (Run against Sentinel port, e.g., 26379)
+
+  SENTINEL masters           → list all monitored primaries + status
+  SENTINEL master mymaster   → info for specific master
+  SENTINEL slaves mymaster   → list replicas (deprecated: use SENTINEL REPLICAS)
+  SENTINEL replicas mymaster → list replicas of mymaster
+  SENTINEL sentinels mymaster → list other Sentinels monitoring mymaster
+  SENTINEL get-master-addr-by-name mymaster → returns [host, port] of current primary
+  SENTINEL failover mymaster → force failover (for testing)
+  SENTINEL reset mymaster    → reset state for master (clear SDOWN, ODOWN flags)
+  SENTINEL ckquorum mymaster → verify quorum is reachable
+  SENTINEL flushconfig       → flush config to disk
+  INFO sentinel              → Sentinel's own metrics
+
+
+9. SENTINEL LIMITATIONS
+─────────────────────────
+  ✗ No sharding: Sentinel manages ONE primary (one dataset)
+      Multiple Sentinel groups needed for multiple Redis instances
+  ✗ Failover has downtime: ~10–30s during primary election
+  ✗ Data loss possible: async replication means inflight writes may be lost
+      Mitigate with: min-slaves-to-write, min-slaves-max-lag
+  ✗ Client must be Sentinel-aware: old jedis non-Sentinel clients won't reconnect
+  ✗ Split-brain risk if network partitions isolate Sentinels
+      min-replicas-to-write 1 + min-replicas-max-lag 10 helps
+
+
+10. DATA LOSS PROTECTION SETTINGS
+────────────────────────────────────
+  Prevent primary from accepting writes if replicas are too far behind:
+    min-replicas-to-write 1       # need at least 1 replica connected
+    min-replicas-max-lag 10       # max 10s replication lag
+
+  If primary can't reach any replica within 10s:
+    → Primary STOPS accepting writes
+    → Reduces split-brain writes to stale primary
+
+  WAIT command for synchronous replication:
+    WAIT 1 500   → wait for 1 replica to ack within 500ms
+    → If returns 0 (no replica confirmed), consider the write risky
+
+
+11. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: What is Redis Sentinel and what problems does it solve?
+  A: Redis Sentinel is a distributed monitoring and failover system for
+     standalone Redis. It solves the SPOF (single point of failure) problem
+     by automatically detecting primary failure and promoting a replica.
+     It also serves as a service discovery endpoint — clients ask Sentinel
+     for the current primary address instead of hardcoding it.
+
+  Q: What is quorum in Redis Sentinel?
+  A: Quorum is the minimum number of Sentinel processes that must independently
+     agree that the primary is down (SDOWN) before declaring it objectively down
+     (ODOWN) and triggering failover. With 3 Sentinels, quorum=2 means at least
+     2 must agree. Additionally, for the actual failover to proceed, a majority
+     (not just quorum) of Sentinels must elect a leader Sentinel.
+
+  Q: How does Sentinel elect the best replica to promote?
+  A: The Sentinel failover leader picks the best replica by:
+     1. Highest replication offset (most up-to-date data)
+     2. Lowest slave-priority value (non-zero; 0 = never promote)
+     3. Smallest lexicographic Run ID (tiebreaker)
+
+  Q: Can data be lost during Sentinel failover?
+  A: Yes. Because replication is asynchronous, writes acknowledged to the
+     client by the primary but not yet replicated to any replica will be lost
+     if the primary fails. Mitigate with min-replicas-to-write and
+     min-replicas-max-lag to refuse writes when replicas fall too far behind,
+     and use WAIT for critical writes.
+
+  Q: When would you choose Sentinel over Redis Cluster?
+  A: Choose Sentinel when your dataset fits on a single Redis instance
+     (single-node capacity is sufficient) and you primarily need automatic
+     failover. Sentinel is simpler to operate — no hash slot management, no
+     restriction on multi-key commands across slots. Use Cluster when you
+     need to shard data across multiple nodes for capacity or write throughput.
+
+================================================================================

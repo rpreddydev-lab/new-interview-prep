@@ -1,0 +1,454 @@
+================================================================
+CONTEXT AND AUTHENTICATION IN GRAPHQL — IN DEPTH
+================================================================
+
+1. WHAT IS GRAPHQL CONTEXT?
+-----------------------------
+The GraphQL context is a shared object that is created ONCE per request
+and passed to EVERY resolver in that request. It is the primary mechanism
+for:
+
+  - Passing authentication/authorization information to resolvers
+  - Sharing per-request resources (DB connections, caches, DataLoaders)
+  - Passing request metadata (IP, locale, request ID, headers)
+  - Injecting dependencies without polluting resolver signatures
+
+Think of it like the HTTP Request object — it flows through everything
+for the lifetime of one GraphQL operation.
+
+2. CONTEXT IN GRAPHQL-JAVA
+-----------------------------
+In graphql-java, every DataFetchingEnvironment (the resolver parameter)
+has access to:
+
+```java
+@SchemaMapping(typeName = "Query", field = "me")
+public User me(DataFetchingEnvironment env) {
+  // Access context (graphql-java style)
+  GraphQLContext context = env.getGraphQlContext();
+  User currentUser = context.get("currentUser");
+  return currentUser;
+}
+```
+
+In Spring for GraphQL, you can inject context values directly:
+```java
+@QueryMapping
+public User me(@ContextValue User currentUser) {
+  return currentUser;
+}
+```
+
+3. BUILDING CONTEXT IN SPRING FOR GRAPHQL
+-------------------------------------------
+Use WebGraphQlInterceptor to populate the context before resolver execution.
+
+  3.1 WebGraphQlInterceptor
+  --------------------------
+  ```java
+  @Component
+  @Order(1)  // Lowest number runs first
+  public class AuthInterceptor implements WebGraphQlInterceptor {
+
+    private final JwtTokenService tokenService;
+    private final UserRepository userRepository;
+
+    @Override
+    public Mono<WebGraphQlResponse> intercept(WebGraphQlRequest request,
+                                              Chain chain) {
+      // Extract Authorization header
+      String authHeader = request.getHeaders()
+        .getFirst(HttpHeaders.AUTHORIZATION);
+
+      if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+        // Proceed without auth context (anonymous request)
+        return chain.next(request);
+      }
+
+      String token = authHeader.substring(7);
+
+      try {
+        Claims claims = tokenService.validateAndParseClaims(token);
+        Long userId = claims.get("userId", Long.class);
+        Set<String> roles = new HashSet<>(claims.get("roles", List.class));
+
+        // Add to GraphQL context
+        request.configureExecutionInput((input, builder) ->
+          builder.graphQLContext(ctx -> {
+            ctx.put("userId", userId);
+            ctx.put("roles", roles);
+            ctx.put("authenticated", true);
+          })
+        );
+      } catch (JwtException e) {
+        // Invalid token — could throw 401 or let resolvers handle it
+        request.configureExecutionInput((input, builder) ->
+          builder.graphQLContext(ctx -> {
+            ctx.put("authenticated", false);
+            ctx.put("authError", "Invalid token");
+          })
+        );
+      }
+
+      return chain.next(request);
+    }
+  }
+  ```
+
+  3.2 Loading Full User Into Context
+  ------------------------------------
+  ```java
+  @Component
+  public class UserContextInterceptor implements WebGraphQlInterceptor {
+
+    private final UserRepository userRepository;
+    private final JwtTokenService tokenService;
+
+    @Override
+    public Mono<WebGraphQlResponse> intercept(WebGraphQlRequest request,
+                                              Chain chain) {
+      String token = extractToken(request.getHeaders());
+
+      if (token == null) {
+        return chain.next(request);
+      }
+
+      return Mono.fromCallable(() -> tokenService.getUserId(token))
+        .flatMap(userId -> Mono.fromCallable(() ->
+          userRepository.findById(userId).orElseThrow()))
+        .flatMap(user -> {
+          request.configureExecutionInput((input, builder) ->
+            builder.graphQLContext(ctx -> ctx.put("currentUser", user))
+          );
+          return chain.next(request);
+        })
+        .onErrorResume(e -> chain.next(request)); // Proceed if token invalid
+    }
+  }
+  ```
+
+  3.3 Accessing Context in Resolvers (@ContextValue)
+  ----------------------------------------------------
+  ```java
+  @QueryMapping
+  public List<Post> myPosts(@ContextValue(required = true) User currentUser) {
+    return postRepository.findByUserId(currentUser.getId());
+  }
+
+  @QueryMapping
+  public User me(@ContextValue(required = false) User currentUser) {
+    if (currentUser == null) {
+      throw new UnauthorizedException("Must be logged in");
+    }
+    return currentUser;
+  }
+  ```
+
+4. AUTHENTICATION PATTERNS
+----------------------------
+  4.1 JWT (JSON Web Token) — Most Common
+  ----------------------------------------
+  ```
+  Client → sends JWT in Authorization: Bearer <token> header
+  Interceptor → validates JWT, extracts user ID/roles, adds to context
+  Resolver → reads currentUser from context
+  ```
+
+  4.2 Session-Based Auth
+  -----------------------
+  ```java
+  // In WebGraphQlInterceptor
+  String sessionId = request.getHeaders()
+    .getFirst("X-Session-ID");
+  User user = sessionManager.getUserBySession(sessionId);
+  // Add user to context...
+  ```
+
+  4.3 Spring Security Integration
+  ---------------------------------
+  ```java
+  @Component
+  public class SpringSecurityContextInterceptor implements WebGraphQlInterceptor {
+
+    @Override
+    public Mono<WebGraphQlResponse> intercept(WebGraphQlRequest request,
+                                              Chain chain) {
+      // Spring Security's ReactiveSecurityContextHolder provides the user
+      return ReactiveSecurityContextHolder.getContext()
+        .map(SecurityContext::getAuthentication)
+        .doOnNext(auth -> {
+          if (auth != null && auth.isAuthenticated()) {
+            request.configureExecutionInput((input, builder) ->
+              builder.graphQLContext(ctx -> {
+                ctx.put("principal", auth.getPrincipal());
+                ctx.put("authorities", auth.getAuthorities());
+              })
+            );
+          }
+        })
+        .then(chain.next(request))
+        .switchIfEmpty(chain.next(request));  // Proceed if no auth
+    }
+  }
+  ```
+
+  4.4 API Key Auth
+  -----------------
+  ```java
+  @Override
+  public Mono<WebGraphQlResponse> intercept(WebGraphQlRequest request, Chain chain) {
+    String apiKey = request.getHeaders().getFirst("X-API-Key");
+    if (apiKey != null) {
+      ApiClient client = apiKeyService.validateKey(apiKey);
+      request.configureExecutionInput((input, builder) ->
+        builder.graphQLContext(ctx -> ctx.put("apiClient", client)));
+    }
+    return chain.next(request);
+  }
+  ```
+
+5. AUTHORIZATION PATTERNS
+---------------------------
+  5.1 Resolver-Level Authorization
+  ----------------------------------
+  ```java
+  @QueryMapping
+  public List<Order> adminOrders(@ContextValue User currentUser) {
+    if (currentUser == null || !currentUser.hasRole("ADMIN")) {
+      throw new UnauthorizedException("Admin access required");
+    }
+    return orderRepository.findAll();
+  }
+  ```
+
+  5.2 @PreAuthorize (Spring Security)
+  -------------------------------------
+  ```java
+  @QueryMapping
+  @PreAuthorize("hasRole('ADMIN')")
+  public List<User> allUsers() {
+    return userRepository.findAll();
+  }
+
+  @MutationMapping
+  @PreAuthorize("isAuthenticated()")
+  public Post createPost(@Argument CreatePostInput input,
+                         @ContextValue User currentUser) {
+    return postService.create(input, currentUser);
+  }
+  ```
+
+  5.3 Schema Directive-Based Authorization (@auth)
+  -------------------------------------------------
+  ```graphql
+  directive @auth(role: Role = USER) on FIELD_DEFINITION
+
+  type Query {
+    me: User
+    allUsers: [User!]! @auth(role: ADMIN)
+    posts: [Post!]!
+  }
+  type Mutation {
+    deleteUser(id: ID!): Boolean! @auth(role: ADMIN)
+    createPost(input: CreatePostInput!): Post! @auth
+  }
+  ```
+
+  ```java
+  @Component
+  public class AuthDirectiveWiring implements SchemaDirectiveWiring {
+
+    @Override
+    public GraphQLFieldDefinition onField(SchemaDirectiveWiringEnvironment<GraphQLFieldDefinition> env) {
+      GraphQLFieldDefinition field = env.getElement();
+      String requiredRole = (String) env.getAppliedDirective("auth")
+        .getArgument("role").getValue();
+
+      DataFetcher<?> originalFetcher = env.getCodeRegistry()
+        .getDataFetcher(env.getFieldsContainer(), field);
+
+      DataFetcher<?> authFetcher = dataEnv -> {
+        User currentUser = dataEnv.getGraphQlContext().get("currentUser");
+        if (currentUser == null) {
+          throw new UnauthorizedException("Authentication required");
+        }
+        if (!currentUser.hasRole(requiredRole)) {
+          throw new ForbiddenException("Role " + requiredRole + " required");
+        }
+        return originalFetcher.get(dataEnv);
+      };
+
+      FieldCoordinates coordinates = FieldCoordinates.coordinates(
+        env.getFieldsContainer(), field);
+      env.getCodeRegistry().dataFetcher(coordinates, authFetcher);
+      return field;
+    }
+  }
+  ```
+
+  5.4 Field-Level Authorization (Row Filtering)
+  -----------------------------------------------
+  ```java
+  // Return only data the user is allowed to see at resolver level
+  @QueryMapping
+  public List<Document> documents(@ContextValue User currentUser) {
+    if (currentUser.hasRole("ADMIN")) {
+      return documentRepository.findAll();
+    }
+    return documentRepository.findByOwnerId(currentUser.getId());
+  }
+
+  // Field-level: only show salary if user is self or admin
+  @SchemaMapping(typeName = "Employee", field = "salary")
+  public Double salary(Employee employee, @ContextValue User currentUser) {
+    boolean isSelf = employee.getId().equals(currentUser.getId());
+    boolean isAdmin = currentUser.hasRole("ADMIN");
+    if (isSelf || isAdmin) {
+      return employee.getSalary();
+    }
+    return null;  // Return null for unauthorized fields
+  }
+  ```
+
+6. SHARING REQUEST RESOURCES VIA CONTEXT
+------------------------------------------
+Context is ideal for DataLoader instances and other per-request resources:
+
+```java
+@Component
+public class DataLoaderInterceptor implements WebGraphQlInterceptor {
+
+  private final UserRepository userRepository;
+  private final PostRepository postRepository;
+
+  @Override
+  public Mono<WebGraphQlResponse> intercept(WebGraphQlRequest request,
+                                            Chain chain) {
+    // Create fresh DataLoaders for this request
+    DataLoader<Long, User> userLoader = DataLoaderFactory.newDataLoader(
+      (keys, env) -> {
+        List<User> users = userRepository.findAllById(keys);
+        Map<Long, User> userMap = users.stream()
+          .collect(Collectors.toMap(User::getId, Function.identity()));
+        return CompletableFuture.completedFuture(
+          keys.stream().map(userMap::get).collect(Collectors.toList()));
+      }
+    );
+
+    request.configureExecutionInput((input, builder) ->
+      builder.graphQLContext(ctx -> {
+        ctx.put("userLoader", userLoader);
+      })
+    );
+    return chain.next(request);
+  }
+}
+```
+
+7. SUBSCRIPTION CONTEXT AND AUTH
+----------------------------------
+For WebSocket subscriptions, auth happens at the connection level,
+not per-message:
+
+```java
+@Component
+public class SubscriptionAuthInterceptor implements WebSocketGraphQlInterceptor {
+
+  @Override
+  public Mono<Object> handleConnectionInitialization(WebSocketSessionInfo info,
+                                                     Map<String, Object> connectionInitPayload) {
+    // connectionInitPayload = payload from `connection_init` WS message
+    String token = (String) connectionInitPayload.get("authToken");
+    if (token == null) {
+      return Mono.error(new UnauthorizedException("Token required for subscriptions"));
+    }
+
+    User user = jwtService.validateAndGetUser(token);
+    // Store in session-level context (persists for subscription lifetime)
+    info.getAttributes().put("currentUser", user);
+    return Mono.empty();
+  }
+
+  @Override
+  public Mono<WebGraphQlResponse> intercept(WebGraphQlRequest request,
+                                            WebSocketGraphQlInterceptor.Chain chain) {
+    User user = (User) request.getAttributes().get("currentUser");
+    if (user != null) {
+      request.configureExecutionInput((input, builder) ->
+        builder.graphQLContext(ctx -> ctx.put("currentUser", user)));
+    }
+    return chain.next(request);
+  }
+}
+```
+
+8. CONTEXT PROPAGATION WITH REACTOR
+--------------------------------------
+When using reactive types (Mono/Flux), Reactor's context is separate
+from GraphQL's context. Spring for GraphQL bridges this automatically,
+but be aware:
+
+```java
+@QueryMapping
+public Mono<User> me() {
+  // Access Spring Security principal via Reactor context (automatically bridged)
+  return ReactiveSecurityContextHolder.getContext()
+    .map(ctx -> ctx.getAuthentication().getPrincipal())
+    .cast(UserDetails.class)
+    .flatMap(ud -> userRepository.findByUsername(ud.getUsername()));
+}
+```
+
+9. INTERVIEW QUESTIONS & ANSWERS
+----------------------------------
+
+Q: What is the GraphQL context and why is it important?
+A: Context is a per-request shared object passed to every resolver in a
+   GraphQL operation. It carries authentication info (current user, roles),
+   shared resources (DataLoaders, DB connections), and request metadata.
+   It's how auth information flows from the HTTP layer into every resolver
+   without polluting resolver signatures with auth parameters.
+
+Q: How is context built in Spring for GraphQL?
+A: Using WebGraphQlInterceptor. Override the `intercept` method, read from
+   the HTTP request (headers, session), and call
+   `request.configureExecutionInput(builder -> builder.graphQLContext(...))`
+   to add values. Interceptors chain together, each adding to or reading
+   from the context. @Order controls execution order.
+
+Q: How do you access context in a resolver?
+A: Two ways: (1) `@ContextValue("key") Type value` — Spring injects the
+   named value from context. (2) `DataFetchingEnvironment env` parameter,
+   then `env.getGraphQlContext().get("key")`. The first is cleaner.
+
+Q: What is the difference between authentication and authorization in GraphQL?
+A: Authentication ("who are you?") happens at the interceptor level —
+   validate the JWT/session and put the User in context. Authorization
+   ("can you do this?") happens in resolvers — check if the user in context
+   has the right role/permissions. Some teams use @auth directives or
+   @PreAuthorize annotations to declare authorization declaratively.
+
+Q: How do you handle authentication for subscriptions?
+A: Since subscriptions use WebSocket, auth happens at WebSocket connection
+   time via the `connection_init` message. The client sends a token as a
+   payload when establishing the connection. Implement
+   WebSocketGraphQlInterceptor.handleConnectionInitialization to validate
+   the token and store user info in the session's attributes. From there
+   it flows into each subscription's context.
+
+Q: Why should you avoid loading the current user in every resolver?
+A: It creates N+1 problems and tight coupling. Instead, load the user once
+   in the interceptor, store in context, and resolvers read from context.
+   This ensures a single DB call per request for the current user, and
+   resolvers stay focused on their domain logic.
+
+Q: How do you implement field-level authorization in GraphQL?
+A: Multiple approaches: (1) Check context in each resolver and return null
+   or throw for unauthorized fields. (2) Use custom @auth schema directive
+   with SchemaDirectiveWiring that wraps the original DataFetcher.
+   (3) Use @PreAuthorize on resolver methods with Spring Security's method
+   security. Directive approach is most declarative and reusable.
+
+================================================================
+END OF FILE
+================================================================

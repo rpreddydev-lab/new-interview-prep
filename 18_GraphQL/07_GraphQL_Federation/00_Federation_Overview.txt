@@ -1,0 +1,285 @@
+================================================================
+GRAPHQL FEDERATION — OVERVIEW
+================================================================
+
+1. THE PROBLEM FEDERATION SOLVES
+================================================================
+
+1.1 The Monolithic GraphQL Problem
+As a company grows from a startup to multiple teams running microservices,
+a single "monolithic" GraphQL API creates real problems:
+  - All teams must contribute to one massive schema repo
+  - Schema changes require coordination across teams
+  - One team's deployment can break another team's fields
+  - The gateway service becomes a bottleneck — it must import code
+    (resolvers, data sources, types) from every service
+
+1.2 The Microservices Context
+In a microservices architecture, you might have:
+  - Users Service   — owns user accounts, profiles, auth
+  - Products Service — owns product catalog, inventory
+  - Orders Service  — owns order management, history
+  - Reviews Service — owns review/rating data
+
+Without federation, you either:
+  (a) Expose 4 separate REST/GraphQL APIs → clients must stitch data
+  (b) Build a monolithic BFF (Backend For Frontend) that imports all 4 → tight coupling
+  (c) Use schema stitching → works but requires manual configuration
+
+Federation gives you a unified API without the coupling.
+
+1.3 The Federation Solution
+With Apollo Federation:
+  - Each microservice owns its own GraphQL schema (a "subgraph")
+  - Services declare which types they own with @key
+  - Services can extend types owned by other services
+  - A Router (gateway) auto-composes all schemas into one unified "supergraph"
+  - Clients see a single GraphQL API — they don't know about subgraphs
+
+
+2. CORE CONCEPTS
+================================================================
+
+2.1 Subgraph
+An individual microservice participating in the federated graph.
+Each subgraph:
+  - Runs its own GraphQL server (Spring Boot, Node.js, Python, etc.)
+  - Has its own schema (subgraph schema)
+  - Declares entity types with @key
+  - Can extend entity types from other subgraphs
+  - Is registered with the Router
+
+2.2 Supergraph
+The composed schema that results from merging all subgraph schemas.
+Clients query the supergraph without knowing it's distributed.
+The Router publishes the supergraph schema to a schema registry (Apollo Studio).
+
+2.3 Router (formerly Gateway)
+The entry point for all client requests. The Router:
+  - Holds the composed supergraph schema
+  - Receives client queries
+  - Creates a "query plan" (which subgraphs to call, in what order)
+  - Calls subgraphs, collects results
+  - Returns the merged response
+  Apollo Router (Rust-based, introduced with Federation v2) replaced the
+  older Apollo Gateway (Node.js) for better performance.
+
+2.4 Entity
+A type that can be referenced across subgraph boundaries. Entities have:
+  - A @key directive declaring their primary key field(s)
+  - A reference resolver (handles `_entities` query)
+  - May be extended by multiple subgraphs
+
+2.5 Query Plan
+The Router computes a query plan for each operation — it's like an
+execution tree showing:
+  - Which subgraphs own which fields
+  - Which calls are parallel vs sequential
+  - How entity references are resolved via `_entities`
+
+
+3. ENTITY TYPES AND CROSS-SERVICE REFERENCES
+================================================================
+
+3.1 Defining an Entity
+```graphql
+# Users Subgraph
+type User @key(fields: "id") {
+  id: ID!
+  name: String!
+  email: String!
+  createdAt: DateTime!
+}
+
+type Query {
+  me: User
+  user(id: ID!): User
+  users: [User!]!
+}
+```
+
+3.2 Referencing an Entity in Another Subgraph
+```graphql
+# Posts Subgraph
+# "stub" for the User type — this subgraph only needs the key
+type User @key(fields: "id") {
+  id: ID! @external    # owned by Users subgraph — do NOT resolve here
+  posts: [Post!]!      # owned by THIS (Posts) subgraph — resolve here
+}
+
+type Post @key(fields: "id") {
+  id: ID!
+  title: String!
+  body: String!
+  author: User!
+}
+
+type Query {
+  post(id: ID!): Post
+  posts: [Post!]!
+}
+```
+
+3.3 The _entities Query (Internals)
+Federation automatically adds to each subgraph:
+```graphql
+union _Entity = User | Post | ...
+
+type Query {
+  _entities(representations: [Any!]!): [_Entity]!
+  _service: _Service!
+}
+```
+When the Router needs to extend a User fetched from Posts with fields
+from Users, it calls Users subgraph's `_entities` with:
+```json
+[{ "__typename": "User", "id": "123" }]
+```
+
+
+4. FEDERATION DIRECTIVES
+================================================================
+
+4.1 @key — Marks an entity's primary key
+```graphql
+type User @key(fields: "id") { ... }
+type OrderItem @key(fields: "orderId productId") { ... }  # composite key
+```
+
+4.2 @external — Field owned by another subgraph
+```graphql
+extend type Product @key(fields: "id") {
+  id: ID! @external
+  reviews: [Review!]!
+}
+```
+
+4.3 @provides — Subgraph can resolve referenced entity fields (avoids round-trip)
+```graphql
+type Review {
+  id: ID!
+  rating: Int!
+  product: Product! @provides(fields: "name")
+}
+extend type Product @key(fields: "id") {
+  id: ID! @external
+  name: String! @external
+}
+```
+Reviews subgraph can return product.name without asking Products subgraph.
+
+4.4 @requires — Field needs data from another subgraph before resolving
+```graphql
+extend type Product @key(fields: "id") {
+  id: ID! @external
+  basePrice: Float! @external
+  discountedPrice: Float! @requires(fields: "basePrice")
+  # Router will fetch basePrice from Products before calling this subgraph
+}
+```
+
+4.5 @shareable (v2) — Type/field can be resolved by multiple subgraphs
+```graphql
+type GeoPoint @shareable {
+  lat: Float!
+  lon: Float!
+}
+```
+
+4.6 @override (v2) — Migrate a field from one subgraph to another
+```graphql
+extend type Product @key(fields: "id") {
+  id: ID! @external
+  description: String! @override(from: "LegacyProductsSubgraph")
+}
+```
+
+
+5. QUERY PLANNING EXAMPLE
+================================================================
+
+Client query:
+```graphql
+query {
+  post(id: "1") {
+    title
+    author {
+      name
+      email
+    }
+  }
+}
+```
+
+Query plan:
+1. Fetch post(id: "1") from Posts Subgraph → returns {title, author: {id: "42"}}
+2. Fetch _entities([{__typename: "User", id: "42"}]) from Users Subgraph
+   → returns {name: "Alice", email: "alice@example.com"}
+3. Merge: post.author = {name: "Alice", email: "alice@example.com"}
+4. Return merged response to client
+
+Parallel calls: if multiple unrelated fields are requested, the Router
+can call multiple subgraphs in parallel.
+
+
+6. FEDERATION v1 vs v2
+================================================================
+
+| Feature                  | Federation v1          | Federation v2             |
+|--------------------------|------------------------|---------------------------|
+| Entity ownership         | One subgraph per field | @shareable allows multiple|
+| Value type sharing       | Manual workaround      | Native support            |
+| Field migration          | Manual (two deploys)   | @override directive        |
+| Directive passthrough    | Not supported          | @composeDirective         |
+| Gateway performance      | JS Apollo Gateway      | Rust Apollo Router        |
+| Schema validation in CI  | rover CLI              | rover CLI (improved)       |
+
+Federation v2 is backward compatible with v1 subgraphs.
+
+
+7. WHEN TO USE FEDERATION
+================================================================
+
+Use Federation when:
+  ✔ Multiple teams work on the same unified API
+  ✔ Services are owned by different domain teams
+  ✔ You want independent deployment of schema slices
+  ✔ You're already running microservices
+
+Do NOT use Federation when:
+  ✘ Single team/repo (monolith is simpler)
+  ✘ Small schema that won't grow
+  ✘ Teams are not working independently
+  ✘ You don't need a unified API (separate REST APIs are fine)
+
+
+8. INTERVIEW QUESTIONS & ANSWERS
+================================================================
+
+Q: What is GraphQL Federation in one sentence?
+A: Federation is a spec that allows multiple GraphQL microservices (subgraphs)
+   to contribute to a single unified API composed by a Router.
+
+Q: How does the Router know where to route a field query?
+A: During schema composition, each field in the supergraph is annotated with
+   which subgraph owns it. The Router uses this ownership map to build
+   query plans.
+
+Q: What happens when a subgraph goes down in Federation?
+A: If a subgraph is unreachable, queries requiring that subgraph's fields
+   will fail (or return null for nullable fields). The Router does not
+   automatically fall back. Resilience requires circuit breakers, retries,
+   or caching at the Router level.
+
+Q: Can two subgraphs define the same field on an entity?
+A: In Federation v1: No (one field = one owner).
+   In Federation v2: Yes, if the field is marked @shareable.
+
+Q: What is a "stub type" in Federation?
+A: When a subgraph references an entity type from another subgraph, it
+   defines a minimal "stub" — only the @key field(s) — so it can model
+   the reference without duplicating the full type definition.
+
+================================================================
+END OF FILE
+================================================================

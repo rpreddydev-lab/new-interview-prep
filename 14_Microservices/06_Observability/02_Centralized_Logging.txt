@@ -1,0 +1,219 @@
+================================================================================
+CENTRALIZED LOGGING
+================================================================================
+
+WHY CENTRALIZED LOGGING?
+--------------------------
+In a monolith: `tail -f app.log` on one server.
+In microservices: 50 services × 5 replicas = 250 pods, each writing logs.
+  → Logs are everywhere. Debugging requires searching across all of them.
+  → Need a central place to aggregate, search, and analyze all logs.
+
+────────────────────────────────────────────────────────────────────────────────
+
+ELK STACK
+==========
+Elasticsearch + Logstash + Kibana
+
+  Services → [Logstash / Filebeat] → [Elasticsearch] → [Kibana]
+
+Logstash: Ingests, parses, transforms log data. Can handle complex transformations.
+Filebeat: Lightweight log shipper (runs as DaemonSet in K8s). Less resource-heavy.
+Elasticsearch: Distributed search and analytics engine. Stores and indexes logs.
+Kibana: Visualization and search UI. Discover, Dashboard, Alerting.
+
+Spring Boot → ELK:
+  # pom.xml — Logstash encoder for structured JSON logs
+  <dependency>
+    <groupId>net.logstash.logback</groupId>
+    <artifactId>logstash-logback-encoder</artifactId>
+    <version>7.4</version>
+  </dependency>
+
+  # logback-spring.xml
+  <?xml version="1.0" encoding="UTF-8"?>
+  <configuration>
+    <springProperty scope="context" name="APP_NAME" source="spring.application.name"/>
+    <springProperty scope="context" name="ENV" source="spring.profiles.active"/>
+
+    <!-- Console (for local dev) -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+      <encoder>
+        <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level [%X{traceId:-}] %logger{36} - %msg%n</pattern>
+      </encoder>
+    </appender>
+
+    <!-- JSON for ELK (in Kubernetes, Filebeat ships stdout) -->
+    <appender name="JSON_CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+      <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+        <customFields>{"app":"${APP_NAME}","env":"${ENV}"}</customFields>
+        <includeMdcKeyName>traceId</includeMdcKeyName>
+        <includeMdcKeyName>spanId</includeMdcKeyName>
+        <includeMdcKeyName>userId</includeMdcKeyName>
+        <includeMdcKeyName>orderId</includeMdcKeyName>
+      </encoder>
+    </appender>
+
+    <springProfile name="prod,staging">
+      <root level="INFO">
+        <appender-ref ref="JSON_CONSOLE"/>  <!-- JSON for ELK ingestion -->
+      </root>
+    </springProfile>
+
+    <springProfile name="dev,local">
+      <root level="DEBUG">
+        <appender-ref ref="CONSOLE"/>  <!-- Human-readable for development -->
+      </root>
+    </springProfile>
+  </configuration>
+
+Output (JSON):
+  {
+    "@timestamp": "2024-01-15T10:23:45.123Z",
+    "level": "INFO",
+    "logger_name": "com.example.OrderService",
+    "message": "Order created successfully",
+    "app": "order-service",
+    "env": "production",
+    "traceId": "4bf92f3577b34da6",
+    "spanId": "00f067aa0ba902b7",
+    "userId": "user-123",
+    "orderId": "456",
+    "thread_name": "http-nio-8080-exec-1"
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+LOKI + GRAFANA (LIGHTER ALTERNATIVE)
+========================================
+
+Grafana Loki is a log aggregation system inspired by Prometheus.
+Unlike ELK, Loki does NOT index log content — only indexes labels (metadata).
+Much cheaper to operate. Search by label, then full-text grep within results.
+
+  Services → [Promtail / Alloy] → [Loki] → [Grafana]
+
+Loki labels (indexed):
+  {app="order-service", namespace="production", level="error"}
+
+Log content (not indexed — searched with regex):
+  | contains "OutOfMemoryError"
+  | logfmt | level="error"
+  | json | userId="user-123"
+
+Spring Boot → Loki (via Loki Logback Appender):
+  <dependency>
+    <groupId>com.github.loki4j</groupId>
+    <artifactId>loki-logback-appender</artifactId>
+    <version>1.5.1</version>
+  </dependency>
+
+  # logback-spring.xml
+  <appender name="LOKI" class="com.github.loki4j.logback.Loki4jAppender">
+    <http>
+      <url>http://loki:3100/loki/api/v1/push</url>
+    </http>
+    <format>
+      <label>
+        <pattern>app=${APP_NAME},env=${ENV},level=%level</pattern>
+      </label>
+      <message>
+        <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level [%X{traceId}] %logger{36} - %msg%n</pattern>
+      </message>
+    </format>
+  </appender>
+
+────────────────────────────────────────────────────────────────────────────────
+
+STRUCTURED LOGGING BEST PRACTICES
+=====================================
+
+1. ALWAYS LOG IN STRUCTURED FORMAT (JSON) in production
+   Enables searching by field value (level, userId, orderId, etc.)
+
+2. USE CORRELATION IDs IN EVERY LOG LINE
+   traceId, correlationId — enables tracing a request across services
+
+3. LOG CONTEXTUAL INFORMATION WITH MDC
+   MDC (Mapped Diagnostic Context) — thread-local key-value store
+
+   @Component
+   public class RequestLoggingFilter implements Filter {
+     @Override
+     public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain) {
+       HttpServletRequest request = (HttpServletRequest) req;
+
+       // Set MDC values — automatically included in all subsequent log statements
+       MDC.put("requestId", UUID.randomUUID().toString());
+       MDC.put("userId", request.getHeader("X-User-Id"));
+       MDC.put("clientIp", request.getRemoteAddr());
+       MDC.put("method", request.getMethod());
+       MDC.put("path", request.getRequestURI());
+
+       try {
+         chain.doFilter(req, res);
+       } finally {
+         MDC.clear();  // ALWAYS clear MDC after request
+       }
+     }
+   }
+
+4. LOG LEVELS — WHAT GOES WHERE
+   ERROR: System error requiring immediate attention (unexpected exceptions)
+   WARN:  Unusual situation, potential issue (fallback triggered, retry attempted)
+   INFO:  Significant business events (order created, payment processed)
+   DEBUG: Detailed flow (for troubleshooting, disabled in production)
+   TRACE: Very detailed (SQL queries, HTTP request/response bodies)
+
+5. NEVER LOG:
+   ✗ Passwords, credit card numbers, SSNs (PII)
+   ✗ JWT tokens, API keys (security)
+   ✗ Huge objects (object.toString() of entire order list)
+
+6. INCLUDE KEY BUSINESS CONTEXT:
+   log.info("Order created", Map.of("orderId", id, "userId", userId, "total", total));
+
+────────────────────────────────────────────────────────────────────────────────
+
+LOG-BASED ALERTING
+===================
+
+Elasticsearch/Kibana alerting:
+  When: count(level=ERROR AND app=order-service) > 10 in last 5 min
+  → Send Slack alert
+
+Loki/Grafana alerting:
+  # Alert rule
+  sum(rate({app="order-service",level="error"}[5m])) by (app) > 0.1
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: Why is centralized logging important for microservices?
+A: With hundreds of service instances each writing logs, troubleshooting
+   requires searching across all logs simultaneously. Centralized logging
+   (ELK/Loki) aggregates all logs in one place with a unified search interface,
+   enables correlation ID-based request tracing, and supports alerting on
+   log patterns.
+
+Q: What is the ELK Stack?
+A: Elasticsearch (distributed search engine, stores and indexes logs),
+   Logstash (log ingestion and transformation pipeline), and Kibana
+   (visualization and search UI). Filebeat is a lightweight log shipper
+   often used instead of Logstash for simple forwarding.
+
+Q: What is the advantage of Loki over ELK?
+A: Loki only indexes labels (metadata), not log content — much cheaper to
+   operate (less storage, no heavy indexing). Labels enable fast pre-filtering.
+   Full-text search within label-filtered results. Integrates natively with
+   Grafana (unified logs + metrics + traces).
+
+Q: What is MDC and why is it useful?
+A: Mapped Diagnostic Context — a thread-local key-value store in logging
+   frameworks. Set request-level context once (userId, requestId, traceId)
+   and it's automatically included in every log statement on that thread.
+   Eliminates repeating contextual information in every log call.
+
+================================================================================

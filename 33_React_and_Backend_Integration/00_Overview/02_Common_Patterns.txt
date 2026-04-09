@@ -1,0 +1,417 @@
+================================================================
+COMMON PATTERNS IN REACT-BACKEND INTEGRATION
+================================================================
+
+This file covers the most commonly used and interview-relevant patterns
+when integrating React with a backend API. Each pattern includes the
+concept, code, trade-offs, and interview notes.
+
+================================================================
+1. SERVICE LAYER PATTERN
+================================================================
+
+CONCEPT:
+  Never make HTTP calls directly inside components.
+  Instead, create a dedicated "services" directory where each file
+  handles one domain (users, products, orders).
+
+WHY:
+  - Components stay focused on UI
+  - Easy to mock in tests
+  - One place to change if API changes
+  - Reusable across multiple components
+
+FILE: src/services/userService.js
+  import apiClient from '../api/axiosConfig';
+
+  export const getUsers = () => apiClient.get('/users');
+
+  export const getUserById = (id) => apiClient.get(`/users/${id}`);
+
+  export const createUser = (userData) =>
+    apiClient.post('/users', userData);
+
+  export const updateUser = (id, userData) =>
+    apiClient.put(`/users/${id}`, userData);
+
+  export const deleteUser = (id) =>
+    apiClient.delete(`/users/${id}`);
+
+USAGE IN COMPONENT:
+  import { getUsers } from '../services/userService';
+
+  useEffect(() => {
+    getUsers()
+      .then(res => setUsers(res.data))
+      .catch(err => setError(err.message));
+  }, []);
+
+================================================================
+2. CUSTOM HOOK PATTERN FOR DATA FETCHING
+================================================================
+
+CONCEPT:
+  Extract all data fetching logic into custom hooks.
+  Components become pure UI — they consume hooks.
+
+FILE: src/hooks/useUsers.js
+  import { useState, useEffect } from 'react';
+  import { getUsers } from '../services/userService';
+
+  export function useUsers() {
+    const [users, setUsers] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+
+    useEffect(() => {
+      const controller = new AbortController();
+      setLoading(true);
+
+      getUsers({ signal: controller.signal })
+        .then(res => {
+          setUsers(res.data);
+          setLoading(false);
+        })
+        .catch(err => {
+          if (err.name !== 'CanceledError') {
+            setError(err.message);
+            setLoading(false);
+          }
+        });
+
+      return () => controller.abort(); // cleanup
+    }, []);
+
+    return { users, loading, error };
+  }
+
+USAGE:
+  function UserList() {
+    const { users, loading, error } = useUsers();
+    if (loading) return <Spinner />;
+    if (error) return <ErrorBanner message={error} />;
+    return <ul>{users.map(u => <li key={u.id}>{u.name}</li>)}</ul>;
+  }
+
+================================================================
+3. REACT QUERY PATTERN (TANSTACK QUERY) — PREFERRED IN 2024+
+================================================================
+
+CONCEPT:
+  React Query manages server state entirely — caching, background
+  refetching, stale data, loading/error states, pagination, mutations.
+
+SETUP: main.jsx
+  import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+  const queryClient = new QueryClient();
+
+  root.render(
+    <QueryClientProvider client={queryClient}>
+      <App />
+    </QueryClientProvider>
+  );
+
+QUERY (READ):
+  import { useQuery } from '@tanstack/react-query';
+  import { getUserById } from '../services/userService';
+
+  function UserProfile({ userId }) {
+    const { data: user, isLoading, isError, error } = useQuery({
+      queryKey: ['user', userId],
+      queryFn: () => getUserById(userId).then(r => r.data),
+      staleTime: 5 * 60 * 1000,  // 5 minutes
+    });
+
+    if (isLoading) return <Spinner />;
+    if (isError) return <p>Error: {error.message}</p>;
+    return <div>{user.name}</div>;
+  }
+
+MUTATION (WRITE):
+  import { useMutation, useQueryClient } from '@tanstack/react-query';
+  import { createUser } from '../services/userService';
+
+  function CreateUserForm() {
+    const queryClient = useQueryClient();
+
+    const mutation = useMutation({
+      mutationFn: (userData) => createUser(userData),
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: ['users'] });
+        // ↑ Invalidates the users list cache → triggers refetch
+      },
+    });
+
+    const handleSubmit = (data) => {
+      mutation.mutate(data);
+    };
+
+    return (
+      <form onSubmit={handleSubmit}>
+        {mutation.isPending && <Spinner />}
+        {mutation.isError && <p>{mutation.error.message}</p>}
+        ...
+      </form>
+    );
+  }
+
+KEY CONCEPTS:
+  - queryKey: unique identifier, used for caching and invalidation
+  - staleTime: how long data is considered fresh (no background refetch)
+  - cacheTime: how long inactive data stays in memory (default 5 min)
+  - invalidateQueries: marks cache as stale → triggers refetch
+  - Optimistic updates: update UI before server confirms
+
+OPTIMISTIC UPDATE EXAMPLE:
+  const mutation = useMutation({
+    mutationFn: updateTodo,
+    onMutate: async (newTodo) => {
+      await queryClient.cancelQueries({ queryKey: ['todos', newTodo.id] });
+      const previous = queryClient.getQueryData(['todos', newTodo.id]);
+      queryClient.setQueryData(['todos', newTodo.id], newTodo); // optimistic
+      return { previous };
+    },
+    onError: (err, newTodo, context) => {
+      queryClient.setQueryData(['todos', newTodo.id], context.previous); // rollback
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['todos'] });
+    },
+  });
+
+================================================================
+4. AXIOS INTERCEPTOR PATTERN
+================================================================
+
+CONCEPT:
+  Request and response interceptors are middleware for HTTP calls.
+  They run for every request/response without modifying individual calls.
+
+FILE: src/api/axiosConfig.js
+  import axios from 'axios';
+  import { getAccessToken, refreshAccessToken } from '../services/authService';
+
+  const apiClient = axios.create({
+    baseURL: import.meta.env.VITE_API_BASE_URL,
+    timeout: 10000,
+    headers: { 'Content-Type': 'application/json' },
+  });
+
+  // REQUEST INTERCEPTOR — add auth token
+  apiClient.interceptors.request.use(
+    (config) => {
+      const token = getAccessToken();
+      if (token) {
+        config.headers.Authorization = `Bearer ${token}`;
+      }
+      return config;
+    },
+    (error) => Promise.reject(error)
+  );
+
+  // RESPONSE INTERCEPTOR — handle 401 with token refresh
+  let isRefreshing = false;
+  let failedQueue = [];
+
+  const processQueue = (error, token = null) => {
+    failedQueue.forEach(prom => {
+      if (error) prom.reject(error);
+      else prom.resolve(token);
+    });
+    failedQueue = [];
+  };
+
+  apiClient.interceptors.response.use(
+    (response) => response,
+    async (error) => {
+      const originalRequest = error.config;
+
+      if (error.response?.status === 401 && !originalRequest._retry) {
+        if (isRefreshing) {
+          return new Promise((resolve, reject) => {
+            failedQueue.push({ resolve, reject });
+          }).then(token => {
+            originalRequest.headers.Authorization = `Bearer ${token}`;
+            return apiClient(originalRequest);
+          });
+        }
+
+        originalRequest._retry = true;
+        isRefreshing = true;
+
+        try {
+          const newToken = await refreshAccessToken();
+          processQueue(null, newToken);
+          originalRequest.headers.Authorization = `Bearer ${newToken}`;
+          return apiClient(originalRequest);
+        } catch (refreshError) {
+          processQueue(refreshError, null);
+          // redirect to login
+          window.location.href = '/login';
+          return Promise.reject(refreshError);
+        } finally {
+          isRefreshing = false;
+        }
+      }
+
+      return Promise.reject(error);
+    }
+  );
+
+  export default apiClient;
+
+================================================================
+5. ERROR BOUNDARY PATTERN (React-level error handling)
+================================================================
+
+CONCEPT:
+  React Error Boundaries catch JavaScript errors during rendering.
+  They are class components with componentDidCatch.
+
+FILE: src/components/ErrorBoundary.jsx
+  import React from 'react';
+
+  class ErrorBoundary extends React.Component {
+    constructor(props) {
+      super(props);
+      this.state = { hasError: false, error: null };
+    }
+
+    static getDerivedStateFromError(error) {
+      return { hasError: true, error };
+    }
+
+    componentDidCatch(error, errorInfo) {
+      // Log to Sentry, Datadog, etc.
+      console.error('Caught by ErrorBoundary:', error, errorInfo);
+    }
+
+    render() {
+      if (this.state.hasError) {
+        return this.props.fallback || <h2>Something went wrong.</h2>;
+      }
+      return this.props.children;
+    }
+  }
+
+  export default ErrorBoundary;
+
+USAGE:
+  <ErrorBoundary fallback={<ErrorPage />}>
+    <UserDashboard />
+  </ErrorBoundary>
+
+NOTE: Error Boundaries do NOT catch async errors (rejected promises).
+  Async errors must be handled with try/catch or .catch() in the service.
+
+================================================================
+6. ABORT CONTROLLER PATTERN (Race condition prevention)
+================================================================
+
+CONCEPT:
+  If a component unmounts before a fetch completes, the state update
+  causes a "Can't perform a React state update on an unmounted component"
+  warning. Use AbortController to cancel in-flight requests.
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    fetchProducts({ signal: controller.signal })
+      .then(data => setProducts(data))
+      .catch(err => {
+        if (err.name === 'AbortError' || axios.isCancel(err)) return;
+        setError(err.message);
+      });
+
+    return () => controller.abort(); // runs on unmount or deps change
+  }, [categoryId]);
+
+Axios accepts signal:
+  apiClient.get('/products', { signal: controller.signal })
+
+================================================================
+7. PAGINATION PATTERN
+================================================================
+
+A) OFFSET-BASED PAGINATION
+  GET /api/products?page=0&size=10&sort=name,asc
+
+  React Query:
+    const { data } = useQuery({
+      queryKey: ['products', { page, size }],
+      queryFn: () => getProducts({ page, size }).then(r => r.data),
+      keepPreviousData: true, // v4: placeholderData: keepPreviousData
+    });
+
+B) INFINITE SCROLL
+  import { useInfiniteQuery } from '@tanstack/react-query';
+
+  const { data, fetchNextPage, hasNextPage } = useInfiniteQuery({
+    queryKey: ['products'],
+    queryFn: ({ pageParam = 0 }) => getProducts(pageParam).then(r => r.data),
+    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+  });
+
+================================================================
+8. GLOBAL ERROR NOTIFICATION PATTERN
+================================================================
+
+CONCEPT:
+  API errors should show user-friendly toast notifications.
+  Use a toast library (react-hot-toast, react-toastify) and trigger
+  it from the Axios response interceptor.
+
+  import toast from 'react-hot-toast';
+
+  apiClient.interceptors.response.use(
+    (response) => response,
+    (error) => {
+      const message = error.response?.data?.message || 'An error occurred';
+      const status = error.response?.status;
+
+      if (status === 400) toast.error(`Validation error: ${message}`);
+      else if (status === 403) toast.error('Access denied');
+      else if (status === 404) toast.error('Resource not found');
+      else if (status >= 500) toast.error('Server error. Please try again.');
+
+      return Promise.reject(error);
+    }
+  );
+
+================================================================
+9. RETRY PATTERN
+================================================================
+
+CONCEPT:
+  For transient failures (network blip, 503), retry automatically.
+
+  With axios-retry:
+    import axiosRetry from 'axios-retry';
+    axiosRetry(apiClient, {
+      retries: 3,
+      retryDelay: axiosRetry.exponentialDelay,
+      retryCondition: (error) =>
+        axiosRetry.isNetworkOrIdempotentRequestError(error) ||
+        error.response?.status === 503,
+    });
+
+  Exponential backoff: 1s, 2s, 4s between retries.
+  Only retry GET/HEAD/OPTIONS by default (idempotent).
+  NEVER retry POST without careful thought (not idempotent).
+
+================================================================
+10. INTERVIEW SUMMARY
+================================================================
+
+Pattern              | Purpose
+---------------------|----------------------------------------------
+Service Layer        | Separate HTTP logic from UI components
+Custom Hook          | Reusable fetch logic with loading/error state
+React Query          | Full server-state management (cache, sync)
+Interceptors         | Cross-cutting concerns (auth, error handling)
+Error Boundary       | Catch rendering errors, show fallback UI
+AbortController      | Cancel requests on unmount / dep change
+Optimistic Update    | Update UI before server confirms for speed
+Pagination           | Offset-based or cursor-based data loading
+Global Error Toast   | Centralized user-facing error notifications
+Retry / Backoff      | Resilience against transient network failures

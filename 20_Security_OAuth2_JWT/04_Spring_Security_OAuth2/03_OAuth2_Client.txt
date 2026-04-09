@@ -1,0 +1,502 @@
+========================================================
+SPRING SECURITY — OAUTH2 CLIENT
+========================================================
+
+When your Spring Boot application needs to:
+  - Log users in via an external Identity Provider (Google, GitHub, Keycloak, etc.)
+  - Call protected APIs on behalf of a user or itself
+
+…it acts as an OAuth2 Client. Spring Security's OAuth2 Client support handles:
+  - Initiating OAuth2/OIDC authorization flows
+  - Exchanging authorization codes for tokens
+  - Storing tokens per-user
+  - Automatically refreshing expired access tokens
+  - Sending access tokens on outbound HTTP calls
+
+========================================================
+1. DEPENDENCY
+========================================================
+
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-oauth2-client</artifactId>
+</dependency>
+
+========================================================
+2. CLIENT REGISTRATION
+========================================================
+
+ClientRegistration is the Spring representation of an OAuth2 client's
+registration with a specific Authorization Server.
+
+Fields:
+  - registrationId: Unique key (e.g., "google", "keycloak")
+  - clientId: Registered client_id at the AS
+  - clientSecret: Client secret
+  - authorizationGrantType: authorization_code, client_credentials, etc.
+  - redirectUri: Where the AS sends the user after auth
+  - scopes: Requested scopes
+  - providerDetails: AS endpoints (auth, token, jwks, userinfo)
+
+application.yml — Common providers (Spring has built-in support):
+
+spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          # Google (built-in provider)
+          google:
+            client-id: ${GOOGLE_CLIENT_ID}
+            client-secret: ${GOOGLE_CLIENT_SECRET}
+            scope: openid, profile, email
+
+          # GitHub (built-in provider — not OIDC, OAuth2 only)
+          github:
+            client-id: ${GITHUB_CLIENT_ID}
+            client-secret: ${GITHUB_CLIENT_SECRET}
+            scope: read:user, user:email
+
+          # Keycloak (custom provider)
+          keycloak:
+            client-id: my-app
+            client-secret: my-secret
+            scope: openid, profile, email, roles
+            authorization-grant-type: authorization_code
+            redirect-uri: "{baseUrl}/login/oauth2/code/{registrationId}"
+            provider: keycloak  # Reference to provider config below
+
+          # Service-to-service (Client Credentials)
+          order-service:
+            client-id: order-service
+            client-secret: order-service-secret
+            authorization-grant-type: client_credentials
+            scope: inventory:read
+            provider: my-auth-server
+
+        provider:
+          # Keycloak provider definition
+          keycloak:
+            issuer-uri: https://keycloak.example.com/realms/my-realm
+            # OR specify endpoints manually:
+            # authorization-uri: .../protocol/openid-connect/auth
+            # token-uri: .../protocol/openid-connect/token
+            # user-info-uri: .../protocol/openid-connect/userinfo
+            # jwk-set-uri: .../protocol/openid-connect/certs
+
+          my-auth-server:
+            issuer-uri: https://auth.example.com
+
+Built-in providers (no provider config needed):
+  google, github, facebook, okta, ping-identity, auth0
+
+========================================================
+3. OAUTH2 LOGIN (USER-FACING)
+========================================================
+
+oauth2Login() enables login via external IdPs (Authorization Code + OIDC flow).
+
+@Bean
+public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http
+        .authorizeHttpRequests(auth -> auth
+            .requestMatchers("/", "/error", "/webjars/**").permitAll()
+            .anyRequest().authenticated()
+        )
+        .oauth2Login(oauth2 -> oauth2
+            .loginPage("/login")                    // Custom login page
+            .defaultSuccessUrl("/dashboard", true)  // Redirect after login
+            .failureUrl("/login?error")
+            .authorizationEndpoint(auth -> auth
+                .baseUri("/oauth2/authorize")  // Default: /oauth2/authorization
+            )
+            .redirectionEndpoint(redirect -> redirect
+                .baseUri("/login/oauth2/code/*")  // Callback URL
+            )
+            .userInfoEndpoint(userInfo -> userInfo
+                .oidcUserService(oidcUserService())  // Custom user service
+            )
+            .tokenEndpoint(token -> token
+                .accessTokenResponseClient(accessTokenResponseClient())
+            )
+        );
+
+    return http.build();
+}
+
+// Default behavior:
+// - Login page: /login (auto-generated if not customized)
+// - Auth initiation: /oauth2/authorization/{registrationId}
+//   e.g., /oauth2/authorization/google → redirects to Google login
+// - Callback: /login/oauth2/code/{registrationId}
+//   e.g., /login/oauth2/code/google → handles auth code exchange
+
+========================================================
+4. ACCESSING AUTHENTICATED USER
+========================================================
+
+After oauth2Login(), the principal is either:
+  - OidcUser: For OIDC providers (has ID token claims)
+  - OAuth2User: For non-OIDC OAuth2 providers (GitHub, Facebook)
+
+In Controller:
+@GetMapping("/profile")
+public String profile(Model model,
+                      @AuthenticationPrincipal OidcUser oidcUser) {
+    model.addAttribute("name", oidcUser.getFullName());
+    model.addAttribute("email", oidcUser.getEmail());
+    model.addAttribute("subject", oidcUser.getSubject());
+    return "profile";
+}
+
+// Or using SecurityContextHolder:
+Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+if (auth instanceof OAuth2AuthenticationToken oauthToken) {
+    OAuth2User user = oauthToken.getPrincipal();
+    String name = user.getAttribute("name");
+    String email = user.getAttribute("email");
+}
+
+// Full OidcUser claims:
+OidcUser oidcUser = ...;
+String subject = oidcUser.getSubject();         // sub
+String name = oidcUser.getFullName();            // name
+String email = oidcUser.getEmail();              // email
+String picture = oidcUser.getPicture();          // picture
+String locale = oidcUser.getLocale();            // locale
+OidcIdToken idToken = oidcUser.getIdToken();     // Full ID Token
+
+========================================================
+5. CUSTOM OIDC USER SERVICE
+========================================================
+
+To merge OIDC user info with your local database:
+
+@Service
+public class CustomOidcUserService extends OidcUserService {
+
+    private final UserRepository userRepository;
+    private final RoleRepository roleRepository;
+
+    @Override
+    public OidcUser loadUser(OidcUserRequest userRequest)
+            throws OAuth2AuthenticationException {
+        // Let Spring load basic OIDC user
+        OidcUser oidcUser = super.loadUser(userRequest);
+
+        // Extract subject identifier
+        String subject = oidcUser.getSubject();
+        String provider = userRequest.getClientRegistration().getRegistrationId();
+
+        // Provision user if first login
+        AppUser appUser = userRepository
+            .findByProviderAndSubject(provider, subject)
+            .orElseGet(() -> createNewUser(oidcUser, provider));
+
+        // Merge Spring authorities with local DB roles
+        Set<GrantedAuthority> authorities = new LinkedHashSet<>();
+        authorities.addAll(oidcUser.getAuthorities()); // OIDC scopes
+        appUser.getRoles().stream()
+            .map(role -> new SimpleGrantedAuthority("ROLE_" + role.getName()))
+            .forEach(authorities::add);
+
+        // Return enhanced OidcUser
+        return new DefaultOidcUser(
+            authorities,
+            oidcUser.getIdToken(),
+            oidcUser.getUserInfo()
+        );
+    }
+
+    private AppUser createNewUser(OidcUser oidcUser, String provider) {
+        AppUser newUser = new AppUser();
+        newUser.setProvider(provider);
+        newUser.setSubject(oidcUser.getSubject());
+        newUser.setEmail(oidcUser.getEmail());
+        newUser.setName(oidcUser.getFullName());
+        newUser.getRoles().add(roleRepository.findByName("USER"));
+        return userRepository.save(newUser);
+    }
+}
+
+// Wire it:
+.oauth2Login(oauth2 -> oauth2
+    .userInfoEndpoint(userInfo -> userInfo
+        .oidcUserService(customOidcUserService)
+    )
+)
+
+========================================================
+6. OAUTH2 AUTHORIZED CLIENT — TOKEN ACCESS
+========================================================
+
+OAuth2AuthorizedClient holds the access token (and optionally refresh token)
+for a user + client registration combination.
+
+Accessing the access token in a Controller:
+
+@GetMapping("/orders")
+public List<Order> getOrders(
+        @RegisteredOAuth2AuthorizedClient("keycloak") OAuth2AuthorizedClient client) {
+    String accessToken = client.getAccessToken().getTokenValue();
+    // Use token to call downstream service
+    return webClient.get()
+        .uri("https://order-service/api/orders")
+        .headers(h -> h.setBearerAuth(accessToken))
+        .retrieve()
+        .bodyToFlux(Order.class)
+        .collectList()
+        .block();
+}
+
+Or via OAuth2AuthorizedClientService (programmatic):
+
+@Autowired
+private OAuth2AuthorizedClientService authorizedClientService;
+
+public String getTokenForUser(String username, String registrationId) {
+    OAuth2AuthorizedClient client = authorizedClientService.loadAuthorizedClient(
+        registrationId, username);
+    if (client == null) return null;
+    return client.getAccessToken().getTokenValue();
+}
+
+========================================================
+7. OAUTH2 AUTHORIZED CLIENT MANAGER
+========================================================
+
+OAuth2AuthorizedClientManager handles:
+  - Loading existing authorized clients
+  - Auto-refreshing expired access tokens
+  - Obtaining new tokens (for client_credentials)
+
+@Bean
+public OAuth2AuthorizedClientManager authorizedClientManager(
+        ClientRegistrationRepository clientRegistrationRepository,
+        OAuth2AuthorizedClientRepository authorizedClientRepository) {
+
+    // Default providers:
+    OAuth2AuthorizedClientProvider authorizedClientProvider =
+        OAuth2AuthorizedClientProviderBuilder.builder()
+            .authorizationCode()        // For auth code flow
+            .refreshToken()             // Auto-refresh
+            .clientCredentials()        // For client credentials
+            .password()                 // Deprecated but supported
+            .build();
+
+    DefaultOAuth2AuthorizedClientManager manager =
+        new DefaultOAuth2AuthorizedClientManager(
+            clientRegistrationRepository,
+            authorizedClientRepository
+        );
+    manager.setAuthorizedClientProvider(authorizedClientProvider);
+
+    return manager;
+}
+
+// For non-web (background/scheduled tasks — no HttpServletRequest):
+@Bean
+public OAuth2AuthorizedClientManager backgroundClientManager(
+        ClientRegistrationRepository clientRegistrationRepository) {
+
+    OAuth2AuthorizedClientService service =
+        new InMemoryOAuth2AuthorizedClientService(clientRegistrationRepository);
+    AuthorizedClientServiceOAuth2AuthorizedClientManager manager =
+        new AuthorizedClientServiceOAuth2AuthorizedClientManager(
+            clientRegistrationRepository, service);
+    manager.setAuthorizedClientProvider(
+        OAuth2AuthorizedClientProviderBuilder.builder()
+            .clientCredentials()
+            .build()
+    );
+    return manager;
+}
+
+========================================================
+8. WEBCLIENT WITH OAUTH2 TOKEN PROPAGATION
+========================================================
+
+Automatically attach access tokens to outbound HTTP calls:
+
+@Configuration
+public class WebClientConfig {
+
+    @Bean
+    public WebClient webClient(OAuth2AuthorizedClientManager authorizedClientManager) {
+        // Create a filter that automatically obtains/refreshes tokens
+        ServletOAuth2AuthorizedClientExchangeFilterFunction oauth2Filter =
+            new ServletOAuth2AuthorizedClientExchangeFilterFunction(authorizedClientManager);
+
+        // Set default client registration to use:
+        oauth2Filter.setDefaultClientRegistrationId("keycloak");
+        // OR: propagate the current user's token:
+        // oauth2Filter.setDefaultOAuth2AuthorizedClient(true);  // Use current user's token
+
+        return WebClient.builder()
+            .apply(oauth2Filter.oauth2Configuration())
+            .baseUrl("https://order-service")
+            .build();
+    }
+}
+
+// Usage in service:
+@Service
+public class OrderServiceClient {
+
+    private final WebClient webClient;
+
+    public List<Order> getAllOrders() {
+        // Token is automatically attached
+        return webClient.get()
+            .uri("/api/orders")
+            .retrieve()
+            .bodyToFlux(Order.class)
+            .collectList()
+            .block();
+    }
+
+    // Override client for specific calls:
+    public List<Order> getOrdersWithSpecificClient(String userId) {
+        return webClient.get()
+            .uri("/api/orders")
+            .attributes(clientRegistrationId("order-service"))  // Use specific client
+            .retrieve()
+            .bodyToFlux(Order.class)
+            .collectList()
+            .block();
+    }
+}
+
+// Background service (no web request context):
+@Service
+public class ScheduledReportService {
+
+    private final WebClient webClient;
+    private final OAuth2AuthorizedClientManager clientManager;
+
+    @Scheduled(fixedRate = 3600000)
+    public void generateReport() {
+        OAuth2AuthorizeRequest request = OAuth2AuthorizeRequest
+            .withClientRegistrationId("reporting-service")
+            .principal("scheduled-task")  // synthetic principal name
+            .build();
+
+        OAuth2AuthorizedClient client = clientManager.authorize(request);
+        String token = client.getAccessToken().getTokenValue();
+
+        webClient.get()
+            .uri("/api/reports/generate")
+            .headers(h -> h.setBearerAuth(token))
+            .retrieve()
+            .toBodilessEntity()
+            .block();
+    }
+}
+
+========================================================
+9. TOKEN STORAGE
+========================================================
+
+OAuth2AuthorizedClientRepository / OAuth2AuthorizedClientService:
+  - Stores OAuth2AuthorizedClient (access token + refresh token) per user
+
+Default storage:
+  - HttpSessionOAuth2AuthorizedClientRepository: Stores in HTTP Session (default for web)
+  - InMemoryOAuth2AuthorizedClientService: In-memory (for testing)
+
+Custom storage (database-backed):
+
+@Component
+public class JpaOAuth2AuthorizedClientService implements OAuth2AuthorizedClientService {
+
+    private final AuthorizedClientRepository clientRepository;
+
+    @Override
+    public <T extends OAuth2AuthorizedClient> T loadAuthorizedClient(
+            String clientRegistrationId, String principalName) {
+        return (T) clientRepository
+            .findByClientRegistrationIdAndPrincipalName(clientRegistrationId, principalName)
+            .map(this::toAuthorizedClient)
+            .orElse(null);
+    }
+
+    @Override
+    public void saveAuthorizedClient(OAuth2AuthorizedClient authorizedClient,
+                                     Authentication principal) {
+        // Save access token and refresh token to DB (encrypted)
+        clientRepository.save(toEntity(authorizedClient, principal));
+    }
+
+    @Override
+    public void removeAuthorizedClient(String clientRegistrationId,
+                                       String principalName) {
+        clientRepository.deleteByClientRegistrationIdAndPrincipalName(
+            clientRegistrationId, principalName);
+    }
+}
+
+========================================================
+10. LOGOUT
+========================================================
+
+For OIDC logout (RP-Initiated Logout):
+
+.logout(logout -> logout
+    .logoutSuccessHandler(
+        new OidcClientInitiatedLogoutSuccessHandler(clientRegistrationRepository)
+    )
+    .logoutRequestMatcher(new AntPathRequestMatcher("/logout"))
+    .invalidateHttpSession(true)
+    .clearAuthentication(true)
+    .deleteCookies("JSESSIONID")
+)
+
+The OidcClientInitiatedLogoutSuccessHandler:
+  1. Clears local session
+  2. Redirects to OIDC provider's end_session_endpoint
+  3. Passes id_token_hint and post_logout_redirect_uri
+
+========================================================
+11. COMMON INTERVIEW QUESTIONS
+========================================================
+
+Q: What is the difference between an OAuth2 Client and a Resource Server in Spring?
+A: An OAuth2 Client initiates flows to obtain tokens (for user login or service-to-service).
+   A Resource Server validates incoming tokens on its endpoints.
+   A service can be both — e.g., a BFF (Backend For Frontend) that logs users in
+   (client) and also exposes its own APIs (resource server).
+
+Q: What is OAuth2AuthorizedClientManager used for?
+A: It manages the lifecycle of OAuth2AuthorizedClient objects. It can:
+   - Load an existing authorized client
+   - Automatically refresh an expired access token
+   - Obtain a new client_credentials token
+   It's the primary way to get tokens programmatically in Spring Security.
+
+Q: How do you make a WebClient call using the current user's OAuth2 token?
+A: Add ServletOAuth2AuthorizedClientExchangeFilterFunction to WebClient with
+   setDefaultOAuth2AuthorizedClient(true). This propagates the current user's
+   access token from SecurityContextHolder to outbound calls.
+
+Q: How does Spring Security handle token refresh automatically?
+A: When OAuth2AuthorizedClientProviderBuilder includes .refreshToken(), the
+   OAuth2AuthorizedClientManager checks if the access token is expired. If so,
+   it uses the stored refresh token to call the token endpoint and updates the
+   stored access token transparently.
+
+Q: What is ClientRegistration?
+A: Immutable Spring model representing the application's registration with one
+   OAuth2/OIDC provider. It holds client_id, client_secret, grant types,
+   redirect_uri, scopes, and provider endpoint URLs.
+
+Q: How do you add custom user roles from your database after social login?
+A: Implement a custom OidcUserService that extends OidcUserService. Override
+   loadUser() to first call super.loadUser(), then look up the user in your DB
+   (create if first login), merge DB roles into the authorities set, and return
+   a new DefaultOidcUser with the combined authorities.
+
+Q: What is the difference between @RegisteredOAuth2AuthorizedClient and OAuth2AuthorizedClientService?
+A: @RegisteredOAuth2AuthorizedClient is a method parameter annotation for controllers.
+   Spring automatically injects the OAuth2AuthorizedClient for the current user.
+   OAuth2AuthorizedClientService is the programmatic API for loading/saving
+   authorized clients, useful in services and background tasks.

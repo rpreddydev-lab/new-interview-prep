@@ -1,0 +1,165 @@
+================================================================
+Pagination and Sorting in Spring Data JPA
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. PAGEABLE AND PAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Pageable encapsulates: page number (0-based), page size, and sort order.
+Page<T> is the result: data slice + total count.
+
+// Repository:
+public interface UserRepository extends JpaRepository<User, Long> {
+    Page<User> findAll(Pageable pageable);
+    Page<User> findByStatus(String status, Pageable pageable);
+}
+
+// Service:
+Pageable pageable = PageRequest.of(
+    0,                              // page number (0-based)
+    20,                             // page size
+    Sort.by("createdAt").descending()
+        .and(Sort.by("email").ascending())
+);
+Page<User> page = userRepo.findAll(pageable);
+
+page.getContent();           // List<User> for this page
+page.getTotalElements();     // total count across all pages
+page.getTotalPages();        // total number of pages
+page.getNumber();            // current page number
+page.isFirst();              // true if first page
+page.isLast();               // true if last page
+page.hasNext();              // true if there's a next page
+page.nextPageable();         // Pageable for next page
+
+Generated SQL (PostgreSQL):
+  SELECT * FROM users WHERE status = ? ORDER BY created_at DESC, email ASC LIMIT 20 OFFSET 0
+  SELECT COUNT(*) FROM users WHERE status = ?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. SLICE (No COUNT query — faster for infinite scroll)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Slice<T> does NOT execute a count query. Useful for "load more" UIs.
+
+Slice<User> findByStatus(String status, Pageable pageable);
+
+slice.getContent();          // current slice data
+slice.hasNext();             // fetches size+1 to determine if more exist
+// No getTotalElements() — avoids expensive COUNT(*)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. CUSTOM QUERY WITH PAGINATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Query requires a separate countQuery when using complex FROM/WHERE:
+
+@Query(
+    value = "SELECT u FROM User u LEFT JOIN u.orders o WHERE u.status = :status AND COUNT(o) > 0",
+    countQuery = "SELECT COUNT(DISTINCT u) FROM User u LEFT JOIN u.orders o WHERE u.status = :status AND o IS NOT EMPTY"
+)
+Page<User> findActiveUsersWithOrders(@Param("status") String status, Pageable pageable);
+
+// Without countQuery, Spring Data tries to derive it — may fail on complex queries
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. SORTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Static sort:
+Sort sort = Sort.by(Sort.Order.desc("createdAt"), Sort.Order.asc("email"));
+
+// From request param (Spring MVC):
+// GET /users?sort=createdAt,desc&sort=email,asc
+// Spring auto-converts to Sort object with @SortDefault or Pageable binding
+
+// Safe sort (prevent SQL injection via dynamic column names):
+// Use JpaSort.unsafe("column") only with trusted input
+// With allowedFields check:
+Sort safeSort = Sort.by("createdAt");  // validated field name from whitelist
+
+// @Query with Sort:
+@Query("SELECT u FROM User u WHERE u.status = :status")
+List<User> findByStatus(@Param("status") String status, Sort sort);
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. PAGINATION ANTI-PATTERNS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Anti-pattern 1: Offset pagination at large offsets
+  OFFSET 10000 LIMIT 20  — DB must scan and discard 10,000 rows before returning 20
+  Gets slower as page number increases!
+
+Anti-pattern 2: JOIN FETCH + Pageable (in-memory pagination)
+  Hibernate warns: HHH90003004 — applies LIMIT in Java, not SQL
+  Can OOM on large datasets
+
+Anti-pattern 3: findAll() then subList() in Java
+  List<User> all = userRepo.findAll();  // loads EVERYTHING
+  return all.subList(0, 20);            // terribly inefficient
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. KEYSET PAGINATION (Seek Method) — Scalable Alternative
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Instead of OFFSET, use a WHERE clause on the last seen value.
+Performance is O(log N) with an index instead of O(N) for OFFSET.
+
+// Page 1:
+SELECT * FROM users ORDER BY created_at DESC, id DESC LIMIT 20
+
+// Page 2 (using last seen values from page 1):
+SELECT * FROM users
+WHERE (created_at < :lastCreatedAt) OR (created_at = :lastCreatedAt AND id < :lastId)
+ORDER BY created_at DESC, id DESC
+LIMIT 20
+
+// Spring Data doesn't natively support keyset, use:
+// - jOOQ
+// - Blaze-Persistence (KeysetPage)
+// - Spring Data Commons Scroll API (Spring Data 3.1+)
+
+// Spring Data 3.1+ Scroll API:
+ScrollPosition position = ScrollPosition.keyset();
+Window<User> window = userRepo.findTop20ByOrderByCreatedAtDescIdDesc(position);
+window.getContent();
+window.positionAt(window.getContent().get(19));  // get next cursor
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. INTERVIEW QUICK HITS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the difference between Page and Slice in Spring Data JPA?
+A: Page executes both a data query AND a COUNT(*) query to return total
+   page count. Slice only executes the data query — it fetches size+1 rows
+   to determine hasNext(), without the expensive COUNT. Use Slice for
+   infinite scroll / "load more" patterns. Use Page when you need total
+   count for a pagination UI.
+
+Q: What is the problem with offset-based pagination for large datasets?
+A: The DB must scan all preceding rows to skip them. OFFSET 10000 LIMIT 20
+   makes the DB discard 10,000 rows before returning 20. Performance
+   degrades linearly with page depth. Keyset pagination (seek method)
+   uses a WHERE clause on the last seen value instead, which is O(log N)
+   with a proper index.
+
+Q: Why can't you use JOIN FETCH with Pageable for collection associations?
+A: JOIN FETCH on a collection multiplies the result rows (Cartesian product).
+   The DB LIMIT/OFFSET is applied to rows, not to entity count. Hibernate
+   cannot correctly apply the SQL LIMIT, so it loads all rows into memory
+   and paginates in Java — causing memory issues. Separate the queries:
+   paginate the root entity, then load associations with @BatchSize or a
+   second query using IN (loadedIds).
+
+Q: How do you provide a custom countQuery with @Query pagination?
+A: Use @Query(value = "...", countQuery = "SELECT COUNT(...)"). Spring Data
+   uses the countQuery for the COUNT(*) in pagination. Without it, Spring
+   tries to auto-derive the count query from the main query, which fails
+   for complex queries with GROUP BY, HAVING, or JOIN conditions.
+
+Q: How does Pageable prevent SQL injection?
+A: Spring Data validates sort properties against the entity's field names
+   at the repository layer. Dynamic sort columns from request parameters
+   are matched against known entity fields. Avoid using JpaSort.unsafe()
+   unless absolutely necessary, and always validate against a whitelist.

@@ -1,0 +1,249 @@
+================================================================================
+CLIENT-SIDE vs SERVER-SIDE SERVICE DISCOVERY
+================================================================================
+
+THE CORE QUESTION
+-----------------
+When Service A wants to call Service B, WHO is responsible for:
+  1. Finding the list of Service B instances?
+  2. Choosing which instance to call?
+  3. Load balancing across instances?
+
+Answer A: The CLIENT (Service A itself) → Client-side Discovery
+Answer B: An INTERMEDIARY (router/LB) → Server-side Discovery
+
+────────────────────────────────────────────────────────────────────────────────
+
+CLIENT-SIDE DISCOVERY
+======================
+
+HOW IT WORKS:
+  1. Service A wants to call Service B
+  2. Service A queries Service Registry: "Give me all instances of order-service"
+  3. Registry returns list: [10.0.0.1:8080, 10.0.0.2:8080, 10.0.0.3:8080]
+  4. Service A applies load balancing algorithm (round-robin, random, etc.)
+  5. Service A calls the selected instance directly
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                                                                  │
+  │  Service A ──[query]──→ Service Registry                        │
+  │             ←──[list of instances]──                            │
+  │  Service A (LB: select instance) ──→ Service B (instance 2)    │
+  │                                                                  │
+  └─────────────────────────────────────────────────────────────────┘
+
+COMPONENTS:
+  - Service Registry: Eureka, Consul
+  - Client-side LB library: Spring Cloud LoadBalancer, Netflix Ribbon (deprecated)
+
+SPRING BOOT IMPLEMENTATION:
+  // Service B registers with Eureka
+  @EnableDiscoveryClient
+  @SpringBootApplication
+  public class OrderServiceApplication { ... }
+
+  // Service A uses @LoadBalanced RestTemplate to call Service B
+  @Configuration
+  public class AppConfig {
+    @Bean
+    @LoadBalanced  // Adds service-discovery-aware LB interceptor
+    public RestTemplate restTemplate() {
+      return new RestTemplate();
+    }
+  }
+
+  @Service
+  public class InventoryClient {
+    @Autowired private RestTemplate restTemplate;
+
+    public boolean checkStock(Long productId, int quantity) {
+      // "inventory-service" is the registered service name — NOT an IP
+      // Spring Cloud LB resolves it to an actual IP via Eureka
+      return restTemplate.getForObject(
+        "http://inventory-service/api/v1/inventory/{id}/available?qty={qty}",
+        Boolean.class, productId, quantity
+      );
+    }
+  }
+
+  // Alternatively with WebClient (reactive):
+  @Bean
+  @LoadBalanced
+  public WebClient.Builder webClientBuilder() {
+    return WebClient.builder();
+  }
+
+LOAD BALANCING ALGORITHMS (Spring Cloud LoadBalancer):
+  - Round Robin (default): Rotate through instances sequentially
+  - Random: Randomly select an instance
+  - Weighted: Route more traffic to higher-capacity instances
+  - Sticky Session: Route same client to same instance (session affinity)
+
+PROS:
+  ✓ Direct communication — no intermediary hop (lower latency)
+  ✓ Simple architecture — no additional infrastructure
+  ✓ Client controls load balancing strategy
+  ✓ Fine-grained control over instance selection (zone preference, etc.)
+
+CONS:
+  ✗ Client code is coupled to service discovery mechanism
+  ✗ Every language/framework needs its own discovery client library
+  ✗ Registry caching — client may have stale instance list
+  ✗ Client is responsible for health-checking instances
+  ✗ More complexity in the client
+
+────────────────────────────────────────────────────────────────────────────────
+
+SERVER-SIDE DISCOVERY
+======================
+
+HOW IT WORKS:
+  1. Service A sends request to a Load Balancer / API Gateway
+  2. Load Balancer queries registry: "Give me instances of order-service"
+  3. Load Balancer selects an instance
+  4. Load Balancer forwards request to selected instance
+  5. Response returns via Load Balancer (or directly from instance)
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                                                                   │
+  │  Service A ──→ [Load Balancer / API Gateway]                     │
+  │                          ↕ [query]                               │
+  │                   Service Registry                               │
+  │                          ↓                                       │
+  │                   Service B (instance 2)                         │
+  │                                                                   │
+  └──────────────────────────────────────────────────────────────────┘
+
+EXAMPLES:
+  - AWS Application Load Balancer (ALB) + ECS/EKS
+  - Kubernetes Service (kube-proxy + DNS)
+  - Nginx Upstream + Consul-template
+  - Istio/Envoy proxy
+  - Spring Cloud Gateway
+
+KUBERNETES SERVER-SIDE DISCOVERY (Most common today):
+  # Service definition
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: order-service
+  spec:
+    selector:
+      app: order-service       # matches pod labels
+    ports:
+      - port: 8080
+        targetPort: 8080
+    type: ClusterIP
+
+  # Service A can call:
+  # http://order-service:8080/api/v1/orders
+  # K8s DNS resolves to ClusterIP, kube-proxy routes to healthy pods
+
+SPRING CLOUD GATEWAY (server-side routing with discovery):
+  spring:
+    cloud:
+      gateway:
+        discovery:
+          locator:
+            enabled: true      # Auto-creates routes for each registered service
+        routes:
+          - id: order-service
+            uri: lb://order-service   # lb:// prefix = use Eureka + client-LB
+            predicates:
+              - Path=/api/v1/orders/**
+
+PROS:
+  ✓ Clients are simpler — no discovery logic needed
+  ✓ Language/framework agnostic (any client can call via standard HTTP)
+  ✓ Centralized load balancing — consistent policy enforcement
+  ✓ Easier to add cross-cutting concerns (auth, rate limiting, TLS)
+  ✓ Works naturally in Kubernetes (built-in)
+
+CONS:
+  ✗ Additional network hop → slightly higher latency
+  ✗ Load balancer is a potential SPOF (must be HA)
+  ✗ More infrastructure to manage (unless using K8s built-in)
+
+────────────────────────────────────────────────────────────────────────────────
+
+DETAILED COMPARISON
+====================
+
+Aspect               │ Client-Side Discovery    │ Server-Side Discovery
+─────────────────────┼──────────────────────────┼──────────────────────────────
+Who resolves?        │ Client application       │ LB / API Gateway
+Who load-balances?   │ Client library           │ Infrastructure
+Direct communication │ Yes (after lookup)       │ No (goes through LB)
+Network hops         │ 1 (after initial lookup) │ 2 (via LB)
+Client complexity    │ Higher (needs library)   │ Lower (standard HTTP)
+Language support     │ Library needed per lang  │ Any language
+Infrastructure       │ Registry only            │ Registry + LB
+Caching              │ Client caches instances  │ LB handles this
+Kubernetes native    │ Less natural             │ Natural (K8s Service)
+Observability        │ Per-client metrics       │ Centralized at LB
+Failure handling     │ Client handles retries   │ LB handles retries
+Examples             │ Eureka+Ribbon, Consul+SDK│ K8s Service, AWS ALB
+
+────────────────────────────────────────────────────────────────────────────────
+
+HYBRID: KUBERNETES WITH SPRING CLOUD
+======================================
+Modern systems often combine both:
+  - Within a cluster: Kubernetes Service (server-side)
+  - Cross-cluster or for fine-grained control: Eureka (client-side)
+  - API Gateway for external traffic: Spring Cloud Gateway (server-side)
+
+Typical architecture:
+  External → [API Gateway: Spring Cloud Gateway]
+                    ↓ (Kubernetes DNS)
+             [Service A Pod]
+                    ↓ (K8s Service DNS = server-side)
+             [Service B Pod (3 replicas, K8s LB handles it)]
+
+────────────────────────────────────────────────────────────────────────────────
+
+SELF-REGISTRATION vs THIRD-PARTY REGISTRATION
+===============================================
+
+Self-Registration: Service registers/deregisters itself
+  - Service uses Eureka client / Consul SDK on startup/shutdown
+  - Simple; service knows its own metadata
+  - Problem: Service must implement registration logic
+  - Used by: Eureka, Consul with service-side agents
+
+Third-Party Registration: An external system registers services
+  - Kubernetes does this: K8s watches pod lifecycle, updates Endpoints
+  - Service doesn't need any registration code
+  - Used by: Kubernetes, Registrator (Docker → Consul)
+  - Cleaner separation of concerns
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What's the difference between client-side and server-side service discovery?
+A: Client-side: the calling service queries the registry directly and does its
+   own load balancing (e.g., Eureka + Spring Cloud LoadBalancer). Server-side:
+   the client sends to an intermediary (K8s Service, API Gateway) which handles
+   discovery and routing. Modern cloud-native apps typically use server-side via
+   Kubernetes.
+
+Q: What are the tradeoffs of client-side vs server-side discovery?
+A: Client-side has direct communication (lower latency) but couples client
+   code to the discovery mechanism and needs per-language library support.
+   Server-side is simpler for clients and language-agnostic, but adds a network
+   hop and centralizes failure risk in the load balancer.
+
+Q: How does Kubernetes service discovery work?
+A: Each K8s Service gets a stable DNS name. kube-proxy maintains iptables rules
+   that route traffic to healthy pods matching the service's label selector.
+   No client-side library needed — any HTTP client can call the service by name.
+
+Q: What is @LoadBalanced in Spring Cloud?
+A: It's an annotation that tells Spring to inject an interceptor into RestTemplate
+   or WebClient that resolves service names (like "order-service") to actual
+   IP addresses via the service registry (Eureka/Consul) and applies client-side
+   load balancing before making the HTTP call.
+
+================================================================================

@@ -1,0 +1,524 @@
+================================================================
+UNARY RPC - COMPLETE GUIDE
+================================================================
+
+----------------------------------------------------------------
+1. WHAT IS UNARY RPC?
+----------------------------------------------------------------
+
+Unary RPC is the simplest form of gRPC communication:
+  - Client sends exactly ONE request
+  - Server sends exactly ONE response
+  - Semantically identical to a traditional function call
+
+Proto definition:
+  rpc MethodName (RequestMessage) returns (ResponseMessage);
+
+HTTP/2 behavior:
+  - Single HTTP/2 stream (one stream ID)
+  - Client: HEADERS frame + DATA frame [END_STREAM]
+  - Server: HEADERS frame + DATA frame + TRAILERS frame [END_STREAM]
+
+This is the most common gRPC pattern and the easiest to understand
+and implement. Use it whenever one request/response is sufficient.
+
+----------------------------------------------------------------
+2. PROTO DEFINITION EXAMPLE
+----------------------------------------------------------------
+
+syntax = "proto3";
+package com.example.order.v1;
+
+option java_package = "com.example.order.v1";
+option java_multiple_files = true;
+
+import "google/protobuf/empty.proto";
+
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  ORDER_STATUS_PENDING     = 1;
+  ORDER_STATUS_CONFIRMED   = 2;
+  ORDER_STATUS_CANCELLED   = 3;
+}
+
+message Order {
+  string      order_id    = 1;
+  string      customer_id = 2;
+  OrderStatus status      = 3;
+  int64       amount_cents = 4;
+}
+
+message CreateOrderRequest {
+  string customer_id  = 1;
+  int64  amount_cents = 2;
+  string product_id   = 3;
+}
+
+message GetOrderRequest {
+  string order_id = 1;
+}
+
+message UpdateOrderStatusRequest {
+  string      order_id = 1;
+  OrderStatus status   = 2;
+}
+
+service OrderService {
+  rpc CreateOrder      (CreateOrderRequest)      returns (Order);
+  rpc GetOrder         (GetOrderRequest)          returns (Order);
+  rpc UpdateOrderStatus(UpdateOrderStatusRequest) returns (Order);
+  rpc DeleteOrder      (GetOrderRequest)          returns (google.protobuf.Empty);
+}
+
+----------------------------------------------------------------
+3. SERVER IMPLEMENTATION (JAVA)
+----------------------------------------------------------------
+
+import io.grpc.Status;
+import io.grpc.stub.StreamObserver;
+
+@GrpcService
+public class OrderServiceImpl extends OrderServiceGrpc.OrderServiceImplBase {
+  
+  private final OrderRepository orderRepository;
+  private final Logger log = LoggerFactory.getLogger(OrderServiceImpl.class);
+  
+  public OrderServiceImpl(OrderRepository orderRepository) {
+    this.orderRepository = orderRepository;
+  }
+  
+  // ── CREATE ORDER (Unary) ─────────────────────────────────
+  @Override
+  public void createOrder(CreateOrderRequest request,
+                           StreamObserver<Order> responseObserver) {
+    
+    // 1. VALIDATE input
+    if (request.getCustomerId().isBlank()) {
+      responseObserver.onError(
+          Status.INVALID_ARGUMENT
+              .withDescription("customer_id is required")
+              .asRuntimeException());
+      return;
+    }
+    if (request.getAmountCents() <= 0) {
+      responseObserver.onError(
+          Status.INVALID_ARGUMENT
+              .withDescription("amount_cents must be positive")
+              .asRuntimeException());
+      return;
+    }
+    
+    try {
+      // 2. BUSINESS LOGIC
+      String orderId = generateOrderId();
+      Order order = Order.newBuilder()
+          .setOrderId(orderId)
+          .setCustomerId(request.getCustomerId())
+          .setAmountCents(request.getAmountCents())
+          .setStatus(OrderStatus.ORDER_STATUS_PENDING)
+          .build();
+      
+      // 3. PERSIST
+      orderRepository.save(orderId, order);
+      log.info("Created order: {}", orderId);
+      
+      // 4. SEND RESPONSE (must call exactly once for unary)
+      responseObserver.onNext(order);
+      
+      // 5. COMPLETE (must call exactly once after onNext)
+      responseObserver.onCompleted();
+      
+    } catch (Exception e) {
+      log.error("Failed to create order", e);
+      responseObserver.onError(
+          Status.INTERNAL
+              .withDescription("Failed to create order")
+              .withCause(e)
+              .asRuntimeException());
+    }
+  }
+  
+  // ── GET ORDER (Unary) ─────────────────────────────────────
+  @Override
+  public void getOrder(GetOrderRequest request,
+                       StreamObserver<Order> responseObserver) {
+    
+    String orderId = request.getOrderId();
+    
+    Optional<Order> orderOpt = orderRepository.findById(orderId);
+    
+    if (orderOpt.isEmpty()) {
+      responseObserver.onError(
+          Status.NOT_FOUND
+              .withDescription("Order not found: " + orderId)
+              .asRuntimeException());
+      return;
+    }
+    
+    responseObserver.onNext(orderOpt.get());
+    responseObserver.onCompleted();
+  }
+  
+  // ── UPDATE ORDER STATUS (Unary) ───────────────────────────
+  @Override
+  public void updateOrderStatus(UpdateOrderStatusRequest request,
+                                 StreamObserver<Order> responseObserver) {
+    
+    Optional<Order> orderOpt = orderRepository.findById(request.getOrderId());
+    
+    if (orderOpt.isEmpty()) {
+      responseObserver.onError(
+          Status.NOT_FOUND
+              .withDescription("Order not found: " + request.getOrderId())
+              .asRuntimeException());
+      return;
+    }
+    
+    Order updated = orderOpt.get().toBuilder()
+        .setStatus(request.getStatus())
+        .build();
+    
+    orderRepository.save(updated.getOrderId(), updated);
+    
+    responseObserver.onNext(updated);
+    responseObserver.onCompleted();
+  }
+  
+  // ── DELETE ORDER (Unary, returns Empty) ────────────────────
+  @Override
+  public void deleteOrder(GetOrderRequest request,
+                           StreamObserver<com.google.protobuf.Empty> responseObserver) {
+    
+    if (!orderRepository.exists(request.getOrderId())) {
+      responseObserver.onError(
+          Status.NOT_FOUND
+              .withDescription("Order not found: " + request.getOrderId())
+              .asRuntimeException());
+      return;
+    }
+    
+    orderRepository.delete(request.getOrderId());
+    
+    responseObserver.onNext(com.google.protobuf.Empty.getDefaultInstance());
+    responseObserver.onCompleted();
+  }
+}
+
+----------------------------------------------------------------
+4. CLIENT IMPLEMENTATION - BLOCKING STUB
+----------------------------------------------------------------
+
+// SYNCHRONOUS (blocking) client - simplest to use
+@Component
+public class OrderServiceClient {
+  
+  private final OrderServiceGrpc.OrderServiceBlockingStub blockingStub;
+  
+  public OrderServiceClient(ManagedChannel channel) {
+    // Create blocking stub from channel
+    this.blockingStub = OrderServiceGrpc.newBlockingStub(channel)
+        .withDeadlineAfter(5, TimeUnit.SECONDS);  // 5 second timeout
+  }
+  
+  public Order createOrder(String customerId, long amountCents) {
+    CreateOrderRequest request = CreateOrderRequest.newBuilder()
+        .setCustomerId(customerId)
+        .setAmountCents(amountCents)
+        .build();
+    
+    try {
+      // This BLOCKS the calling thread until response arrives or timeout
+      return blockingStub.createOrder(request);
+    } catch (StatusRuntimeException e) {
+      log.error("RPC failed: {}", e.getStatus());
+      throw e;
+    }
+  }
+  
+  public Order getOrder(String orderId) {
+    GetOrderRequest request = GetOrderRequest.newBuilder()
+        .setOrderId(orderId)
+        .build();
+    
+    return blockingStub.getOrder(request);
+    // Throws StatusRuntimeException if NOT_FOUND
+  }
+}
+
+----------------------------------------------------------------
+5. CLIENT IMPLEMENTATION - ASYNC STUB
+----------------------------------------------------------------
+
+// ASYNCHRONOUS client - non-blocking, uses callbacks
+@Component
+public class AsyncOrderServiceClient {
+  
+  private final OrderServiceGrpc.OrderServiceStub asyncStub;
+  
+  public AsyncOrderServiceClient(ManagedChannel channel) {
+    this.asyncStub = OrderServiceGrpc.newStub(channel);
+  }
+  
+  // Async with callback
+  public void createOrderAsync(String customerId, long amountCents,
+                                Consumer<Order> onSuccess,
+                                Consumer<Throwable> onError) {
+    
+    CreateOrderRequest request = CreateOrderRequest.newBuilder()
+        .setCustomerId(customerId)
+        .setAmountCents(amountCents)
+        .build();
+    
+    asyncStub.withDeadlineAfter(5, TimeUnit.SECONDS)
+        .createOrder(request, new StreamObserver<Order>() {
+          
+          @Override
+          public void onNext(Order order) {
+            // Called once for unary (one response message)
+            onSuccess.accept(order);
+          }
+          
+          @Override
+          public void onError(Throwable t) {
+            // Called on error (instead of onCompleted)
+            onError.accept(t);
+          }
+          
+          @Override
+          public void onCompleted() {
+            // Called after onNext for unary (stream ended)
+            // For unary, you typically don't need to do anything here
+          }
+        });
+    
+    // This returns immediately! The callback runs on gRPC thread pool.
+  }
+  
+  // Async with CompletableFuture (cleaner for Java 8+)
+  public CompletableFuture<Order> createOrderFuture(String customerId, long amountCents) {
+    CompletableFuture<Order> future = new CompletableFuture<>();
+    
+    CreateOrderRequest request = CreateOrderRequest.newBuilder()
+        .setCustomerId(customerId)
+        .setAmountCents(amountCents)
+        .build();
+    
+    asyncStub.createOrder(request, new StreamObserver<Order>() {
+      @Override
+      public void onNext(Order order) { future.complete(order); }
+      
+      @Override
+      public void onError(Throwable t) { future.completeExceptionally(t); }
+      
+      @Override
+      public void onCompleted() { /* onNext already called */ }
+    });
+    
+    return future;
+  }
+}
+
+----------------------------------------------------------------
+6. CLIENT IMPLEMENTATION - FUTURE STUB
+----------------------------------------------------------------
+
+// FUTURE stub - returns Guava ListenableFuture
+@Component
+public class FutureOrderServiceClient {
+  
+  private final OrderServiceGrpc.OrderServiceFutureStub futureStub;
+  
+  public FutureOrderServiceClient(ManagedChannel channel) {
+    this.futureStub = OrderServiceGrpc.newFutureStub(channel);
+  }
+  
+  public ListenableFuture<Order> createOrder(String customerId, long amountCents) {
+    CreateOrderRequest request = CreateOrderRequest.newBuilder()
+        .setCustomerId(customerId)
+        .setAmountCents(amountCents)
+        .build();
+    
+    return futureStub
+        .withDeadlineAfter(5, TimeUnit.SECONDS)
+        .createOrder(request);
+  }
+  
+  // Using with Futures.transform
+  public ListenableFuture<String> getOrderId(String customerId) {
+    return Futures.transform(
+        createOrder(customerId, 1000),
+        order -> order.getOrderId(),
+        MoreExecutors.directExecutor()
+    );
+  }
+}
+
+----------------------------------------------------------------
+7. ERROR HANDLING PATTERNS
+----------------------------------------------------------------
+
+gRPC Status Codes for Unary RPC:
+  Status.OK                   = 0  // Success
+  Status.CANCELLED            = 1  // Client cancelled the RPC
+  Status.UNKNOWN              = 2  // Unknown error
+  Status.INVALID_ARGUMENT     = 3  // Bad input from client
+  Status.DEADLINE_EXCEEDED    = 4  // Timed out
+  Status.NOT_FOUND            = 5  // Resource not found
+  Status.ALREADY_EXISTS       = 6  // Resource already exists
+  Status.PERMISSION_DENIED    = 7  // Not authorized
+  Status.RESOURCE_EXHAUSTED   = 8  // Rate limit or quota exceeded
+  Status.FAILED_PRECONDITION  = 9  // System not in correct state
+  Status.ABORTED              = 10 // Optimistic concurrency failure
+  Status.INTERNAL             = 13 // Internal server error
+  Status.UNAVAILABLE          = 14 // Server overloaded or down
+  Status.UNAUTHENTICATED      = 16 // No valid credentials
+
+Client-side error handling:
+  try {
+    Order order = blockingStub.getOrder(request);
+    processOrder(order);
+  } catch (StatusRuntimeException e) {
+    Status.Code code = e.getStatus().getCode();
+    switch (code) {
+      case NOT_FOUND:
+        log.warn("Order not found: {}", request.getOrderId());
+        return Optional.empty();
+      case DEADLINE_EXCEEDED:
+        log.error("Request timed out");
+        throw new ServiceTimeoutException("Order service timed out");
+      case UNAVAILABLE:
+        log.error("Order service is unavailable - try retry");
+        throw new ServiceUnavailableException(e);
+      default:
+        log.error("Unexpected gRPC error: {}", e.getStatus());
+        throw new RuntimeException("gRPC error: " + code, e);
+    }
+  }
+
+Rich error details (server side):
+  import com.google.rpc.Code;
+  import com.google.rpc.Status;
+  import com.google.rpc.BadRequest;
+  import io.grpc.protobuf.StatusProto;
+  
+  BadRequest badRequest = BadRequest.newBuilder()
+      .addFieldViolations(BadRequest.FieldViolation.newBuilder()
+          .setField("customer_id")
+          .setDescription("customer_id must not be blank")
+          .build())
+      .build();
+  
+  Status status = Status.newBuilder()
+      .setCode(Code.INVALID_ARGUMENT.getNumber())
+      .setMessage("Validation failed")
+      .addDetails(Any.pack(badRequest))
+      .build();
+  
+  responseObserver.onError(StatusProto.toStatusRuntimeException(status));
+
+----------------------------------------------------------------
+8. DEADLINES AND TIMEOUTS
+----------------------------------------------------------------
+
+Setting deadline on client side:
+  // Method 1: Per-call deadline
+  Order order = blockingStub
+      .withDeadlineAfter(5, TimeUnit.SECONDS)
+      .getOrder(request);
+  
+  // Method 2: Deadline from parent context (propagated)
+  Deadline deadline = Deadline.after(5, TimeUnit.SECONDS);
+  Order order = blockingStub
+      .withDeadline(deadline)
+      .getOrder(request);
+  
+  // Method 3: Inherit from Context (for deadline propagation across services)
+  Context ctx = Context.current().withDeadlineAfter(5, TimeUnit.SECONDS, executor);
+  ctx.run(() -> {
+    Order order = blockingStub.getOrder(request);
+  });
+
+Checking deadline on server side:
+  @Override
+  public void getOrder(GetOrderRequest request, StreamObserver<Order> resp) {
+    // Check if client already cancelled (deadline exceeded before we started)
+    if (Context.current().isCancelled()) {
+      resp.onError(Status.CANCELLED.withDescription("Client cancelled").asException());
+      return;
+    }
+    
+    // Long operation
+    Order order = orderRepository.findById(request.getOrderId()).orElseThrow();
+    
+    // Check again before responding
+    if (Context.current().isCancelled()) {
+      resp.onError(Status.CANCELLED.asException());
+      return;
+    }
+    
+    resp.onNext(order);
+    resp.onCompleted();
+  }
+
+----------------------------------------------------------------
+9. UNARY RPC LIFECYCLE SUMMARY
+----------------------------------------------------------------
+
+COMPLETE LIFECYCLE:
+  
+  CLIENT                                          SERVER
+  ──────────────────────────────────────────────────────
+  1. client calls stub.getOrder(request)
+  2. gRPC serializes request to protobuf bytes
+  3. Sends HTTP/2 HEADERS frame:
+     :method=POST
+     :path=/com.example.order.v1.OrderService/GetOrder
+     content-type=application/grpc
+     grpc-timeout=5S (if deadline set)
+  4. Sends HTTP/2 DATA frame: [5-byte prefix][protobuf bytes]
+  5. Sends END_STREAM flag (request complete)
+                                                  6. Receives and deserializes request
+                                                  7. Calls getOrder() handler
+                                                  8. Executes business logic
+                                                  9. Builds response message
+                                                  10. Calls responseObserver.onNext(order)
+                                                  11. Serializes order to protobuf bytes
+                                                  12. Sends HTTP/2 HEADERS frame: :status=200
+                                                  13. Sends HTTP/2 DATA frame: [prefix][proto bytes]
+                                                  14. Calls responseObserver.onCompleted()
+                                                  15. Sends HTTP/2 TRAILERS:
+                                                      grpc-status=0 (OK)
+  16. Client receives response DATA frame
+  17. Deserializes protobuf bytes to Order object
+  18. Returns Order from stub.getOrder()
+  OR: Client receives TRAILERS with non-zero grpc-status
+  19. Throws StatusRuntimeException
+
+----------------------------------------------------------------
+10. INTERVIEW KEY POINTS
+----------------------------------------------------------------
+
+Q: In unary RPC, what is the order of calls on the server side?
+A: The server must call:
+   1. responseObserver.onNext(response) — exactly ONCE to send the response
+   2. responseObserver.onCompleted() — to signal successful completion
+   OR:
+   1. responseObserver.onError(exception) — to signal failure
+   Never call onNext AND onError, and never call onCompleted after onError.
+
+Q: What is the difference between BlockingStub and AsyncStub for unary RPC?
+A: BlockingStub.getOrder() blocks the calling thread until the response
+   arrives or a deadline is exceeded. AsyncStub.getOrder() returns
+   immediately and calls the StreamObserver callbacks on a gRPC thread.
+   Use BlockingStub for simple sequential code; AsyncStub for high-throughput
+   or when you don't want to block threads.
+
+Q: How do you propagate deadlines across multiple gRPC service calls?
+A: Use Context.current() to inherit the incoming deadline automatically.
+   In Spring gRPC, the server context includes the client's deadline.
+   When making outbound calls, use withDeadline(Context.current().getDeadline())
+   to propagate the remaining deadline to downstream services.
+
+================================================================
+END OF FILE
+================================================================

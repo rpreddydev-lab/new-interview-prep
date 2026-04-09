@@ -1,0 +1,353 @@
+================================================================
+SCHEMA MAPPING IN SPRING FOR GRAPHQL — IN DEPTH
+================================================================
+
+1. WHAT IS SCHEMA MAPPING?
+---------------------------
+Schema mapping is the process of connecting GraphQL schema fields to Java
+methods that resolve them. Spring for GraphQL supports two styles:
+
+  a) Annotation-based (@QueryMapping, @SchemaMapping, etc.) — preferred
+  b) Programmatic (RuntimeWiringConfigurer with DataFetcher) — flexible
+
+Under the hood, both register a DataFetcher in the RuntimeWiring. Spring
+for GraphQL inspects @Controller beans at startup and registers mappings.
+
+2. HOW SPRING DISCOVERS SCHEMA MAPPINGS
+-----------------------------------------
+At startup, Spring for GraphQL:
+  1. Scans all @Controller beans for annotated methods
+  2. For each annotated method, determines the target type + field name
+  3. Registers a AnnotatedControllerConfigurer DataFetcher for each mapping
+  4. Registers these with graphql-java's RuntimeWiring
+
+Type name resolution order for @SchemaMapping:
+  a) From typeName attribute on the annotation
+  b) From the parent type of the method's first parameter (if it's a known type)
+  c) From the containing class's @SchemaMapping annotation (if on the class)
+  d) Error: cannot determine type name
+
+Field name resolution order:
+  a) From field attribute on the annotation
+  b) From the method name itself
+
+3. TYPE NAME INFERENCE RULES
+------------------------------
+```java
+// 1. Explicit typeName attribute (always works)
+@SchemaMapping(typeName = "Post", field = "author")
+public User author(Post post) { ... }
+
+// 2. Inferred from first parameter type (works if parameter type = GraphQL type name)
+@SchemaMapping    // typeName = "Post" (from Post class), field = "comments"
+public List<Comment> comments(Post post) { ... }
+
+// 3. Using @Controller at class level (Spring 6.x supports class-level typeName)
+// @SchemaMapping(typeName = "Post")   ← not yet standard, prefer method-level
+```
+
+4. FIELD NAME INFERENCE RULES
+-------------------------------
+```java
+// 1. Explicit field attribute
+@SchemaMapping(typeName = "Post", field = "authorFullName")
+public String author(Post post) { ... }    // Note: method name doesn't matter here
+
+// 2. Inferred from method name
+@SchemaMapping(typeName = "Post")
+public String authorFullName(Post post) {  // GraphQL field = "authorFullName"
+  return post.getAuthor().getFullName();
+}
+```
+
+5. DATAFETCHER MAPPING (PROGRAMMATIC STYLE)
+---------------------------------------------
+For cases where annotation style isn't sufficient:
+
+```java
+@Configuration
+public class GraphQLWiringConfig {
+
+  private final BookService bookService;
+  private final SearchService searchService;
+
+  @Bean
+  public RuntimeWiringConfigurer runtimeWiringConfigurer() {
+    return builder -> {
+      builder.type("Query", wiring -> wiring
+        .dataFetcher("books", env -> bookService.findAll())
+        .dataFetcher("book", env -> {
+          Long id = Long.valueOf(env.getArgument("id").toString());
+          return bookService.findById(id);
+        })
+        .dataFetcher("search", new SearchDataFetcher(searchService))
+      );
+
+      builder.type("Book", wiring -> wiring
+        .dataFetcher("author", env -> {
+          Book book = env.getSource();
+          return authorService.findById(book.getAuthorId());
+        })
+      );
+
+      // Custom type resolver for interfaces/unions
+      builder.type("SearchResult", wiring -> wiring
+        .typeResolver(env -> {
+          Object obj = env.getObject();
+          if (obj instanceof Book) return env.getSchema().getObjectType("Book");
+          if (obj instanceof Author) return env.getSchema().getObjectType("Author");
+          return null;
+        })
+      );
+    };
+  }
+}
+```
+
+6. INTERFACE TYPE RESOLUTION
+------------------------------
+When a field returns an interface, GraphQL needs to know which concrete
+type to use for `__typename`. Set up type resolvers:
+
+```graphql
+# Schema
+interface Node { id: ID! }
+type User implements Node { id: ID!, name: String! }
+type Post implements Node { id: ID!, title: String! }
+type Query { node(id: ID!): Node }
+```
+
+```java
+@Configuration
+public class TypeResolverConfig {
+
+  @Bean
+  public RuntimeWiringConfigurer typeResolvers() {
+    return builder -> {
+      builder.type("Node", wiring -> wiring
+        .typeResolver(env -> {
+          Object source = env.getObject();
+          GraphQLSchema schema = env.getSchema();
+          if (source instanceof User) {
+            return schema.getObjectType("User");
+          }
+          if (source instanceof Post) {
+            return schema.getObjectType("Post");
+          }
+          throw new RuntimeException("Unknown type: " + source.getClass().getSimpleName());
+        })
+      );
+    };
+  }
+}
+```
+
+Spring for GraphQL also supports `__typename` on POJO:
+```java
+// Spring can auto-resolve type if your class name matches schema type name
+// Or use ClassNameTypeResolver
+@Bean
+public RuntimeWiringConfigurer wiringConfigurer() {
+  return b -> b.type("SearchResult",
+    wiring -> wiring.typeResolver(new ClassNameTypeResolver())
+  );
+}
+```
+
+7. CUSTOM SCALAR MAPPING
+--------------------------
+Register custom scalar types with RuntimeWiringConfigurer:
+
+```graphql
+# schema.graphqls
+scalar Date
+scalar DateTime
+scalar BigDecimal
+scalar UUID
+```
+
+```java
+@Configuration
+public class ScalarConfig {
+
+  @Bean
+  public RuntimeWiringConfigurer customScalars() {
+    return builder -> builder
+      .scalar(ExtendedScalars.Date)          // java.time.LocalDate
+      .scalar(ExtendedScalars.DateTime)      // java.time.OffsetDateTime
+      .scalar(ExtendedScalars.GraphQLBigDecimal)
+      .scalar(ExtendedScalars.UUID)
+      .scalar(buildCustomEmailScalar());
+  }
+
+  private GraphQLScalarType buildCustomEmailScalar() {
+    return GraphQLScalarType.newScalar()
+      .name("Email")
+      .description("An RFC 5322 compliant email address")
+      .coercing(new Coercing<String, String>() {
+        @Override
+        public String serialize(Object value) throws CoercingSerializeException {
+          String email = value.toString();
+          if (!email.contains("@")) throw new CoercingSerializeException("Invalid email");
+          return email.toLowerCase();
+        }
+
+        @Override
+        public String parseValue(Object input) throws CoercingParseValueException {
+          return serialize(input);
+        }
+
+        @Override
+        public String parseLiteral(Object ast) throws CoercingParseLiteralException {
+          if (ast instanceof StringValue sv) return serialize(sv.getValue());
+          throw new CoercingParseLiteralException("Expected String");
+        }
+      })
+      .build();
+  }
+}
+```
+
+Maven dependency for extended scalars:
+```xml
+<dependency>
+  <groupId>com.graphql-java</groupId>
+  <artifactId>graphql-java-extended-scalars</artifactId>
+  <version>21.0</version>
+</dependency>
+```
+
+8. SCHEMA MAPPING FOR PAGINATION (RELAY CONNECTION)
+------------------------------------------------------
+```graphql
+# schema.graphqls
+type Query { posts(first: Int, after: String): PostConnection! }
+type PostConnection { edges: [PostEdge!]!, pageInfo: PageInfo! }
+type PostEdge { node: Post!, cursor: String! }
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+```
+
+```java
+@QueryMapping
+public PostConnection posts(@Argument Integer first, @Argument String after) {
+  Page<Post> page = postRepository.findAll(
+    PageRequest.of(decodeCursor(after), first != null ? first : 10)
+  );
+
+  List<PostEdge> edges = page.getContent().stream()
+    .map(post -> PostEdge.builder()
+      .node(post)
+      .cursor(encodeCursor(post.getId()))
+      .build())
+    .collect(Collectors.toList());
+
+  return PostConnection.builder()
+    .edges(edges)
+    .pageInfo(PageInfo.builder()
+      .hasNextPage(page.hasNext())
+      .hasPreviousPage(page.hasPrevious())
+      .startCursor(edges.isEmpty() ? null : edges.get(0).getCursor())
+      .endCursor(edges.isEmpty() ? null : edges.get(edges.size() - 1).getCursor())
+      .build())
+    .build();
+}
+
+private String encodeCursor(Long id) {
+  return Base64.getEncoder().encodeToString(("cursor:" + id).getBytes());
+}
+
+private int decodeCursor(String cursor) {
+  if (cursor == null) return 0;
+  String decoded = new String(Base64.getDecoder().decode(cursor));
+  return Integer.parseInt(decoded.replace("cursor:", ""));
+}
+```
+
+9. SCHEMA-FIRST vs CODE-FIRST
+-------------------------------
+Schema-first (recommended — what Spring for GraphQL uses):
+  → Write .graphqls files first
+  → Implement Java resolvers to match
+  → Schema is the contract; Java is the implementation
+  PRO: Schema is human-readable, language-agnostic, versioned separately
+  CON: Possible drift between schema and Java code (use codegen to prevent)
+
+Code-first (via libraries like graphql-kotlin or DGS):
+  → Write Java classes and annotations
+  → Schema is generated from the code
+  PRO: Java is single source of truth, less ceremony
+  CON: Schema can become Java-centric, harder for non-Java teams
+
+Spring for GraphQL is schema-first only.
+
+10. GENERATING JAVA TYPES FROM SCHEMA (CODEGEN)
+-------------------------------------------------
+Use graphql-codegen or graphql-java-codegen to generate Java classes
+from schema, preventing drift:
+
+```xml
+<!-- pom.xml -->
+<plugin>
+  <groupId>io.github.kobylynskyi</groupId>
+  <artifactId>graphql-codegen-maven-plugin</artifactId>
+  <version>5.7.2</version>
+  <executions>
+    <execution>
+      <goals><goal>generate</goal></goals>
+      <configuration>
+        <graphqlSchemaPaths>
+          <graphqlSchemaPath>${project.basedir}/src/main/resources/graphql</graphqlSchemaPath>
+        </graphqlSchemaPaths>
+        <outputDir>${project.build.directory}/generated-sources/graphql</outputDir>
+        <packageName>com.example.graphql.model</packageName>
+        <generateModels>true</generateModels>
+        <generateApis>false</generateApis>
+      </configuration>
+    </execution>
+  </executions>
+</plugin>
+```
+
+11. INTERVIEW QUESTIONS & ANSWERS
+-----------------------------------
+
+Q: How does Spring for GraphQL know which method handles "Query.user"?
+A: It scans @Controller beans at startup. A method annotated with
+   @QueryMapping defaults to using the method name as the field name.
+   The type is Query (hardcoded for @QueryMapping). You can override with
+   @QueryMapping("user") or @SchemaMapping(typeName="Query", field="user").
+
+Q: What happens if two methods map to the same schema field?
+A: An exception is thrown at startup — two DataFetchers cannot be registered
+   for the same field coordinates. Each GraphQL field must have exactly
+   one DataFetcher.
+
+Q: How do you handle interface type resolution in Spring for GraphQL?
+A: Register a TypeResolver for the interface using RuntimeWiringConfigurer.
+   The TypeResolver receives the resolved Java object and must return the
+   GraphQLObjectType. Common strategies: instanceof checks, a getTypeName()
+   method on the object, or ClassNameTypeResolver (matches class name to
+   schema type name).
+
+Q: What is the difference between schema-first and code-first GraphQL?
+A: Schema-first: write .graphqls files, implement resolvers to match.
+   Spring for GraphQL is schema-first. Code-first: annotate Java classes,
+   generate schema from code (e.g., graphql-kotlin, Netflix DGS annotation
+   processor). Schema-first gives cleaner API contracts and better
+   multi-team collaboration; code-first reduces boilerplate but can create
+   Java-centric schemas.
+
+Q: How do you prevent schema-code drift in a schema-first approach?
+A: Use graphql-codegen to generate Java types and interfaces from the schema
+   at build time. Resolvers implement generated interfaces, so if you change
+   the schema, the generated interface changes, and the Java code fails to
+   compile until updated. This forces synchronization.
+
+================================================================
+END OF FILE
+================================================================

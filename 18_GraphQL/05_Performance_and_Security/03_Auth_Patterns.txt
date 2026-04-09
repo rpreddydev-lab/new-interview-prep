@@ -1,0 +1,381 @@
+================================================================
+AUTHENTICATION AND AUTHORIZATION PATTERNS IN GRAPHQL — IN DEPTH
+================================================================
+
+1. AUTH TERMINOLOGY
+--------------------
+  Authentication (AuthN): Verifying who the user is (login, JWT validation)
+  Authorization (AuthZ): Verifying what the user can do (role checks, ownership)
+
+GraphQL doesn't define how to handle auth — it's left to the implementation.
+Common patterns:
+  a) JWT token in Authorization header
+  b) Session-based auth (cookie)
+  c) API Key
+  d) OAuth 2.0 / OpenID Connect
+  e) mTLS (certificate-based)
+
+2. JWT-BASED AUTHENTICATION (MOST COMMON)
+-------------------------------------------
+  Token Flow:
+  ```
+  1. Client: POST /auth/login { email, password }
+  2. Server: returns { accessToken, refreshToken }
+  3. Client: stores access token, sends with every GraphQL request:
+     Authorization: Bearer eyJhbGciOiJSUzI1NiJ9...
+  4. Server: validates JWT signature and expiry
+  5. Server: extracts userId, roles from token claims
+  6. Server: adds user to GraphQL context
+  7. Resolver: reads user from context for authorization checks
+  ```
+
+  JWT in Spring:
+  ```java
+  @Component
+  public class JwtAuthInterceptor implements WebGraphQlInterceptor {
+
+    private final JwtDecoder jwtDecoder;  // Spring Security's JWKS decoder
+    private final UserRepository userRepository;
+
+    @Override
+    public Mono<WebGraphQlResponse> intercept(WebGraphQlRequest request, Chain chain) {
+      String token = extractBearerToken(request.getHeaders());
+
+      if (token == null) {
+        return chain.next(request);  // Unauthenticated — resolver will check
+      }
+
+      try {
+        Jwt jwt = jwtDecoder.decode(token);
+        Long userId = jwt.getClaim("userId");
+        List<String> roles = jwt.getClaim("roles");
+
+        request.configureExecutionInput((input, builder) ->
+          builder.graphQLContext(ctx -> {
+            ctx.put("userId", userId);
+            ctx.put("roles", new HashSet<>(roles));
+            ctx.put("authenticated", true);
+          })
+        );
+      } catch (JwtException e) {
+        // Invalid token — propagate; resolvers requiring auth will fail
+        request.configureExecutionInput((input, builder) ->
+          builder.graphQLContext(ctx -> ctx.put("authError", "Invalid token")));
+      }
+
+      return chain.next(request);
+    }
+  }
+  ```
+
+3. SPRING SECURITY INTEGRATION
+---------------------------------
+Let Spring Security handle auth, expose SecurityContext to resolvers:
+
+```java
+@Configuration
+@EnableMethodSecurity  // Enables @PreAuthorize on @Controller methods
+public class SecurityConfig {
+
+  @Bean
+  public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    return http
+      .csrf(csrf -> csrf.disable())
+      .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+      .authorizeHttpRequests(auth -> auth
+        .requestMatchers("/graphql").permitAll()  // GraphQL endpoint open
+        .requestMatchers("/graphiql").hasRole("DEVELOPER")
+        .anyRequest().authenticated()
+      )
+      .oauth2ResourceServer(oauth -> oauth.jwt(Customizer.withDefaults()))
+      .build();
+  }
+}
+
+// In resolver
+@Controller
+public class UserController {
+
+  @QueryMapping
+  @PreAuthorize("hasRole('ADMIN')")
+  public List<User> allUsers() {
+    return userRepository.findAll();
+  }
+
+  @MutationMapping
+  @PreAuthorize("isAuthenticated()")
+  public Post createPost(@Argument CreatePostInput input) {
+    User currentUser = getCurrentUser();
+    return postService.create(input, currentUser);
+  }
+}
+```
+
+4. AUTHORIZATION PATTERNS
+---------------------------
+
+  4.1 Field-Level Authorization
+  ------------------------------
+  ```java
+  @SchemaMapping(typeName = "Employee", field = "salary")
+  public Double salary(Employee emp, @ContextValue User currentUser) {
+    if (currentUser.isAdmin() || currentUser.getId().equals(emp.getId())) {
+      return emp.getSalary();
+    }
+    return null;  // Return null for unauthorized
+  }
+
+  @SchemaMapping(typeName = "User", field = "email")
+  public String email(User user, @ContextValue User currentUser) {
+    if (currentUser == null) return null;           // Anonymous: hidden
+    if (currentUser.getId().equals(user.getId())) return user.getEmail();  // Own email: visible
+    if (currentUser.isAdmin()) return user.getEmail();      // Admin: visible
+    return "***@***.***";  // Others: masked
+  }
+  ```
+
+  4.2 Row-Level Authorization (Data Filtering)
+  ---------------------------------------------
+  ```java
+  @QueryMapping
+  public List<Document> documents(@ContextValue User currentUser) {
+    if (currentUser == null) return List.of();
+    if (currentUser.isAdmin()) return documentRepository.findAll();
+    // Non-admin: only see own documents
+    return documentRepository.findByOwnerId(currentUser.getId());
+  }
+  ```
+
+  4.3 @Auth Directive Pattern
+  ----------------------------
+  ```graphql
+  directive @auth(role: Role = USER) on FIELD_DEFINITION | OBJECT
+
+  enum Role { GUEST, USER, MODERATOR, ADMIN }
+
+  type Query {
+    me: User
+    allUsers: [User!]! @auth(role: ADMIN)
+    moderatePost(id: ID!): Post! @auth(role: MODERATOR)
+  }
+  ```
+
+  ```java
+  @Component
+  public class AuthDirectiveWiring implements SchemaDirectiveWiring {
+
+    @Override
+    public GraphQLFieldDefinition onField(
+        SchemaDirectiveWiringEnvironment<GraphQLFieldDefinition> env) {
+
+      String requiredRole = env.getAppliedDirective("auth")
+        .getArgument("role").getValue().toString();
+
+      DataFetcher<?> originalFetcher = env.getCodeRegistry()
+        .getDataFetcher(env.getFieldsContainer(), env.getElement());
+
+      DataFetcher<?> authFetcher = dataEnv -> {
+        User user = dataEnv.getGraphQlContext().get("currentUser");
+        if (user == null) {
+          throw new UnauthorizedException("Authentication required");
+        }
+        if (!user.hasRole(requiredRole)) {
+          throw new ForbiddenException("Role required: " + requiredRole);
+        }
+        return originalFetcher.get(dataEnv);
+      };
+
+      FieldCoordinates coords = FieldCoordinates.coordinates(
+        env.getFieldsContainer(), env.getElement());
+      env.getCodeRegistry().dataFetcher(coords, authFetcher);
+      return env.getElement();
+    }
+  }
+  ```
+
+  4.4 Ownership Checks
+  ---------------------
+  ```java
+  @MutationMapping
+  public Post updatePost(@Argument Long id,
+                         @Argument UpdatePostInput input,
+                         @ContextValue User currentUser) {
+    Post post = postRepository.findById(id)
+      .orElseThrow(() -> new ResourceNotFoundException("Post", id));
+
+    // Only author or admin can update
+    if (!post.getAuthorId().equals(currentUser.getId()) && !currentUser.isAdmin()) {
+      throw new ForbiddenException("You don't have permission to update this post");
+    }
+
+    post.setTitle(input.title());
+    post.setContent(input.content());
+    return postRepository.save(post);
+  }
+  ```
+
+5. HANDLING UNAUTHENTICATED AND UNAUTHORIZED ERRORS
+-----------------------------------------------------
+```java
+@Component
+public class AuthExceptionResolver extends DataFetcherExceptionResolverAdapter {
+
+  @Override
+  protected GraphQLError resolveToSingleError(Throwable ex, DataFetchingEnvironment env) {
+    if (ex instanceof UnauthorizedException) {
+      return GraphqlErrorBuilder.newError(env)
+        .message(ex.getMessage())
+        .errorType(ErrorType.UNAUTHORIZED)
+        .extensions(Map.of(
+          "code", "UNAUTHORIZED",
+          "loginRequired", true
+        ))
+        .build();
+    }
+    if (ex instanceof ForbiddenException) {
+      return GraphqlErrorBuilder.newError(env)
+        .message(ex.getMessage())
+        .errorType(ErrorType.FORBIDDEN)
+        .extensions(Map.of(
+          "code", "FORBIDDEN"
+        ))
+        .build();
+    }
+    return null;
+  }
+}
+```
+
+Response for unauthorized:
+```json
+{
+  "data": { "allUsers": null },
+  "errors": [{
+    "message": "Authentication required",
+    "path": ["allUsers"],
+    "extensions": { "code": "UNAUTHORIZED", "loginRequired": true }
+  }]
+}
+```
+
+6. MULTI-TENANT AUTHORIZATION
+--------------------------------
+When multiple tenants share the same deployment:
+
+```java
+@Component
+public class TenantContextInterceptor implements WebGraphQlInterceptor {
+
+  @Override
+  public Mono<WebGraphQlResponse> intercept(WebGraphQlRequest request, Chain chain) {
+    String tenantId = request.getHeaders().getFirst("X-Tenant-ID");
+
+    if (tenantId == null) {
+      return Mono.error(new IllegalArgumentException("Tenant ID required"));
+    }
+
+    // Validate tenant exists
+    if (!tenantService.exists(tenantId)) {
+      return Mono.error(new ForbiddenException("Invalid tenant"));
+    }
+
+    request.configureExecutionInput((input, builder) ->
+      builder.graphQLContext(ctx -> ctx.put("tenantId", tenantId)));
+
+    return chain.next(request);
+  }
+}
+
+// Resolver with tenant isolation
+@QueryMapping
+public List<Resource> resources(@ContextValue String tenantId, @ContextValue User user) {
+  return resourceRepository.findByTenantIdAndAccessibleByUser(tenantId, user.getId());
+}
+```
+
+7. OAUTH 2.0 / OIDC INTEGRATION
+---------------------------------
+```java
+@Configuration
+public class OAuthConfig {
+
+  @Bean
+  public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+    return http
+      .oauth2ResourceServer(oauth -> oauth
+        .jwt(jwt -> jwt
+          .jwtAuthenticationConverter(jwtAuthConverter())
+        )
+      )
+      .build();
+  }
+
+  @Bean
+  public JwtAuthenticationConverter jwtAuthConverter() {
+    JwtGrantedAuthoritiesConverter converter = new JwtGrantedAuthoritiesConverter();
+    converter.setAuthoritiesClaimName("roles");
+    converter.setAuthorityPrefix("ROLE_");
+
+    JwtAuthenticationConverter jwtConverter = new JwtAuthenticationConverter();
+    jwtConverter.setJwtGrantedAuthoritiesConverter(converter);
+    return jwtConverter;
+  }
+}
+```
+
+8. BEST PRACTICES
+------------------
+  ✅ Authenticate at the interceptor level (not in each resolver)
+  ✅ Never trust client-provided user IDs — always verify with token
+  ✅ Use @ContextValue to access auth info in resolvers (not method params)
+  ✅ Implement row-level security in the service layer, not just in schemas
+  ✅ Log authorization failures with context (user, operation, resource)
+  ✅ Never expose internal error details on auth failures
+  ✅ Use @PreAuthorize for declarative authorization on methods
+  ✅ Test both authorized and unauthorized scenarios in every test suite
+  ❌ Don't put auth logic in the schema (use directives sparingly)
+  ❌ Don't trust frontend-computed permissions — always verify server-side
+
+9. INTERVIEW QUESTIONS & ANSWERS
+----------------------------------
+
+Q: How does authentication work in GraphQL?
+A: GraphQL itself has no auth mechanism — it's HTTP-layer concern. Clients
+   send credentials (JWT in Authorization header, session cookie, API key)
+   with each request. A WebGraphQlInterceptor validates the credentials,
+   extracts user identity, and stores it in the GraphQL execution context.
+   Resolvers then read the current user from context.
+
+Q: What is the difference between authentication and authorization in GraphQL?
+A: Authentication ("who are you?") happens once per request in the interceptor
+   — validates the token and puts User in context. Authorization ("can you
+   do this?") happens in individual resolvers or via @PreAuthorize —
+   checks if the authenticated user has permission for the specific operation
+   or data being requested.
+
+Q: How do you implement field-level authorization?
+A: Multiple approaches: (1) @SchemaMapping resolver checks context user and
+   returns null or throws for unauthorized access. (2) Custom @auth directive
+   with SchemaDirectiveWiring that wraps each resolver with an auth check.
+   (3) @PreAuthorize with Spring Security method security. Field-level auth
+   is important for sensitive fields like salary, PII, or internal metadata.
+
+Q: How would you handle authorization in a multi-tenant GraphQL API?
+A: Extract tenant ID from the request (header or JWT claim), validate it,
+   and store it in the GraphQL context. All resolvers use the tenantId when
+   querying the database (e.g., `WHERE tenant_id = ?`). Use row-level
+   security (RLS) at the DB level as a defense-in-depth measure. Never
+   allow cross-tenant data access even if the user is authenticated.
+
+Q: What is the @auth directive pattern and when should you use it?
+A: The @auth directive is applied to schema fields to declaratively specify
+   required roles. A SchemaDirectiveWiring wraps the original DataFetcher
+   with an auth check. Use when you want authorization to be visible in the
+   schema (self-documenting), when the auth rules are role-based and
+   consistent, and when you want to enforce auth without modifying resolver code.
+   Avoid for complex ownership-based auth where each user's access depends
+   on data relationships.
+
+================================================================
+END OF FILE
+================================================================

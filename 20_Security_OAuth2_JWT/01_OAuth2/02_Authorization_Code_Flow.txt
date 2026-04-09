@@ -1,0 +1,303 @@
+================================================================
+AUTHORIZATION CODE FLOW — DEEP DIVE
+================================================================
+
+The Authorization Code Flow is the most secure and most commonly used
+OAuth2 flow for applications with a backend. This file covers every
+step in detail with security considerations.
+
+================================================================
+PREREQUISITES
+================================================================
+
+ACTORS:
+  - User                   : resource owner using a browser
+  - Client App             : your application (e.g., Spring Boot app)
+  - Authorization Server   : e.g., Keycloak, Okta, Auth0, Spring AS
+  - Resource Server        : API that holds protected data
+
+CLIENT REGISTRATION:
+  Before the flow, the client is registered with the AS:
+    client_id         → public identifier for the app
+    client_secret     → secret (only for confidential clients)
+    redirect_uris     → allowed callback URLs (strictly validated!)
+    allowed scopes    → what scopes the client can request
+    grant_types       → which flows are enabled
+
+================================================================
+STEP-BY-STEP FLOW
+================================================================
+
+STEP 1: User Initiates Login
+-----------------------------
+User clicks "Login" in the app.
+App redirects user's browser to the Authorization Endpoint.
+
+GET https://auth-server.com/oauth2/authorize
+  ?response_type=code          ← request an authorization code
+  &client_id=my-spring-app     ← identifies the app to AS
+  &redirect_uri=https://app.com/login/oauth2/code/myapp
+  &scope=openid%20email%20profile%20read:orders
+  &state=k8s7fGhj23KqzRt       ← random CSRF token, client-generated
+  &nonce=c8d9Yq37Xs            ← (OIDC) prevents replay of ID token
+
+PARAMETER DETAILS:
+  response_type=code  : Must be "code" for this flow
+  client_id           : Registered client identifier
+  redirect_uri        : Must EXACTLY match registered URIs (no wildcards)
+  scope               : Space-separated list of requested permissions
+  state               : Random string; must be verified on callback
+  nonce               : OIDC parameter; embedded in ID token for replay protection
+
+STEP 2: User Authenticates at Authorization Server
+---------------------------------------------------
+AS shows login page.
+User enters credentials (or uses SSO session if already logged in).
+AS may prompt for MFA.
+
+STEP 3: User Consents (Consent Screen)
+---------------------------------------
+AS shows what permissions the app is requesting:
+  "my-spring-app wants to:
+   ✓ View your profile
+   ✓ View your email
+   ✓ Read your orders"
+  [Allow] [Deny]
+
+Note: Consent may be skipped if:
+  - The client is a first-party app (trusted)
+  - User already consented before
+  - AS policy auto-approves trusted clients
+
+STEP 4: Authorization Server Redirects Back with Code
+------------------------------------------------------
+AS redirects user's browser to the redirect_uri with:
+
+GET https://app.com/login/oauth2/code/myapp
+  ?code=SplxlOBeZQQYbYS6WxSbIA    ← short-lived authorization code
+  &state=k8s7fGhj23KqzRt          ← same state as sent
+
+CLIENT MUST:
+  1. Verify state matches what was sent (CSRF protection)
+  2. Exchange the code immediately (it expires in ~10 minutes)
+  3. Use the code only once (AS invalidates after first use)
+
+STEP 5: Backend Exchanges Code for Tokens
+------------------------------------------
+This is a DIRECT (server-to-server) POST from the app's backend.
+The user's browser is NOT involved.
+
+POST https://auth-server.com/oauth2/token
+Content-Type: application/x-www-form-urlencoded
+Authorization: Basic base64(client_id:client_secret)   ← client authentication
+
+Body:
+  grant_type=authorization_code
+  &code=SplxlOBeZQQYbYS6WxSbIA
+  &redirect_uri=https://app.com/login/oauth2/code/myapp
+
+WHY INCLUDE redirect_uri HERE?
+  Validation only — it must match what was in the original auth request.
+  Not actually redirected to again.
+
+AS validates:
+  - Code exists and hasn't expired
+  - Code matches the client (not stolen by another client)
+  - redirect_uri matches registration
+  - Client credentials are valid (secret or PKCE verifier)
+
+STEP 6: Authorization Server Returns Tokens
+--------------------------------------------
+Response:
+{
+  "access_token": "eyJhbGciOiJSUzI1NiJ9...",
+  "token_type": "Bearer",
+  "expires_in": 900,                          ← 15 minutes
+  "refresh_token": "8xLOxBtZp8...",          ← long-lived
+  "id_token": "eyJhbGciOiJSUzI1NiJ9...",    ← OIDC only
+  "scope": "openid email read:orders"
+}
+
+STEP 7: Client Stores Tokens and Accesses API
+----------------------------------------------
+Client stores:
+  - Access token in memory (or short-lived server session)
+  - Refresh token securely (HttpOnly cookie or secure server storage)
+  - NEVER in localStorage (XSS vulnerable)
+
+Client calls Resource Server:
+  GET https://api.app.com/orders
+  Authorization: Bearer eyJhbGciOiJSUzI1NiJ9...
+
+Resource Server validates token and returns data.
+
+================================================================
+TOKEN STORAGE BEST PRACTICES
+================================================================
+
+Application Type    Access Token Storage      Refresh Token Storage
+-----------------------------------------------------------------------
+Web App (SSR)       Server memory / Redis     HttpOnly cookie (SameSite)
+SPA                 Memory (JS variable)      HttpOnly cookie via BFF
+Mobile App          Secure Keychain/Keystore  Secure Keychain/Keystore
+
+NEVER store tokens in:
+  ✗ localStorage  (XSS can steal them)
+  ✗ sessionStorage (XSS vulnerable, shared across tabs)
+  ✗ Cookies without HttpOnly flag
+  ✗ URL parameters (browser history, logs)
+
+================================================================
+COMPLETE FLOW DIAGRAM
+================================================================
+
+User Browser            Client App             Auth Server         Resource Server
+     |                      |                       |                      |
+     | Click Login           |                       |                      |
+     |--------------------->|                       |                      |
+     |                      | Redirect to AS        |                      |
+     |<---------------------------------------------|                      |
+     |                                              |                      |
+     | GET /authorize?code&state&...                |                      |
+     |--------------------------------------------->|                      |
+     |                                              |                      |
+     | [Login + Consent]                            |                      |
+     |--------------------------------------------->|                      |
+     |                                              |                      |
+     | Redirect to /callback?code=ABC&state=XYZ     |                      |
+     |<---------------------------------------------|                      |
+     |                                              |                      |
+     | GET /callback?code=ABC&state=XYZ             |                      |
+     |--------------------->|                       |                      |
+     |                      | Verify state          |                      |
+     |                      | POST /token           |                      |
+     |                      |  code=ABC             |                      |
+     |                      |  client_secret=***    |                      |
+     |                      |---------------------->|                      |
+     |                      |                       |                      |
+     |                      | {access_token,        |                      |
+     |                      |  refresh_token}       |                      |
+     |                      |<----------------------|                      |
+     |                      |                       |                      |
+     | Logged In!            |                       |                      |
+     |<---------------------|                       |                      |
+     |                      |                       |                      |
+     | Access Resource       |                       |                      |
+     |--------------------->|                       |                      |
+     |                      | GET /api/data         |                      |
+     |                      | Authorization: Bearer |                      |
+     |                      |--------------------------------------------->|
+     |                      |                       |     Validate token   |
+     |                      |              Response |<---------------------|
+     |<---------------------|                       |                      |
+
+================================================================
+SPRING SECURITY — OAUTH2 LOGIN (CLIENT SIDE)
+================================================================
+
+# application.yml
+spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          keycloak:
+            client-id: my-spring-app
+            client-secret: ${CLIENT_SECRET}
+            authorization-grant-type: authorization_code
+            redirect-uri: "{baseUrl}/login/oauth2/code/{registrationId}"
+            scope: openid, email, profile, read:orders
+        provider:
+          keycloak:
+            issuer-uri: https://auth-server.com/realms/myrealm
+
+// Spring Security config
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/", "/public/**").permitAll()
+                .anyRequest().authenticated()
+            )
+            .oauth2Login(oauth2 -> oauth2
+                .defaultSuccessUrl("/dashboard", true)
+                .failureUrl("/login?error")
+            )
+            .logout(logout -> logout
+                .logoutSuccessUrl("/")
+                .invalidateHttpSession(true)
+                .clearAuthentication(true)
+            );
+        return http.build();
+    }
+}
+
+// Access user info after login
+@GetMapping("/profile")
+public String profile(Authentication authentication) {
+    OidcUser user = (OidcUser) authentication.getPrincipal();
+    String email = user.getEmail();
+    String name = user.getFullName();
+    Map<String, Object> claims = user.getClaims();
+    return "profile";
+}
+
+================================================================
+SECURITY THREATS IN AUTHORIZATION CODE FLOW
+================================================================
+
+THREAT 1: CSRF on Authorization Request
+  Attack : Attacker tricks user into initiating auth on attacker's behalf
+  Defense: state parameter — generate random value, verify on callback
+
+THREAT 2: Authorization Code Interception
+  Attack : Code stolen from URL (e.g., referrer header, browser history)
+  Defense: PKCE — code can't be exchanged without code_verifier
+
+THREAT 3: Open Redirect Attack
+  Attack : Attacker uses a redirect_uri not matching registration:
+           /authorize?redirect_uri=https://evil.com
+  Defense: AS must EXACTLY match redirect_uri against registered values
+
+THREAT 4: Token Leakage via Referrer
+  Attack : Token in URL is sent in Referrer header to linked pages
+  Defense: Never put tokens in URLs; use Authorization header
+
+THREAT 5: Mix-Up Attack (multiple AS)
+  Attack : Client has multiple AS registered; response routed to wrong one
+  Defense: AS should include 'iss' claim; client validates it
+
+================================================================
+COMMON INTERVIEW QUESTIONS
+================================================================
+
+Q: Why does the Authorization Code flow use a code instead of returning
+   the token directly in the redirect?
+A: The code is short-lived, single-use, and delivered via the browser. The
+   actual token exchange happens server-to-server with client authentication,
+   keeping tokens out of the browser's URL, history, and logs.
+
+Q: What is the state parameter and why is it important?
+A: A random, client-generated value included in the auth request and verified
+   on callback. Prevents CSRF attacks where an attacker could initiate an
+   OAuth flow and have the victim's browser complete it.
+
+Q: What does the redirect_uri validation prevent?
+A: Open redirector attacks — if the AS didn't strictly validate the
+   redirect_uri, an attacker could set it to their own domain and receive
+   the authorization code.
+
+Q: How does Spring Security handle the Authorization Code flow?
+A: Spring Security OAuth2 Client automatically handles the redirect to AS,
+   generates the state parameter, receives the callback, exchanges the code
+   for tokens, and stores the tokens in OAuth2AuthorizedClientService.
+   Configure via spring.security.oauth2.client.* properties.
+
+Q: Where should you store tokens in a web application?
+A: Access tokens in server-side memory or short-lived encrypted session.
+   Refresh tokens in HttpOnly, Secure, SameSite cookies or server-side
+   session store. Never in localStorage due to XSS risk.

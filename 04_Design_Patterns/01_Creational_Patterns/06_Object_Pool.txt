@@ -1,0 +1,268 @@
+================================================================
+  OBJECT POOL PATTERN
+================================================================
+
+  Category:   Creational (not one of GoF 23, but widely recognized)
+  Intent:     Reuse a set of pre-created, initialized objects from a pool
+              instead of creating and destroying them on demand.
+              Objects are "checked out" and "returned" to the pool.
+  Also known as: Resource Pool, Connection Pool
+  Frequency:  High in system design interviews (DB connection pooling is everywhere).
+
+----------------------------------------------------------------
+PROBLEM SOLVED
+----------------------------------------------------------------
+
+  Some objects are expensive to create and/or destroy:
+    - Database connections (TCP handshake, authentication, protocol setup)
+    - Thread creation (OS kernel scheduling, stack allocation)
+    - Socket connections
+    - Large XML/PDF parsers (SAXParser, DocumentBuilder)
+    - Heavyweight game objects (bullets, particles)
+
+  Without Object Pool:
+    - Create connection: ~100-200ms
+    - Execute query: ~1ms
+    - Close connection: overhead
+    - For 1000 req/sec: 200 seconds wasted just on connection setup
+
+  With Connection Pool:
+    - Pool pre-creates N connections at startup
+    - Request borrows a connection from pool: O(1)
+    - Returns to pool when done: O(1)
+    - Zero connection creation overhead per request
+
+----------------------------------------------------------------
+CORE OPERATIONS
+----------------------------------------------------------------
+
+  acquire()   -- Get an available object from the pool.
+                 If pool is empty: wait, create new, or throw exception.
+  release()   -- Return object to pool for reuse.
+                 Reset object state before returning.
+  Pool validates objects: check if connection is still live before lending.
+
+----------------------------------------------------------------
+JAVA IMPLEMENTATION — SIMPLE GENERIC POOL
+----------------------------------------------------------------
+
+  import java.util.concurrent.ArrayBlockingQueue;
+  import java.util.concurrent.BlockingQueue;
+  import java.util.function.Supplier;
+
+  public class ObjectPool<T> {
+      private final BlockingQueue<T> pool;
+      private final Supplier<T> factory;
+      private final int maxSize;
+
+      public ObjectPool(int maxSize, Supplier<T> factory) {
+          this.maxSize = maxSize;
+          this.factory = factory;
+          this.pool = new ArrayBlockingQueue<>(maxSize);
+          // Pre-populate pool
+          for (int i = 0; i < maxSize; i++) {
+              pool.offer(factory.get());
+          }
+      }
+
+      // Acquire — blocks until object available
+      public T acquire() throws InterruptedException {
+          return pool.take();      // blocks if empty
+      }
+
+      // Acquire with timeout
+      public T acquire(long timeout, java.util.concurrent.TimeUnit unit)
+              throws InterruptedException {
+          T obj = pool.poll(timeout, unit);
+          if (obj == null) throw new RuntimeException("Pool exhausted — timeout");
+          return obj;
+      }
+
+      // Release — return to pool
+      public void release(T obj) {
+          if (obj != null) {
+              pool.offer(obj);    // returns to pool
+          }
+      }
+
+      public int available() { return pool.size(); }
+  }
+
+  // Usage with database connections
+  ObjectPool<Connection> connPool = new ObjectPool<>(10, () -> {
+      try { return DriverManager.getConnection(url, user, pass); }
+      catch (SQLException e) { throw new RuntimeException(e); }
+  });
+
+  Connection conn = connPool.acquire();
+  try {
+      // use connection
+  } finally {
+      connPool.release(conn);    // ALWAYS release in finally!
+  }
+
+----------------------------------------------------------------
+REAL-WORLD: HikariCP (JDBC CONNECTION POOL)
+----------------------------------------------------------------
+
+  HikariCP is the default connection pool in Spring Boot. It uses Object Pool pattern.
+
+    // application.properties
+    spring.datasource.hikari.maximum-pool-size=10
+    spring.datasource.hikari.minimum-idle=5
+    spring.datasource.hikari.connection-timeout=30000    # ms
+    spring.datasource.hikari.idle-timeout=600000         # ms
+
+  HikariCP internals:
+    - Uses a custom ConcurrentBag for ultra-fast lock-free borrow/return.
+    - Validates connections with isValid() or connectionTestQuery before lending.
+    - Evicts idle connections after idle-timeout.
+    - Creates new connections if pool is depleted (up to max-pool-size).
+
+  Pool size rule of thumb (database):
+    connections = (number of CPU cores * 2) + effective_spindle_count
+    For most apps: 10 connections per CPU core is a starting point.
+
+----------------------------------------------------------------
+THREAD POOL — ANOTHER OBJECT POOL EXAMPLE
+----------------------------------------------------------------
+
+  Java ExecutorService is a Thread Pool:
+    ExecutorService pool = Executors.newFixedThreadPool(8);
+    // 8 threads pre-created, reused for all submitted tasks
+
+    pool.submit(() -> processRequest(request));
+    pool.shutdown();
+
+  Thread Pool flow:
+    Task submitted --> idle thread acquired from pool --> task executes
+    --> thread returns to pool --> waits for next task
+
+----------------------------------------------------------------
+OBJECT LIFECYCLE IN THE POOL
+----------------------------------------------------------------
+
+  Object state management is critical:
+    - On RELEASE: reset object state to clean/initial state.
+    - On ACQUIRE: optionally validate that the object is still usable.
+    - On VALIDATION FAILURE: discard and create a new one.
+
+  Example: Connection validation
+    public Connection acquire() throws Exception {
+        Connection conn = pool.poll(30, TimeUnit.SECONDS);
+        if (conn == null) throw new RuntimeException("Pool timeout");
+        if (!conn.isValid(1)) {
+            conn.close();         // discard dead connection
+            conn = createConnection();  // create fresh
+        }
+        return conn;
+    }
+
+----------------------------------------------------------------
+OBJECT POOL CONFIGURATION PARAMETERS
+----------------------------------------------------------------
+
+  Parameter             Description
+  --------------------  --------------------------------------------------
+  initialSize           Objects created at pool startup
+  maxSize / maxTotal    Maximum objects in pool (active + idle)
+  minIdle               Minimum idle objects kept in pool
+  maxIdle               Maximum idle objects (excess are destroyed)
+  maxWait / timeout     How long to wait for object when pool is full
+  testOnBorrow          Validate before lending (slower but safer)
+  testOnReturn          Validate on return
+  testWhileIdle         Background validation of idle objects
+  timeBetweenEvictionRuns  How often eviction thread runs
+
+  HikariCP, Apache DBCP, Apache Commons Pool all expose these.
+
+----------------------------------------------------------------
+POOL STATES
+----------------------------------------------------------------
+
+  Object can be:
+    IDLE      -- In pool, waiting to be borrowed.
+    ACTIVE    -- Checked out, in use by a thread.
+    INVALID   -- Connection lost, object corrupted — must be discarded.
+
+  Pool can be:
+    HEALTHY   -- Objects available.
+    EXHAUSTED -- All objects checked out; new requests wait or fail.
+    DEPLETED  -- maxSize reached and all are invalid.
+
+----------------------------------------------------------------
+OBJECT POOL vs FLYWEIGHT
+----------------------------------------------------------------
+
+  Object Pool:
+    - Objects have MUTABLE state.
+    - Objects are checked out exclusively (one user at a time).
+    - Objects are returned to pool after use.
+    - Reuse to avoid expensive creation.
+
+  Flyweight:
+    - Objects have IMMUTABLE shared (intrinsic) state.
+    - Shared among many clients simultaneously (read-only).
+    - Not returned — just referenced.
+    - Reuse to save memory.
+
+  Key difference: Pool manages EXCLUSIVE access to mutable objects.
+                  Flyweight shares IMMUTABLE objects concurrently.
+
+----------------------------------------------------------------
+COMPLEXITY
+----------------------------------------------------------------
+
+  acquire():  O(1) — poll from BlockingQueue.
+  release():  O(1) — offer to BlockingQueue.
+  Space:      O(n) where n = pool size.
+
+  Overhead vs "new":
+    Without pool: O(creation cost) per request (can be 100ms+ for DB connections).
+    With pool:    O(1) amortized (creation cost spread over many requests).
+
+----------------------------------------------------------------
+INTERVIEW Q&A
+----------------------------------------------------------------
+
+  Q: What is the Object Pool pattern?
+  A: Pre-create a set of expensive objects and reuse them rather than creating
+     and destroying on demand. Objects are checked out from the pool and returned
+     when done. Most common use case: database connection pooling.
+
+  Q: Why do we pool database connections?
+  A: Creating a DB connection involves TCP handshake, authentication, and protocol
+     negotiation — ~100-200ms. Queries themselves take ~1ms. Without pooling,
+     connection setup dominates request time. Pooling amortizes this cost.
+
+  Q: What should you do in the finally block when using a pool?
+  A: Always release the object back to the pool in a finally block to prevent
+     leaks. If an exception is thrown, the object would otherwise remain checked
+     out forever, exhausting the pool.
+
+  Q: What happens when the pool is exhausted?
+  A: Depending on configuration: (1) wait up to a timeout, then throw exception.
+     (2) Create a new object beyond maxIdle but within maxSize. (3) Throw
+     immediately. HikariCP uses connectionTimeout; Apache DBCP uses maxWait.
+
+  Q: What is the difference between Object Pool and Flyweight?
+  A: Pool: mutable objects, exclusive access, returned after use.
+     Flyweight: immutable shared objects, concurrent read-only access, never returned.
+
+  Q: What pool size should I configure?
+  A: For DB connections: (CPU cores * 2) + effective disk spindles is a common
+     starting formula. Too small = thread waiting. Too large = DB server overloaded
+     with too many concurrent connections.
+
+----------------------------------------------------------------
+INTERVIEW TIPS
+----------------------------------------------------------------
+
+  - Object Pool is almost always asked in the context of connection pooling.
+  - Always mention HikariCP as the Spring Boot default — shows practical knowledge.
+  - Emphasize: release in finally block — a critical production concern.
+  - Distinguish from Flyweight when both are mentioned.
+  - Thread Pool (ExecutorService) is another prime example alongside DB connection pool.
+  - For coding: BlockingQueue with take()/offer() is the cleanest thread-safe pool.
+
+================================================================

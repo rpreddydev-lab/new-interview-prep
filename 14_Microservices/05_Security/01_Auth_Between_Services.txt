@@ -1,0 +1,202 @@
+================================================================================
+AUTHENTICATION BETWEEN MICROSERVICES
+================================================================================
+
+THE SERVICE-TO-SERVICE AUTHENTICATION PROBLEM
+-----------------------------------------------
+User-facing authentication (JWT from login) solves "who is this user?"
+But microservices also call each other — INTERNAL (east-west) traffic.
+
+Questions for internal calls:
+  - How does Order Service prove it's Order Service (not a rogue service)?
+  - How do we prevent any internal service from calling any other?
+  - How do we enforce: only Payment Service can call the Settlement Service?
+
+────────────────────────────────────────────────────────────────────────────────
+
+APPROACHES TO SERVICE AUTHENTICATION
+======================================
+
+1. NO INTERNAL AUTHENTICATION (Trust the network)
+   - Internal traffic implicitly trusted
+   - Only external calls authenticated
+   - Used in: small teams, closed VPCs with network segmentation
+   - Risk: If attacker gets inside the network, can call any service
+
+2. SHARED SECRET / API KEYS
+   - Each service pair shares a secret key
+   - Sender includes key in header: X-Service-Secret: abc123
+   - Simple but does NOT scale (N² keys for N services)
+   - Key rotation is painful
+   - Secret can be leaked in logs/memory
+
+3. JWT (CLIENT CREDENTIALS FLOW)
+   - Each service gets its own client_id/client_secret
+   - Exchanges credentials for a service JWT at auth server
+   - Includes JWT in inter-service calls
+   - Downstream services validate the JWT
+   - Scalable, standard OAuth2
+
+4. mTLS (MUTUAL TLS) — BEST PRACTICE
+   - Both client AND server present certificates
+   - Cryptographically proves service identity
+   - No shared secrets needed
+   - Automatic with service mesh (Istio/Linkerd)
+   - See: 03_mTLS_Mutual_TLS.txt for details
+
+────────────────────────────────────────────────────────────────────────────────
+
+JWT CLIENT CREDENTIALS BETWEEN SERVICES
+=========================================
+
+Service A calls Service B:
+
+  // Service A: get or cache service token
+  @Service
+  public class ServiceTokenProvider {
+
+    @Autowired WebClient authWebClient;
+    private volatile String cachedToken;
+    private volatile Instant tokenExpiry;
+
+    public String getServiceToken() {
+      if (cachedToken != null && Instant.now().isBefore(tokenExpiry.minusSeconds(60))) {
+        return cachedToken;  // Return cached token (refresh 1 min before expiry)
+      }
+      return fetchNewToken();
+    }
+
+    private String fetchNewToken() {
+      TokenResponse response = authWebClient.post()
+        .uri("/oauth2/token")
+        .bodyValue("grant_type=client_credentials" +
+                   "&client_id=order-service" +
+                   "&client_secret=" + serviceSecret +
+                   "&scope=inventory:read inventory:write")
+        .retrieve()
+        .bodyToMono(TokenResponse.class)
+        .block();
+
+      this.cachedToken = response.getAccessToken();
+      this.tokenExpiry = Instant.now().plusSeconds(response.getExpiresIn());
+      return cachedToken;
+    }
+  }
+
+  // Service A: inject token into outgoing calls
+  @Component
+  public class ServiceAuthFilter implements ExchangeFilterFunction {
+    @Autowired ServiceTokenProvider tokenProvider;
+
+    @Override
+    public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
+      ClientRequest authenticatedRequest = ClientRequest.from(request)
+        .header(HttpHeaders.AUTHORIZATION, "Bearer " + tokenProvider.getServiceToken())
+        .build();
+      return next.exchange(authenticatedRequest);
+    }
+  }
+
+  // WebClient with service auth filter
+  @Bean
+  public WebClient inventoryWebClient(ServiceAuthFilter filter) {
+    return WebClient.builder()
+      .baseUrl("http://inventory-service")
+      .filter(filter)
+      .build();
+  }
+
+  // Service B (Inventory Service): validates the JWT
+  // Uses the same Spring Security resource server config as user JWTs
+  // But validates audience and scope:
+  @PreAuthorize("hasAuthority('SCOPE_inventory:read')")
+  @GetMapping("/api/v1/inventory/{id}")
+  public InventoryDTO getInventory(@PathVariable Long id, @AuthenticationPrincipal Jwt jwt) {
+    String callerService = jwt.getSubject();  // "order-service"
+    log.info("Inventory called by service: {}", callerService);
+    return inventoryService.get(id);
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+PROPAGATING USER CONTEXT BETWEEN SERVICES
+============================================
+
+When Order Service calls Inventory Service on behalf of a user:
+  - Need to propagate WHO the user is (for audit, personalization)
+  - But Inventory Service should still know the CALLER is Order Service
+
+Approach 1: Forward original user JWT
+  // Order Service extracts user JWT from incoming request and forwards it
+  // Inventory Service validates the user JWT
+  // Authenticates USER, not the service
+
+  @GetMapping("/api/v1/inventory/{id}")
+  public InventoryDTO getInventory(@PathVariable Long id,
+      @RequestHeader("Authorization") String userJwt) {
+    // Pass through the user's JWT to downstream
+    return inventoryClient.getInventory(id, userJwt);
+  }
+
+Approach 2: Extract user claims and inject as headers (via API Gateway)
+  // API Gateway validates user JWT and injects verified claims as headers
+  // Downstream services trust these headers (because they can only be
+  // set by the trusted gateway, not by external clients)
+
+  @GetMapping("/api/v1/inventory/{id}")
+  public InventoryDTO getInventory(@PathVariable Long id,
+      @RequestHeader("X-User-Id") String userId,
+      @RequestHeader("X-User-Roles") String roles,
+      @AuthenticationPrincipal Jwt serviceJwt) {
+    // serviceJwt: verified service identity
+    // userId: verified by API Gateway
+    return inventoryService.get(id, userId);
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPIFFE AND SPIRE (MODERN STANDARD)
+=====================================
+
+SPIFFE (Secure Production Identity Framework For Everyone):
+  - Standard for service identity in distributed systems
+  - Each service gets a cryptographic identity: spiffe://trust-domain/service-name
+  - Issues X.509 certificates automatically
+  - Used by Istio under the hood for mTLS
+
+SPIRE (SPIFFE Runtime Environment):
+  - Implements SPIFFE
+  - Issues short-lived (1 hour) certificates
+  - Auto-rotates before expiry
+  - No long-lived secrets
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: How do microservices authenticate each other?
+A: Multiple approaches: JWT client credentials (service gets a token from auth
+   server using client_id/client_secret, includes in calls), mTLS (mutual
+   TLS — both sides present certificates, proving identity cryptographically),
+   or API keys (simpler but less scalable). mTLS via service mesh (Istio) is
+   the most secure and scalable approach.
+
+Q: How do you propagate user context through multiple service calls?
+A: Two main approaches: forward the original user JWT in each service call
+   (services validate it themselves), or have the API Gateway extract verified
+   user claims and inject as trusted headers (X-User-Id, X-User-Roles). The
+   second approach is preferred — simplifies downstream service logic.
+
+Q: What is the problem with using shared API keys for service authentication?
+A: N² key management problem — every service pair needs a shared key. Key
+   rotation must be coordinated across all services. Keys can leak in logs
+   or memory. Doesn't scale. JWT client credentials or mTLS are better.
+
+Q: What is SPIFFE?
+A: A standard for cryptographic service identity. Each service gets a SPIFFE ID
+   (e.g., spiffe://example.com/order-service) backed by an X.509 certificate.
+   SPIRE issues and rotates these certificates automatically. Used by Istio
+   for mTLS service identity without manual certificate management.
+
+================================================================================

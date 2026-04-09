@@ -1,0 +1,259 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DESIGN: DISTRIBUTED JOB SCHEDULER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FUNCTIONAL:
+  - Schedule one-off jobs: "run this job at 2024-01-15 14:30:00 UTC"
+  - Schedule recurring jobs: "run every day at midnight" (cron syntax)
+  - Job types: HTTP callback (POST to URL), or generic task (function ref)
+  - Retry failed jobs with configurable backoff
+  - Cancel/pause scheduled jobs
+  - Job execution history (success/failure, duration, logs)
+  - Job dependency: Job B runs only after Job A completes (bonus)
+
+NON-FUNCTIONAL:
+  - 10M jobs/day scheduled (one-off + recurring) = 116 jobs/second
+  - Jobs MUST fire within 1 second of scheduled time (p99)
+  - At-least-once execution (jobs may run more than once — workers must be idempotent)
+  - No missed jobs (even during partial outages)
+  - Scale: 1M concurrently scheduled jobs in the system
+  - High availability: coordinator failure must not stop scheduled jobs
+  - Exactly-once semantics for critical jobs: via external idempotency key
+
+OUT OF SCOPE: long-running workflows (DAGs), real-time streaming
+
+
+2. ESTIMATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SCHEDULED JOBS:
+  1M concurrently active jobs in system
+  10M new jobs scheduled/day = 116 jobs/second created
+
+EXECUTION RATE:
+  10M executions/day / 86,400 = 116 job executions/second average
+  Peak (midnight cron): millions of jobs scheduled at same second!
+  "All daily jobs at 00:00 UTC" → must handle burst
+
+COORDINATOR POLLING:
+  Poll DB every second for due jobs
+  Query: SELECT * FROM jobs WHERE scheduled_at <= NOW() AND status = 'PENDING' LIMIT 1000
+  Process up to 1,000 jobs/second per coordinator
+  For peak: scale to 10+ coordinators
+
+
+3. HIGH-LEVEL ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+COMPONENTS:
+  ┌─────────────────────────────────────────────────────────────┐
+  │  REST API (Job CRUD)                                        │
+  │  POST /jobs  GET /jobs/{id}  DELETE /jobs/{id}              │
+  └──────────────────────┬──────────────────────────────────────┘
+                         │
+                ┌────────▼────────┐
+                │  Job Store      │
+                │  (PostgreSQL)   │
+                │  all job defs,  │
+                │  schedules,     │
+                │  status         │
+                └────────┬────────┘
+                         │ poll every second
+                ┌────────▼────────┐
+                │  Coordinator    │
+                │  (multiple      │
+                │   instances)    │
+                │  - Find due jobs│
+                │  - Claim jobs   │
+                │  - Push to queue│
+                └────────┬────────┘
+                         │
+                ┌────────▼────────┐
+                │  Job Queue      │
+                │  (Kafka/SQS)    │
+                └────────┬────────┘
+                         │
+                ┌────────▼────────────────────────────────────┐
+                │  Worker Fleet (auto-scaling)                 │
+                │  - Execute job (HTTP callback or function)  │
+                │  - Report result back to Job Store          │
+                │  - Retry on failure                         │
+                └──────────────────────────────────────────────┘
+
+
+4. JOB DATA MODEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+JOBS TABLE (PostgreSQL):
+  job_id          BIGINT PRIMARY KEY (Snowflake)
+  name            VARCHAR(255)
+  type            VARCHAR(20)  -- 'one_off' or 'recurring'
+  cron_expr       VARCHAR(100) -- NULL for one-off (e.g. "0 * * * *" = hourly)
+  scheduled_at    TIMESTAMP    -- next execution time
+  status          VARCHAR(20)  -- PENDING / RUNNING / COMPLETED / FAILED / CANCELLED
+  payload         JSONB        -- HTTP endpoint, params, etc.
+  max_retries     INT
+  retry_count     INT DEFAULT 0
+  timeout_sec     INT          -- kill worker if exceeds this
+  lock_token      UUID         -- for optimistic locking (set when claimed by coordinator)
+  lock_expires_at TIMESTAMP    -- lock expires if worker crashes
+  created_at      TIMESTAMP
+  updated_at      TIMESTAMP
+
+KEY INDEXES:
+  CREATE INDEX idx_scheduled_pending ON jobs (scheduled_at, status)
+    WHERE status = 'PENDING';   -- partial index: only pending jobs
+  
+  This index makes the coordinator's polling query blazing fast:
+    EXPLAIN: Index Scan using idx_scheduled_pending
+    WHERE scheduled_at <= NOW()
+
+JOB EXECUTIONS TABLE (history):
+  execution_id    BIGINT PRIMARY KEY
+  job_id          BIGINT
+  status          VARCHAR(20)  -- COMPLETED / FAILED / TIMED_OUT
+  started_at      TIMESTAMP
+  completed_at    TIMESTAMP
+  duration_ms     INT
+  worker_id       VARCHAR(100)
+  error_message   TEXT
+  output          TEXT
+
+
+5. COORDINATOR — PREVENTING DOUBLE EXECUTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROBLEM: Multiple coordinator instances running
+         Both see the same due job
+         Both dispatch to workers → job executes twice!
+
+SOLUTION: PESSIMISTIC LOCKING (SELECT FOR UPDATE SKIP LOCKED)
+
+  -- Coordinator atomically claims a batch of due jobs
+  BEGIN TRANSACTION;
+  
+  SELECT job_id, payload, scheduled_at
+  FROM jobs
+  WHERE scheduled_at <= NOW()
+    AND status = 'PENDING'
+  ORDER BY scheduled_at ASC
+  LIMIT 100
+  FOR UPDATE SKIP LOCKED;     -- PostgreSQL: skip rows locked by other transactions
+  
+  -- Update claimed jobs to RUNNING with a lock token
+  UPDATE jobs
+  SET status = 'RUNNING',
+      lock_token = gen_random_uuid(),
+      lock_expires_at = NOW() + INTERVAL '5 minutes'
+  WHERE job_id IN (...claimed_ids...);
+  
+  COMMIT;
+  
+  -- Now safely dispatch to workers
+
+SKIP LOCKED BEHAVIOR:
+  Coordinator A acquires lock on jobs 1-100
+  Coordinator B runs same query simultaneously → SKIPS jobs 1-100 (locked)
+  Coordinator B gets jobs 101-200
+  No double dispatch!
+
+LOCK EXPIRY (for crash recovery):
+  If worker crashes, it never releases the lock
+  lock_expires_at: lock auto-expires in 5 minutes
+  Coordinator: also runs query: WHERE status = 'RUNNING' AND lock_expires_at < NOW()
+  These timed-out jobs get re-dispatched (at-least-once semantics)
+
+
+6. CRON SCHEDULING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CRON EXPRESSION: "0 2 * * 1" = every Monday at 02:00
+  Format: minute hour day-of-month month day-of-week
+
+RECURRING JOB LIFECYCLE:
+  1. Job definition stored with cron_expr
+  2. scheduled_at = next_occurrence(cron_expr, from: NOW())
+  3. Job fires, executes
+  4. Post-execution: scheduled_at = next_occurrence(cron_expr, from: execution_time)
+  5. Status reset to PENDING with new scheduled_at
+  
+  This way: only ONE row per recurring job in the DB (not one per execution)
+
+MISSED FIRE WINDOW:
+  If system was down for 2 hours, a daily job "should have fired" twice
+  Options:
+    1. FIRE_ONCE: Only fire once on recovery (catch up to now)
+    2. FIRE_ALL: Fire all missed instances (default for idempotent jobs)
+    3. DO_NOTHING: Skip missed fires (for time-sensitive reports)
+  
+  Per-job config: missed_fire_policy
+
+
+7. HANDLING MIDNIGHT BURST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROBLEM: At midnight UTC, 80% of daily cron jobs are scheduled
+         1M jobs become due simultaneously → coordinator overwhelmed
+
+SOLUTIONS:
+
+1. JITTER (Best approach):
+   When scheduling, add random offset: scheduled_at = requested_at + random(0, 60s)
+   Spread the burst over 60 seconds
+   "Daily at midnight" becomes "daily at midnight ± up to 60 seconds"
+   Load: 1M/60s = 16,667 jobs/second (manageable)
+
+2. PRIORITY QUEUE IN COORDINATOR:
+   Kafka: partition by job priority
+   Critical jobs processed first, bulk jobs from separate partition
+
+3. AUTOSCALING:
+   Coordinator detects queue depth > threshold → trigger worker fleet scale-up
+   AWS: ECS/EC2 auto-scaling group based on SQS queue depth metric
+
+
+8. TOOLS COMPARISON
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Tool            Language  Persistence  Distributed  Cron  Notes
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Quartz          Java      DB           Yes          Yes   Classic, complex
+Spring Scheduler Java     None         No           Yes   Simple, single node
+Sidekiq         Ruby      Redis        Yes          Sidekiq Cron addon
+Celery Beat     Python    DB/Redis     Limited      Yes   Django ecosystem
+AWS EventBridge Cloud     Managed      Yes          Yes   Fully managed, serverless
+Temporal        Any       Cassandra    Yes          Yes   Workflow orchestration
+Apache Airflow  Python    DB           Yes          Yes   DAG-based, data pipelines
+
+For interview design question: custom implementation with PostgreSQL + Kafka
+shows understanding of the core mechanics.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWER — "Design a distributed job scheduler"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"The hardest problem is preventing duplicate job execution with multiple
+coordinator instances running. I solve this with PostgreSQL's
+SELECT FOR UPDATE SKIP LOCKED — each coordinator atomically claims a
+batch of due jobs by locking the rows; other coordinators skip locked
+rows and claim different batches.
+
+The data model is simple: a jobs table with scheduled_at timestamp,
+status, and a lock_expires_at for crash recovery. A partial index on
+(scheduled_at, status) WHERE status='PENDING' makes the coordinator's
+polling query O(log N) instead of a full table scan.
+
+For recurring jobs: one row per job definition. After execution, the
+coordinator computes next_occurrence(cron_expr) and resets scheduled_at
+to the next fire time with status=PENDING. No row proliferation.
+
+The midnight burst problem: I add random jitter (0-60 seconds) to all
+scheduled_at times at job creation, spreading 1M simultaneous jobs
+over a 60-second window. This reduces peak load from 1M/second to ~17K/second.
+
+Workers operate at-least-once (idempotent job design required). Stale
+locks from crashed workers are reclaimed by the coordinator after
+lock_expires_at. This ensures no job is ever permanently stuck."

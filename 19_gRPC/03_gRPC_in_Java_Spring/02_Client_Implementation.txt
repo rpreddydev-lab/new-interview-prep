@@ -1,0 +1,411 @@
+================================================================
+gRPC CLIENT IMPLEMENTATION IN SPRING BOOT
+================================================================
+
+----------------------------------------------------------------
+1. THREE CLIENT STUB TYPES
+----------------------------------------------------------------
+
+For a service `OrderService`, protoc generates three stub types:
+
+  1. OrderServiceGrpc.OrderServiceBlockingStub
+     - Synchronous, blocking
+     - Works like a regular method call
+     - Throws StatusRuntimeException on error
+     - Best for: simple request-response in synchronous code
+
+  2. OrderServiceGrpc.OrderServiceStub  (async stub)
+     - Asynchronous, non-blocking
+     - Uses StreamObserver callbacks
+     - Required for client streaming and bidi streaming
+     - Best for: streaming RPCs, reactive-style code
+
+  3. OrderServiceGrpc.OrderServiceFutureStub
+     - Unary RPCs only (no streaming support)
+     - Returns ListenableFuture<T>
+     - Best for: unary RPCs in async non-reactive code
+
+┌──────────────────────┬──────────────┬──────────────┬────────────┐
+│ Use Case             │ Blocking     │ Async        │ Future     │
+├──────────────────────┼──────────────┼──────────────┼────────────┤
+│ Unary (simple)       │ ✅ Ideal      │ ✅ Possible   │ ✅ Good    │
+│ Server streaming     │ ✅ Iterator   │ ✅ Preferred  │ ❌ No      │
+│ Client streaming     │ ❌ No         │ ✅ Required   │ ❌ No      │
+│ Bidi streaming       │ ❌ No         │ ✅ Required   │ ❌ No      │
+│ Spring MVC (sync)    │ ✅ Natural    │ 🔶 Harder    │ ✅ OK      │
+│ Reactive / Virtual   │ 🔶 Blocks    │ ✅ Better    │ 🔶 OK      │
+└──────────────────────┴──────────────┴──────────────┴────────────┘
+
+----------------------------------------------------------------
+2. CHANNEL CREATION AND LIFECYCLE
+----------------------------------------------------------------
+
+A ManagedChannel represents a logical connection to a remote server.
+One channel can multiplex thousands of concurrent RPCs over HTTP/2.
+
+Manual channel creation:
+  ManagedChannel channel = ManagedChannelBuilder
+      .forAddress("localhost", 9090)
+      .usePlaintext()                           // no TLS (dev only)
+      .maxInboundMessageSize(16 * 1024 * 1024)  // 16MB
+      .keepAliveTime(30, TimeUnit.SECONDS)
+      .keepAliveTimeout(5, TimeUnit.SECONDS)
+      .idleTimeout(5, TimeUnit.MINUTES)
+      .build();
+
+  // Stubs are lightweight wrappers — create as many as needed
+  OrderServiceGrpc.OrderServiceBlockingStub stub =
+      OrderServiceGrpc.newBlockingStub(channel);
+
+With grpc-spring-boot-starter (@GrpcClient injection):
+  // Config in application.yml:
+  // grpc.client.order-service.address=static://localhost:9090
+  // grpc.client.order-service.negotiation-type=plaintext
+  
+  @GrpcClient("order-service")
+  private OrderServiceGrpc.OrderServiceBlockingStub blockingStub;
+  
+  @GrpcClient("order-service")
+  private OrderServiceGrpc.OrderServiceStub asyncStub;
+  
+  @GrpcClient("order-service")
+  private ManagedChannel channel;   // inject the raw channel if needed
+
+Channel shutdown (important — otherwise JVM won't exit):
+  channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
+  // grpc-spring-boot-starter handles this automatically
+
+----------------------------------------------------------------
+3. BLOCKING STUB USAGE
+----------------------------------------------------------------
+
+@Component
+public class OrderClient {
+  
+  @GrpcClient("order-service")
+  private OrderServiceGrpc.OrderServiceBlockingStub orderStub;
+  
+  // ── UNARY ─────────────────────────────────────────────────
+
+  public CreateOrderResponse createOrder(String customerId,
+                                         String productId,
+                                         int quantity) {
+    try {
+      return orderStub
+          .withDeadlineAfter(5, TimeUnit.SECONDS)
+          .createOrder(CreateOrderRequest.newBuilder()
+              .setCustomerId(customerId)
+              .setProductId(productId)
+              .setQuantity(quantity)
+              .build());
+    } catch (StatusRuntimeException e) {
+      Status status = e.getStatus();
+      switch (status.getCode()) {
+        case NOT_FOUND -> throw new OrderNotFoundException(status.getDescription());
+        case INVALID_ARGUMENT -> throw new BadRequestException(status.getDescription());
+        case DEADLINE_EXCEEDED -> throw new TimeoutException("Order service timed out");
+        case UNAVAILABLE -> throw new ServiceUnavailableException("Order service down");
+        default -> throw new RuntimeException("Unexpected gRPC error: " + status, e);
+      }
+    }
+  }
+  
+  // ── SERVER STREAMING (blocking iterator) ─────────────────
+
+  public List<Order> listOrders(String customerId) {
+    // Returns an Iterator<T> — blocks on each next()
+    Iterator<Order> iterator = orderStub
+        .withDeadlineAfter(30, TimeUnit.SECONDS)
+        .listOrders(ListOrdersRequest.newBuilder()
+            .setCustomerId(customerId)
+            .build());
+    
+    List<Order> orders = new ArrayList<>();
+    while (iterator.hasNext()) {
+      orders.add(iterator.next());
+    }
+    return orders;
+  }
+}
+
+----------------------------------------------------------------
+4. ASYNC STUB USAGE
+----------------------------------------------------------------
+
+@Component
+public class OrderAsyncClient {
+  
+  @GrpcClient("order-service")
+  private OrderServiceGrpc.OrderServiceStub asyncStub;
+  
+  // ── UNARY with CompletableFuture ─────────────────────────
+
+  public CompletableFuture<CreateOrderResponse> createOrderAsync(
+      CreateOrderRequest request) {
+    
+    CompletableFuture<CreateOrderResponse> future = new CompletableFuture<>();
+    
+    asyncStub
+        .withDeadlineAfter(5, TimeUnit.SECONDS)
+        .createOrder(request, new StreamObserver<CreateOrderResponse>() {
+          @Override
+          public void onNext(CreateOrderResponse value) {
+            future.complete(value);
+          }
+          @Override
+          public void onError(Throwable t) {
+            future.completeExceptionally(t);
+          }
+          @Override
+          public void onCompleted() { /* future was already completed in onNext */ }
+        });
+    
+    return future;
+  }
+  
+  // ── SERVER STREAMING ─────────────────────────────────────
+
+  public void watchOrders(String customerId,
+                          Consumer<Order> onOrder,
+                          Consumer<Throwable> onError,
+                          Runnable onComplete) {
+    
+    asyncStub
+        .withDeadlineAfter(60, TimeUnit.SECONDS)
+        .listOrders(
+            ListOrdersRequest.newBuilder().setCustomerId(customerId).build(),
+            new StreamObserver<Order>() {
+              @Override public void onNext(Order order) { onOrder.accept(order); }
+              @Override public void onError(Throwable t) { onError.accept(t); }
+              @Override public void onCompleted() { onComplete.run(); }
+            });
+  }
+  
+  // ── CLIENT STREAMING ─────────────────────────────────────
+
+  public CompletableFuture<BatchCreateResult> batchCreateOrders(
+      List<CreateOrderRequest> orders) {
+    
+    CompletableFuture<BatchCreateResult> future = new CompletableFuture<>();
+    
+    StreamObserver<CreateOrderRequest> requestObserver =
+        asyncStub.batchCreateOrders(new StreamObserver<BatchCreateResult>() {
+          @Override public void onNext(BatchCreateResult v) { future.complete(v); }
+          @Override public void onError(Throwable t) { future.completeExceptionally(t); }
+          @Override public void onCompleted() {}
+        });
+    
+    orders.forEach(requestObserver::onNext);
+    requestObserver.onCompleted();
+    
+    return future;
+  }
+}
+
+----------------------------------------------------------------
+5. FUTURE STUB USAGE
+----------------------------------------------------------------
+
+@Component
+public class OrderFutureClient {
+  
+  @GrpcClient("order-service")
+  private OrderServiceGrpc.OrderServiceFutureStub futureStub;
+  
+  // Returns ListenableFuture — can convert to CompletableFuture
+  public CompletableFuture<CreateOrderResponse> createOrder(CreateOrderRequest request) {
+    
+    ListenableFuture<CreateOrderResponse> listenableFuture =
+        futureStub.withDeadlineAfter(5, TimeUnit.SECONDS)
+                  .createOrder(request);
+    
+    // Convert Guava ListenableFuture to Java CompletableFuture
+    return toCompletableFuture(listenableFuture);
+  }
+  
+  private <T> CompletableFuture<T> toCompletableFuture(ListenableFuture<T> lf) {
+    CompletableFuture<T> cf = new CompletableFuture<>();
+    lf.addListener(() -> {
+      try {
+        cf.complete(lf.get());
+      } catch (ExecutionException e) {
+        cf.completeExceptionally(e.getCause());
+      } catch (Exception e) {
+        cf.completeExceptionally(e);
+      }
+    }, MoreExecutors.directExecutor());
+    return cf;
+  }
+}
+
+----------------------------------------------------------------
+6. CONFIGURING CHANNELS WITH grpc-spring-boot-starter
+----------------------------------------------------------------
+
+grpc:
+  client:
+    # Static address (hard-coded server address)
+    order-service:
+      address: static://192.168.1.10:9090,192.168.1.11:9090
+      negotiation-type: PLAINTEXT
+      deadline: 5000ms
+      keep-alive-time: 30s
+      max-inbound-message-size: 10485760   # 10MB in bytes
+    
+    # DNS-based service discovery
+    payment-service:
+      address: dns:///payment.company.internal:9090
+      negotiation-type: TLS
+      
+    # Consul / Eureka via spring-cloud-starter-consul-discovery
+    inventory-service:
+      address: discovery:///inventory-service
+      negotiation-type: PLAINTEXT
+      
+    # Kubernetes headless service (DNS round-robin)
+    notification-service:
+      address: dns:///notification.default.svc.cluster.local:9090
+      negotiation-type: TLS
+
+----------------------------------------------------------------
+7. CUSTOM CHANNEL CONFIGURATION (INTERCEPTORS, TLS)
+----------------------------------------------------------------
+
+For custom channel configuration, implement GrpcChannelConfigurer:
+
+@Bean
+public GrpcChannelConfigurer channelConfigurer(SslContext sslContext) {
+  return (channelBuilder, name) -> {
+    if (channelBuilder instanceof NettyChannelBuilder nettyBuilder) {
+      nettyBuilder
+          .sslContext(sslContext)
+          .maxInboundMessageSize(16 * 1024 * 1024)
+          .overrideAuthority("custom.authority.com");
+    }
+  };
+}
+
+Adding client-side interceptors:
+  @GrpcGlobalClientInterceptor
+  @Order(10)
+  public class AuthClientInterceptor implements ClientInterceptor {
+    
+    @Override
+    public <Req, Resp> ClientCall<Req, Resp> interceptCall(
+        MethodDescriptor<Req, Resp> method, CallOptions callOptions, Channel next) {
+      
+      return new ForwardingClientCall.SimpleForwardingClientCall<>(
+          next.newCall(method, callOptions)) {
+        
+        @Override
+        public void start(Listener<Resp> responseListener, Metadata headers) {
+          headers.put(
+              Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER),
+              "Bearer " + tokenProvider.getToken());
+          super.start(responseListener, headers);
+        }
+      };
+    }
+  }
+
+Or per-stub interceptors:
+  OrderServiceGrpc.OrderServiceBlockingStub stub = orderStub
+      .withInterceptors(new AuthClientInterceptor())
+      .withDeadlineAfter(5, TimeUnit.SECONDS);
+
+----------------------------------------------------------------
+8. DEADLINE AND CONTEXT PROPAGATION
+----------------------------------------------------------------
+
+Deadline propagation (parent → child service calls):
+  // In a gRPC server method:
+  @Override
+  public void createOrder(CreateOrderRequest request,
+                          StreamObserver<CreateOrderResponse> responseObserver) {
+    
+    // Get remaining deadline from current context
+    Deadline parentDeadline = Context.current().getDeadline();
+    
+    // Propagate to child call — subtract a buffer for overhead
+    boolean hasDeadline = parentDeadline != null;
+    
+    InventoryCheckResponse inventoryResponse = inventoryStub
+        .withDeadline(hasDeadline ? parentDeadline : Deadline.after(2, TimeUnit.SECONDS))
+        .checkAvailability(InventoryCheckRequest.newBuilder()
+            .setProductId(request.getProductId())
+            .setQuantity(request.getQuantity())
+            .build());
+    
+    // ... rest of logic
+  }
+
+Best practice: Always propagate the parent deadline or use a
+shorter deadline (never a longer one — that defeats the purpose).
+
+----------------------------------------------------------------
+9. STUB CACHING AND PERFORMANCE
+----------------------------------------------------------------
+
+Stubs are lightweight wrappers around a Channel and are thread-safe.
+You can (and should) reuse stubs.
+
+WRONG:
+  // Creating a new channel per request — extremely expensive!
+  public CreateOrderResponse createOrder(CreateOrderRequest req) {
+    ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9090)
+        .usePlaintext().build();
+    try {
+      return OrderServiceGrpc.newBlockingStub(channel).createOrder(req);
+    } finally {
+      channel.shutdown();
+    }
+  }
+
+RIGHT:
+  // Inject once, reuse everywhere — channel handles connection pooling
+  @GrpcClient("order-service")
+  private OrderServiceGrpc.OrderServiceBlockingStub orderStub;
+  
+  // orderStub is thread-safe and can be called from multiple threads
+
+----------------------------------------------------------------
+10. INTERVIEW KEY POINTS
+----------------------------------------------------------------
+
+Q: What is the difference between BlockingStub and FutureStub?
+A: Both support only unary RPCs (no streaming). BlockingStub blocks the
+   calling thread until the response arrives, throwing StatusRuntimeException
+   on error. FutureStub returns a ListenableFuture immediately, allowing
+   the calling thread to continue. You can register callbacks on the future
+   or convert it to CompletableFuture. FutureStub is useful in async pipelines
+   or when you want to fan out multiple parallel calls.
+
+Q: How does @GrpcClient work under the hood?
+A: grpc-spring-boot-starter registers a BeanDefinitionRegistryPostProcessor
+   that scans beans for fields/parameters annotated with @GrpcClient. For
+   each unique client name, it creates a GrpcChannelFactory that reads the
+   corresponding configuration from application.yml (grpc.client.<name>.*).
+   The factory creates a ManagedChannel and wraps it appropriately. When
+   a field is of type BlockingStub, AsyncStub, or FutureStub, the framework
+   creates the stub via reflection using the generated newBlockingStub(),
+   newStub(), or newFutureStub() methods.
+
+Q: Why should you never create a new ManagedChannel per request?
+A: Creating a channel involves TCP connection establishment (+ TLS handshake
+   if encrypted), which is expensive. Channels are designed to be long-lived
+   — they maintain a pool of HTTP/2 connections and multiplex all RPCs over
+   them. Creating a new channel per request wastes resources, increases
+   latency, and can exhaust file descriptors. Instead, create one channel
+   per target service and reuse it for all stubs.
+
+Q: How do you handle gRPC client errors in Spring Boot?
+A: Catch StatusRuntimeException and switch on e.getStatus().getCode() to
+   translate to application-specific exceptions. For example: NOT_FOUND →
+   ResourceNotFoundException, UNAVAILABLE → ServiceUnavailableException.
+   You can also register a global client interceptor that handles errors
+   centrally (e.g., logging, circuit breaking, metrics). For reactive code,
+   use onErrorMap() in Project Reactor to transform gRPC errors reactively.
+
+================================================================
+END OF FILE
+================================================================

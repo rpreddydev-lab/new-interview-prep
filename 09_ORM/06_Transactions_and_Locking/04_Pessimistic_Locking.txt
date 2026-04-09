@@ -1,0 +1,161 @@
+================================================================
+Pessimistic Locking in JPA/Hibernate
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHAT IS PESSIMISTIC LOCKING?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Pessimistic locking acquires a DB lock at READ time, preventing other
+transactions from modifying (or reading) the locked row until the
+lock is released at commit/rollback.
+
+Use pessimistic locking when:
+- Conflict probability is high (frequent concurrent updates to same row)
+- "Last write wins" is unacceptable
+- Critical financial operations (inventory decrement, seat reservation)
+- You need to ensure atomicity of read → check → update
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. LOCK MODE TYPES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+LockModeType              | SQL Generated         | Blocks
+──────────────────────────|───────────────────────|─────────────────────────────────────
+PESSIMISTIC_READ          | SELECT ... FOR SHARE  | Other writes; allows concurrent reads
+PESSIMISTIC_WRITE         | SELECT ... FOR UPDATE | Other reads AND writes (exclusive lock)
+PESSIMISTIC_FORCE_INCREMENT| SELECT + version++   | PESSIMISTIC_WRITE + bumps @Version
+
+Most commonly used: PESSIMISTIC_WRITE (exclusive lock)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. PESSIMISTIC LOCKING WITH ENTITYMANAGER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Lock on find:
+Product product = em.find(Product.class, id, LockModeType.PESSIMISTIC_WRITE);
+// SQL: SELECT * FROM products WHERE id = ? FOR UPDATE
+
+// Lock on existing entity:
+em.lock(product, LockModeType.PESSIMISTIC_WRITE);
+
+// Lock via query:
+Product product = em.createQuery("SELECT p FROM Product p WHERE p.id = :id", Product.class)
+    .setParameter("id", id)
+    .setLockMode(LockModeType.PESSIMISTIC_WRITE)
+    .getSingleResult();
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. PESSIMISTIC LOCKING IN SPRING DATA JPA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Repository
+public interface ProductRepository extends JpaRepository<Product, Long> {
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT p FROM Product p WHERE p.id = :id")
+    Optional<Product> findByIdForUpdate(@Param("id") Long id);
+
+    // Works with derived queries too:
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    Optional<Product> findByIdAndStatus(Long id, String status);
+}
+
+// Service usage:
+@Transactional
+public void purchaseProduct(Long productId, int qty) {
+    Product p = productRepo.findByIdForUpdate(productId).orElseThrow();
+    // Row is now locked — no other transaction can update until this tx ends
+    if (p.getStock() < qty) throw new InsufficientStockException();
+    p.setStock(p.getStock() - qty);
+    productRepo.save(p);
+    // Lock released on commit
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. LOCK TIMEOUT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Prevent indefinite blocking with lock timeout:
+
+// Via hint:
+Product p = em.find(Product.class, id, LockModeType.PESSIMISTIC_WRITE,
+    Map.of("jakarta.persistence.lock.timeout", 5000));  // 5 seconds
+
+// Via query hint:
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "5000"))
+Optional<Product> findByIdForUpdate(Long id);
+
+// SKIP LOCKED (PostgreSQL / Oracle / MySQL 8+):
+// Skip rows already locked — useful for task queues
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "-2"))  // -2 = skip locked
+List<Task> findByStatusAndSkipLocked(String status, Pageable pageable);
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. DEADLOCK PREVENTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Deadlock: Transaction A holds lock on row X and wants row Y.
+          Transaction B holds lock on row Y and wants row X.
+          Both wait forever.
+
+Prevention strategies:
+1. Always lock resources in a CONSISTENT ORDER
+   (e.g., always lock Product before Order, not the other way)
+
+2. Use SKIP LOCKED for task queues (skip rows already being processed)
+
+3. Keep transactions SHORT to minimize lock hold time
+
+4. Use optimistic locking for high-read, low-conflict scenarios instead
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. OPTIMISTIC vs PESSIMISTIC COMPARISON
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Aspect             | Optimistic                  | Pessimistic
+───────────────────|─────────────────────────────|──────────────────────────────────
+Lock acquired      | At commit time (version check)| Immediately on SELECT
+DB lock            | NO                          | YES (FOR UPDATE / FOR SHARE)
+Conflict detection | Late (exception on commit)  | Early (blocks immediately)
+Throughput         | High (no blocking reads)    | Lower (blocking)
+Deadlock risk      | Low                         | Higher
+Retry needed       | YES (on OptimisticLockExc)  | NO (waits or timeout)
+Use when           | Conflicts rare, reads heavy | Conflicts frequent, writes critical
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. INTERVIEW QUICK HITS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is PESSIMISTIC_WRITE and when do you use it?
+A: PESSIMISTIC_WRITE generates SELECT ... FOR UPDATE, acquiring an exclusive
+   row-level lock. No other transaction can read or write the locked row until
+   the lock is released. Use it for critical sections where you must ensure
+   atomicity of read → check → update, like inventory reservation or
+   payment processing.
+
+Q: What is PESSIMISTIC_READ?
+A: PESSIMISTIC_READ generates SELECT ... FOR SHARE. Multiple transactions
+   can hold a shared lock simultaneously (concurrent reads are allowed),
+   but it blocks any transaction attempting to write. Use when you need
+   to prevent modifications but allow others to read.
+
+Q: What is the difference between PESSIMISTIC_WRITE and PESSIMISTIC_FORCE_INCREMENT?
+A: PESSIMISTIC_FORCE_INCREMENT does everything PESSIMISTIC_WRITE does, plus
+   it increments the @Version column even if the entity data didn't change.
+   Used when you want to signal that a row was "touched" and invalidate
+   other optimistic lock holders.
+
+Q: How do you prevent deadlocks in a pessimistic locking scenario?
+A: Always acquire locks in a consistent order across all transactions.
+   Use short transaction boundaries to minimize lock hold time. Consider
+   SELECT SKIP LOCKED for work queues. Set lock timeout to avoid indefinite
+   waits. If deadlock is unavoidable at DB level, catch the exception and retry.
+
+Q: What is SELECT SKIP LOCKED and when is it useful?
+A: SKIP LOCKED skips rows that are already locked by another transaction
+   instead of waiting. It's ideal for job queue patterns — multiple workers
+   can each grab different tasks without blocking each other.
+   In Spring: use jakarta.persistence.lock.timeout = -2 (Hibernate hint).

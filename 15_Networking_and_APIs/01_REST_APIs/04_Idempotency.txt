@@ -1,0 +1,308 @@
+================================================================================
+IDEMPOTENCY — IN DEPTH
+================================================================================
+
+DEFINITION
+-----------
+An operation is IDEMPOTENT if performing it once produces the same result as
+performing it multiple times.
+
+f(f(x)) = f(x)   ← mathematical definition
+
+In HTTP APIs: calling an endpoint N times leaves the server in the same state
+as calling it once.
+
+SAFE: Has no side effects (read-only).
+All safe operations are idempotent, but not all idempotent operations are safe.
+
+================================================================================
+1. IDEMPOTENCY OF HTTP METHODS
+================================================================================
+
+METHOD    IDEMPOTENT   SAFE    REASON
+--------  -----------  ------  -------------------------------------------------
+GET       YES          YES     Read-only; no state change
+HEAD      YES          YES     Read-only
+PUT       YES          NO      Replaces resource with same data each time
+DELETE    YES          NO      First call removes; subsequent calls → 404 (same state)
+OPTIONS   YES          YES     Read-only metadata
+POST      NO           NO      Creates new resource each call (unless with key)
+PATCH     CONDITIONAL  NO      Depends on semantics (absolute vs relative change)
+
+DELETE IDEMPOTENCY NUANCE:
+  First call:  DELETE /users/42 → 204 No Content (deleted)
+  Second call: DELETE /users/42 → 404 Not Found  (still gone)
+  
+  The STATE is the same: user 42 does not exist.
+  Status code differs, but that's an informational difference, not a state change.
+  → DELETE is idempotent.
+
+PATCH CONDITIONAL IDEMPOTENCY:
+  IDEMPOTENT:     PATCH /users/42 { "name": "Alice" }
+                  Calling 5 times → name is still "Alice" ✅
+  
+  NOT IDEMPOTENT: PATCH /counter { "operation": "increment" }
+                  Each call increases counter by 1 ❌
+
+================================================================================
+2. WHY IDEMPOTENCY MATTERS IN DISTRIBUTED SYSTEMS
+================================================================================
+
+IN A DISTRIBUTED SYSTEM, THESE HAPPEN REGULARLY:
+  - Network timeouts (request sent, response lost)
+  - Connection resets mid-request
+  - Load balancer retries
+  - Client retry logic (exponential backoff)
+  - Duplicate messages from message queues
+
+WITHOUT IDEMPOTENCY:
+  Client sends: POST /payments { amount: 100 }
+  Server processes payment → charges card
+  Response gets lost (network timeout)
+  Client retries: POST /payments { amount: 100 }
+  Server processes payment AGAIN → charges card TWICE 💥
+
+WITH IDEMPOTENCY KEY:
+  Client sends: POST /payments
+  Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
+  { amount: 100 }
+  
+  Server charges card → stores (key → response) in Redis
+  Response gets lost
+  
+  Client retries with SAME key: POST /payments
+  Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
+  { amount: 100 }
+  
+  Server: "I've seen this key. Here's the cached response." 
+  → Returns original 201 Created response without charging again ✅
+
+================================================================================
+3. IDEMPOTENCY KEY PATTERN
+================================================================================
+
+IMPLEMENTATION STEPS:
+
+Client side:
+  1. Generate UUID before sending request
+  2. Send UUID in Idempotency-Key header
+  3. Retry with SAME UUID on failure
+  4. New operations get new UUIDs
+
+Server side:
+  1. On receiving request: check Redis/DB for key
+  2. If found: return stored response (don't reprocess)
+  3. If not found: process request, store (key → response, status_code, timestamp)
+  4. Expire keys after TTL (e.g., 24 hours)
+
+JAVA IMPLEMENTATION EXAMPLE:
+
+  @PostMapping("/payments")
+  public ResponseEntity<PaymentResponse> createPayment(
+          @RequestHeader("Idempotency-Key") String idempotencyKey,
+          @RequestBody PaymentRequest request) {
+      
+      // Check if we've seen this key
+      Optional<CachedResponse> cached = idempotencyStore.get(idempotencyKey);
+      if (cached.isPresent()) {
+          return ResponseEntity
+              .status(cached.get().getStatus())
+              .body(cached.get().getBody());
+      }
+      
+      // Process payment
+      PaymentResponse response = paymentService.processPayment(request);
+      
+      // Store response (TTL = 24 hours)
+      idempotencyStore.store(idempotencyKey, response, 201, Duration.ofHours(24));
+      
+      return ResponseEntity.status(201).body(response);
+  }
+
+REDIS STORAGE:
+  Key:   idempotency:{userId}:{idempotency-key}
+  Value: { status: 201, body: {...}, timestamp: "2026-04-08T10:00:00Z" }
+  TTL:   86400 seconds (24 hours)
+
+================================================================================
+4. DATABASE-LEVEL IDEMPOTENCY
+================================================================================
+
+NATURAL IDEMPOTENCY (best approach):
+  Design operations that are naturally idempotent in the DB.
+
+  INSERT with unique constraint:
+    INSERT INTO orders (idempotency_key, amount, ...)
+    VALUES ('key123', 100, ...)
+    ON CONFLICT (idempotency_key) DO NOTHING
+    RETURNING id, status
+  
+  First call: inserts and returns new order.
+  Retry:      ON CONFLICT returns existing order. ✅
+
+  UPSERT:
+    INSERT INTO user_preferences (user_id, theme, ...)
+    VALUES (42, 'dark', ...)
+    ON CONFLICT (user_id) DO UPDATE SET theme = EXCLUDED.theme
+  
+  Always ends in the same state. ✅
+
+DEDUPLICATION TABLE:
+  CREATE TABLE processed_events (
+    event_id VARCHAR(36) PRIMARY KEY,
+    processed_at TIMESTAMP,
+    result_id BIGINT
+  );
+  
+  Before processing: check if event_id exists
+  After processing:  insert event_id
+  → Prevents duplicate processing of events from Kafka/SQS.
+
+================================================================================
+5. OPTIMISTIC LOCKING (Conditional Idempotency)
+================================================================================
+
+PROBLEM: Concurrent updates where last-write-wins causes data loss.
+SOLUTION: Use ETag/version number to detect concurrent modifications.
+
+FLOW:
+  1. GET /users/42 → ETag: "v3"
+  2. Client modifies locally
+  3. PUT /users/42 If-Match: "v3" { "name": "Updated" }
+  4a. ETag matches (no one else modified): 200 OK, new ETag: "v4"
+  4b. ETag doesn't match (concurrent modify): 412 Precondition Failed
+
+IMPLEMENTATION:
+  @PutMapping("/users/{id}")
+  public ResponseEntity<User> updateUser(
+          @PathVariable Long id,
+          @RequestHeader(value = "If-Match", required = false) String ifMatch,
+          @RequestBody User user) {
+      
+      User existing = userRepo.findById(id).orElseThrow(NotFoundException::new);
+      String currentEtag = "\"" + existing.getVersion() + "\"";
+      
+      if (ifMatch != null && !ifMatch.equals(currentEtag)) {
+          return ResponseEntity.status(HttpStatus.PRECONDITION_FAILED).build();
+      }
+      
+      User updated = userRepo.save(user);
+      return ResponseEntity.ok()
+          .eTag(String.valueOf(updated.getVersion()))
+          .body(updated);
+  }
+
+  // Entity with version:
+  @Entity
+  public class User {
+      @Version  // JPA optimistic locking
+      private Long version;
+      ...
+  }
+
+JPA @VERSION:
+  JPA's @Version annotation automatically implements optimistic locking.
+  If two transactions try to update the same entity concurrently:
+  → Second transaction throws OptimisticLockException
+  → Handled by returning 409 Conflict or retrying.
+
+================================================================================
+6. IDEMPOTENCY IN MESSAGE QUEUES
+================================================================================
+
+MESSAGE QUEUES GUARANTEE AT-LEAST-ONCE DELIVERY:
+  A message may be delivered multiple times (retry on failure).
+  Consumers must handle duplicate messages.
+
+CONSUMER DEDUPLICATION:
+  Track messageId in a deduplication table.
+  Before processing: check if messageId was already processed.
+  
+  // Kafka consumer example
+  @KafkaListener(topics = "orders")
+  public void processOrder(OrderEvent event) {
+      if (processedEvents.contains(event.getEventId())) {
+          log.warn("Duplicate event: {}", event.getEventId());
+          return;  // Skip duplicate
+      }
+      
+      orderService.processOrder(event);
+      processedEvents.add(event.getEventId());  // Mark as processed
+  }
+
+OUTBOX PATTERN (for idempotent event publishing):
+  1. Write to DB and outbox table in same transaction
+  2. Outbox reader polls and publishes events to Kafka
+  3. Event has unique ID; consumer deduplicates on ID
+  → Prevents "charge customer but don't publish event" scenarios
+
+================================================================================
+7. IDEMPOTENCY IN PAYMENT SYSTEMS (Real-World Case Study)
+================================================================================
+
+STRIPE'S IDEMPOTENCY KEY PATTERN:
+  - Client generates UUID per payment attempt
+  - Sent as Idempotency-Key header
+  - Stripe stores response for 30 days
+  - Duplicate key with different params → 422 error
+
+PAYMENT SCENARIOS:
+  Scenario 1: Request succeeds, response lost
+    Client retries with same key → Server returns cached success response ✅
+    Card charged once ✅
+
+  Scenario 2: Request fails (card declined)
+    Client retries with same key → Same failure response returned ✅
+    Card not charged ✅
+
+  Scenario 3: Server failed before saving result
+    Client retries with same key → Server reprocesses (key not in cache)
+    This is a risk — handle with transactions and deduplication logic
+
+  Scenario 4: Client retries with SAME key but DIFFERENT body
+    Stripe returns 422: "This idempotency key was used with different params"
+    Prevents accidental modification of already-processed requests
+
+================================================================================
+8. INTERVIEW QUESTIONS — IDEMPOTENCY
+================================================================================
+
+Q1: What is idempotency? Give an HTTP example.
+    An operation is idempotent if performing it N times produces the same result
+    as performing it once. HTTP example: DELETE /users/42 — first call deletes
+    and returns 204, subsequent calls return 404, but the resource state (absent)
+    is the same. GET is both safe and idempotent. PUT replaces a resource with
+    the same data each time, resulting in the same final state.
+
+Q2: Why is POST not idempotent and how do you make it so?
+    POST creates a new resource on each call, so calling it N times creates N
+    resources. To make it idempotent: use an Idempotency-Key header (UUID
+    generated by client). Server caches response for that key; duplicate
+    requests return cached response without reprocessing.
+
+Q3: Why does idempotency matter in microservices?
+    Microservices communicate over networks where timeouts, retries, and
+    at-least-once delivery are common. Without idempotency, retries cause
+    duplicate orders, double charges, or inconsistent state. With idempotency,
+    retries are safe and the system converges to correct state.
+
+Q4: What is optimistic locking and how does it use ETags?
+    Optimistic locking assumes concurrent modifications are rare. Client GETs
+    resource with ETag. Sends ETag in If-Match header on update. If ETag
+    doesn't match current version (someone else changed it), return 412
+    Precondition Failed. Client fetches latest version and retries with new ETag.
+    JPA @Version annotation automates this at the database layer.
+
+Q5: How do you handle duplicate messages in Kafka consumers?
+    Kafka provides at-least-once delivery. Consumers must implement deduplication:
+    track message ID in a Redis set or database table. Before processing, check
+    if ID was seen. If yes, skip. If no, process and record ID. Or design the
+    consumer operation to be naturally idempotent (upsert, conditional insert).
+
+Q6: What is the difference between idempotent and safe?
+    Safe = no side effects (read-only); does not change server state.
+    Idempotent = result is same regardless of call count; may have side effects
+    on first call. All safe operations are idempotent. DELETE and PUT are
+    idempotent but not safe (they modify state).
+
+================================================================================

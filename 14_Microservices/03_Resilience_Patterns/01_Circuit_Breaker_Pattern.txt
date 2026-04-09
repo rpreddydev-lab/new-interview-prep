@@ -1,0 +1,285 @@
+================================================================================
+CIRCUIT BREAKER PATTERN
+================================================================================
+
+MOTIVATION
+----------
+Named after the electrical circuit breaker: when a fault is detected, the
+breaker "trips" (opens the circuit), stopping the flow of electricity to
+prevent further damage.
+
+In software: when downstream service failures are detected, stop sending
+requests to it to:
+  1. Prevent resource exhaustion (threads, connections)
+  2. Allow the failing service time to recover
+  3. Provide immediate fallback responses instead of slow failures
+
+────────────────────────────────────────────────────────────────────────────────
+
+HOW THE CIRCUIT BREAKER WORKS — 3 STATES
+==========================================
+
+STATE 1: CLOSED (Normal Operation)
+  - Requests flow through normally
+  - Each request result recorded (success/failure)
+  - Failure rate tracked in a sliding window
+  - When failure rate > threshold → transition to OPEN
+
+STATE 2: OPEN (Failing Fast)
+  - ALL requests are blocked immediately (no calls to downstream)
+  - Fallback is returned without attempting the call
+  - A wait timer starts (e.g., 10 seconds)
+  - When timer expires → transition to HALF-OPEN
+
+STATE 3: HALF-OPEN (Testing Recovery)
+  - Limited number of test requests are allowed through
+  - If test requests succeed → transition back to CLOSED
+  - If test requests fail → transition back to OPEN
+  - This allows the circuit to "self-heal" when the service recovers
+
+State Machine:
+  CLOSED ──(failure rate > threshold)──→ OPEN
+  OPEN ──(wait duration expires)──→ HALF-OPEN
+  HALF-OPEN ──(test calls succeed)──→ CLOSED
+  HALF-OPEN ──(test calls fail)──→ OPEN
+
+────────────────────────────────────────────────────────────────────────────────
+
+SLIDING WINDOW TYPES
+=====================
+
+COUNT-BASED WINDOW:
+  Track last N calls. If X% of last N calls failed → OPEN.
+  Example: Last 10 calls, 5 failed (50% failure) → circuit opens
+
+TIME-BASED WINDOW:
+  Track calls in last N seconds. If X% of calls in that window failed → OPEN.
+  Example: Last 60 seconds, 50% failure rate → circuit opens
+
+COUNT-BASED is simpler. TIME-BASED is more accurate for variable traffic.
+
+────────────────────────────────────────────────────────────────────────────────
+
+RESILIENCE4J CIRCUIT BREAKER CONFIGURATION
+============================================
+
+application.yml:
+  resilience4j:
+    circuitbreaker:
+      instances:
+        inventoryService:
+          # Sliding window
+          sliding-window-type: COUNT_BASED      # COUNT_BASED or TIME_BASED
+          sliding-window-size: 10               # Last 10 calls (count) or last 10s (time)
+
+          # Thresholds
+          failure-rate-threshold: 50            # 50% failure rate → OPEN
+          slow-call-rate-threshold: 80          # 80% of calls > slowCallDuration → OPEN
+          slow-call-duration-threshold: 2s      # Calls > 2s counted as "slow"
+
+          # Minimum calls before evaluating
+          minimum-number-of-calls: 5            # Need at least 5 calls before tripping
+
+          # OPEN → HALF-OPEN transition
+          wait-duration-in-open-state: 10s      # Stay OPEN for 10s before testing
+
+          # HALF-OPEN behavior
+          permitted-number-of-calls-in-half-open-state: 3  # 3 test calls in HALF-OPEN
+
+          # What counts as failure
+          record-exceptions:
+            - java.io.IOException
+            - java.util.concurrent.TimeoutException
+            - feign.FeignException
+
+          # What does NOT count as failure
+          ignore-exceptions:
+            - com.example.exceptions.BusinessException
+
+SPRING BOOT ANNOTATION USAGE:
+  @Service
+  public class InventoryService {
+
+    @CircuitBreaker(name = "inventoryService", fallbackMethod = "defaultInventory")
+    public InventoryDTO getInventory(Long productId) {
+      return inventoryClient.getInventory(productId);  // HTTP call
+    }
+
+    // Fallback method — same return type, extra Throwable parameter
+    public InventoryDTO defaultInventory(Long productId, Throwable ex) {
+      log.warn("Circuit breaker triggered for product {}: {}", productId, ex.getMessage());
+      // Return cached/default inventory
+      return new InventoryDTO(productId, 0, InventoryStatus.UNKNOWN);
+    }
+  }
+
+PROGRAMMATIC API:
+  @Autowired
+  CircuitBreakerRegistry circuitBreakerRegistry;
+
+  public InventoryDTO getInventory(Long productId) {
+    CircuitBreaker cb = circuitBreakerRegistry.circuitBreaker("inventoryService");
+
+    Supplier<InventoryDTO> decorated = CircuitBreaker.decorateSupplier(cb,
+      () -> inventoryClient.getInventory(productId)
+    );
+
+    return Try.ofSupplier(decorated)
+      .recover(CallNotPermittedException.class,
+        ex -> new InventoryDTO(productId, 0, InventoryStatus.UNKNOWN))
+      .get();
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+CIRCUIT BREAKER EVENTS (MONITORING)
+======================================
+Resilience4j emits events you can listen to:
+
+  @Component
+  public class CircuitBreakerEventListener {
+    @PostConstruct
+    public void register(CircuitBreakerRegistry registry) {
+      registry.circuitBreaker("inventoryService")
+        .getEventPublisher()
+        .onStateTransition(event -> log.warn(
+          "Circuit breaker state changed: {} → {}",
+          event.getStateTransition().getFromState(),
+          event.getStateTransition().getToState()
+        ))
+        .onFailureRateExceeded(event -> log.error(
+          "Failure rate exceeded: {}%", event.getFailureRate()
+        ))
+        .onCallNotPermitted(event -> log.warn("Call blocked by open circuit breaker"));
+    }
+  }
+
+Metrics exposed to Prometheus/Grafana:
+  resilience4j_circuitbreaker_state          # 0=CLOSED, 1=OPEN, 2=HALF_OPEN
+  resilience4j_circuitbreaker_failure_rate   # Current failure rate %
+  resilience4j_circuitbreaker_calls_total    # Total calls by result
+
+────────────────────────────────────────────────────────────────────────────────
+
+CIRCUIT BREAKER WITH FEIGN CLIENT
+====================================
+  # application.yml
+  feign:
+    circuitbreaker:
+      enabled: true
+
+  @FeignClient(name = "inventory-service", fallback = InventoryFallback.class)
+  public interface InventoryClient {
+    @GetMapping("/api/v1/inventory/{id}")
+    InventoryDTO getInventory(@PathVariable Long id);
+  }
+
+  @Component
+  public class InventoryFallback implements InventoryClient {
+    @Override
+    public InventoryDTO getInventory(Long id) {
+      return new InventoryDTO(id, 0, InventoryStatus.UNKNOWN);
+    }
+  }
+
+FALLBACK WITH CAUSE (to log the actual exception):
+  @FeignClient(name = "inventory-service", fallbackFactory = InventoryFallbackFactory.class)
+  public interface InventoryClient { ... }
+
+  @Component
+  public class InventoryFallbackFactory implements FallbackFactory<InventoryClient> {
+    @Override
+    public InventoryClient create(Throwable cause) {
+      return id -> {
+        log.error("Inventory service fallback for id={}: {}", id, cause.getMessage());
+        return new InventoryDTO(id, 0, InventoryStatus.UNKNOWN);
+      };
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+CIRCUIT BREAKER DESIGN CONSIDERATIONS
+========================================
+
+1. TUNE THE THRESHOLDS CAREFULLY
+   - Too sensitive: false positives (trips on normal traffic spikes)
+   - Too insensitive: cascading failures before it trips
+   - Start with 50% failure rate, 10 calls window, 10s wait
+
+2. MEANINGFUL FALLBACKS
+   - Don't just return null or throw exception in fallback
+   - Return cached data, default values, or degraded but useful responses
+   - Log the fallback activation with the cause
+
+3. SEPARATE CIRCUIT BREAKERS PER DEPENDENCY
+   - inventoryService_CB, paymentService_CB, etc.
+   - Don't share circuit breakers across different services
+
+4. BULKHEAD + CIRCUIT BREAKER
+   - Use both together: Bulkhead limits concurrent calls
+   - Circuit Breaker stops calls when too many are failing
+   - Complementary patterns
+
+5. HALF-OPEN STATE TEST CALLS
+   - Keep permitted-number-of-calls-in-half-open-state small (3-5)
+   - Too many: overloads a partially recovering service
+   - Too few: slow to confirm recovery
+
+────────────────────────────────────────────────────────────────────────────────
+
+CIRCUIT BREAKER vs RETRY — WHEN TO USE WHICH?
+===============================================
+
+Use RETRY when:
+  - The failure is transient (network blip, 503 due to pod restart)
+  - You expect the service to be available again quickly
+  - Retrying makes logical sense (idempotent operations)
+
+Use CIRCUIT BREAKER when:
+  - The service is consistently failing (DB down, service crashed)
+  - You want to fail fast instead of waiting for timeouts
+  - You want automatic recovery detection
+
+Use BOTH:
+  Retry handles transient failures (3 attempts with backoff)
+  If all retries fail, Circuit Breaker records the failure
+  After threshold crossed, Circuit Breaker opens (no more retries attempted)
+
+  Order: CircuitBreaker → Retry
+  (Circuit Breaker checks first; if OPEN, don't even try/retry)
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: Explain the Circuit Breaker pattern and its 3 states.
+A: Circuit Breaker monitors calls to a downstream service.
+   CLOSED: calls flow through, failures tracked in sliding window.
+   OPEN: trips when failure rate > threshold; fails fast (no calls to service).
+   HALF-OPEN: after wait period, allows limited test calls; CLOSED if they succeed,
+   OPEN again if they fail.
+
+Q: How do you implement Circuit Breaker in Spring Boot?
+A: Using Resilience4j. Add dependency + AOP. Use @CircuitBreaker annotation on
+   service methods with a fallbackMethod parameter. Configure thresholds in
+   application.yml: failure rate threshold, sliding window size, wait duration.
+
+Q: What should a fallback method return?
+A: A meaningful degraded response — cached data, default values, or a helpful
+   error response. Never return null silently. Log the fallback with the cause.
+   The response should indicate the degradation to the client/calling service.
+
+Q: What's the difference between COUNT_BASED and TIME_BASED sliding windows?
+A: COUNT_BASED tracks the last N calls regardless of time. TIME_BASED tracks
+   calls in the last N seconds. TIME_BASED is more accurate for variable traffic
+   volumes; COUNT_BASED is simpler to reason about.
+
+Q: What are "slow calls" in Circuit Breaker?
+A: Calls that complete but take longer than a configured threshold (e.g., 2s).
+   Resilience4j counts slow calls as a type of "failure" that contributes to
+   the slow-call-rate. This trips the circuit even if technically successful
+   (slow responses degrade the system just like failures).
+
+================================================================================

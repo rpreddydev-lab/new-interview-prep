@@ -1,0 +1,306 @@
+================================================================================
+REDIS LUA SCRIPTING — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. WHAT IS LUA SCRIPTING IN REDIS?
+────────────────────────────────────
+  Redis embeds the Lua interpreter (since Redis 2.6).
+  You can run Lua scripts that execute atomically on the Redis server.
+
+  KEY PROPERTIES:
+  - Scripts run atomically: no other commands execute while script runs
+  - Script = a single transaction (like MULTI/EXEC but with full logic)
+  - Scripts can read AND write keys, perform conditionals, loops
+  - Scripting fills the gap where MULTI/EXEC is too rigid
+
+  Why scripting vs MULTI/EXEC?
+    MULTI/EXEC: queue commands, execute all — but no branching (if/else)
+    Lua script: full programming logic + atomicity + can use results mid-script
+
+
+2. EVAL — RUNNING SCRIPTS
+───────────────────────────
+  Syntax:
+    EVAL script numkeys [key [key …]] [arg [arg …]]
+
+  Parameters:
+    script   → Lua script body (string)
+    numkeys  → number of key arguments that follow
+    key      → accessible as KEYS[1], KEYS[2], … in Lua (1-indexed!)
+    arg      → accessible as ARGV[1], ARGV[2], … in Lua
+
+  Examples:
+    -- Simple get-and-return
+    EVAL "return redis.call('GET', KEYS[1])" 1 mykey
+
+    -- Conditional increment only if key exists
+    EVAL "
+      if redis.call('EXISTS', KEYS[1]) == 1 then
+        return redis.call('INCR', KEYS[1])
+      else
+        return -1
+      end
+    " 1 counter
+
+    -- Set if not exists with expiry (atomic SETNX + EXPIRE)
+    EVAL "
+      if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then
+        return 1
+      else
+        return 0
+      end
+    " 1 lock:resource myvalue 30000
+
+
+3. REDIS.CALL vs REDIS.PCALL
+──────────────────────────────
+  redis.call(command, args…)
+    - Executes the command
+    - On error: raises Lua error → script aborts → error returned to client
+
+  redis.pcall(command, args…)
+    - Executes the command
+    - On error: returns Lua table with "err" field → script continues
+    - Use pcall when you want to handle errors gracefully
+
+  Example (pcall):
+    local result = redis.pcall('GET', KEYS[1])
+    if result.err then
+      return "error: " .. result.err
+    end
+    return result
+
+
+4. TYPE CONVERSION: LUA ↔ REDIS
+─────────────────────────────────
+  Redis → Lua:
+    Integer reply      → Lua number
+    Bulk string reply  → Lua string
+    Multi-bulk reply   → Lua table (array)
+    Status reply       → Lua table with 'ok' field
+    Error reply        → Lua table with 'err' field
+    Nil bulk reply     → Lua false (boolean false)
+
+  Lua → Redis:
+    Lua number         → Integer reply (truncated to integer!)
+    Lua string         → Bulk string reply
+    Lua table (array)  → Multi-bulk reply
+    Lua table with 'ok' → Status reply ("+OK")
+    Lua table with 'err' → Error reply
+    Lua false/nil      → Nil bulk reply
+    Lua true           → Integer reply 1
+
+  ⚠ IMPORTANT: Lua floats are truncated to integers when returned to Redis!
+    return 3.14  → client receives (integer) 3
+    Use string: return tostring(3.14) → "+3.14"
+
+
+5. SCRIPT CACHING — EVALSHA
+─────────────────────────────
+  EVAL sends the entire script body on every call. Over network this wastes bandwidth.
+  Solution: SHA1-cache the script on Redis server.
+
+  Workflow:
+    1. Load script once:
+       SCRIPT LOAD "return redis.call('GET', KEYS[1])"
+       → Returns SHA1 hash: "e0e1f9fabfa9d353e7b9bc020dae...f5c"
+
+    2. Execute by SHA1:
+       EVALSHA e0e1f9fabfa9d353e7b9bc020dae...f5c 1 mykey
+
+    3. If SHA1 not in cache: NOSCRIPT error
+       → Fall back to EVAL and reload
+
+  Other SCRIPT commands:
+    SCRIPT EXISTS sha1 [sha1 …]  → returns 1/0 for each SHA1 in cache
+    SCRIPT FLUSH [ASYNC|SYNC]    → clear all cached scripts
+    SCRIPT KILL                  → kill currently running script (only if no writes yet)
+    DEBUG RELOAD                 → force reload scripts (debugging)
+
+
+6. REDIS FUNCTIONS (REDIS 7.0+)
+─────────────────────────────────
+  Problem with EVAL/EVALSHA:
+    Scripts are per-connection cached, not persisted on server restart.
+    Scripts can't be named or versioned.
+    Script library management is messy.
+
+  Redis Functions (7.0+) solve this:
+    - Named, versioned, persistent function libraries
+    - Stored in the keyspace → replicated, persisted in RDB/AOF
+    - Libraries can have multiple functions
+
+  Commands:
+    FUNCTION LOAD "#!lua name=mylib\n redis.register_function('myfunc', …)"
+    FCALL myfunc numkeys [key …] [arg …]
+    FUNCTION LIST [LIBRARYNAME pattern] [WITHCODE]
+    FUNCTION DELETE libname
+    FUNCTION DUMP / FUNCTION RESTORE   → transfer function libraries
+
+  Example:
+    FUNCTION LOAD "#!lua name=ratelimit\n
+      redis.register_function('check_rate', function(keys, args)
+        local current = redis.call('INCR', keys[1])
+        if current == 1 then
+          redis.call('EXPIRE', keys[1], tonumber(args[1]))
+        end
+        return current <= tonumber(args[2])
+      end)
+    "
+    FCALL check_rate 1 rate:user:42 60 100
+
+
+7. REAL-WORLD EXAMPLES
+────────────────────────
+
+7a. Atomic Rate Limiter (Fixed Window):
+  EVAL "
+    local current = redis.call('INCR', KEYS[1])
+    if current == 1 then
+      redis.call('EXPIRE', KEYS[1], ARGV[1])
+    end
+    if current > tonumber(ARGV[2]) then
+      return 0
+    end
+    return 1
+  " 1 rate:user:42 60 100
+  -- Args: window=60s, limit=100 requests
+  -- Returns 1 if allowed, 0 if rate-limited
+
+7b. Distributed Lock Acquire:
+  -- SET if not exists with expiry (SETNX + EXPIRE atomically):
+  EVAL "
+    return redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2])
+  " 1 lock:myresource <unique-token> 30000
+
+7c. Distributed Lock Release (check-and-delete):
+  -- CRITICAL: Only delete if value matches (verify ownership)
+  EVAL "
+    if redis.call('GET', KEYS[1]) == ARGV[1] then
+      return redis.call('DEL', KEYS[1])
+    else
+      return 0
+    end
+  " 1 lock:myresource <unique-token>
+  -- Without this: could accidentally release another client's lock
+
+7d. Check-and-Set (CAS):
+  EVAL "
+    if redis.call('GET', KEYS[1]) == ARGV[1] then
+      redis.call('SET', KEYS[1], ARGV[2])
+      return 1
+    else
+      return 0
+    end
+  " 1 mykey old_value new_value
+
+7e. Get-then-Set with TTL reset:
+  -- Touch TTL on read (sliding expiry)
+  EVAL "
+    local val = redis.call('GET', KEYS[1])
+    if val then
+      redis.call('EXPIRE', KEYS[1], ARGV[1])
+    end
+    return val
+  " 1 session:abc123 3600
+
+
+8. ATOMICITY GUARANTEE
+────────────────────────
+  All Lua script execution is ATOMIC.
+  Redis's event loop processes one command at a time (single-threaded commands).
+  While a script runs, no other client's commands are executed.
+
+  This means:
+  - No need for WATCH/MULTI/EXEC when using Lua
+  - The script sees a consistent snapshot of state
+  - No race conditions between script steps
+  - HOWEVER: long-running scripts BLOCK all other clients!
+
+  Best practices:
+  - Keep scripts short (< 1ms execution)
+  - Never do blocking calls from Lua
+  - Never do non-deterministic operations (time, rand) that affect writes
+  - Use redis.call result within the same script
+
+
+9. SCRIPT LIMITATIONS
+──────────────────────
+  ✗ BLOCKING: Long scripts block ALL Redis clients (no multi-threading)
+  ✗ DEBUG HARD: Limited debugging tools (redis-cli --ldb for step-by-step)
+  ✗ FLOAT ISSUE: Floats returned to Redis are truncated to integers
+  ✗ ALL-OR-NOTHING WRITE: If script fails mid-way after some writes → partial writes!
+       Unlike MULTI/EXEC where either all or none execute (Redis Tx semantics)
+       Lua script CAN partially execute if it errors after some redis.calls
+  ✗ CLUSTER: All KEYS[n] must be in the same hash slot
+       Script can't access keys across different shards
+  ✗ NO REPLICAS: Avoid reading from replicas in scripts (replication lag)
+  ✗ NOSCRIPT: EVALSHA fails if script not cached (handle with fallback to EVAL)
+
+
+10. JAVA/SPRING INTEGRATION
+─────────────────────────────
+  // Spring Data Redis - DefaultRedisScript
+  @Bean
+  DefaultRedisScript<Long> rateLimitScript() {
+      DefaultRedisScript<Long> script = new DefaultRedisScript<>();
+      script.setScriptText(
+          "local current = redis.call('INCR', KEYS[1])\n" +
+          "if current == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end\n" +
+          "if current > tonumber(ARGV[2]) then return 0 end\n" +
+          "return 1"
+      );
+      script.setResultType(Long.class);
+      return script;
+  }
+
+  // Execute script
+  Long result = redisTemplate.execute(
+      rateLimitScript,
+      Collections.singletonList("rate:user:" + userId),
+      "60", "100"   // ARGV[1]=window, ARGV[2]=limit
+  );
+
+  // Load script from file
+  @Bean
+  DefaultRedisScript<Long> lockScript() {
+      DefaultRedisScript<Long> script = new DefaultRedisScript<>();
+      script.setLocation(new ClassPathResource("scripts/release-lock.lua"));
+      script.setResultType(Long.class);
+      return script;
+  }
+
+
+11. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: Why use Lua scripting instead of MULTI/EXEC?
+  A: MULTI/EXEC can't use the result of one command to conditionally run another —
+     all commands are queued before execution. Lua scripts allow full conditionals,
+     loops, and intermediate result usage while maintaining atomicity. Example: check
+     if a key exists, then decide whether to increment — impossible with MULTI/EXEC.
+
+  Q: Are Lua scripts fully atomic in Redis?
+  A: Yes — while a Lua script runs, no other command can execute (single-threaded
+     model). However, if a script ERRORS mid-execution after some redis.calls
+     have already written data, those partial writes are NOT rolled back. This is
+     different from MULTI/EXEC, which guarantees all-or-nothing execution.
+
+  Q: What's the difference between EVAL and EVALSHA?
+  A: EVAL sends the full script text on every call. EVALSHA sends only the SHA1 hash
+     of the script, which Redis looks up in its script cache. EVALSHA saves bandwidth
+     but requires prior SCRIPT LOAD. If the SHA1 isn't cached (after SCRIPT FLUSH
+     or restart), EVALSHA returns NOSCRIPT error and you must fall back to EVAL.
+
+  Q: How do Lua scripts work with Redis Cluster?
+  A: All keys accessed in a Lua script must reside in the same hash slot (same shard).
+     Redis enforces this at runtime. If your script needs keys from multiple slots,
+     use hash tags: {user:42}:session and {user:42}:profile → same slot.
+
+  Q: What replaced EVAL in modern Redis?
+  A: Redis 7.0 introduced Redis Functions (FUNCTION LOAD, FCALL). Functions are
+     named, versioned, and persistent — stored as part of the keyspace and
+     replicated/persisted in RDB/AOF. Unlike EVAL scripts which are ephemeral
+     (lost on server restart unless SCRIPT LOAD is called again), Functions
+     survive restarts and are available cluster-wide.
+
+================================================================================

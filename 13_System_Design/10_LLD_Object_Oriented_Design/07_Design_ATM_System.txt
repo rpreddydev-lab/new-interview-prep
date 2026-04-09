@@ -1,0 +1,492 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LLD: DESIGN AN ATM SYSTEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CLARIFICATIONS:
+  - Transaction types: WITHDRAW, DEPOSIT, BALANCE_INQUIRY, TRANSFER
+  - PIN validation: 3 failed attempts → lock card
+  - Multiple accounts per card? Yes (checking, savings)
+  - Receipt printing? Yes
+  - Daily withdrawal limit? Yes ($500 default)
+  - Card capture? Yes — if 3 wrong PIN or expired card
+
+ENTITIES:
+  ATM, Card, Account, Customer, CashDispenser, Transaction,
+  CardReader, KeyPad, Display, ReceiptPrinter, Bank
+
+
+2. ATM STATE MACHINE (Core of This Problem)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STATES:
+  IDLE                → Waiting for card insertion
+  CARD_INSERTED       → Card read, waiting for PIN
+  PIN_ENTERED         → PIN submitted, awaiting bank auth
+  AUTHENTICATED       → PIN correct, showing main menu
+  TRANSACTION_SELECT  → User choosing WITHDRAW/DEPOSIT/BALANCE/TRANSFER
+  PROCESSING          → Transaction in progress (talking to bank)
+  DISPENSING_CASH     → CashDispenser counting bills
+  RECEIPT_PRINTING    → Printing receipt
+  CARD_CAPTURE        → Retaining suspicious/blocked card
+  IDLE                → Return to start
+
+TRANSITIONS:
+  IDLE → CARD_INSERTED        (card inserted)
+  CARD_INSERTED → PIN_ENTERED (PIN entered via keypad)
+  PIN_ENTERED → AUTHENTICATED (bank confirms PIN)
+  PIN_ENTERED → CARD_INSERTED (wrong PIN, attempts < 3)
+  PIN_ENTERED → CARD_CAPTURE  (3 consecutive wrong PINs)
+  AUTHENTICATED → TRANSACTION_SELECT
+  TRANSACTION_SELECT → PROCESSING (transaction type selected)
+  PROCESSING → DISPENSING_CASH (withdraw approved)
+  PROCESSING → RECEIPT_PRINTING (balance inquiry / deposit)
+  DISPENSING_CASH → RECEIPT_PRINTING
+  RECEIPT_PRINTING → IDLE (ejects card)
+
+
+3. CLASS DESIGN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+enum ATMState         { IDLE, CARD_INSERTED, AUTHENTICATED, PROCESSING, DISPENSING, CARD_CAPTURE }
+enum TransactionType  { WITHDRAW, DEPOSIT, BALANCE_INQUIRY, TRANSFER }
+enum TransactionStatus{ APPROVED, DECLINED, INSUFFICIENT_FUNDS, ACCOUNT_LOCKED }
+enum AccountType      { CHECKING, SAVINGS }
+
+// --- Account ---
+
+class Account {
+    private String accountNumber;
+    private AccountType type;
+    private double balance;
+    private boolean isLocked;
+    private double dailyWithdrawalLimit;
+    private double withdrawnToday;
+    private LocalDate lastWithdrawalDate;
+    
+    Account(String accountNumber, AccountType type, double initialBalance) {
+        this.accountNumber = accountNumber;
+        this.type = type;
+        this.balance = initialBalance;
+        this.dailyWithdrawalLimit = 500.0;
+        this.withdrawnToday = 0;
+        this.isLocked = false;
+    }
+    
+    boolean canWithdraw(double amount) {
+        if (isLocked) return false;
+        if (balance < amount) return false;
+        
+        // Reset daily limit if new day
+        if (!LocalDate.now().equals(lastWithdrawalDate)) {
+            withdrawnToday = 0;
+        }
+        
+        return (withdrawnToday + amount) <= dailyWithdrawalLimit;
+    }
+    
+    synchronized boolean withdraw(double amount) {
+        if (!canWithdraw(amount)) return false;
+        balance -= amount;
+        withdrawnToday += amount;
+        lastWithdrawalDate = LocalDate.now();
+        return true;
+    }
+    
+    synchronized void deposit(double amount) {
+        if (amount <= 0) throw new IllegalArgumentException("Deposit must be positive");
+        balance += amount;
+    }
+    
+    synchronized boolean transfer(Account target, double amount) {
+        if (!canWithdraw(amount)) return false;
+        balance -= amount;
+        target.deposit(amount);
+        return true;
+    }
+    
+    double getBalance()         { return balance; }
+    String getAccountNumber()   { return accountNumber; }
+    AccountType getType()       { return type; }
+    boolean isLocked()          { return isLocked; }
+    void lock()                 { this.isLocked = true; }
+}
+
+// --- Card ---
+
+class Card {
+    private String cardNumber;
+    private String encryptedPIN;         // stored as hash (SHA-256 + salt)
+    private LocalDate expiryDate;
+    private boolean isBlocked;
+    private int failedAttempts;
+    private String customerId;
+    
+    Card(String cardNumber, String encryptedPIN, LocalDate expiryDate, String customerId) {
+        this.cardNumber = cardNumber;
+        this.encryptedPIN = encryptedPIN;
+        this.expiryDate = expiryDate;
+        this.customerId = customerId;
+        this.isBlocked = false;
+        this.failedAttempts = 0;
+    }
+    
+    boolean isExpired() { return LocalDate.now().isAfter(expiryDate); }
+    
+    boolean validatePIN(String enteredPIN) {
+        if (isBlocked || isExpired()) return false;
+        
+        // Compare SHA-256(enteredPIN + salt) with stored encryptedPIN
+        if (hash(enteredPIN).equals(encryptedPIN)) {
+            failedAttempts = 0;  // reset on success
+            return true;
+        }
+        
+        failedAttempts++;
+        if (failedAttempts >= 3) {
+            isBlocked = true;
+        }
+        return false;
+    }
+    
+    private String hash(String pin) {
+        // Simplified: in reality use BCrypt or PBKDF2
+        return Integer.toString(pin.hashCode());
+    }
+    
+    boolean isBlocked()        { return isBlocked; }
+    int getFailedAttempts()    { return failedAttempts; }
+    String getCardNumber()     { return cardNumber; }
+    String getCustomerId()     { return customerId; }
+}
+
+// --- Customer ---
+
+class Customer {
+    private String customerId;
+    private String name;
+    private Map<String, Account> accounts;  // accountNumber → Account
+    
+    Customer(String customerId, String name) {
+        this.customerId = customerId;
+        this.name = name;
+        this.accounts = new HashMap<>();
+    }
+    
+    void addAccount(Account account) {
+        accounts.put(account.getAccountNumber(), account);
+    }
+    
+    List<Account> getAccounts() { return new ArrayList<>(accounts.values()); }
+    Account getAccount(String accNum) { return accounts.get(accNum); }
+}
+
+// --- Transaction ---
+
+class Transaction {
+    private String transactionId;
+    private TransactionType type;
+    private double amount;
+    private Account fromAccount;
+    private Account toAccount;          // for transfers
+    private TransactionStatus status;
+    private LocalDateTime timestamp;
+    private double balanceAfter;
+    
+    Transaction(String transactionId, TransactionType type, double amount, Account fromAccount) {
+        this.transactionId = transactionId;
+        this.type = type;
+        this.amount = amount;
+        this.fromAccount = fromAccount;
+        this.timestamp = LocalDateTime.now();
+        this.status = TransactionStatus.APPROVED;
+    }
+    
+    String getTransactionId() { return transactionId; }
+    TransactionType getType() { return type; }
+    double getAmount()        { return amount; }
+    LocalDateTime getTimestamp() { return timestamp; }
+    void setStatus(TransactionStatus s) { this.status = s; }
+    void setBalanceAfter(double b)      { this.balanceAfter = b; }
+}
+
+// --- CashDispenser (Strategy for bill selection) ---
+
+interface BillSelectionStrategy {
+    Map<Integer, Integer> selectBills(double amount);  // denomination → count
+}
+
+class GreedyBillSelection implements BillSelectionStrategy {
+    private int[] denominations = {100, 50, 20, 10, 5, 1};
+    
+    @Override
+    public Map<Integer, Integer> selectBills(double amount) {
+        Map<Integer, Integer> bills = new LinkedHashMap<>();
+        int remaining = (int) amount;
+        
+        for (int denom : denominations) {
+            if (remaining >= denom) {
+                int count = remaining / denom;
+                bills.put(denom, count);
+                remaining -= count * denom;
+            }
+        }
+        
+        if (remaining > 0) throw new IllegalStateException("Cannot dispense exact amount: " + amount);
+        return bills;
+    }
+}
+
+class CashDispenser {
+    private Map<Integer, Integer> cashInventory;    // denomination → available count
+    private BillSelectionStrategy strategy;
+    
+    CashDispenser(BillSelectionStrategy strategy) {
+        cashInventory = new HashMap<>();
+        cashInventory.put(100, 100);  // 100 × $100 bills = $10,000
+        cashInventory.put(50, 200);
+        cashInventory.put(20, 500);
+        cashInventory.put(10, 200);
+        this.strategy = strategy;
+    }
+    
+    boolean hasSufficientCash(double amount) {
+        double total = cashInventory.entrySet().stream()
+            .mapToDouble(e -> e.getKey() * e.getValue()).sum();
+        return total >= amount;
+    }
+    
+    synchronized boolean dispense(double amount) {
+        if (!hasSufficientCash(amount)) return false;
+        
+        Map<Integer, Integer> bills = strategy.selectBills(amount);
+        
+        // Verify ATM actually has these bills
+        for (Map.Entry<Integer, Integer> entry : bills.entrySet()) {
+            if (cashInventory.getOrDefault(entry.getKey(), 0) < entry.getValue()) {
+                return false;  // insufficient bills of this denomination
+            }
+        }
+        
+        // Deduct from inventory
+        bills.forEach((denom, count) -> cashInventory.merge(denom, -count, Integer::sum));
+        return true;
+    }
+    
+    void refill(Map<Integer, Integer> bills) {
+        bills.forEach((denom, count) -> cashInventory.merge(denom, count, Integer::sum));
+    }
+    
+    double getTotalCash() {
+        return cashInventory.entrySet().stream()
+            .mapToDouble(e -> e.getKey() * e.getValue()).sum();
+    }
+}
+
+// --- ATM (orchestrator — State Machine) ---
+
+class ATM {
+    private String atmId;
+    private ATMState state;
+    private Card currentCard;
+    private Customer currentCustomer;
+    private Account selectedAccount;
+    private List<Transaction> transactionLog;
+    private CashDispenser cashDispenser;
+    private Bank bank;                    // external bank connection
+    
+    ATM(String atmId, Bank bank) {
+        this.atmId = atmId;
+        this.bank = bank;
+        this.state = ATMState.IDLE;
+        this.cashDispenser = new CashDispenser(new GreedyBillSelection());
+        this.transactionLog = new ArrayList<>();
+    }
+    
+    // Step 1: Card insertion
+    void insertCard(Card card) {
+        if (state != ATMState.IDLE) throw new IllegalStateException("ATM not ready");
+        
+        if (card.isExpired()) {
+            display("Card expired. Please contact your bank.");
+            ejectCard();
+            return;
+        }
+        
+        if (card.isBlocked()) {
+            display("Card blocked. Please contact your bank.");
+            captureCard();
+            return;
+        }
+        
+        currentCard = card;
+        state = ATMState.CARD_INSERTED;
+        display("Please enter your PIN:");
+    }
+    
+    // Step 2: PIN entry
+    boolean enterPIN(String pin) {
+        if (state != ATMState.CARD_INSERTED) throw new IllegalStateException("Insert card first");
+        
+        if (currentCard.validatePIN(pin)) {
+            currentCustomer = bank.getCustomer(currentCard.getCustomerId());
+            state = ATMState.AUTHENTICATED;
+            display("Welcome, " + currentCustomer.getName() + "!");
+            return true;
+        }
+        
+        if (currentCard.isBlocked()) {
+            display("Too many wrong attempts. Card captured.");
+            captureCard();
+            return false;
+        }
+        
+        int remaining = 3 - currentCard.getFailedAttempts();
+        display("Wrong PIN. " + remaining + " attempt(s) remaining.");
+        return false;
+    }
+    
+    // Step 3: Transaction execution
+    
+    double checkBalance(String accountNumber) {
+        requireState(ATMState.AUTHENTICATED);
+        Account account = getAccountOrThrow(accountNumber);
+        
+        Transaction txn = new Transaction("TXN-" + System.nanoTime(),
+                                          TransactionType.BALANCE_INQUIRY, 0, account);
+        txn.setBalanceAfter(account.getBalance());
+        transactionLog.add(txn);
+        
+        return account.getBalance();
+    }
+    
+    boolean withdraw(String accountNumber, double amount) {
+        requireState(ATMState.AUTHENTICATED);
+        Account account = getAccountOrThrow(accountNumber);
+        
+        state = ATMState.PROCESSING;
+        
+        // Check bank authorization
+        if (!account.withdraw(amount)) {
+            state = ATMState.AUTHENTICATED;
+            display("Insufficient funds or daily limit reached.");
+            return false;
+        }
+        
+        // Dispense cash
+        state = ATMState.DISPENSING;
+        if (!cashDispenser.dispense(amount)) {
+            // Rollback the account deduction
+            account.deposit(amount);
+            state = ATMState.AUTHENTICATED;
+            display("ATM cannot dispense the requested amount.");
+            return false;
+        }
+        
+        Transaction txn = new Transaction("TXN-" + System.nanoTime(),
+                                          TransactionType.WITHDRAW, amount, account);
+        txn.setBalanceAfter(account.getBalance());
+        transactionLog.add(txn);
+        bank.recordTransaction(txn);
+        
+        display("Please collect your cash: $" + amount);
+        printReceipt(txn);
+        return true;
+    }
+    
+    // Step 4: End session
+    void finishTransaction() {
+        state = ATMState.IDLE;
+        currentCard = null;
+        currentCustomer = null;
+        selectedAccount = null;
+        display("Thank you. Please take your card.");
+    }
+    
+    private void captureCard() {
+        bank.reportCapturedCard(currentCard.getCardNumber());
+        currentCard = null;
+        currentCustomer = null;
+        state = ATMState.CARD_CAPTURE;
+        display("Card has been captured. Contact your bank for assistance.");
+    }
+    
+    private void ejectCard() {
+        currentCard = null;
+        state = ATMState.IDLE;
+    }
+    
+    private Account getAccountOrThrow(String accountNumber) {
+        Account account = currentCustomer.getAccount(accountNumber);
+        if (account == null) throw new NotFoundException("Account not found");
+        return account;
+    }
+    
+    private void requireState(ATMState required) {
+        if (state != required) throw new IllegalStateException(
+            "Required state: " + required + ", current: " + state);
+    }
+    
+    private void display(String message) { System.out.println("[ATM " + atmId + "]: " + message); }
+    private void printReceipt(Transaction txn) { /* ReceiptPrinter logic */ }
+    
+    ATMState getState() { return state; }
+}
+
+// --- Bank (gateway to core banking system) ---
+
+class Bank {
+    private Map<String, Customer> customers;   // customerId → customer
+    private List<Transaction> allTransactions;
+    
+    Bank() {
+        customers = new HashMap<>();
+        allTransactions = new ArrayList<>();
+    }
+    
+    Customer getCustomer(String customerId) { return customers.get(customerId); }
+    void recordTransaction(Transaction txn) { allTransactions.add(txn); }
+    void reportCapturedCard(String cardNumber) {
+        System.out.println("Card captured: " + cardNumber + " — fraud team notified");
+    }
+}
+
+
+4. DESIGN PATTERNS SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STATE: ATM class transitions through IDLE → CARD_INSERTED → AUTHENTICATED → PROCESSING → ...
+  Operations (insertCard, enterPIN, withdraw) only valid in specific states
+  IllegalStateException guards enforce valid transitions
+
+STRATEGY: BillSelectionStrategy
+  GreedyBillSelection: use highest denominations first ($100s before $20s)
+  ExactBillSelection: minimize bill count for given amount
+  ATM can switch strategy based on cash inventory
+
+CHAIN OF RESPONSIBILITY: Transaction validation
+  BalanceCheckHandler → DailyLimitHandler → FraudCheckHandler → DispenseHandler
+  Each handler either processes or passes to next
+
+FACADE: ATM class provides simple insertCard/enterPIN/withdraw API
+  Hides Card, Account, CashDispenser, Bank complexity
+
+
+5. SECURITY CONSIDERATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PIN STORAGE: Never store plain-text PIN
+  Store SHA-256(PIN + user_salt) or use BCrypt
+  Compare hash of entered PIN with stored hash
+
+CARD SKIMMING DEFENSE: EMV chip instead of magnetic stripe
+  Each transaction generates a unique one-time cryptogram
+
+COMMUNICATION: ATM ↔ Bank uses TLS + MAC (message authentication code)
+  Each message signed to prevent MITM tampering
+
+TIMING ATTACKS: Card captures after 3 wrong PINs
+  Add consistent delay regardless of correct/wrong PIN
+  Prevent timing analysis from determining PIN length

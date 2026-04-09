@@ -1,0 +1,217 @@
+================================================================================
+INBOX AND OUTBOX PATTERNS (REVISITED IN CONTEXT OF PATTERNS)
+================================================================================
+
+The Outbox Pattern was covered in detail in 04_Data_Management/08_Outbox_Pattern_Deep_Dive.txt.
+This file covers the Inbox Pattern and both patterns together in the context of
+building a reliable messaging system with exactly-once semantics.
+
+════════════════════════════════════════════════════════════════════════════════
+
+THE RELIABLE MESSAGING PROBLEM
+================================
+
+In microservices, services communicate via messages (Kafka, RabbitMQ, etc.).
+Two fundamental problems:
+  1. PRODUCER SIDE: How to atomically save state AND publish event?
+     → Outbox Pattern (already covered)
+  2. CONSUMER SIDE: Message delivered twice. How to process exactly once?
+     → Inbox (Idempotent Consumer) Pattern
+
+At-least-once delivery is standard in message brokers.
+Combined Outbox (producer) + Inbox (consumer) = effectively exactly-once semantics.
+
+────────────────────────────────────────────────────────────────────────────────
+
+THE INBOX PATTERN
+==================
+
+Also known as: Idempotent Consumer, Deduplication Pattern.
+
+Problem:
+  Kafka can deliver the same message multiple times:
+    - Consumer crashes after processing but before committing offset
+    - Consumer rebalance causes re-processing
+    - Producer retried and published duplicate
+
+  Consumer processes an event:
+    Step 1: Receive OrderCreated event (messageId: abc-123)
+    Step 2: Reserve inventory
+    Step 3: Commit Kafka offset  ← CRASH here
+    Restart → message abc-123 delivered again
+    Step 2 executes AGAIN → double inventory reservation!
+
+Solution — Inbox Table:
+  Before processing: INSERT INTO inbox_events (message_id, ...)
+  If INSERT succeeds (not duplicate): process
+  If INSERT fails (duplicate key): skip (already processed)
+
+  The inbox table records which messages have been processed.
+
+────────────────────────────────────────────────────────────────────────────────
+
+INBOX IMPLEMENTATION
+=====================
+
+Database table:
+  CREATE TABLE inbox_events (
+    id          BIGSERIAL PRIMARY KEY,
+    message_id  VARCHAR(255) UNIQUE NOT NULL,   -- Unique constraint is the guard
+    topic       VARCHAR(255) NOT NULL,
+    payload     JSONB NOT NULL,
+    processed_at TIMESTAMPTZ DEFAULT NOW(),
+    consumer_group VARCHAR(100)
+  );
+
+  CREATE UNIQUE INDEX idx_inbox_message_id ON inbox_events(message_id);
+
+  -- Cleanup job: delete old entries (keep only last 7 days)
+  CREATE INDEX idx_inbox_processed_at ON inbox_events(processed_at);
+
+Idempotent consumer with Inbox:
+  @Service
+  @Transactional
+  public class InventoryEventConsumer {
+
+    @Autowired private InboxRepository inboxRepository;
+    @Autowired private InventoryService inventoryService;
+
+    @KafkaListener(
+      topics = "order-events",
+      groupId = "inventory-service"
+    )
+    public void onOrderCreated(@Payload String payload,
+                               @Header(KafkaHeaders.RECEIVED_KEY) String messageId) {
+      // Step 1: Try to insert into inbox (idempotency check)
+      boolean alreadyProcessed = !tryInsertInbox(messageId, "order-events", payload);
+
+      if (alreadyProcessed) {
+        log.debug("Duplicate message ignored: messageId={}", messageId);
+        return;  // Do nothing — already processed
+      }
+
+      // Step 2: Process the event (atomically with inbox insert, same transaction)
+      OrderCreatedEvent event = deserialize(payload, OrderCreatedEvent.class);
+      inventoryService.reserveItems(event.getOrderId(), event.getItems());
+
+      // Step 3: Commit Kafka offset (after DB transaction commits)
+    }
+
+    private boolean tryInsertInbox(String messageId, String topic, String payload) {
+      try {
+        inboxRepository.save(InboxEvent.builder()
+          .messageId(messageId)
+          .topic(topic)
+          .payload(payload)
+          .consumerGroup("inventory-service")
+          .build()
+        );
+        return true;  // Successfully inserted, first time processing
+      } catch (DataIntegrityViolationException e) {
+        // Unique constraint violated → duplicate message
+        return false;
+      }
+    }
+  }
+
+Using Spring Kafka Transactions (alternative — transactional outbox + consumer):
+  @Configuration
+  public class KafkaConfig {
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, String> kafkaListenerFactory(
+        ConsumerFactory<String, String> consumerFactory,
+        KafkaTransactionManager<String, String> transactionManager) {
+
+      var factory = new ConcurrentKafkaListenerContainerFactory<String, String>();
+      factory.setConsumerFactory(consumerFactory);
+      // Enable Kafka transactions + chain with DB transaction
+      factory.getContainerProperties().setTransactionManager(transactionManager);
+      return factory;
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+MESSAGE ID STRATEGY
+====================
+
+The message ID must be:
+  1. Unique per message
+  2. Stable across retries (same event = same ID)
+  3. Deterministic (not random UUID per delivery)
+
+Good strategies:
+  // Kafka: use record key + offset + partition as composite ID
+  String messageId = String.format("%s-%d-%d",
+    record.key(), record.partition(), record.offset());
+
+  // Or include in event payload:
+  {
+    "eventId": "order-created-123-v1",  // orderId + event type + version
+    "orderId": 123,
+    ...
+  }
+
+  // Or use UUID generated at SOURCE when event is first created:
+  // (stored in Outbox table, survives retries)
+
+────────────────────────────────────────────────────────────────────────────────
+
+OUTBOX + INBOX TOGETHER
+=========================
+
+  [Order Service]                         [Inventory Service]
+  ┌─────────────────────────────┐         ┌─────────────────────────────┐
+  │ DB Transaction:             │         │ DB Transaction:             │
+  │  - Save order               │         │  - Insert into inbox_events │
+  │  - Insert into outbox_events│  Kafka  │    (idempotency check)      │
+  └──────────────┬──────────────┘  ────►  │  - Reserve inventory        │
+                 │                        └─────────────────────────────┘
+  [Outbox Relay]
+  Reads outbox → publishes to Kafka → marks processed
+
+  Result:
+  - Order Service: atomically saves order + event (Outbox)
+  - Inventory Service: exactly-once processing (Inbox)
+  - Combined: effectively exactly-once end-to-end
+
+────────────────────────────────────────────────────────────────────────────────
+
+INBOX CLEANUP
+==============
+
+Old inbox entries must be cleaned up (space management):
+
+  @Scheduled(cron = "0 0 2 * * *")  // Daily at 2 AM
+  @Transactional
+  public void cleanupOldInboxEntries() {
+    Instant cutoff = Instant.now().minus(7, ChronoUnit.DAYS);
+    int deleted = inboxRepository.deleteByProcessedAtBefore(cutoff);
+    log.info("Cleaned up {} old inbox entries", deleted);
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is the Inbox Pattern?
+A: The Inbox (Idempotent Consumer) pattern prevents duplicate processing of
+   messages. Before processing, the consumer inserts the message ID into an
+   inbox database table. If the INSERT succeeds (first time), process the event
+   atomically in the same transaction. If it fails with a unique constraint
+   violation, the message was already processed — skip it.
+
+Q: Why can't you just make your handler idempotent without an inbox table?
+A: Some operations are naturally idempotent (UPDATE SET status='SHIPPED' WHERE
+   status='PENDING'). But many are not (INSERT, charge a credit card, send email).
+   The inbox table provides a generic, reliable idempotency mechanism that works
+   for ANY operation, without needing to reason about individual handler idempotency.
+
+Q: How do Outbox and Inbox patterns complement each other?
+A: Outbox solves the producer side: atomic "save state + publish event" without
+   dual-write issues. Inbox solves the consumer side: exactly-once processing
+   despite at-least-once delivery. Combined, they provide effectively exactly-once
+   end-to-end semantics for event-driven microservices.
+
+================================================================================

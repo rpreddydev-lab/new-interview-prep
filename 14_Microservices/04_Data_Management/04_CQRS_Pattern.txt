@@ -1,0 +1,302 @@
+================================================================================
+CQRS PATTERN — COMMAND QUERY RESPONSIBILITY SEGREGATION
+================================================================================
+
+DEFINITION
+----------
+CQRS separates the READ (Query) and WRITE (Command) responsibilities of a
+data model into separate models, often separate databases.
+
+Command side: Handles state changes (create, update, delete)
+              Optimized for writes, enforces business rules
+Query side:   Handles reads only
+              Optimized for reads, denormalized for query performance
+
+Coined by Greg Young, inspired by Bertrand Meyer's CQS (Command Query Separation):
+"A method should either change state OR return data, never both."
+
+────────────────────────────────────────────────────────────────────────────────
+
+THE PROBLEM CQRS SOLVES
+=========================
+
+Traditional single-model approach:
+  Same object (e.g., Order entity) used for both reads and writes
+  - Write: enforce validations, business rules, transitions
+  - Read: serve different views (order summary, order detail, admin view, analytics)
+
+Problems:
+  - Relational queries needed for reads require JOINs across many tables
+  - Write-optimized schema (normalized) is poor for reads (complex JOINs)
+  - Can't scale reads and writes independently
+  - Read-heavy vs write-heavy services compete for same DB resources
+  - Complex queries on the same table that's heavily written to → lock contention
+
+CQRS solution:
+  - Write to a normalized DB (command side) — optimized for consistency
+  - Read from a denormalized read model — optimized for query performance
+  - Update the read model asynchronously via events
+
+────────────────────────────────────────────────────────────────────────────────
+
+CQRS ARCHITECTURE
+==================
+
+         WRITE SIDE (Commands)              READ SIDE (Queries)
+         ──────────────────────             ──────────────────────
+         ┌─────────────────────┐            ┌──────────────────────┐
+         │ Command Handler     │            │  Query Handler       │
+         │ (Business Logic)    │            │  (Read-only)         │
+         └────────┬────────────┘            └──────────┬───────────┘
+                  │                                    │
+         ┌────────▼────────────┐            ┌──────────▼───────────┐
+         │  Write DB           │            │  Read DB             │
+         │  (PostgreSQL,       │   Events   │  (Elasticsearch,     │
+         │   normalized)       │────────────│   MongoDB,           │
+         └─────────────────────┘            │   Redis,             │
+                  │                         │   denormalized table)│
+                  │                         └──────────────────────┘
+            Domain Events
+            published here
+
+Read model is updated by consuming domain events from the write side.
+This introduces EVENTUAL CONSISTENCY — reads may lag writes by milliseconds/seconds.
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING BOOT CQRS IMPLEMENTATION
+=================================
+
+Command side — Order Write:
+  // Command objects
+  public record CreateOrderCommand(Long userId, List<OrderItem> items, String shippingAddress) {}
+  public record UpdateOrderStatusCommand(Long orderId, OrderStatus newStatus) {}
+
+  // Domain event
+  public record OrderCreatedEvent(Long orderId, Long userId, BigDecimal total,
+                                   List<OrderItem> items, Instant createdAt) {}
+
+  @Service
+  @Transactional
+  public class OrderCommandHandler {
+
+    @Autowired private OrderRepository orderRepository;
+    @Autowired private ApplicationEventPublisher eventPublisher;
+
+    public Long createOrder(CreateOrderCommand cmd) {
+      // Business rules enforced here
+      Order order = Order.builder()
+        .userId(cmd.userId())
+        .items(cmd.items())
+        .status(OrderStatus.PENDING)
+        .total(calculateTotal(cmd.items()))
+        .build();
+
+      orderRepository.save(order);
+
+      // Publish domain event for read model update
+      eventPublisher.publishEvent(new OrderCreatedEvent(
+        order.getId(), order.getUserId(), order.getTotal(),
+        order.getItems(), order.getCreatedAt()
+      ));
+
+      return order.getId();
+    }
+  }
+
+Query side — Order Read:
+  // Read model (denormalized for performance)
+  @Document(indexName = "orders")  // Elasticsearch
+  public class OrderReadModel {
+    private Long orderId;
+    private String customerName;  // Denormalized from User service
+    private String customerEmail;
+    private List<OrderItemView> items; // Denormalized with product names
+    private BigDecimal total;
+    private String status;
+    private Instant createdAt;
+  }
+
+  @Repository
+  public interface OrderSearchRepository extends ElasticsearchRepository<OrderReadModel, Long> {
+    List<OrderReadModel> findByCustomerEmailOrderByCreatedAtDesc(String email);
+    Page<OrderReadModel> findByStatus(String status, Pageable pageable);
+  }
+
+Read model updater (event consumer):
+  @Service
+  public class OrderReadModelProjection {
+
+    @Autowired private OrderSearchRepository searchRepository;
+    @Autowired private UserClient userClient;
+
+    @EventListener  // Or @KafkaListener if events via Kafka
+    @Async
+    public void on(OrderCreatedEvent event) {
+      // Enrich with user data for the read model
+      UserDTO user = userClient.getUser(event.userId());
+
+      OrderReadModel readModel = OrderReadModel.builder()
+        .orderId(event.orderId())
+        .customerName(user.getFullName())
+        .customerEmail(user.getEmail())
+        .items(event.items().stream().map(OrderItemView::from).toList())
+        .total(event.total())
+        .status("PENDING")
+        .createdAt(event.createdAt())
+        .build();
+
+      searchRepository.save(readModel);  // Write to Elasticsearch
+    }
+  }
+
+Query controller:
+  @RestController
+  @RequestMapping("/api/v1/orders")
+  public class OrderQueryController {
+
+    @Autowired private OrderSearchRepository searchRepository;
+
+    // Command endpoint
+    @PostMapping
+    public ResponseEntity<Long> createOrder(
+        @RequestBody CreateOrderRequest request,
+        @AuthenticationPrincipal UserPrincipal user) {
+      Long orderId = orderCommandHandler.createOrder(request.toCommand(user.getId()));
+      return ResponseEntity.status(201).body(orderId);
+    }
+
+    // Query endpoint (hits the read model)
+    @GetMapping
+    public Page<OrderReadModel> getMyOrders(
+        @AuthenticationPrincipal UserPrincipal user,
+        Pageable pageable) {
+      return searchRepository.findByCustomerEmailOrderByCreatedAtDesc(
+        user.getEmail(), pageable
+      );
+    }
+
+    @GetMapping("/search")
+    public List<OrderReadModel> searchOrders(@RequestParam String query) {
+      return searchRepository.findByFullTextSearch(query);
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+CQRS WITH MULTIPLE READ MODELS
+================================
+
+One write model can feed MULTIPLE read models optimized for different use cases:
+
+Write Model:
+  orders table (PostgreSQL, normalized, ACID)
+
+Read Models:
+  1. orders_summary (PostgreSQL denormalized) — for customer "my orders" page
+  2. orders_elasticsearch — for admin search/filtering
+  3. orders_redis — for real-time order status widget (TTL-based cache)
+  4. orders_analytics (Cassandra) — for time-series analytics
+  5. orders_reporting (data warehouse) — for monthly reports
+
+All built from the same OrderCreatedEvent, OrderUpdatedEvent, etc.
+
+────────────────────────────────────────────────────────────────────────────────
+
+CQRS + EVENT SOURCING
+======================
+Often combined: Event Sourcing provides the events; CQRS uses them to build read models.
+See: 05_Event_Sourcing.txt for details.
+
+────────────────────────────────────────────────────────────────────────────────
+
+CQRS TRADE-OFFS
+================
+
+BENEFITS:
+  ✓ Independent scaling of reads and writes
+  ✓ Optimized query performance (denormalized read models)
+  ✓ Multiple specialized read models for different use cases
+  ✓ Cleaner separation of business logic (commands) from presentation (queries)
+  ✓ Write DB can be highly normalized; read DB can be completely flat
+
+COSTS:
+  ✗ Eventual consistency (read model may lag writes)
+  ✗ Higher complexity (two models, event synchronization)
+  ✗ Read-after-write consistency problem
+  ✗ Event handling failures can leave read model inconsistent
+  ✗ Overkill for simple CRUD applications
+
+────────────────────────────────────────────────────────────────────────────────
+
+READ-AFTER-WRITE CONSISTENCY
+===============================
+
+Problem: User creates an order → immediately queries for it → gets 404 (read model not yet updated)
+
+Solutions:
+  1. Return the data with the response (don't query after write)
+     POST /orders → returns {orderId: 123, status: "PENDING", ...}
+     UI uses this response directly
+
+  2. Read from write model for immediate reads
+     Route "get by ID" queries to the write DB (strong consistency)
+     Route search/list queries to the read model
+
+  3. Version-based consistency
+     Response includes version number
+     Query includes "wait for version X"
+
+  4. Accept eventual consistency
+     Show "Your order is being processed" immediately
+     Refresh/poll until visible
+
+────────────────────────────────────────────────────────────────────────────────
+
+WHEN TO USE CQRS
+==================
+
+Use CQRS when:
+  ✓ Read patterns are significantly different from write patterns
+  ✓ Read/write loads differ greatly (read-heavy system)
+  ✓ Multiple views of the same data are needed
+  ✓ Complex domain logic on write side
+  ✓ Full-text search or analytics on query side
+  ✓ Working with Event Sourcing
+
+Don't use CQRS when:
+  ✗ Simple CRUD applications
+  ✗ Team is small, complexity isn't justified
+  ✗ Strong read-after-write consistency is required
+  ✗ Data model is simple
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is CQRS and what problem does it solve?
+A: Command Query Responsibility Segregation separates read and write models.
+   Solves the mismatch between write-optimized (normalized) and read-optimized
+   (denormalized) data structures. Enables independent scaling, multiple read
+   models for different use cases, and better separation of business logic.
+
+Q: How is the read model kept in sync with the write model?
+A: Through domain events. The command side publishes events on every state change
+   (e.g., OrderCreatedEvent). Event handlers on the query side consume these events
+   and update the read model. This is asynchronous — the read model is eventually
+   consistent.
+
+Q: What is the read-after-write consistency problem in CQRS?
+A: After writing a command, the client may immediately query and not see the result
+   yet because the read model hasn't been updated. Solutions: return data in the
+   command response, temporarily read from the write model, or accept eventual
+   consistency with UI feedback.
+
+Q: Is CQRS always used with Event Sourcing?
+A: No. They complement each other but are independent patterns. CQRS can use any
+   write model (SQL tables). Event Sourcing stores every state change as events
+   and naturally produces events that can update CQRS read models. Together they
+   provide full audit trail + optimized reads.
+
+================================================================================

@@ -1,0 +1,394 @@
+================================================================
+SPRING BOOT TESTING — @DataJpaTest REPOSITORY TESTING
+Complete Interview Preparation Guide
+================================================================
+
+1. WHAT IS @DataJpaTest?
+================================================================
+
+@DataJpaTest is a test slice annotation that loads ONLY the JPA layer:
+  - @Entity classes
+  - @Repository interfaces
+  - JPA / Hibernate configuration
+  - Spring Data infrastructure
+  - DataSource (embedded by default)
+
+What is NOT loaded:
+  - @Service, @Component, @Controller classes
+  - Security
+  - Messaging, caching, etc.
+
+This makes repository tests FAST and FOCUSED.
+
+By default:
+  - Uses an IN-MEMORY database (H2)
+  - Each test wrapped in @Transactional → rolled back after each test
+  - Hibernate DDL creates schema from your entities
+
+================================================================
+2. BASIC SETUP
+================================================================
+
+Dependencies:
+  <!-- spring-boot-starter-test includes JPA test support -->
+  <!-- For H2 embedded DB: -->
+  <dependency>
+      <groupId>com.h2database</groupId>
+      <artifactId>h2</artifactId>
+      <scope>test</scope>
+  </dependency>
+
+Simple test:
+  @DataJpaTest
+  class UserRepositoryTest {
+      
+      @Autowired UserRepository userRepository;
+      @Autowired TestEntityManager entityManager;
+      
+      @Test
+      void findByEmail_shouldReturnUser() {
+          // Arrange — persist test data
+          User user = new User(null, "alice@test.com", "Alice", Role.USER);
+          entityManager.persistAndFlush(user);
+          
+          // Act
+          Optional<User> found = userRepository.findByEmail("alice@test.com");
+          
+          // Assert
+          assertTrue(found.isPresent());
+          assertEquals("Alice", found.get().getName());
+      }
+      
+      @Test
+      void findByEmail_shouldReturnEmptyWhenNotFound() {
+          Optional<User> found = userRepository.findByEmail("nobody@test.com");
+          assertFalse(found.isPresent());
+      }
+  }
+
+================================================================
+3. TestEntityManager
+================================================================
+
+TestEntityManager wraps JPA's EntityManager with test utilities.
+
+Key methods:
+  entityManager.persist(entity)        → persist and return entity
+  entityManager.persistAndFlush(entity)→ persist + flush to DB
+  entityManager.persistFlushFind(entity) → persist + flush + find (refresh)
+  entityManager.find(Type.class, id)   → find by primary key
+  entityManager.flush()                → flush pending operations to DB
+  entityManager.clear()                → clear first-level cache (L1)
+  entityManager.refresh(entity)        → reload entity from DB
+  entityManager.getEntityManager()     → access underlying EntityManager
+
+WHY FLUSH?
+  Spring Data repositories use the EntityManager internally.
+  Without flush(), the SQL may not reach the DB before the assertion.
+  Use persistAndFlush() to ensure data is in the DB before querying.
+
+WHY CLEAR?
+  Hibernate L1 cache might return the in-memory entity without hitting DB.
+  entityManager.clear() + entityManager.flush() ensures a real DB round-trip.
+  
+  @Test
+  void findById_shouldReturnFromDatabase() {
+      User user = entityManager.persistAndFlush(
+          new User(null, "alice@test.com", "Alice", Role.USER)
+      );
+      entityManager.clear();  // evict from cache — next find hits DB
+      
+      Optional<User> found = userRepository.findById(user.getId());
+      assertTrue(found.isPresent());
+  }
+
+================================================================
+4. TESTING CUSTOM QUERIES (@Query)
+================================================================
+
+  // Repository with custom query:
+  @Repository
+  interface OrderRepository extends JpaRepository<Order, Long> {
+      
+      @Query("SELECT o FROM Order o WHERE o.customerId = :customerId AND o.status = :status")
+      List<Order> findByCustomerAndStatus(
+          @Param("customerId") String customerId,
+          @Param("status") OrderStatus status
+      );
+      
+      @Query(value = "SELECT COUNT(*) FROM orders WHERE created_at >= :since", 
+             nativeQuery = true)
+      long countOrdersSince(@Param("since") LocalDateTime since);
+      
+      // Pageable query
+      Page<Order> findByStatus(OrderStatus status, Pageable pageable);
+  }
+  
+  // Test:
+  @DataJpaTest
+  class OrderRepositoryTest {
+      
+      @Autowired OrderRepository orderRepository;
+      @Autowired TestEntityManager em;
+      
+      @BeforeEach
+      void setUpData() {
+          Customer c1 = em.persist(new Customer("cust-1", "Alice"));
+          Customer c2 = em.persist(new Customer("cust-2", "Bob"));
+          
+          em.persist(new Order("cust-1", OrderStatus.PENDING, new BigDecimal("99.99")));
+          em.persist(new Order("cust-1", OrderStatus.CONFIRMED, new BigDecimal("49.99")));
+          em.persist(new Order("cust-2", OrderStatus.PENDING, new BigDecimal("29.99")));
+          em.flush();
+      }
+      
+      @Test
+      void findByCustomerAndStatus_shouldReturnOnlyMatchingOrders() {
+          List<Order> orders = orderRepository.findByCustomerAndStatus(
+              "cust-1", OrderStatus.PENDING
+          );
+          
+          assertEquals(1, orders.size());
+          assertEquals("cust-1", orders.get(0).getCustomerId());
+          assertEquals(OrderStatus.PENDING, orders.get(0).getStatus());
+      }
+      
+      @Test
+      void findByStatus_shouldReturnPagedResults() {
+          Pageable pageable = PageRequest.of(0, 2, Sort.by("createdAt").descending());
+          
+          Page<Order> page = orderRepository.findByStatus(OrderStatus.PENDING, pageable);
+          
+          assertEquals(2, page.getTotalElements());
+          assertEquals(1, page.getTotalPages());
+          assertEquals(2, page.getContent().size());
+      }
+      
+      @Test
+      void countOrdersSince_shouldReturnCorrectCount() {
+          LocalDateTime yesterday = LocalDateTime.now().minusDays(1);
+          
+          long count = orderRepository.countOrdersSince(yesterday);
+          
+          assertEquals(3, count);  // all test orders created "now"
+      }
+  }
+
+================================================================
+5. USING A REAL DATABASE WITH TESTCONTAINERS
+================================================================
+
+If you need PostgreSQL-specific features (JSON, arrays, window functions):
+  @DataJpaTest
+  @AutoConfigureTestDatabase(replace = NONE)  // ← disables H2 replacement
+  @Testcontainers
+  class UserRepositoryPostgresTest {
+      
+      @Container
+      static PostgreSQLContainer<?> postgres = 
+          new PostgreSQLContainer<>("postgres:15")
+              .withDatabaseName("testdb")
+              .withUsername("test")
+              .withPassword("test");
+      
+      @DynamicPropertySource
+      static void configureDataSource(DynamicPropertyRegistry registry) {
+          registry.add("spring.datasource.url", postgres::getJdbcUrl);
+          registry.add("spring.datasource.username", postgres::getUsername);
+          registry.add("spring.datasource.password", postgres::getPassword);
+          registry.add("spring.datasource.driver-class-name", 
+              () -> "org.postgresql.Driver");
+          registry.add("spring.jpa.database-platform", 
+              () -> "org.hibernate.dialect.PostgreSQLDialect");
+      }
+      
+      @Autowired UserRepository userRepository;
+      @Autowired TestEntityManager em;
+      
+      @Test
+      void shouldQueryJsonbColumn() {
+          // PostgreSQL-specific JSON query
+          User user = new User("alice@test.com", "Alice", 
+              Map.of("theme", "dark", "language", "en"));
+          em.persistAndFlush(user);
+          
+          List<User> darkThemeUsers = userRepository.findByPreference("theme", "dark");
+          
+          assertEquals(1, darkThemeUsers.size());
+      }
+  }
+
+================================================================
+6. SQL SCRIPTS FOR TEST DATA
+================================================================
+
+Using @Sql annotation:
+  @DataJpaTest
+  @Sql("/sql/users.sql")  // runs before EACH test (default)
+  class UserRepositoryTest { ... }
+
+Execution phases:
+  @Sql(scripts = "/sql/insert-test-data.sql",
+       executionPhase = Sql.ExecutionPhase.BEFORE_TEST_METHOD)
+  @Sql(scripts = "/sql/cleanup.sql",
+       executionPhase = Sql.ExecutionPhase.AFTER_TEST_METHOD)
+  class OrderRepositoryTest { ... }
+
+Per-method @Sql:
+  @Test
+  @Sql("/sql/premium-customers.sql")
+  void premiumCustomerQueryTest() { ... }
+
+Example SQL script (src/test/resources/sql/users.sql):
+  INSERT INTO users (id, email, name, role) VALUES 
+  ('user-1', 'alice@test.com', 'Alice', 'USER'),
+  ('user-2', 'bob@test.com', 'Bob', 'ADMIN'),
+  ('user-3', 'carol@test.com', 'Carol', 'USER');
+
+================================================================
+7. TESTING JPA RELATIONSHIPS
+================================================================
+
+  @DataJpaTest
+  class OrderWithItemsTest {
+      
+      @Autowired OrderRepository orderRepository;
+      @Autowired TestEntityManager em;
+      
+      @Test
+      void shouldEagerlyLoadOrderItems() {
+          // Arrange: Order with 2 items
+          Order order = new Order("cust-1");
+          order.addItem(new OrderItem("SKU-001", 2, new BigDecimal("49.99")));
+          order.addItem(new OrderItem("SKU-002", 1, new BigDecimal("29.99")));
+          em.persistAndFlush(order);
+          em.clear();  // clear L1 cache to force DB load
+          
+          // Act
+          Optional<Order> found = orderRepository.findByIdWithItems(order.getId());
+          
+          // Assert
+          assertTrue(found.isPresent());
+          assertEquals(2, found.get().getItems().size());
+          assertEquals(new BigDecimal("129.97"), found.get().getTotal());
+      }
+      
+      @Test
+      void shouldNotLazyLoadOutsideTransaction() {
+          Order order = em.persistAndFlush(new Order("cust-1"));
+          em.clear();
+          
+          Order found = orderRepository.findById(order.getId()).orElseThrow();
+          
+          // Accessing a LAZY collection inside the transaction is fine
+          // (we're still inside the @Transactional test)
+          assertNotNull(found.getItems());
+      }
+  }
+
+================================================================
+8. TESTING AUDITING (@CreatedDate, @LastModifiedDate)
+================================================================
+
+  @DataJpaTest
+  @Import(AuditingConfig.class)  // import the @EnableJpaAuditing config
+  class AuditedEntityTest {
+      
+      @Autowired UserRepository userRepository;
+      
+      @Test
+      void shouldAutoPopulateAuditFields() {
+          User user = new User(null, "alice@test.com", "Alice");
+          
+          User saved = userRepository.saveAndFlush(user);
+          
+          assertNotNull(saved.getCreatedAt());
+          assertNotNull(saved.getUpdatedAt());
+          assertEquals(saved.getCreatedAt(), saved.getUpdatedAt());
+          
+          // Update and check updatedAt changes
+          saved.setName("Alice Updated");
+          User updated = userRepository.saveAndFlush(saved);
+          
+          assertTrue(updated.getUpdatedAt().isAfter(updated.getCreatedAt()));
+      }
+  }
+
+================================================================
+9. TRANSACTION BEHAVIOR IN TESTS
+================================================================
+
+@DataJpaTest automatically applies @Transactional:
+  - All changes within a test are rolled back after
+  - Different tests DON'T see each other's data
+
+If you want to COMMIT (rare):
+  @Test
+  @Commit
+  void testThatPersistsData() {
+      // Data will be visible in subsequent tests (use with caution!)
+  }
+
+If you want to disable rollback:
+  @Test
+  @Rollback(false)
+  void testWithoutRollback() { ... }
+
+================================================================
+10. COMMON ISSUES AND SOLUTIONS
+================================================================
+
+ISSUE: "Could not determine recommended JdbcType for Java type"
+  → Entity field type mismatch; check @Column types
+
+ISSUE: "Table not found" error
+  → spring.jpa.hibernate.ddl-auto not set to create-drop for tests
+  → Or schema.sql in wrong location
+
+ISSUE: LazyInitializationException in test
+  → Accessing lazy-loaded collection outside transaction
+  → @DataJpaTest wraps in transaction so this shouldn't happen
+  → If testing service layer, ensure @Transactional on service
+
+ISSUE: Data from previous test visible
+  → Test isn't in @Transactional scope
+  → Or you used @Commit / @Rollback(false)
+
+ISSUE: @DataJpaTest not finding @Repository
+  → Check component scan path
+  → Ensure @Entity and @Repository in same or sub-packages of main class
+
+================================================================
+11. INTERVIEW QUESTIONS
+================================================================
+
+Q: What does @DataJpaTest load?
+A: It loads only the JPA-related components: @Entity classes, @Repository
+   interfaces, JPA/Hibernate configuration, and an in-memory H2 database.
+   It does NOT load services, controllers, or security.
+
+Q: Why is each @DataJpaTest test wrapped in @Transactional by default?
+A: To provide test isolation — all DB changes are rolled back after each
+   test method, so tests don't affect each other.
+
+Q: What is TestEntityManager and why use it instead of the repository?
+A: TestEntityManager wraps the JPA EntityManager with test utilities.
+   Use it to set up test data (persistAndFlush) and clear the L1 cache
+   (clear) to force real DB queries and avoid false-positive cache hits.
+
+Q: How do you use a real PostgreSQL database instead of H2 in @DataJpaTest?
+A: Add @AutoConfigureTestDatabase(replace = NONE) to disable H2 replacement.
+   Then use Testcontainers with @DynamicPropertySource to provide connection
+   properties pointing to a real PostgreSQL container.
+
+Q: What does entityManager.clear() do in tests?
+A: Evicts all entities from the first-level (L1) cache. After clear(),
+   the next findById() must hit the actual database instead of returning
+   the cached entity. Essential for testing that data was actually persisted.
+
+Q: How do you test paginated queries with @DataJpaTest?
+A: Call the repository method with a Pageable argument:
+   PageRequest.of(page, size, Sort.by("field").descending())
+   Then assert on page.getTotalElements(), page.getTotalPages(), page.getContent().
+
+================================================================

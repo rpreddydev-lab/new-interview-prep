@@ -1,0 +1,243 @@
+================================================================================
+REDIS TRANSACTIONS (MULTI/EXEC) — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. WHAT ARE REDIS TRANSACTIONS?
+─────────────────────────────────
+  Redis Transactions group multiple commands into a single atomic block.
+  No other client's commands are interleaved between MULTI and EXEC.
+
+  Four commands define a transaction:
+    MULTI   → start transaction (enter "queued" mode)
+    EXEC    → execute all queued commands atomically
+    DISCARD → abort the transaction, clear queue
+    WATCH   → optimistic locking (condition for EXEC)
+
+  Important distinction from RDBMS transactions:
+    ✓ Atomic execution: all queued commands run together
+    ✗ NO ROLLBACK: if command N fails, commands 1…N-1 are NOT undone
+    ✗ NO ISOLATION: other clients CAN read your written keys during execution
+       (Tx is atomic in execution, not isolated during queue phase)
+
+
+2. MULTI / EXEC / DISCARD
+───────────────────────────
+  Usage:
+    > MULTI
+    OK
+    > SET user:42:name "Alice"
+    QUEUED
+    > INCR user:42:visits
+    QUEUED
+    > EXPIRE user:42:session 3600
+    QUEUED
+    > EXEC
+    1) OK           ← result of SET
+    2) (integer) 1  ← result of INCR
+    3) (integer) 1  ← result of EXPIRE
+
+  Discard:
+    > MULTI
+    OK
+    > SET key1 value1
+    QUEUED
+    > DISCARD
+    OK
+    (queue cleared, nothing executed)
+
+  Two types of errors in transactions:
+
+  Type 1 — Syntax error during queuing (command doesn't exist):
+    > MULTI
+    > NOTACOMMAND foo bar     ← Error immediately: EXECABORT
+    > EXEC
+    (error) EXECABORT Transaction discarded because of previous errors.
+    → ENTIRE transaction is discarded (Redis aborts immediately)
+
+  Type 2 — Runtime error during EXEC (wrong type, etc.):
+    > MULTI
+    > SET mystr "hello"
+    > INCR mystr          ← wrong type — but QUEUED without error
+    > SET anotherkey "x"
+    > EXEC
+    1) OK
+    2) (error) WRONGTYPE Operation against a key holding wrong value
+    3) OK
+    → SET and SET succeed; INCR fails; NO ROLLBACK of SET before it
+
+
+3. WATCH — OPTIMISTIC LOCKING
+───────────────────────────────
+  WATCH marks keys for optimistic locking.
+  If ANY watched key is modified by another client between WATCH and EXEC:
+    → EXEC returns nil (transaction aborted)
+    → Retry the transaction
+
+  This implements CAS (Compare-And-Set / Check-And-Set).
+
+  Workflow:
+    WATCH key1 [key2 …]   → watch keys
+    MULTI                 → begin transaction
+    … commands …          → queue commands
+    EXEC                  → if watched keys changed → returns nil
+
+  WATCH is cleared by:
+    - EXEC (successful or aborted)
+    - DISCARD
+    - Connection close
+
+  Retry Pattern (Check-And-Set):
+    def increment_with_retry(redis, key):
+        while True:
+            with redis.pipeline() as pipe:
+                try:
+                    pipe.watch(key)
+                    current = int(pipe.get(key) or 0)
+                    new_value = current + 1
+                    pipe.multi()
+                    pipe.set(key, new_value)
+                    pipe.execute()   # Returns None if watched key changed
+                    return new_value
+                except WatchError:
+                    continue        # Retry on conflict
+
+  CAS Example — Transfer balance:
+    WATCH account:alice account:bob
+    alice_balance = GET account:alice   # read outside MULTI
+    bob_balance   = GET account:bob
+    if alice_balance >= 100:
+        MULTI
+        DECRBY account:alice 100
+        INCRBY account:bob   100
+        EXEC                            # nil if anyone modified alice/bob
+
+
+4. TRANSACTION vs LUA SCRIPT
+──────────────────────────────
+  Feature                  │ MULTI/EXEC          │ Lua Script (EVAL)
+  ─────────────────────────┼─────────────────────┼─────────────────────────────
+  Atomic execution         │ Yes                 │ Yes
+  Conditional logic        │ No                  │ Yes (if/else/loops)
+  Use intermediate results │ No                  │ Yes (assign + branch)
+  Error → rollback         │ No                  │ No (partial writes possible)
+  Optimistic locking       │ WATCH               │ Not needed (atomic)
+  Cluster support          │ All keys same slot  │ All keys same slot
+  Overhead                 │ Low (command batch) │ Higher (Lua interpreter)
+  Network round trips      │ 1 (pipeline MULTI)  │ 1 (EVAL sends all)
+
+  Rule of thumb:
+    - Use MULTI/EXEC: simple command batching where atomicity needed
+    - Use Lua: conditional logic required within atomic block
+    - Use WATCH+MULTI/EXEC: optimistic CAS patterns
+
+
+5. TRANSACTION vs PIPELINE
+─────────────────────────────
+  Pipeline:
+    - Client-side batching: buffers commands, sends all at once
+    - Reduces RTT (round-trip time)
+    - NOT atomic: server executes commands one by one as received
+    - Other clients' commands can interleave
+
+  MULTI/EXEC:
+    - Server-side batching: commands queued on server
+    - IS atomic: no interleaving with other clients during EXEC
+    - Requires MULTI/EXEC wrapper
+    - Pipeline + MULTI/EXEC together: send MULTI, commands, EXEC in one network round trip
+
+  Combined approach (Spring):
+    redisTemplate.executePipelined(new SessionCallback<>() {
+        public Object execute(RedisOperations ops) {
+            ops.multi();
+            ops.opsForValue().set("key1", "val1");
+            ops.opsForValue().increment("counter");
+            return ops.exec();
+        }
+    });
+
+
+6. COMMON PATTERNS
+────────────────────
+
+6a. Atomic Counter with Expiry:
+  MULTI
+  INCR page:views:2024-01-15
+  EXPIRE page:views:2024-01-15 86400
+  EXEC
+  -- Both commands guaranteed to execute together
+
+6b. Atomic Multi-Field Update (Hash):
+  MULTI
+  HSET user:42 name "Alice" email "alice@example.com"
+  HSET user:42:meta updated_at "2024-01-15" version 5
+  ZADD user:42:activity 1705363200 "profile_update"
+  EXEC
+
+6c. Atomic Dequeue and Process:
+  MULTI
+  RPOPLPUSH queue:jobs queue:processing
+  EXEC
+
+6d. Leaderboard Atomic Update:
+  MULTI
+  ZADD leaderboard 1000 "user:42"
+  HSET user:42 last_score 1000 last_game "2024-01-15"
+  EXEC
+
+
+7. WHAT HAPPENS IF REDIS CRASHES DURING EXEC?
+───────────────────────────────────────────────
+  Depends on persistence mode:
+
+  AOF (appendfsync always):
+    All EXEC commands are fully written to AOF before reply.
+    On restart, either all commands replayed or none (EXEC is atomic in AOF).
+
+  AOF (appendfsync everysec):
+    Commands flushed every second. If crash mid-second:
+    EXEC may be partially written → redis-check-aof can repair.
+
+  RDB only:
+    If crash occurs, last snapshot is restored.
+    Anything since last BGSAVE is lost (including the transaction).
+
+  ⚠ Redis Transactions do NOT guarantee durability unless AOF everysec/always.
+
+
+8. INTERVIEW QUESTIONS & ANSWERS
+──────────────────────────────────
+  Q: Does Redis support rollback in transactions?
+  A: No. Redis does NOT support rollback. If a command fails during EXEC (runtime
+     error like wrong type), the other commands still execute. Redis authors argue
+     that command failures are programming errors, not runtime conditions, so
+     rollback is unnecessary complexity. For atomicity with rollback, use a
+     distributed transaction coordinator or application-level compensating transactions.
+
+  Q: What is WATCH used for?
+  A: WATCH implements optimistic locking (CAS). It marks keys to be monitored.
+     If any watched key is modified by another client between WATCH and EXEC,
+     the EXEC returns nil and the transaction is aborted. The caller retries.
+     This is how you implement check-and-set patterns safely without pessimistic
+     locking (which doesn't exist in Redis).
+
+  Q: What's the difference between a Redis transaction and a pipeline?
+  A: Pipeline is client-side batching — reduces network RTT by sending multiple
+     commands at once, but commands are NOT atomic on the server. MULTI/EXEC is
+     server-side atomic grouping — all commands execute without interleaving.
+     You can combine both: pipeline the MULTI, commands, and EXEC in one network
+     round trip with server-side atomicity.
+
+  Q: Can Redis transactions span multiple keys in a cluster?
+  A: Only if all keys belong to the same hash slot (same shard). In Redis Cluster,
+     a transaction's keys are constrained to a single shard. Use hash tags
+     (curly braces) to force keys into the same slot: {user:42}:name,
+     {user:42}:score → same slot.
+
+  Q: How does MULTI/EXEC compare to Lua scripting for atomicity?
+  A: Both are atomic. MULTI/EXEC can't branch or use intermediate results —
+     it's a blind batch. Lua scripts can read a value and conditionally write
+     based on it, all atomically. For complex conditional logic, use Lua.
+     For simple command grouping where atomicity is needed, MULTI/EXEC is simpler
+     and has less overhead.
+
+================================================================================

@@ -1,0 +1,240 @@
+================================================================================
+REDIS KEYSPACE NOTIFICATIONS — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. WHAT ARE KEYSPACE NOTIFICATIONS?
+─────────────────────────────────────
+  Redis Keyspace Notifications let clients subscribe to Pub/Sub channels
+  that receive events when Redis operations happen on keys.
+
+  Think of it as: "notify me when key X expires / is deleted / is modified"
+
+  Two types of notifications:
+    Keyspace notifications:  "which events happened to key X?"
+      Channel: __keyspace@<db>__:<keyname>
+      Message: event type (e.g., "set", "del", "expire")
+
+    Keyevent notifications:  "which keys were affected by event Y?"
+      Channel: __keyevent@<db>__:<eventtype>
+      Message: key name
+
+  Example: SET mykey "hello" on db 0:
+    Keyspace: PUBLISH __keyspace@0__:mykey "set"
+    Keyevent: PUBLISH __keyevent@0__:set "mykey"
+
+
+2. ENABLING KEYSPACE NOTIFICATIONS
+─────────────────────────────────────
+  Disabled by default (CPU overhead).
+
+  Enable via redis.conf:
+    notify-keyspace-events "KEA"
+
+  Enable via runtime command:
+    CONFIG SET notify-keyspace-events KEA
+
+  Flag Characters (combine as needed):
+    K  → Keyspace events (channels: __keyspace@N__:key)
+    E  → Keyevent events (channels: __keyevent@N__:event)
+    g  → Generic commands: DEL, EXPIRE, RENAME, ...
+    $  → String commands: SET, GETSET, INCR, ...
+    l  → List commands: LPUSH, RPUSH, LPOP, ...
+    s  → Set commands: SADD, SREM, ...
+    z  → Sorted Set commands: ZADD, ZREM, ZINCRBY, ...
+    x  → Expired events (when a key TTL expires and is deleted)
+    d  → Module key type events
+    t  → Stream commands
+    m  → Key miss events (commands on non-existent keys)
+    e  → Evicted events (when maxmemory policy removes a key)
+    A  → Alias for "g$lszxt" (all events except 'm' and 'd')
+
+  Common configs:
+    "KEx"   → Keyspace expired-key events only
+    "KEA"   → All keyspace + keyevent events (verbose, high CPU)
+    "Kx"    → Keyspace expired events only
+    "Ex"    → Keyevent expired events only (listen for expired keys)
+    "KEg$"  → Generic + string events (keyspace + keyevent)
+
+  ⚠ Leaving notify-keyspace-events empty (default = "") disables all notifications.
+
+
+3. SUBSCRIBING TO NOTIFICATIONS
+─────────────────────────────────
+  # Monitor ALL events on all keys in db 0
+  PSUBSCRIBE __keyevent@0__:*
+
+  # Monitor only expired keys in db 0
+  SUBSCRIBE __keyevent@0__:expired
+
+  # Monitor a specific key for any events
+  PSUBSCRIBE __keyspace@0__:mykey
+
+  # Monitor all SET operations on db 0
+  SUBSCRIBE __keyevent@0__:set
+
+  Message received example:
+    1) "pmessage"
+    2) "__keyevent@0__:*"         ← pattern
+    3) "__keyevent@0__:expired"   ← matched channel
+    4) "session:user:42"          ← the key that expired
+
+
+4. KEY EXPIRY NOTIFICATIONS — PRIMARY USE CASE
+────────────────────────────────────────────────
+  CONFIG SET notify-keyspace-events Ex
+
+  Subscribe: SUBSCRIBE __keyevent@0__:expired
+
+  When a key expires → receive: {key_name}
+
+  Use cases:
+    - Session expiry handling: cleanup related data when session expires
+    - Task scheduling: set a key with TTL = delay time → expire event = trigger
+    - Order timeout: if order key expires → cancel the order
+    - Lease expiration: service registration keys with TTL
+
+  Java example (Spring):
+    @Bean
+    RedisMessageListenerContainer keyExpiryListener(
+            RedisConnectionFactory factory) {
+        RedisMessageListenerContainer container = new RedisMessageListenerContainer();
+        container.setConnectionFactory(factory);
+        container.addMessageListener(
+            new SessionExpiryListener(),
+            new PatternTopic("__keyevent@0__:expired")
+        );
+        return container;
+    }
+
+    class SessionExpiryListener implements MessageListener {
+        @Override
+        public void onMessage(Message message, byte[] pattern) {
+            String expiredKey = message.toString();
+            // expiredKey = "session:user:42"
+            if (expiredKey.startsWith("session:")) {
+                String userId = expiredKey.split(":")[2];
+                cleanupUserSession(userId);
+            }
+        }
+    }
+
+
+5. DELAYED TASK QUEUE PATTERN
+───────────────────────────────
+  Use key expiry notifications as a delay/scheduling mechanism:
+
+  Schedule a task for 30 minutes from now:
+    SET task:order:42:timeout "cancel" EX 1800
+    -- When the key expires, subscribe to:
+    -- __keyevent@0__:expired → receive "task:order:42:timeout"
+
+  Worker subscribes to expired events:
+    SUBSCRIBE __keyevent@0__:expired
+    On message "task:order:42:timeout":
+      → Cancel order 42 if still pending
+
+  ⚠ LIMITATIONS of this pattern:
+    - TTL precision is ~1 second (not millisecond)
+    - Key expiry is lazy + active (may fire slightly late)
+    - In a cluster, you must subscribe on ALL nodes (expiry happens on key's shard)
+    - Key expiry notification fires WHEN key is actually deleted
+      (lazy deletion = fires on next access; background = fires within seconds)
+    - Better alternatives: Redis Sorted Sets (score = timestamp) + polling worker
+      or Redis Streams
+
+
+6. EVICTION NOTIFICATIONS
+───────────────────────────
+  CONFIG SET notify-keyspace-events Ke  (enable eviction events)
+  SUBSCRIBE __keyevent@0__:evicted
+
+  Use case: Log/audit which keys were evicted from cache.
+  React to evictions: reload evicted data from DB into a different cache tier.
+
+
+7. LIMITATIONS & CAVEATS
+──────────────────────────
+  ✗ Fire-and-forget (Pub/Sub semantics):
+      No persistence, no replay, no guaranteed delivery.
+      If listener is offline when key expires → notification is MISSED.
+
+  ✗ No guarantee of single delivery:
+      Cluster: if a key expires and you're not subscribed to that shard's node,
+      you won't get the notification.
+
+  ✗ Performance cost:
+      Generating notifications for all events is expensive.
+      Use minimal flag combinations (e.g., "Ex" not "KEA").
+
+  ✗ Timing imprecision:
+      Expired events fire when key is actually deleted (lazy or active).
+      Keys may expire up to a few seconds after their TTL in low-traffic scenarios.
+
+  ✗ Expired events in cluster:
+      Must subscribe on every master node in the cluster.
+      Or use a single listener per shard and handle accordingly.
+
+  ✗ Key miss events (m flag):
+      Extremely noisy (every cache miss generates an event).
+      Almost never enable in production.
+
+
+8. PRACTICAL USE CASES SUMMARY
+────────────────────────────────
+  Use Case                     │ Notification Type        │ Config
+  ─────────────────────────────┼──────────────────────────┼────────────────
+  Session cleanup on expiry    │ __keyevent@0__:expired   │ Ex
+  Delayed task execution       │ __keyevent@0__:expired   │ Ex
+  Audit log of key changes     │ __keyspace@0__:mykey     │ KE$g
+  Cache miss detection         │ __keyevent@0__:miss      │ Em  (careful!)
+  Eviction monitoring          │ __keyevent@0__:evicted   │ Ee
+  Real-time key change alerts  │ __keyevent@0__:set       │ KE$
+
+
+9. SPRING SESSION + KEYSPACE NOTIFICATIONS
+────────────────────────────────────────────
+  Spring Session Redis uses keyspace notifications to detect expired sessions:
+    → Sets notify-keyspace-events to "gxE" automatically (or you set it)
+    → Subscribes to __keyevent@0__:expired
+    → On session key expiry, fires SessionDestroyedEvent
+
+  In application.properties:
+    spring.session.store-type=redis
+    spring.redis.host=localhost
+    spring.redis.port=6379
+
+  Must have keyspace notifications enabled:
+    CONFIG SET notify-keyspace-events gxE
+
+
+10. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: What are Redis keyspace notifications and when would you use them?
+  A: Keyspace notifications let clients receive Pub/Sub messages when specific
+     Redis key events occur (SET, DEL, EXPIRE, eviction, etc.). Common uses:
+     detecting session expiry to clean up related data, implementing delayed task
+     queues (set key with TTL = delay, react on expired event), auditing key
+     changes, and cache eviction monitoring.
+
+  Q: How do you enable keyspace notifications?
+  A: Set the notify-keyspace-events config with flag characters.
+     CONFIG SET notify-keyspace-events Ex enables keyevent (E) expired (x) events.
+     "KEA" enables all keyspace+keyevent events (expensive).
+     It's disabled by default to avoid performance overhead.
+
+  Q: What are the limitations of using key expiry notifications?
+  A: Pub/Sub semantics mean messages are fire-and-forget — if your subscriber
+     is offline, the notification is lost. Key expiry may fire slightly after
+     the actual TTL (lazy deletion). In Redis Cluster, you must subscribe to
+     all master nodes. For reliable delayed task processing, use a Sorted Set
+     with timestamp scores + polling worker instead.
+
+  Q: What's the difference between keyspace and keyevent notifications?
+  A: Keyspace: subscribe to a specific key name → receive all event types on that key.
+       Channel: __keyspace@0__:mykey → message: "set", "del", "expired"
+     Keyevent: subscribe to a specific event type → receive all key names affected.
+       Channel: __keyevent@0__:expired → message: key name that expired
+     Subscribe to keyevent for monitoring patterns (e.g., all expired keys).
+     Subscribe to keyspace when watching a specific key's lifecycle.
+
+================================================================================

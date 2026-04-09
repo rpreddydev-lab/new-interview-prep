@@ -1,0 +1,209 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LOGGING — STRUCTURED LOGGING, ELK STACK, BEST PRACTICES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. WHAT ARE LOGS?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Logs: immutable, time-stamped records of discrete events
+
+  Characteristics:
+    Discrete events (not aggregated like metrics)
+    Arbitrary structure and cardinality
+    High detail — capture full context of an event
+    Most expensive pillar to store (volume is high)
+
+  Types:
+    Application logs: business events ("Order #123 placed by user 456")
+    System logs: OS-level events (kernel, systemd, /var/log/syslog)
+    Audit logs: security-relevant events (who did what when)
+    Access logs: HTTP request logs (nginx/apache access.log)
+
+
+2. STRUCTURED vs UNSTRUCTURED LOGGING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+UNSTRUCTURED (BAD):
+  ERROR: Failed to process order 123 for user 456, amount $99.99
+
+  Problems:
+    Must parse free text to extract fields (slow, brittle regex)
+    Different messages have different formats → hard to aggregate
+    Grep works for simple cases, not for complex filters
+
+STRUCTURED (GOOD — JSON):
+  {
+    "timestamp": "2024-01-15T14:32:00.123Z",
+    "level": "ERROR",
+    "service": "order-service",
+    "trace_id": "abc123def456",
+    "span_id": "7890abcd",
+    "user_id": 456,
+    "order_id": 123,
+    "amount": 99.99,
+    "error": "InsufficientFundsException",
+    "message": "Failed to process order"
+  }
+
+  Benefits:
+    Machine-readable → ingest into Elasticsearch, filter by any field
+    Correlate: filter by trace_id → see all logs from one request
+    Aggregate: count errors grouped by error type, user_id, service
+    Dashboard: Kibana query: level:ERROR AND service:order-service
+
+
+3. LOG LEVELS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  TRACE: Most verbose — detailed step-by-step execution
+    "Entering method calculateShipping() with params: ..."
+    Only enable in development or targeted debugging sessions
+    NEVER in production (volume overwhelms system)
+
+  DEBUG: Diagnostic information for developers
+    "Cache miss for key user:456, fetching from DB"
+    Enable in production temporarily for debugging specific issue
+
+  INFO: Significant business events (normal flow)
+    "Order #123 created", "User logged in", "Payment processed"
+    Default level in production
+    Should be meaningful to business, not just technical
+
+  WARN: Something unexpected but not an error; worth investigating
+    "Retry 2/3 for payment gateway", "Cache hit rate < 50%"
+    Investigate WARN trends; they often predict future ERROR spikes
+
+  ERROR: Error occurred, request failed, user impacted
+    "Order #123 failed: payment gateway returned 402"
+    Alert on sustained ERROR rate increase
+
+  FATAL: System cannot continue; imminent crash
+    "Database connection pool exhausted — shutting down"
+    Rare; always triggers immediate PagerDuty alert
+
+  Rule: INFO default in prod; WARN/ERROR trigger alerts; TRACE/DEBUG disabled in prod
+
+
+4. CORRELATION IDs / TRACE IDs
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Problem: user reports "my order is broken" — how do you find the logs?
+
+Solution: Correlation ID propagated through entire request lifecycle
+
+  API Gateway generates: X-Request-ID: "abc123def456"
+  All services include this ID in every log entry
+  Downstream services forward the header: X-Request-ID → next service
+  
+  Find all logs for one user request:
+    Elasticsearch query: { "query": { "term": { "trace_id": "abc123def456" } } }
+    → every log entry from all services for that single request
+
+  Implementation in Spring Boot:
+    MDC (Mapped Diagnostic Context):
+      MDC.put("traceId", requestId);   // set at request entry
+      log.error("Failed to process order", e);  // automatically includes traceId in output
+
+  W3C TraceContext standard:
+    traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+    Format: version-traceId-parentSpanId-flags
+    All major APM vendors (Datadog, Jaeger, Zipkin) understand this format
+
+
+5. LOG AGGREGATION PIPELINE (ELK STACK)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+                  [App 1] [App 2] [App 3]
+                      ↓       ↓       ↓
+               ┌──────────────────────────┐
+               │   Filebeat / Fluentd     │   ← Log shippers
+               │  (tail log files, parse) │
+               └──────────────────────────┘
+                            ↓
+               ┌──────────────────────────┐
+               │      Logstash            │   ← Transformation
+               │  (filter, enrich, route) │
+               └──────────────────────────┘
+                            ↓
+               ┌──────────────────────────┐
+               │    Elasticsearch         │   ← Storage & indexing
+               │  (full-text search,      │
+               │   aggregations, ILM)     │
+               └──────────────────────────┘
+                            ↓
+               ┌──────────────────────────┐
+               │        Kibana            │   ← Visualization
+               │  (Discover, Dashboards,  │
+               │   Alerting)              │
+               └──────────────────────────┘
+
+  Alternatives:
+    Grafana Loki: labels-only indexing (cheaper than ES), log lines stored as-is
+      "logs like Prometheus" — efficient for label-based queries
+    Splunk: enterprise-grade, expensive, powerful SPL query language
+    AWS CloudWatch Logs: managed, integrates with Lambda/ECS
+    Datadog Logs: unified with metrics and APM
+
+
+6. INDEX LIFECYCLE MANAGEMENT (ILM)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Logs accumulate fast — must manage storage
+
+  Phases:
+    Hot (0-7 days): Fast SSD, frequently queried
+    Warm (7-30 days): Slower storage, less frequent access
+    Cold (30-90 days): Cheap storage, rarely accessed
+    Delete (>90 days): Remove unless compliance requires longer retention
+
+  Compliance exceptions:
+    PCI DSS: retain access logs 1 year
+    HIPAA: retain audit logs 6 years
+    SOC 2: retain security logs 1 year
+
+
+7. LOG SAMPLING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Problem: 100K requests/sec × 5 log lines = 500K lines/sec = unaffordable
+
+Sampling strategies:
+  Head-based: randomly sample 10% of requests; log all or none for a trace
+    Simple; loses 90% of data including the rare bugs
+
+  Tail-based: buffer all traces; if request is slow/errored → keep; otherwise discard
+    Keeps 100% of interesting traces; complex to implement (must buffer)
+    OpenTelemetry Collector can do tail-based sampling
+
+  Dynamic sampling: always sample errors; sample INFO at 1%; sample TRACE at 0.1%
+    High-value (errors) fully retained; bulk (success) sampled
+
+  Always sample:
+    All errors and exceptions
+    Requests above p99 latency threshold
+    Specific user IDs under investigation
+
+
+8. BEST PRACTICES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DO:
+  Use structured logging (JSON) from day 1
+  Include: timestamp, level, service, trace_id, user_id (if relevant), message
+  Log at the service boundary (request in, response out with latency)
+  Log all errors with full stack trace
+  Use MDC/context propagation for correlation IDs
+
+DON'T:
+  Log passwords, tokens, credit card numbers, SSNs (PII/PCI compliance)
+  Log in a tight loop (performance impact)
+  Use concatenated strings: log.error("Error for user " + userId) → not lazy
+    Use: log.error("Error for user {}", userId)  ← toString() only called if actually logging
+  Swallow exceptions silently: catch (Exception e) { } ← NEVER
+
+SECURITY — NEVER LOG:
+  Passwords, PINs, authentication tokens
+  Full credit card numbers (PAN) — log last 4 only
+  Social Security Numbers
+  Private keys, API secrets
+  GDPR-covered PII (email, phone — mask or exclude)

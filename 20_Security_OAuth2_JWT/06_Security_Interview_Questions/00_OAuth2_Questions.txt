@@ -1,0 +1,506 @@
+========================================================
+OAUTH2 & OIDC INTERVIEW QUESTIONS
+========================================================
+
+Comprehensive Q&A for senior-level interviews covering OAuth2 flows,
+grant types, token security, PKCE, OIDC, and Keycloak.
+
+========================================================
+SECTION 1: FUNDAMENTALS
+========================================================
+
+Q1: What problem does OAuth2 solve?
+A: OAuth2 solves the delegated authorization problem. Before OAuth2, if a third-party
+   app needed access to your data (e.g., Gmail contacts), it had to ask for your
+   password — a security nightmare (credential sharing, no scope limitation, no
+   revocation). OAuth2 lets users grant limited access to their resources to
+   third-party clients without sharing credentials. The client gets a scoped,
+   time-limited access token, and the user can revoke it at any time.
+
+Q2: Is OAuth2 an authentication protocol or authorization protocol?
+A: Authorization. OAuth2 was designed purely for delegated authorization — granting
+   access to resources. It does NOT define how to identify who the user is. The access
+   token tells you "the bearer can read contacts," but doesn't say who the bearer is.
+   OIDC (OpenID Connect) is the authentication layer built on top of OAuth2. It adds
+   the ID Token (a signed JWT) that identifies the user.
+
+Q3: Explain the four OAuth2 roles.
+A:
+  Resource Owner:       The user who owns the data (e.g., Gmail account holder)
+  Resource Server:      The API that holds the data (e.g., Gmail API)
+  Client:               The application requesting access (e.g., a calendar app)
+  Authorization Server: The server that authenticates the user and issues tokens
+                        (e.g., Google Auth, Keycloak)
+
+Q4: What are the main OAuth2 grant types and when do you use each?
+A:
+  Authorization Code:          Web/mobile apps with a backend. User interacts.
+  Authorization Code + PKCE:   Mobile/SPA apps without a backend secret.
+  Client Credentials:          Machine-to-machine (service-to-service). No user.
+  Device Authorization:        Smart TVs, CLIs — devices with no browser/input.
+  Refresh Token:                Exchanging a refresh token for a new access token.
+
+  Deprecated (avoid):
+  Implicit:                    Old SPA grant, tokens in URL fragment. Replaced by PKCE.
+  Resource Owner Password:     User gives password to client. Only for first-party apps
+                               when no redirect is possible. Breaks third-party trust.
+
+Q5: Walk me through the Authorization Code flow step by step.
+A:
+  Step 1: User clicks "Login with Google" → client redirects to AS:
+          GET /authorize?
+            response_type=code
+            &client_id=abc
+            &redirect_uri=https://app.com/callback
+            &scope=openid email
+            &state=random_string_for_csrf
+
+  Step 2: Authorization Server authenticates the user (login page).
+
+  Step 3: AS asks user to consent to the requested scopes.
+
+  Step 4: AS redirects back to client with authorization code:
+          GET https://app.com/callback?code=AUTH_CODE&state=same_state
+
+  Step 5: Client validates state parameter (CSRF protection).
+
+  Step 6: Client POSTs to token endpoint:
+          POST /token
+          grant_type=authorization_code
+          &code=AUTH_CODE
+          &redirect_uri=https://app.com/callback
+          &client_id=abc
+          &client_secret=xyz
+
+  Step 7: AS returns tokens:
+          {
+            "access_token": "...",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": "...",
+            "id_token": "..."    ← if openid scope requested
+          }
+
+  The authorization code is short-lived (typically 60s) and single-use.
+  The backend-to-AS communication in Step 6 uses client_secret (not in browser URL).
+
+Q6: What is the purpose of the `state` parameter?
+A: CSRF protection on the OAuth2 flow itself. The client generates a random string,
+   includes it in the authorization request, and validates that the callback received
+   the same `state` value. This prevents an attacker from initiating a flow and
+   tricking the client into processing a code that the attacker obtained.
+
+Q7: What is PKCE and why is it needed?
+A: PKCE (Proof Key for Code Exchange, RFC 7636) protects the Authorization Code flow
+   for public clients (mobile apps, SPAs) that can't securely store a client_secret.
+
+   Problem: If the authorization code is intercepted by a malicious app on the device,
+   it could exchange it for tokens.
+
+   Solution: The client generates a high-entropy random secret (code_verifier, 43-128
+   chars). It computes code_challenge = BASE64URL(SHA256(code_verifier)) and sends
+   code_challenge in the authorization request. When exchanging the code, it also
+   sends code_verifier in plain text. The AS verifies that SHA256(code_verifier) ==
+   stored code_challenge. The interceptor doesn't have code_verifier, so they can't
+   exchange the code even if they intercept it.
+
+   Should also use PKCE for confidential clients as a defense-in-depth measure.
+
+Q8: Why was the Implicit grant type deprecated?
+A: The Implicit grant returns tokens directly in the URL fragment
+   (#access_token=...). Problems:
+   1) Tokens are exposed in browser history, server logs, referrer headers
+   2) No client authentication possible (no secret exchanged)
+   3) No refresh tokens (security concern at the time)
+   4) Vulnerable to token leakage via open redirectors
+   PKCE + Authorization Code flow provides all the same benefits without these risks.
+
+Q9: Explain the Client Credentials grant type.
+A: Used for machine-to-machine (M2M) communication. There is no user; the client
+   authenticates as itself.
+
+   Request:
+   POST /token
+   grant_type=client_credentials
+   &client_id=service-a
+   &client_secret=secret
+   &scope=api.read
+
+   No authorization code step, no user login. The AS issues an access token scoped
+   to what service-a is allowed to do. Used in microservices for service-to-service
+   calls (e.g., Order Service calling Payment Service).
+
+Q10: What is the difference between an access token and a refresh token?
+A:
+  Access Token:
+    - Short-lived (5 min – 1 hour)
+    - Sent to Resource Server on every request
+    - Used to access protected resources
+    - Can be JWT (self-contained) or opaque
+
+  Refresh Token:
+    - Long-lived (days to weeks, or long-lived with rotation)
+    - Sent ONLY to the Authorization Server
+    - Used to get a new access token when the current one expires
+    - Never sent to Resource Servers
+    - Higher security risk — must be stored securely
+
+========================================================
+SECTION 2: TOKEN SECURITY
+========================================================
+
+Q11: How does an OAuth2 Resource Server validate a JWT access token?
+A:
+  1) Parse the JWT (base64url decode header + payload)
+  2) Check the algorithm in header — reject 'none' and unexpected algorithms
+  3) Fetch the public key from JWKS URI using the 'kid' (key ID) in header
+  4) Verify the signature using the public key
+  5) Validate claims:
+     - iss (issuer): must match expected AS URL
+     - aud (audience): must include this service's identifier
+     - exp (expiration): must be in the future
+     - nbf (not before): current time must be ≥ nbf
+     - iat (issued at): sanity check
+  6) Check any custom claims required by the application (scope, roles)
+
+Q12: What is a JWKS URI and how does key rotation work?
+A: JWKS (JSON Web Key Set) is a published endpoint from the Authorization Server
+   that lists its public keys. Example: https://auth.example.com/.well-known/jwks.json
+
+   Key rotation process:
+   1) AS generates a new RSA/EC key pair
+   2) New public key added to JWKS endpoint (both old AND new present)
+   3) New tokens signed with new private key (using new 'kid')
+   4) Resource servers fetch JWKS dynamically and cache it (NimbusJwtDecoder
+      in Spring auto-refreshes when unknown kid encountered)
+   5) After all old tokens expire, old key removed from JWKS
+   6) Zero-downtime rotation achieved
+
+Q13: How do you invalidate/revoke a JWT access token?
+A: JWTs are stateless — there's no revocation built-in. Options:
+   1) Short expiry: Accept that tokens are valid for a short window (5-15 min).
+      Compromise: minor security risk vs operational complexity.
+   2) Token blacklist: Store revoked JTIs (JWT ID claims) in Redis. Check on every
+      request. Adds latency; Redis becomes a critical dependency.
+   3) Opaque token: Use short-lived JWT for performance + opaque refresh token.
+      Revoke opaque token at AS to prevent new access token issuance.
+   4) Token introspection: Resource Server calls AS to validate on each request.
+      Authoritative but adds latency (use caching).
+   5) Short-lived + refresh rotation: Revoke the refresh token, short-lived AT
+      becomes useless quickly.
+
+Q14: What is token introspection (RFC 7662)?
+A: Token introspection allows a Resource Server to verify an opaque access token
+   with the Authorization Server. The RS sends the token to the introspection
+   endpoint, and the AS responds with whether it's active and its metadata.
+
+   POST /introspect
+   token=opaque_token_value&token_type_hint=access_token
+
+   Response:
+   {
+     "active": true,
+     "sub": "alice",
+     "scope": "orders:read",
+     "exp": 1700000000,
+     "client_id": "myapp"
+   }
+
+   Cache introspection results for the token's lifetime to avoid AS hammering.
+   "active: false" means the token is expired or revoked.
+
+Q15: What is the Phantom Token pattern?
+A: A pattern where the Authorization Server issues opaque tokens to clients (for
+   revocability), but an API Gateway exchanges them for short-lived JWTs before
+   forwarding requests to microservices. Benefits:
+   - Clients only ever see opaque tokens (revocable)
+   - Microservices get self-contained JWTs (no introspection calls needed)
+   - Best of both worlds: revocability + stateless resource server performance
+
+Q16: What is refresh token rotation?
+A: On each refresh token use, the AS issues a new refresh token AND invalidates the
+   old one. Benefits:
+   - Refresh tokens become single-use
+   - If a refresh token is stolen and used, the legitimate user's next refresh
+     attempt fails (old token invalid), alerting to theft
+   - Spring Authorization Server: TokenSettings.builder()
+     .reuseRefreshTokens(false) enables rotation
+
+Q17: What should you check for refresh token theft detection?
+A: With rotation enabled, if someone uses an already-used refresh token, it means
+   the token family has been compromised. The AS should:
+   1) Invalidate the ENTIRE token family (all refresh tokens from that original grant)
+   2) Force re-authentication
+   3) Log a security event
+   4) Optionally notify the user
+
+========================================================
+SECTION 3: OIDC (OPENID CONNECT)
+========================================================
+
+Q18: What does OIDC add on top of OAuth2?
+A:
+  OAuth2: "User has granted you access to their resources"
+  OIDC:   "Here's WHO the user is" (authentication layer)
+
+  OIDC additions:
+  - ID Token: A signed JWT that identifies the user (who they are, when they
+    authenticated, how they were authenticated)
+  - UserInfo endpoint: Returns additional user claims
+  - Standard claims: sub, name, email, picture, locale, etc.
+  - Standard scopes: openid, profile, email, address, phone
+  - Discovery endpoint: /.well-known/openid-configuration
+  - Standard flows: same as OAuth2 but must include 'openid' scope
+
+Q19: Explain the ID Token and how to validate it.
+A: The ID Token is a JWT issued by the OIDC provider and consumed by the CLIENT
+   (not the Resource Server). It represents the authentication event.
+
+   Key claims:
+     iss: Issuer URL
+     sub: Subject (user's unique identifier at the IdP)
+     aud: Must be the client_id
+     exp: Expiration
+     iat: Issued at
+     auth_time: When user last authenticated
+     nonce: Random value sent in authorization request (replay attack prevention)
+     amr: Authentication methods (password, mfa, etc.)
+     acr: Authentication context class reference
+
+   Validation steps:
+   1) Verify signature (AS's public key from JWKS)
+   2) iss == expected issuer
+   3) aud == client_id (or contains it)
+   4) exp > now
+   5) iat not too old (clock skew tolerance, typically 5 min)
+   6) nonce matches (if nonce was sent in auth request)
+   7) acr satisfies required level (if step-up authentication used)
+
+Q20: What is the difference between an ID Token and an Access Token?
+A:
+  ID Token:
+    - Intended for the CLIENT application
+    - Identifies the user (authentication)
+    - Should NOT be sent to APIs (except OIDC UserInfo endpoint)
+    - Contains user identity claims
+
+  Access Token:
+    - Intended for the RESOURCE SERVER
+    - Grants authorization to access resources
+    - Contains scopes, may contain roles/permissions
+    - Should NOT be decoded/used by client for identity (use ID Token)
+
+  Common mistake: Sending ID Token to APIs as Bearer token. Don't do this.
+
+Q21: What is the nonce parameter in OIDC?
+A: A random, unique value generated by the client and included in the authorization
+   request. The AS embeds it in the ID Token. The client verifies the nonce in the
+   ID Token matches what it sent. Prevents replay attacks — an attacker can't reuse
+   a captured ID Token since the nonce won't match the client's current session.
+
+Q22: What is the OIDC UserInfo endpoint?
+A: An OAuth2-protected endpoint (typically at /userinfo) that returns claims about
+   the authenticated user. The client sends the access token to the UserInfo endpoint
+   and receives additional claims beyond what's in the ID Token.
+
+   Scopes determine what claims are returned:
+     profile scope → name, given_name, family_name, picture, locale
+     email scope   → email, email_verified
+     address scope → address
+     phone scope   → phone_number
+
+   Used when ID Token is small (to keep it compact) and additional claims are needed.
+
+Q23: Explain the difference between OIDC Discovery and Dynamic Client Registration.
+A:
+  Discovery (RFC 8414 / OIDC Discovery):
+    AS publishes its capabilities at /.well-known/openid-configuration
+    Contains: authorization_endpoint, token_endpoint, jwks_uri, scopes_supported,
+    grant_types_supported, etc.
+    Clients use this to auto-configure without hardcoding AS URLs.
+
+  Dynamic Client Registration (RFC 7591):
+    Clients register themselves programmatically with the AS at runtime.
+    POST /register with client metadata → receives client_id/client_secret
+    Used in large-scale, multi-tenant systems where clients are registered
+    on-the-fly rather than statically pre-configured.
+
+========================================================
+SECTION 4: KEYCLOAK SPECIFICS
+========================================================
+
+Q24: How does Keycloak differ from a generic OAuth2/OIDC provider?
+A:
+  Keycloak-specific features:
+  - realm_access.roles: User roles embedded in JWT as nested claim
+  - resource_access.<clientId>.roles: Client-specific roles
+  - Keycloak Admin REST API for user/role management
+  - Protocol mappers: customize token claims
+  - Client scopes and optional scopes
+  - Identity federation (LDAP, Active Directory, social providers)
+  - Fine-grained authorization (Keycloak Authorization Services)
+  - Sessions: admin can force logout, view active sessions
+  - Events: audit log of login/token events
+  - Themes: customizable login pages
+
+Q25: How do you extract Keycloak roles in a Spring Resource Server?
+A: Keycloak puts roles at realm_access.roles (array of strings) in the JWT.
+   Spring Security's default JwtGrantedAuthoritiesConverter reads the 'scope' claim,
+   so you need a custom converter:
+
+   @Bean
+   public JwtAuthenticationConverter jwtAuthenticationConverter() {
+       JwtGrantedAuthoritiesConverter converter = new JwtGrantedAuthoritiesConverter();
+       // Custom converter that reads realm_access.roles:
+       return new JwtAuthenticationConverter() {{
+           setJwtGrantedAuthoritiesConverter(jwt -> {
+               Collection<GrantedAuthority> authorities = new ArrayList<>();
+               // Standard scopes
+               String scope = jwt.getClaimAsString("scope");
+               if (scope != null) {
+                   Arrays.stream(scope.split(" "))
+                       .map(s -> new SimpleGrantedAuthority("SCOPE_" + s))
+                       .forEach(authorities::add);
+               }
+               // Keycloak realm roles
+               Map<String, Object> realmAccess = jwt.getClaimAsMap("realm_access");
+               if (realmAccess != null) {
+                   List<String> roles = (List<String>) realmAccess.get("roles");
+                   if (roles != null) {
+                       roles.stream()
+                           .map(r -> new SimpleGrantedAuthority("ROLE_" + r))
+                           .forEach(authorities::add);
+                   }
+               }
+               return authorities;
+           });
+       }};
+   }
+
+Q26: What is a Keycloak Realm vs Client?
+A:
+  Realm: A logical namespace/tenant. Contains users, roles, groups, clients,
+  identity providers. Multiple realms can run in one Keycloak. Realms are
+  completely isolated from each other.
+
+  Client: Represents an application (Resource Server or OAuth2 client) registered
+  within a realm. Configured with redirect URIs, allowed grant types, scopes,
+  protocol mappers, and service account settings.
+
+  Common pattern:
+  - One realm per environment (dev/staging/prod) OR one realm per tenant
+  - One client per application/service registered in that realm
+
+Q27: How would you configure a Spring Boot app as a Keycloak Resource Server?
+A:
+  application.yml:
+  spring:
+    security:
+      oauth2:
+        resourceserver:
+          jwt:
+            issuer-uri: http://keycloak:8080/realms/myrealm
+
+  This auto-configures:
+  - JWKS URI fetched from issuer/.well-known/openid-configuration
+  - JwtDecoder with issuer validation
+  - BearerTokenAuthenticationFilter
+  - 401 on missing/invalid token
+
+  Add custom SecurityFilterChain + JwtAuthenticationConverter for role extraction.
+
+========================================================
+SECTION 5: ADVANCED & SCENARIO-BASED
+========================================================
+
+Q28: How would you implement multi-tenant OAuth2?
+A: Use AuthenticationManagerResolver<HttpServletRequest> to select the right
+   JwtDecoder based on the tenant. The tenant can be identified from:
+   - Path variable (/api/tenants/{tenant}/...)
+   - Subdomain (tenant1.api.example.com)
+   - JWT 'iss' claim itself
+
+   @Bean
+   public AuthenticationManagerResolver<HttpServletRequest> resolver() {
+       Map<String, AuthenticationManager> managers = new HashMap<>();
+       // Pre-populate or load dynamically:
+       managers.put("tenant1", authManagerForIssuer("https://auth.tenant1.com"));
+       managers.put("tenant2", authManagerForIssuer("https://auth.tenant2.com"));
+       return request -> {
+           String tenant = extractTenant(request); // from path/subdomain/header
+           return managers.get(tenant);
+       };
+   }
+
+Q29: An access token is stolen in transit. What is the impact and mitigation?
+A:
+  Impact:
+  - Attacker has the token until it expires (minutes to hours)
+  - Can make API calls as the victim within token's scope
+  - With opaque tokens: can be revoked. With JWT: cannot be revoked directly.
+
+  Mitigations:
+  - Always use HTTPS (prevents interception)
+  - Short token expiry (5-15 min) limits blast radius
+  - Audience validation (token only works for intended RS)
+  - Sender-constrained tokens (DPoP): bind token to client's key pair — stolen
+    token unusable without private key
+  - Token binding (deprecated by browsers, but conceptually useful)
+  - Monitor for unusual usage patterns (geo, rate, etc.)
+
+Q30: What is DPoP (Demonstrating Proof of Possession)?
+A: An extension (RFC 9449) that sender-constrains access tokens. The client creates
+   a key pair, and the AS embeds the public key thumbprint in the access token.
+   On each API request, the client signs a DPoP proof JWT (containing the request
+   method + URI + timestamp) with its private key. The RS verifies both the access
+   token AND the DPoP proof. A stolen token is useless without the private key.
+
+Q31: Explain the Back-Channel Logout flow.
+A: In OIDC, when a user logs out from one application (or from the IdP directly),
+   the AS can notify all other applications in that SSO session to also log out.
+
+   Front-channel logout: AS redirects browser to each client's logout URI (visible
+   to user, can fail silently if client is down).
+
+   Back-channel logout: AS makes server-to-server HTTP POST to each registered
+   logout URI with a logout_token (contains the session ID / sub). Client validates
+   the token and invalidates the local session. More reliable than front-channel.
+
+Q32: What are the security risks of storing tokens in localStorage vs cookies?
+A:
+  localStorage:
+    - Accessible by JavaScript → vulnerable to XSS attacks
+    - Any injected script can steal the token
+    - No same-site protection
+    - Avoid for refresh tokens; avoid for sensitive access tokens
+
+  Cookies (httpOnly + secure + SameSite=Strict/Lax):
+    - Not accessible by JavaScript (httpOnly flag)
+    - Only sent over HTTPS (secure flag)
+    - SameSite prevents CSRF for cross-origin requests
+    - Vulnerable to CSRF (but SameSite + CSRF tokens mitigate this)
+    - Recommended for storing session/refresh tokens in browser apps
+
+  Best practice for SPAs:
+    - Access token in memory (JavaScript variable) — short-lived, lost on page reload
+    - Refresh token in httpOnly cookie — secure, survives reload
+    - Use BFF (Backend for Frontend) to keep tokens server-side entirely
+
+Q33: What is the Authorization Code flow with client authentication?
+A: For confidential clients, the token endpoint requires the client to prove its
+   identity. Methods:
+   - client_secret_basic: HTTP Basic Auth (client_id:client_secret in Authorization header)
+   - client_secret_post: client_id + client_secret in POST body
+   - private_key_jwt: Client signs a JWT with its private key (most secure, no shared secret)
+   - client_secret_jwt: Client signs a JWT with shared secret
+   - tls_client_auth: mTLS — client certificate for authentication (no secret needed)
+
+Q34: You have a mobile app — which grant type and what security precautions?
+A: Use Authorization Code + PKCE:
+   - No client_secret (public client, can't store secrets)
+   - PKCE instead of client_secret for auth code exchange
+   - Register redirect URI as custom scheme (myapp://callback) or universal link
+   - Store tokens in platform secure storage (Keychain on iOS, EncryptedSharedPreferences on Android)
+   - Refresh token rotation (reuseRefreshTokens=false)
+   - Short access token lifetime (15 min)
+   - Certificate pinning to prevent MITM

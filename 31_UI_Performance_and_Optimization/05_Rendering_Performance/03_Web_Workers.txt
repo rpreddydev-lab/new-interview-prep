@@ -1,0 +1,397 @@
+================================================================
+WEB WORKERS
+================================================================
+
+WHAT IS THE PROBLEM?
+──────────────────────
+JavaScript is single-threaded. All JS code runs on the MAIN THREAD
+which is ALSO responsible for:
+  - DOM manipulation and rendering
+  - Event handling (clicks, keyboard, touch)
+  - CSS animations and transitions (JS-driven)
+  - Garbage collection
+
+If your JS runs for > 50ms, the browser can't handle user input → BAD INP.
+If your JS runs for > 16ms, animations drop frames → JANK.
+
+WEB WORKERS let you run JavaScript in BACKGROUND THREADS:
+  - Separate from the main thread
+  - No DOM access (workers can't touch the DOM)
+  - Full JS capabilities: Arrays, Objects, fetch, IndexedDB, WebAssembly
+  - Communicate with main thread via message passing (postMessage)
+
+THREAD SAFETY: Workers use message passing (no shared memory by default)
+so there are no race conditions. Data is COPIED (not shared) — called
+"Structured Clone Algorithm."
+
+================================================================
+WEB WORKER TYPES
+================================================================
+
+1. DEDICATED WORKER (most common):
+   - Owned by a single script/window
+   - Lives as long as the page that created it
+   - Use for: CPU-heavy computations for one page
+
+2. SHARED WORKER:
+   - Shared across multiple tabs/windows from same origin
+   - Use for: Background sync, shared state, database operations
+   
+3. SERVICE WORKER:
+   - Special worker for intercepting network requests
+   - Used for: Offline caching, push notifications, background sync
+   - Covered in: 04_Caching_Strategies.txt
+
+================================================================
+CREATING AND USING A DEDICATED WORKER
+================================================================
+
+// ─── worker.js (separate file) ───
+// This runs in the worker thread (no window, no document)
+
+self.addEventListener('message', (event) => {
+  const { type, data } = event.data;
+  
+  switch (type) {
+    case 'SORT': {
+      // Heavy computation happens here (not blocking main thread!)
+      const sorted = data.items.slice().sort((a, b) => {
+        return a.name.localeCompare(b.name);
+      });
+      
+      // Send result back to main thread
+      self.postMessage({ type: 'SORT_RESULT', data: sorted });
+      break;
+    }
+    
+    case 'FILTER': {
+      const filtered = data.items.filter(item =>
+        item.value > data.threshold
+      );
+      self.postMessage({ type: 'FILTER_RESULT', data: filtered });
+      break;
+    }
+  }
+});
+
+// ─── main.js (main thread) ───
+const worker = new Worker(new URL('./worker.js', import.meta.url), {
+  type: 'module', // Use ES modules in worker
+});
+
+// Send data to worker
+worker.postMessage({
+  type: 'SORT',
+  data: { items: largeArray }
+});
+
+// Receive result
+worker.addEventListener('message', (event) => {
+  const { type, data } = event.data;
+  if (type === 'SORT_RESULT') {
+    setState(data); // Update UI with sorted data
+  }
+});
+
+// Clean up when done
+worker.terminate();
+
+================================================================
+REACT + WEB WORKERS
+================================================================
+
+REACT HOOK FOR WORKER COMMUNICATION:
+  // src/hooks/useWorker.js
+  import { useRef, useCallback } from 'react';
+  
+  export function useWorker(workerPath) {
+    const workerRef = useRef(null);
+    const callbacksRef = useRef(new Map());
+    let messageId = 0;
+    
+    if (!workerRef.current) {
+      workerRef.current = new Worker(
+        new URL(workerPath, import.meta.url),
+        { type: 'module' }
+      );
+      
+      workerRef.current.addEventListener('message', (event) => {
+        const { id, result, error } = event.data;
+        const { resolve, reject } = callbacksRef.current.get(id) || {};
+        callbacksRef.current.delete(id);
+        
+        if (error) reject(new Error(error));
+        else resolve(result);
+      });
+    }
+    
+    const execute = useCallback((type, data) => {
+      const id = ++messageId;
+      
+      return new Promise((resolve, reject) => {
+        callbacksRef.current.set(id, { resolve, reject });
+        workerRef.current.postMessage({ id, type, data });
+      });
+    }, []);
+    
+    return execute;
+  }
+  
+  // Worker file (sort-worker.js):
+  self.addEventListener('message', async ({ data: { id, type, data } }) => {
+    try {
+      let result;
+      if (type === 'SORT') result = data.sort((a, b) => a - b);
+      self.postMessage({ id, result });
+    } catch (error) {
+      self.postMessage({ id, error: error.message });
+    }
+  });
+  
+  // Usage in component:
+  function DataTable({ items }) {
+    const [sorted, setSorted] = useState([]);
+    const execute = useWorker('./sort-worker.js');
+    
+    useEffect(() => {
+      execute('SORT', items).then(setSorted);
+    }, [items]);
+    
+    return <table>{/* render sorted */}</table>;
+  }
+
+================================================================
+COMLINK - SIMPLIFYING WORKER COMMUNICATION
+================================================================
+
+Comlink (by Google Chrome team) makes workers feel like regular functions.
+Eliminates manual postMessage/addEventListener boilerplate.
+
+  npm install comlink
+
+  // worker.ts
+  import * as Comlink from 'comlink';
+  
+  const api = {
+    async processData(items: Item[]) {
+      return items
+        .filter(item => item.active)
+        .sort((a, b) => b.score - a.score)
+        .map(item => ({ ...item, rank: items.indexOf(item) + 1 }));
+    },
+    
+    async runML(data: number[]) {
+      // Heavy ML inference
+      return predict(data);
+    }
+  };
+  
+  Comlink.expose(api);
+  
+  // main.ts
+  import * as Comlink from 'comlink';
+  
+  const worker = new Worker(new URL('./worker.ts', import.meta.url), {
+    type: 'module'
+  });
+  const api = Comlink.wrap<typeof api>(worker);
+  
+  // Use worker just like a regular async function!
+  const processed = await api.processData(items);
+  
+  // React component:
+  function useWorkerProcessing(items) {
+    const [result, setResult] = useState([]);
+    
+    useEffect(() => {
+      const worker = new Worker(new URL('./worker.ts', import.meta.url));
+      const api = Comlink.wrap(worker);
+      
+      api.processData(items).then(setResult);
+      
+      return () => worker.terminate();
+    }, [items]);
+    
+    return result;
+  }
+
+================================================================
+USE CASES FOR WEB WORKERS
+================================================================
+
+GREAT FIT:
+  1. IMAGE/VIDEO PROCESSING
+     - Filters, resizing, compression
+     - Reading/processing File objects (file input)
+     - Canvas operations (off-screen canvas)
+  
+  2. DATA PROCESSING
+     - Sorting/filtering large datasets (1000+ items)
+     - Complex calculations (statistics, aggregations)
+     - Data transformations (normalization, parsing)
+  
+  3. ENCRYPTION/HASHING
+     - Encryption, decryption, digital signatures
+     - Password hashing (bcrypt in WebAssembly)
+  
+  4. PARSING AND COMPILATION
+     - Parsing large JSON files
+     - Syntax highlighting engines
+     - Markdown/CSV/XML parsing
+  
+  5. MACHINE LEARNING INFERENCE
+     - TensorFlow.js inference off main thread
+     - Natural language processing
+  
+  6. REAL-TIME CALCULATIONS
+     - Physics simulations
+     - Game logic
+     - Sensor data processing
+
+BAD FIT:
+  - DOM access (workers can't access DOM)
+  - Simple computations (overhead > benefit)
+  - Frequent small tasks (postMessage has overhead)
+  - Code that needs synchronous access to main thread
+
+================================================================
+OFFSCREENCANVAS - CANVAS IN A WORKER
+================================================================
+
+OffscreenCanvas lets you render to a canvas element from a worker thread,
+keeping rendering off the main thread.
+
+  // main.js
+  const canvas = document.getElementById('myCanvas');
+  const offscreen = canvas.transferControlToOffscreen();
+  
+  const worker = new Worker('./canvas-worker.js');
+  worker.postMessage({ canvas: offscreen }, [offscreen]); // Transfer ownership
+  
+  // canvas-worker.js
+  let ctx;
+  
+  self.addEventListener('message', (e) => {
+    if (e.data.canvas) {
+      ctx = e.data.canvas.getContext('2d');
+      startAnimation();
+    }
+  });
+  
+  function startAnimation() {
+    function frame() {
+      ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+      // ... complex rendering ...
+      requestAnimationFrame(frame); // rAF works in workers!
+    }
+    requestAnimationFrame(frame);
+  }
+  
+  // BENEFIT: Entire animation loop runs off main thread
+  // Main thread busy with JS? Animation still runs smoothly!
+
+================================================================
+SHAREDARRAYBUFFER AND ATOMICS (ADVANCED)
+================================================================
+
+For performance-critical cases, workers can SHARE memory (zero-copy):
+
+  // REQUIREMENTS: Cross-Origin Isolated (COOP + COEP headers required)
+  // Headers:
+  // Cross-Origin-Opener-Policy: same-origin
+  // Cross-Origin-Embedder-Policy: require-corp
+  
+  // main.js
+  const sharedBuffer = new SharedArrayBuffer(1024); // 1KB shared memory
+  const sharedArray = new Int32Array(sharedBuffer);
+  
+  worker.postMessage({ buffer: sharedBuffer }); // Buffer SHARED (not copied!)
+  
+  // Atomics: thread-safe operations
+  Atomics.add(sharedArray, 0, 1);    // Atomic increment (thread-safe)
+  Atomics.store(sharedArray, 0, 42); // Thread-safe write
+  Atomics.load(sharedArray, 0);      // Thread-safe read
+  Atomics.wait(sharedArray, 0, 42);  // Wait until array[0] !== 42
+  Atomics.notify(sharedArray, 0, 1); // Notify waiting workers
+
+  // USE CASE: Real-time data processing (audio, video, sensors)
+  // where copying would be too slow or wasteful
+
+================================================================
+PARTYTOWN — THIRD-PARTY SCRIPTS IN WORKERS
+================================================================
+
+Partytown (by Builder.io) runs third-party scripts (analytics, chat widgets)
+in Web Workers, freeing the main thread completely.
+
+  npm install @builder.io/partytown
+
+  // next.config.js (Next.js integration)
+  const { withPartytown } = require('@builder.io/partytown/integration/next');
+  
+  module.exports = withPartytown({
+    partytown: {
+      forward: ['dataLayer.push', 'gtag'], // Forward calls to worker
+    }
+  });
+  
+  // pages/_document.js
+  import { createPartytownScriptUrl } from '@builder.io/partytown/integration';
+  
+  export default function Document() {
+    return (
+      <Html>
+        <Head>
+          {/* Partytown snippet inlined */}
+          <script
+            dangerouslySetInnerHTML={{
+              __html: `partytown = { forward: ['dataLayer.push'] };`
+            }}
+          />
+        </Head>
+        <body>
+          {/* Google Analytics in worker thread! */}
+          <Script
+            src="https://www.googletagmanager.com/gtag/js"
+            strategy="worker"  // Next.js + Partytown: runs in worker
+          />
+        </body>
+      </Html>
+    );
+  }
+  
+  // RESULT: Google Analytics has ZERO impact on main thread performance!
+  // Page INP and responsiveness unaffected by analytics.
+
+================================================================
+INTERVIEW ANSWERS
+================================================================
+
+Q: Why can't Web Workers access the DOM?
+A: The DOM is not thread-safe. If two threads could simultaneously modify
+   the DOM, you'd need locks/mutexes to prevent race conditions, which would
+   add enormous complexity and potential deadlocks. The browser designers
+   chose to keep the DOM single-threaded: only the main thread accesses it.
+   Workers communicate with the main thread via message passing, and the
+   main thread does the DOM updates. This is actually a useful constraint —
+   it forces clean separation between computation (worker) and rendering (main).
+
+Q: What is the structured clone algorithm and what are its limitations?
+A: When you postMessage to a worker, data is COPIED using the structured clone
+   algorithm. It handles: primitives, Arrays, Objects, Map, Set, Date, RegExp,
+   ArrayBuffer (with transfer). Limitations: it can't clone functions (no
+   transferring behavior), DOM nodes, or WeakMap/WeakSet. For large data,
+   copying is expensive — prefer Transferable objects (ArrayBuffer, MessagePort,
+   OffscreenCanvas) which are MOVED (not copied) to the worker in O(1) time.
+   With SharedArrayBuffer, memory can be shared entirely (zero copy, but
+   requires Cross-Origin Isolation headers).
+
+Q: When would you use Comlink vs raw postMessage for workers?
+A: Raw postMessage is appropriate for simple, infrequent communication where
+   the message protocol is stable. Comlink is better when you have complex
+   worker APIs with many functions, when you want TypeScript type safety across
+   the thread boundary, or when the worker acts like a service with multiple
+   methods. Comlink essentially wraps the request/response postMessage pattern
+   in a Proxy, making it look like async function calls. The trade-off is a
+   small library dependency (~2KB) and slightly more overhead per call, but
+   dramatically better developer experience for non-trivial worker communication.

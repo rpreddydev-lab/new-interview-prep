@@ -1,0 +1,281 @@
+================================================================================
+REDIS GEOSPATIAL COMMANDS — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. WHAT ARE REDIS GEOSPATIAL COMMANDS?
+────────────────────────────────────────
+  Redis Geospatial commands (since Redis 3.2) allow storing geographic
+  coordinates (latitude/longitude) and querying by distance.
+
+  Built on top of Sorted Sets:
+    - Each member's "score" is a 52-bit geohash (encodes lat+lon)
+    - Uses the WGS-84 coordinate system (same as GPS)
+    - All geo commands interact with a Sorted Set under the hood
+
+  Geohash:
+    - Earth is divided into a grid of cells
+    - Each cell has a string hash (GEOHASH) and a numeric integer hash
+    - Redis uses 52-bit integer precision: ~0.6mm accuracy
+    - Cells are hierarchical: prefix match = proximity
+
+
+2. CORE COMMANDS
+─────────────────
+  GEOADD key [NX|XX] [CH] lon lat member [lon lat member …]
+    → Add members with coordinates
+    → NX: only add new members (don't update)
+    → XX: only update existing members
+    → CH: return changed count instead of added count
+    → Returns: number of NEW elements added
+
+  GEOPOS key member [member …]
+    → Get coordinates of members
+    → Returns array of [longitude, latitude] per member
+    → Returns nil for non-existent members
+
+  GEODIST key member1 member2 [unit]
+    → Distance between two members
+    → Units: m (meters), km (kilometers), mi (miles), ft (feet)
+    → Returns nil if either member doesn't exist
+
+  GEOHASH key member [member …]
+    → Returns standard geohash string (11-char base32) for members
+    → Useful for external geohash-compatible systems
+
+  GEOSEARCH key FROMMEMBER member | FROMLONLAT lon lat
+             BYRADIUS radius unit | BYBOX width height unit
+             [ASC|DESC] [COUNT count [ANY]]
+             [WITHCOORD] [WITHDIST] [WITHHASH]
+    → Search for members within radius/box from a point
+    → ASC/DESC: sort by distance
+    → COUNT n: return at most n results
+    → COUNT n ANY: return n results quickly (not necessarily nearest)
+    → WITHCOORD: include coordinates in response
+    → WITHDIST: include distance in response
+
+  GEOSEARCHSTORE dest key FROMMEMBER member | FROMLONLAT lon lat
+                 BYRADIUS radius unit | BYBOX width height unit
+                 [ASC|DESC] [COUNT count [ANY]] [STOREDIST]
+    → Like GEOSEARCH but stores results in dest sorted set
+    → STOREDIST: score = distance (instead of geohash)
+
+  Deprecated (use GEOSEARCH instead):
+    GEORADIUS key lon lat radius unit [options]
+    GEORADIUSBYMEMBER key member radius unit [options]
+
+
+3. INTERNALS — HOW SCORES ARE GEOHASHES
+─────────────────────────────────────────
+  Coordinates → Geohash integer:
+    1. Normalize lat [-90, 90] and lon [-180, 180] to [0, 1]
+    2. Interleave the binary representations of lat and lon
+    3. This forms a 52-bit integer (fits in a Redis sorted set score which is float64)
+
+  Properties of geohash:
+    - Members close in space have similar geohash values
+    - Prefix matching = approximate proximity
+    - Sorted Set range query (ZRANGEBYLEX on hash prefix) = proximity search
+
+  Score precision:
+    52 bits → ~0.6mm horizontal accuracy at equator
+    Redis uses Mercator projection (standard for web mapping)
+
+
+4. GEOSEARCH EXAMPLES
+──────────────────────
+  # Add locations
+  GEOADD stores:nyc -73.9857 40.7484 "Grand Central"
+  GEOADD stores:nyc -73.9880 40.7527 "Times Square"
+  GEOADD stores:nyc -73.9441 40.7831 "Central Park"
+  GEOADD stores:nyc -74.0060 40.7128 "Battery Park"
+
+  # Distance between two stores
+  GEODIST stores:nyc "Grand Central" "Times Square" km
+  → "0.5742"
+
+  # Find stores within 2km of a point (user location)
+  GEOSEARCH stores:nyc FROMLONLAT -73.9857 40.7484
+            BYRADIUS 2 km ASC WITHCOORD WITHDIST COUNT 5
+  → 1) 1) "Grand Central"
+       2) "0.0000"      (distance)
+       3) 1) "-73.9857"  (lon)
+          2) "40.7484"   (lat)
+    2) 1) "Times Square"
+       2) "0.5742"
+       ...
+
+  # Find stores within 1km of a member
+  GEOSEARCH stores:nyc FROMMEMBER "Grand Central"
+            BYRADIUS 1 km ASC WITHDIST
+  → Grand Central (0.0), Times Square (0.5742)
+
+  # Get geohash strings (for external use)
+  GEOHASH stores:nyc "Grand Central" "Times Square"
+  → 1) "dr5ru2c0ce0"
+    2) "dr5ru5h9gd0"
+  # Note: first 7-8 chars match → close proximity!
+
+  # Box search (2km wide x 3km tall box around user)
+  GEOSEARCH stores:nyc FROMLONLAT -73.9857 40.7484
+            BYBOX 2 3 km ASC WITHDIST
+
+
+5. USE CASES
+─────────────
+
+5a. Nearby Drivers (Ride-Sharing):
+  # Driver updates location every 5 seconds
+  GEOADD drivers -73.9857 40.7484 "driver:42"
+
+  # Passenger searches for drivers within 5km
+  GEOSEARCH drivers FROMLONLAT <passenger_lon> <passenger_lat>
+            BYRADIUS 5 km ASC COUNT 10 WITHDIST
+
+5b. Nearby Stores / Points of Interest:
+  GEOADD poi:restaurants -73.9857 40.7484 "Pizza Palace"
+  GEOSEARCH poi:restaurants FROMLONLAT <user_lon> <user_lat>
+            BYRADIUS 1 km ASC WITHDIST COUNT 20
+
+5c. Delivery Zone Check:
+  # Is user inside delivery radius?
+  GEODIST deliveries:zone1 "warehouse" "user:location" km
+  → If result < 5.0 → eligible for delivery
+
+5d. Geofencing:
+  # Did the vehicle enter a zone?
+  def check_geofence(vehicle_lon, vehicle_lat, zone_center, radius_km):
+      results = redis.geosearch("geofences",
+          longitude=zone_center.lon, latitude=zone_center.lat,
+          radius=radius_km, unit="km",
+          member=vehicle_id, withdist=True)
+      return len(results) > 0
+
+5e. Store Locator with Pagination:
+  # Get 10 stores, skip first 10 (page 2)
+  GEOSEARCHSTORE temp:search:user42 stores:nyc
+      FROMLONLAT <user_lon> <user_lat>
+      BYRADIUS 50 km ASC STOREDIST
+
+  ZRANGE temp:search:user42 10 19 WITHSCORES  # scores = distances
+  EXPIRE temp:search:user42 30  # cleanup after 30 seconds
+
+
+6. SPRING DATA REDIS INTEGRATION
+──────────────────────────────────
+  // Using GeoOperations
+  @Autowired RedisTemplate<String, String> redisTemplate;
+
+  GeoOperations<String, String> geoOps = redisTemplate.opsForGeo();
+
+  // Add location
+  geoOps.add("stores", new Point(-73.9857, 40.7484), "Grand Central");
+
+  // Search nearby
+  Circle within = new Circle(
+      new Point(-73.9857, 40.7484),
+      new Distance(2, Metrics.KILOMETERS)
+  );
+
+  GeoResults<GeoLocation<String>> results = geoOps.search(
+      "stores",
+      new GeoReference.GeoCoordinateReference<>(new Point(-73.9857, 40.7484)),
+      new GeoShape.RadiusShape(new Distance(2, Metrics.KILOMETERS)),
+      GeoSearchCommandArgs.newGeoSearchArgs()
+          .includeDistance()
+          .includeCoordinates()
+          .sortAscending()
+          .limit(10)
+  );
+
+  for (GeoResult<GeoLocation<String>> result : results) {
+      System.out.println(result.getContent().getName() + " - "
+          + result.getDistance().getValue() + " km");
+  }
+
+  // Distance between two members
+  Distance dist = geoOps.distance("stores",
+      "Grand Central", "Times Square", Metrics.KILOMETERS);
+
+
+7. SCALABILITY IN REDIS CLUSTER
+─────────────────────────────────
+  Geo commands operate on a single Sorted Set key.
+  In Redis Cluster, one key = one shard.
+  Entire geospatial index on one node → single shard becomes bottleneck.
+
+  Sharding strategies:
+    1. Geographic sharding:
+       stores:nyc, stores:la, stores:chicago → different keys/shards
+       Route user requests to nearest region shard.
+
+    2. Hash tag grouping:
+       {nyc}:drivers  → all nyc data on same shard
+
+    3. Time-based sharding for drivers:
+       drivers:2024-01-15:shard-0 through shard-N
+       Update in background, GEOSEARCHSTORE results to a query key.
+
+    4. External search engine:
+       For very large datasets (millions of members), use:
+       Elasticsearch, OpenSearch, PostGIS, or RedisSearch (with geo support)
+
+
+8. ACCURACY AND LIMITATIONS
+─────────────────────────────
+  ✗ Projection: Redis uses spherical approximation (not ellipsoidal)
+    → Up to 0.5% error compared to true geodesic calculations
+    → Acceptable for most proximity searches
+
+  ✗ Single-key limitation: all members in one sorted set
+    → Sharding required for large datasets
+
+  ✗ No polygon search: only radius (circle) and box queries
+    → For polygon search, use PostGIS or Elasticsearch
+
+  ✗ No altitude: 2D coordinates only
+
+  ✓ Precision: ~0.6mm accuracy (52-bit geohash)
+  ✓ Speed: O(N+log M) for GEOSEARCH
+    where N = results returned, M = total members in set
+
+
+9. COMPARISON: GEOSEARCH COMPLEXITY
+─────────────────────────────────────
+  GEOADD:           O(log N) per element
+  GEOPOS:           O(log N) per element
+  GEODIST:          O(log N)
+  GEOHASH:          O(log N) per element
+  GEOSEARCH:        O(N+log M) — N = results, M = index size
+  GEOSEARCHSTORE:   O(N+log M)
+
+
+10. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: How does Redis store geospatial data internally?
+  A: Geospatial data is stored as a Sorted Set where each member's score is a
+     52-bit integer geohash encoding both latitude and longitude. Using WGS-84
+     coordinates, Redis interleaves the binary representations of lat and lon
+     to create a Z-order (Morton) curve. This gives ~0.6mm precision and allows
+     proximity queries via sorted set range operations.
+
+  Q: What's the difference between GEORADIUS and GEOSEARCH?
+  A: GEORADIUS is the old command (Redis 3.2–5.x), now deprecated.
+     GEOSEARCH (Redis 6.2+) replaces it and is more powerful: supports both
+     FROMMEMBER and FROMLONLAT origins, supports both BYRADIUS and BYBOX
+     shapes, and GEOSEARCHSTORE replaces GEORADIUSSTORE.
+
+  Q: How would you scale a geospatial index in Redis Cluster?
+  A: One key = one shard, so shard geographic regions manually:
+     stores:nyc, stores:la, etc. Route queries to the correct shard.
+     Alternatively, for very large datasets (millions of points), use a
+     dedicated search engine like Elasticsearch (geo_point) or PostGIS
+     which are designed for distributed geospatial indexing.
+
+  Q: Can you do polygon searches with Redis geospatial commands?
+  A: No, Redis only supports circle (BYRADIUS) and rectangle (BYBOX) queries.
+     For polygon searches (arbitrary shapes), use PostGIS, Elasticsearch with
+     geo_polygon query, or implement a client-side approximation:
+     do a bounding-box BYBOX query first, then filter results by polygon
+     containment in application code.
+
+================================================================================

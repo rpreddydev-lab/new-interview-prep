@@ -1,0 +1,222 @@
+================================================================
+DATABASE SCALING: READ REPLICAS AND SHARDING
+================================================================
+
+WHY DATABASE SCALING IS HARD
+------------------------------
+The web/API tier is stateless and easy to scale horizontally.
+The database tier holds mutable state — much harder to scale.
+
+Single DB bottlenecks:
+  - Write capacity (only one primary writes)
+  - Read capacity (all reads from one machine)
+  - Storage capacity (one machine's disk)
+  - Memory (working set must fit in RAM for performance)
+
+Solution strategies:
+  1. Read Replicas      — scale reads
+  2. Sharding/Partitioning — scale writes and storage
+  3. Caching           — reduce reads hitting DB
+  4. Vertical scaling  — temporary, has limits
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+READ REPLICAS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CONCEPT:
+  Primary (Master) DB handles all writes.
+  One or more Replica (Slave) DBs replicate from primary and handle reads.
+
+  ┌──────────────┐   replication   ┌──────────────┐
+  │   PRIMARY DB │ ──────────────→ │  REPLICA 1   │
+  │  (writes)    │ ──────────────→ │  REPLICA 2   │
+  └──────────────┘                 │  REPLICA 3   │
+                                   └──────────────┘
+  App:  writes → PRIMARY
+        reads  → any REPLICA (via load balancer)
+
+REPLICATION TYPES:
+
+  Synchronous (Strong Consistency):
+    Write is ACKed only after ALL replicas confirm they have the data.
+    Pro:  Zero lag — replicas always have latest data
+    Con:  Write latency increases (must wait for all replicas)
+    Use:  Financial data, ledgers, anything requiring no data loss on failover
+
+  Asynchronous (Eventual Consistency):
+    Write is ACKed after PRIMARY writes (replicas update in background).
+    Pro:  Low write latency
+    Con:  Replication lag — replicas may be seconds behind
+    Use:  Social media posts, product descriptions, content (small lag OK)
+
+  Semi-Synchronous:
+    Write ACKed after at least ONE replica confirms (not all).
+    Balance between durability and performance.
+    MySQL default mode.
+
+REPLICATION LAG PROBLEMS:
+  Read-your-writes violation:
+    User posts tweet → writes to primary
+    User refreshes feed → reads from replica
+    Replica hasn't caught up → tweet not visible!
+  
+  Solution 1: Route reads that NEED freshness to primary
+  Solution 2: Track per-user "last write timestamp"; 
+              if replica is behind that timestamp → read from primary
+  Solution 3: After write, route that user's reads to primary for 1 minute
+
+READ REPLICA SCALING:
+  - Add replicas until read capacity is sufficient
+  - Typical: 1 primary + 3-5 replicas for 10:1 read:write ratio
+  - Can add 10, 20+ replicas if needed (Aurora supports up to 15 replicas)
+  - Load balance reads across replicas (round-robin or least-connections)
+
+FAILOVER WITH READ REPLICAS:
+  If primary fails:
+    1. Detect failure (health check timeout)
+    2. Promote one replica to primary (lowest replication lag)
+    3. Update connection strings (or use DNS-based failover)
+    4. Other replicas start replicating from new primary
+  
+  RTO: ~30 seconds to 2 minutes (automatic with tools like MHA, AWS RDS)
+  RPO: Seconds of data loss (async replication lag)
+      Zero data loss with synchronous replication
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DATABASE SHARDING (Horizontal Partitioning)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CONCEPT:
+  Split data across multiple database instances (shards).
+  Each shard holds a subset of the total data.
+  Enables horizontal scaling of WRITES and STORAGE.
+
+  User data sharded by user_id:
+  Shard 0: users 0–999,999
+  Shard 1: users 1,000,000–1,999,999
+  Shard 2: users 2,000,000–2,999,999
+  ...
+
+  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+  │  Shard 0 │  │  Shard 1 │  │  Shard 2 │  │  Shard 3 │
+  │ users    │  │ users    │  │ users    │  │ users    │
+  │ 0-250K   │  │ 250K-500K│  │ 500K-750K│  │ 750K-1M  │
+  └──────────┘  └──────────┘  └──────────┘  └──────────┘
+
+SHARD KEY SELECTION (Most Important Decision):
+  The shard key determines how data is distributed.
+  A bad shard key causes HOT SHARDS (uneven distribution).
+
+  Good shard keys:
+    - user_id (for user-centric data)
+    - order_id (for order data)
+    - High cardinality, uniformly distributed values
+
+  Bad shard keys:
+    - timestamp (new writes all go to latest shard → HOT WRITE SHARD)
+    - status (only a few values → uneven distribution)
+    - country (US gets 80% of traffic → HOT SHARD)
+
+SHARDING STRATEGIES:
+
+  1. Range-Based Sharding:
+     Shard by value range.
+     user_id 0-999999 → Shard 0
+     user_id 1000000-1999999 → Shard 1
+
+     Pro:  Range queries efficient (scan one shard for a user range)
+     Con:  Hot shards possible (new users always go to last shard)
+     Fixed by: Monotonically increasing sharding is a problem → use hash
+
+  2. Hash-Based Sharding:
+     shard = hash(shard_key) % num_shards
+     user_id 12345 → hash(12345) % 4 = 2 → Shard 2
+
+     Pro:  Even distribution (good hash → uniform distribution)
+     Con:  Range queries must hit all shards (inefficient)
+           Resharding is hard (changing num_shards changes all assignments)
+
+  3. Consistent Hashing:
+     Place shards on a ring; key maps to the nearest shard clockwise.
+     Adding/removing a shard only remaps ~1/N of the keys.
+     Used by: Amazon DynamoDB, Apache Cassandra, Redis Cluster.
+
+  4. Directory-Based Sharding:
+     Maintain a lookup table (directory) mapping keys to shards.
+     Flexible — easy to move specific keys between shards.
+     Con:  Directory is a bottleneck and single point of failure
+           Cache the directory aggressively.
+
+CROSS-SHARD QUERIES (The Big Problem with Sharding):
+  SELECT * FROM orders WHERE user_id = 123
+  → Easy: route to shard for user 123
+
+  SELECT * FROM orders WHERE status = 'pending'
+  → Hard: must query ALL shards and merge results (scatter-gather)
+
+  JOINs across shards:
+  → Not supported; must do application-level joins
+  → Denormalize to avoid cross-shard joins
+
+  Solutions for cross-shard queries:
+  a) Denormalization: store all needed data in one place
+  b) Separate analytics DB: stream data to a DWH (Snowflake, BigQuery)
+     that supports full table scans
+  c) Secondary index on global table: maintain a separate lookup table
+
+RESHARDING:
+  When a shard becomes too large (data grows) or too hot (traffic spike),
+  you need to reshard — split one shard into two.
+
+  This is PAINFUL:
+    1. Stop writes to old shard (or use dual-write)
+    2. Copy data to new shards
+    3. Update routing logic
+    4. Verify data integrity
+    5. Enable new shards
+
+  Minimize resharding pain by:
+    - Starting with more shards than needed (e.g., 1000 virtual shards)
+    - Map virtual shards to physical shards — moving virtual shards is easy
+    - Use consistent hashing (minimal remapping)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VERTICAL PARTITIONING vs HORIZONTAL PARTITIONING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Horizontal Partitioning (Sharding):
+  Split rows across multiple tables/DBs (same schema)
+  users table → shard_0.users, shard_1.users, ...
+
+Vertical Partitioning:
+  Split columns across multiple tables/DBs
+  users: { id, name, email, created_at } → DB 1
+  user_profiles: { user_id, bio, avatar_url, ... } → DB 2 (accessed less often)
+  
+  Pro: Rarely accessed columns don't slow down hot queries
+  Con: Cross-partition queries require joins or application-level merging
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHEN TO CHOOSE WHAT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Read-heavy (10:1 read:write ratio):
+  → Add read replicas (2-5 is usually sufficient)
+  → Add caching layer (Redis) before adding replicas
+
+Write-heavy or Large Dataset:
+  → Sharding by a good shard key
+  → Or: use write-optimized DB (Cassandra, DynamoDB)
+
+Both read and write heavy:
+  → Shard for write scaling
+  → Add read replicas to each shard for read scaling
+  → Cache in front of each shard
+
+DECISION CHECKLIST:
+  □ Is the bottleneck reads or writes?
+  □ What is the read:write ratio?
+  □ Does data need strong consistency (no sharding for ACID)?
+  □ What is the natural shard key?
+  □ Are there cross-shard query requirements?
+  □ Is the data set large enough to warrant sharding?

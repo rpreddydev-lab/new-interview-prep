@@ -1,0 +1,287 @@
+================================================================
+TOKEN INTROSPECTION (RFC 7662)
+================================================================
+
+WHAT IS TOKEN INTROSPECTION?
+------------------------------
+Token Introspection is a protocol that allows a resource server to
+validate an OPAQUE token by asking the authorization server about it.
+
+The resource server sends the token to the AS and receives back the
+token's metadata: whether it's active, who it belongs to, what scopes
+it has, and when it expires.
+
+RFC 7662: "OAuth 2.0 Token Introspection"
+
+================================================================
+WHY DO WE NEED INTROSPECTION?
+================================================================
+
+TWO TOKEN TYPES:
+  1. JWT (Self-contained): Resource server validates locally using public key
+     → Fast, no network call, but can't be revoked until expiry
+
+  2. Opaque Token (Reference Token): Random string, no embedded info
+     → Must call AS to validate
+     → Can be revoked instantly
+     → Hidden metadata from client
+
+Introspection is needed for OPAQUE TOKENS. The resource server cannot
+decode them — it must ask the AS "is this token valid and what does it mean?"
+
+================================================================
+INTROSPECTION FLOW
+================================================================
+
+CLIENT                    RESOURCE SERVER              AUTH SERVER
+  |                             |                           |
+  | GET /api/orders             |                           |
+  | Authorization: Bearer abc   |                           |
+  |---------------------------->|                           |
+  |                             |                           |
+  |                             | POST /oauth2/introspect   |
+  |                             | token=abc                 |
+  |                             | token_type_hint=access_   |
+  |                             |   token                   |
+  |                             |-------------------------->|
+  |                             |                           |
+  |                             | 200 OK                    |
+  |                             | {                         |
+  |                             |   "active": true,         |
+  |                             |   "sub": "user123",       |
+  |                             |   "scope": "read:orders", |
+  |                             |   "exp": 1713484800       |
+  |                             | }                         |
+  |                             |<--------------------------|
+  |                             |                           |
+  |                             | Authorize request         |
+  |                             |                           |
+  | 200 OK (orders data)        |                           |
+  |<----------------------------|                           |
+
+================================================================
+INTROSPECTION REQUEST
+================================================================
+
+POST /oauth2/introspect HTTP/1.1
+Host: auth-server.com
+Content-Type: application/x-www-form-urlencoded
+Authorization: Basic base64(resource-server-id:resource-server-secret)
+
+Body:
+  token=abc123opaquetoken
+  &token_type_hint=access_token    ← optional hint: access_token or refresh_token
+
+RESOURCE SERVER AUTHENTICATION:
+  The resource server itself must authenticate to the introspection endpoint
+  to prevent unauthorized parties from probing token validity.
+
+================================================================
+INTROSPECTION RESPONSE
+================================================================
+
+ACTIVE TOKEN:
+{
+  "active": true,
+  "sub": "user-12345",           ← subject (user ID)
+  "client_id": "my-spa",        ← which client the token was issued to
+  "username": "john@example.com",
+  "scope": "read:orders write:orders",
+  "iss": "https://auth-server.com",
+  "aud": ["https://api.app.com"],
+  "iat": 1713481200,
+  "exp": 1713484800,
+  "token_type": "Bearer",
+  "jti": "unique-token-id"       ← JWT ID (for tracking)
+}
+
+INACTIVE TOKEN (expired, revoked, or invalid):
+{
+  "active": false
+}
+
+NOTE: When active=false, the spec says NO other claims should be trusted,
+      even if present. Resource server should return 401.
+
+================================================================
+CACHING INTROSPECTION RESPONSES
+================================================================
+
+PROBLEM:
+  Calling the introspection endpoint on every API request adds latency
+  and puts load on the AS.
+
+SOLUTION: Cache introspection responses
+
+CACHING STRATEGY:
+  - Cache key: token (hash it for security)
+  - Cache value: introspection response
+  - TTL: MIN(token's remaining lifetime, desired max cache time)
+  
+  Do NOT cache for longer than the token's expiry time!
+
+SPRING CONFIGURATION:
+  spring:
+    security:
+      oauth2:
+        resourceserver:
+          opaque-token:
+            introspection-uri: https://auth-server.com/oauth2/introspect
+            client-id: my-resource-server
+            client-secret: ${RS_SECRET}
+
+CUSTOM CACHING:
+@Component
+public class CachingOpaqueTokenIntrospector implements OpaqueTokenIntrospector {
+
+    private final OpaqueTokenIntrospector delegate;
+    private final Cache<String, OAuth2AuthenticatedPrincipal> cache;
+
+    public CachingOpaqueTokenIntrospector(
+            OpaqueTokenIntrospector delegate,
+            CacheManager cacheManager) {
+        this.delegate = delegate;
+        this.cache = cacheManager.getCache("tokens");
+    }
+
+    @Override
+    public OAuth2AuthenticatedPrincipal introspect(String token) {
+        return cache.get(token, () -> delegate.introspect(token));
+    }
+}
+
+================================================================
+INTROSPECTION vs JWT VALIDATION
+================================================================
+
+                    JWT                         Opaque Token Introspection
+---------------------------------------------------------------------------
+Network call        None (local validation)     Yes (per request, or cached)
+Latency             Fast                        Slower (network RTT)
+Revocation          Hard (until expiry)         Instant (AS updates state)
+Token size          Large (embedded claims)     Small (random string)
+Token metadata      Visible to client           Hidden from client
+AS availability     Not required                Required for validation
+Caching             Not needed                  Needed for performance
+Best for            Stateless microservices     When revocation is critical
+
+TOKEN INTROSPECTION USED WHEN:
+  ✓ Immediate revocation is required (e.g., user logs out, account suspended)
+  ✓ You want to hide token metadata from clients/intermediaries
+  ✓ Tokens issued to legacy systems that don't understand JWT
+
+JWT PREFERRED WHEN:
+  ✓ High-performance, stateless validation needed
+  ✓ Distributed microservices (avoid AS bottleneck)
+  ✓ AS is a different team/system (publish JWKS, avoid tight coupling)
+
+================================================================
+TOKEN INTROSPECTION IN SPRING SECURITY
+================================================================
+
+// Resource Server with opaque token introspection:
+@Configuration
+@EnableWebSecurity
+public class ResourceServerConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/public/**").permitAll()
+                .anyRequest().authenticated()
+            )
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .opaqueToken(opaque -> opaque
+                    .introspectionUri("https://auth-server.com/oauth2/introspect")
+                    .introspectionClientCredentials("rs-client-id", "rs-secret")
+                )
+            );
+        return http.build();
+    }
+}
+
+// Custom introspector for additional validation:
+@Component
+public class CustomIntrospector implements OpaqueTokenIntrospector {
+
+    private final SpringReactiveOpaqueTokenIntrospector delegate;
+
+    @Override
+    public OAuth2AuthenticatedPrincipal introspect(String token) {
+        OAuth2AuthenticatedPrincipal principal = delegate.introspect(token);
+
+        // Additional custom validation
+        Instant exp = principal.getAttribute("exp");
+        if (exp != null && Instant.now().isAfter(exp)) {
+            throw new OAuth2IntrospectionException("Token has expired");
+        }
+
+        // Check required audience
+        List<String> audiences = principal.getAttribute("aud");
+        if (audiences == null || !audiences.contains("https://api.myapp.com")) {
+            throw new OAuth2IntrospectionException("Token not intended for this resource server");
+        }
+
+        return principal;
+    }
+}
+
+// Access introspected claims in controller:
+@GetMapping("/orders")
+public List<Order> getOrders(
+        @AuthenticationPrincipal OAuth2AuthenticatedPrincipal principal) {
+    String userId = principal.getAttribute("sub");
+    String scope = principal.getAttribute("scope");
+    return orderService.getOrdersForUser(userId);
+}
+
+================================================================
+HYBRID APPROACH: TOKEN INTROSPECTION + JWT
+================================================================
+
+Some systems use a hybrid approach:
+  1. Opaque reference token issued to clients (small, revocable)
+  2. Resource server calls introspection endpoint
+  3. AS introspection endpoint internally looks up and returns JWT claims
+  4. Resource server caches the JWT-like response
+
+This is called "Token Exchange" or "Phantom Token" pattern (used in Kong API Gateway).
+
+Benefits:
+  - Clients get small, opaque tokens (can't decode/inspect)
+  - Resource servers get efficient JWT-like validation with caching
+  - Full revocation support
+
+================================================================
+COMMON INTERVIEW QUESTIONS
+================================================================
+
+Q: What is token introspection and when would you use it?
+A: Token introspection is a protocol (RFC 7662) that allows a resource server
+   to validate an opaque token by querying the authorization server. Use it
+   when you need immediate token revocation capability, when tokens are opaque
+   strings, or when you want to hide token metadata from clients.
+
+Q: What is the performance concern with token introspection?
+A: Every API call requires a network round-trip to the AS to validate the
+   token, which adds latency and can bottleneck the AS. Solution: cache
+   introspection responses with a TTL not exceeding the token's remaining
+   lifetime.
+
+Q: How does Spring Security validate opaque tokens?
+A: Configure spring.security.oauth2.resourceserver.opaque-token with the
+   introspection-uri and client credentials. Spring Security will automatically
+   call the introspection endpoint for each request. Implement
+   OpaqueTokenIntrospector for custom logic.
+
+Q: When would you choose opaque tokens over JWT?
+A: When you need immediate revocation (user account suspended, security
+   incident response), when you don't want token contents visible to clients,
+   or when token size matters. JWT is preferred for stateless microservices
+   where AS availability and network latency are concerns.
+
+Q: What does "active": false mean in an introspection response?
+A: The token is invalid — it's either expired, revoked, or never existed.
+   The resource server MUST return 401 Unauthorized and ignore any other
+   claims in the response.

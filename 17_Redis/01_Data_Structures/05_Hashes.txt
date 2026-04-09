@@ -1,0 +1,262 @@
+================================================================================
+REDIS HASHES — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. OVERVIEW
+────────────
+A Redis Hash is a map of field-value pairs — essentially an object or dictionary
+stored under a single key. Think of it as:
+  key → { field1: value1, field2: value2, … }
+
+Key properties:
+  - Fields and values are strings (binary-safe)
+  - O(1) average for HSET/HGET/HDEL/HEXISTS
+  - Compact memory representation for small hashes (listpack encoding)
+  - Perfect for storing objects with named attributes
+  - Max fields per hash: 2^32 - 1
+
+
+2. INTERNAL ENCODING
+─────────────────────
+  listpack: when ≤128 fields AND each field/value ≤64 bytes
+    - Contiguous memory layout: [field1, val1, field2, val2, …]
+    - Very cache-friendly, minimal overhead
+    - O(N) for HGET/HDEL (linear scan), but N is small → fast
+    - OBJECT ENCODING key → "listpack"
+
+  hashtable: for larger hashes
+    - O(1) average for all field operations
+    - Higher per-entry memory overhead
+    - OBJECT ENCODING key → "hashtable"
+
+  Thresholds (redis.conf):
+    hash-max-listpack-entries  128
+    hash-max-listpack-value     64
+
+  Memory tip: Storing 1M user objects as individual String keys uses more
+  memory than storing them as fields in a Hash (or many small Hashes).
+  The hash-max-listpack-entries trick can dramatically reduce memory.
+
+
+3. CORE COMMANDS
+─────────────────
+
+  Set / Get:
+    HSET key field value [field value …]    → set one or more fields
+                                              Returns count of NEW fields added
+    HSETNX key field value                  → set only if field doesn't exist
+    HGET key field                          → get single field value
+    HMGET key field [field …]               → get multiple fields
+    HGETALL key                             → all field-value pairs as flat list
+    HKEYS key                               → all field names
+    HVALS key                               → all values
+    HLEN key                                → number of fields. O(1).
+    HEXISTS key field                       → 1 if field exists, 0 if not
+
+  Numeric fields:
+    HINCRBY key field increment             → increment integer field. O(1).
+    HINCRBYFLOAT key field increment        → increment float field
+
+  Delete:
+    HDEL key field [field …]               → delete fields. Returns count.
+
+  Scan:
+    HSCAN key cursor [MATCH pat] [COUNT n]  → iterate field-value pairs
+
+  Random:
+    HRANDFIELD key [count [WITHVALUES]]     → random field(s)
+
+
+4. HASH vs STRING FOR OBJECT STORAGE
+──────────────────────────────────────
+  Approach A: Serialize entire object to JSON String
+    SET user:42 '{"name":"Alice","age":30,"email":"a@b.com"}'
+
+    Pros:
+      ✓ Single round-trip for full object
+      ✓ Atomic get/set of entire object
+      ✓ Works with any serialization format
+    Cons:
+      ✗ Must deserialize to read/update ONE field
+      ✗ Full object written on any field update
+      ✗ More CPU for serialization
+
+  Approach B: Store object as Hash
+    HSET user:42 name "Alice" age 30 email "a@b.com"
+
+    Pros:
+      ✓ Read/update individual fields (HGET, HSET)
+      ✓ No serialization overhead
+      ✓ Atomic HINCRBY for numeric fields
+      ✓ listpack encoding saves memory for small objects
+    Cons:
+      ✗ Multiple round-trips if you need many fields
+      ✗ HGETALL returns all fields (no partial selection without HMGET)
+      ✗ No nested structures natively (use RedisJSON for that)
+
+  Rule of thumb:
+    - Read/update entire object → String (JSON)
+    - Read/update individual fields → Hash
+    - Many small objects → Hash with listpack (best memory efficiency)
+
+
+5. THE MEMORY OPTIMIZATION TRICK: HASH AS LOOKUP TABLE
+───────────────────────────────────────────────────────
+  Problem: Storing 1 million user sessions as String keys:
+    SET session:000001 "data"
+    SET session:000002 "data"
+    … (1M keys = significant overhead per key)
+
+  Trick: Shard keys into Hashes:
+    key   = session:000042
+    hash_key   = session:hash:0         (bucket = id % num_buckets)
+    hash_field = 000042
+
+    HSET session:hash:0 000042 "data"
+    # Each hash bucket has ≤128 entries → listpack encoding → very compact!
+
+  Memory savings: up to 10x less memory for small values.
+  This is explicitly recommended in the Redis documentation.
+
+  Calculation: if hash-max-listpack-entries=128, use 128 as bucket size.
+  For 1M sessions: 1M / 128 = ~7812 hash keys, each with 128 fields in listpack.
+
+
+6. REAL-WORLD USE CASES
+────────────────────────
+
+6a. User Profile:
+  HSET user:42 name "Alice" email "a@b.com" age 30 city "NY" premium 1
+  HGET user:42 email
+  HGETALL user:42
+  HINCRBY user:42 login_count 1
+  HDEL user:42 city     # remove field
+
+6b. Configuration / Settings:
+  HSET config:app db_pool_size 20 cache_ttl 3600 debug_mode 0
+  HGET config:app db_pool_size
+
+6c. Shopping Cart:
+  HSET cart:user:42 item:1001 2 item:1002 1 item:1003 3
+  # quantity of item:1001 in cart:
+  HGET cart:user:42 item:1001
+  # Add 1 more of item:1001:
+  HINCRBY cart:user:42 item:1001 1
+  # Remove item:
+  HDEL cart:user:42 item:1003
+  # Total items:
+  HLEN cart:user:42
+  # All cart items:
+  HGETALL cart:user:42   → [item:1001, 3, item:1002, 1]
+
+6d. Counting Events per Category:
+  HINCRBY stats:2024-01-15 page_views 1000
+  HINCRBY stats:2024-01-15 api_calls 5000
+  HINCRBY stats:2024-01-15 errors 12
+  HGETALL stats:2024-01-15
+
+6e. Feature Flags per User:
+  HSET flags:user:42 dark_mode 1 beta_access 1 new_nav 0
+  HGET flags:user:42 dark_mode
+
+6f. Inventory / Stock:
+  HSET inventory:warehouse-1 SKU-001 500 SKU-002 200 SKU-003 0
+  HINCRBY inventory:warehouse-1 SKU-001 -10   # sold 10 units
+  HGET inventory:warehouse-1 SKU-001           # remaining stock
+
+6g. Rate Limiting per Endpoint:
+  HINCRBY ratelimit:user:42 GET:/api/users 1
+  HINCRBY ratelimit:user:42 POST:/api/orders 1
+  HGET ratelimit:user:42 GET:/api/users
+  HGETALL ratelimit:user:42    # all endpoint usage
+
+
+7. HRANDFIELD (Redis 6.2+)
+────────────────────────────
+  HRANDFIELD user:42          → one random field name
+  HRANDFIELD user:42 3        → 3 distinct random field names
+  HRANDFIELD user:42 -3       → 3 random field names (may repeat)
+  HRANDFIELD user:42 3 WITHVALUES → 3 random fields with values
+
+  Use case: random survey question from a question pool stored as Hash
+  Use case: random feature display (A/B testing)
+
+
+8. PERFORMANCE SUMMARY
+───────────────────────
+  Command              │ Complexity
+  ─────────────────────┼─────────────────────────────────────
+  HSET (N fields)      │ O(N)
+  HGET                 │ O(1)
+  HMGET (N fields)     │ O(N)
+  HDEL (N fields)      │ O(N)
+  HEXISTS              │ O(1)
+  HLEN                 │ O(1)
+  HGETALL              │ O(N) — avoid on large hashes
+  HKEYS / HVALS        │ O(N)
+  HSCAN                │ O(1) amortized per call
+  HINCRBY              │ O(1)
+  HRANDFIELD           │ O(N) for distinct count
+
+
+9. HGETALL vs HMGET vs HSCAN
+──────────────────────────────
+  HGETALL key:
+    Returns ALL fields and values as a flat array.
+    Fine for small hashes, dangerous for hashes with thousands of fields.
+    Blocks server for very large hashes.
+
+  HMGET key field1 field2 …:
+    Returns only the specified fields.
+    Preferred when you need a subset of fields (avoids transferring all data).
+
+  HSCAN key cursor MATCH pat COUNT n:
+    Iterates fields in chunks. Non-blocking. Safe for large hashes.
+    Use for background processing, reporting, or when hash may be large.
+
+
+10. ANTI-PATTERNS
+──────────────────
+  ✗ Storing deeply nested JSON as a Hash value
+    → Hash is flat (no nested hashes). Use RedisJSON module for JSON.
+
+  ✗ Using a single Hash for system-wide stats with millions of fields
+    → Becomes a hashtable (not listpack), loses memory benefit.
+    → Split into smaller hashes by time period or shard.
+
+  ✗ HGETALL on production for large hashes without HSCAN
+    → Can block server. Use HSCAN or only access specific fields.
+
+  ✗ Not setting TTL on Hash keys used as caches
+    → Memory leaks. Always set EXPIRE on Hash keys used for caching.
+
+
+11. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: What is the memory optimization benefit of using Hashes in Redis?
+  A: When a Hash has ≤128 fields and each field/value is ≤64 bytes, Redis
+     uses listpack encoding — a contiguous memory array. This is far more
+     memory-efficient than separate String keys (each key has robj overhead,
+     hash table entry, SDS header). Storing 1M small objects as Hash fields
+     can use 10x less memory than 1M String keys.
+
+  Q: How do you implement a shopping cart in Redis?
+  A: Use a Hash per user: HSET cart:user:42 item:1001 2 item:1002 1.
+     HINCRBY to add/remove quantities. HDEL to remove items. HGETALL to
+     read the entire cart. HLEN for item count. Set a TTL for cart expiry.
+
+  Q: What's the difference between HSET and HMSET?
+  A: HMSET is deprecated (since Redis 4.0.0). HSET now accepts multiple
+     field-value pairs in a single call, making HMSET redundant. Always use HSET.
+
+  Q: When would you choose Hash over a JSON String?
+  A: Hash when you frequently update individual fields (HINCRBY for counters,
+     HSET for partial updates). JSON String when you always read the entire
+     object and rarely update individual fields (avoids deserialize overhead).
+
+  Q: Can you store a Hash inside a Hash in Redis?
+  A: No, natively. Hash values are always strings. For nested structures, use
+     the RedisJSON module (JSON.SET/GET) or serialize nested objects as JSON
+     strings within the Hash field values.
+
+================================================================================

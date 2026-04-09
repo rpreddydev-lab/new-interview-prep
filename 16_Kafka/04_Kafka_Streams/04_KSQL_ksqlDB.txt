@@ -1,0 +1,246 @@
+================================================================================
+  ksqlDB / KSQL — STREAMING SQL ON KAFKA
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHAT IS ksqlDB?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ksqlDB is a streaming SQL engine built on top of Kafka Streams.
+It lets you write SQL queries against Kafka topics without writing Java code.
+
+History:
+  - KSQL: original product by Confluent (2017)
+  - ksqlDB: rebrand with persistent query support, push/pull queries (2019)
+  - Now: part of Confluent Platform; also open source (Apache 2.0)
+
+Architecture:
+  - ksqlDB Server: JVM process running on top of Kafka Streams
+  - ksqlDB CLI / REST API: submit SQL statements
+  - Queries compile to Kafka Streams topologies internally
+  - Multiple ksqlDB servers form a cluster (coordinated via Kafka topic: _confluent-ksql-default_command_topic)
+
+  ┌─────────────────────────────────────────────────────────┐
+  │  ksqlDB Server                                          │
+  │    SQL Engine → Kafka Streams topology → runs in-JVM   │
+  │    State stores (RocksDB) for materialized views        │
+  │    REST API / WebSocket for push queries                │
+  └─────────────────────────────────────────────────────────┘
+        ↑ reads/writes ↓
+  ┌─────────────────────────────────────────────────────────┐
+  │  Apache Kafka Cluster                                   │
+  └─────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. STREAMS vs TABLES IN ksqlDB
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+In ksqlDB you first declare whether a Kafka topic is a STREAM or TABLE:
+
+STREAM — maps to KStream (event log):
+  CREATE STREAM orders (
+    order_id VARCHAR KEY,
+    customer_id VARCHAR,
+    amount DOUBLE,
+    status VARCHAR
+  ) WITH (
+    KAFKA_TOPIC = 'orders',
+    VALUE_FORMAT = 'JSON'
+  );
+
+TABLE — maps to KTable (latest value per key):
+  CREATE TABLE customers (
+    customer_id VARCHAR PRIMARY KEY,
+    name VARCHAR,
+    city VARCHAR
+  ) WITH (
+    KAFKA_TOPIC = 'customers',
+    VALUE_FORMAT = 'JSON'
+  );
+
+A TABLE requires a PRIMARY KEY (the Kafka record key).
+A STREAM can have a key column or no key.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. CREATING DERIVED STREAMS AND TABLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CREATE STREAM AS SELECT (CSAS) — creates a new stream backed by a new Kafka topic:
+  CREATE STREAM paid_orders AS
+  SELECT order_id, customer_id, amount
+  FROM orders
+  WHERE status = 'PAID'
+  EMIT CHANGES;
+
+  -- Results written to: paid_orders Kafka topic
+  -- Runs as a persistent Kafka Streams topology
+
+CREATE TABLE AS SELECT (CTAS) — creates a materialized aggregation table:
+  CREATE TABLE order_count_by_customer AS
+  SELECT customer_id, COUNT(*) AS order_count
+  FROM orders
+  GROUP BY customer_id
+  EMIT CHANGES;
+
+  -- Results written to: order_count_by_customer Kafka topic + state store
+
+Windowed aggregation:
+  CREATE TABLE order_count_5min AS
+  SELECT customer_id,
+         COUNT(*) AS cnt,
+         WINDOWSTART AS window_start,
+         WINDOWEND AS window_end
+  FROM orders
+  WINDOW TUMBLING (SIZE 5 MINUTES)
+  GROUP BY customer_id
+  EMIT CHANGES;
+
+  -- Available window types: TUMBLING, HOPPING, SESSION
+  -- HOPPING example: WINDOW HOPPING (SIZE 10 MINUTES, ADVANCE BY 5 MINUTES)
+
+Joins:
+  -- Stream-Table join (enrich stream with reference data)
+  CREATE STREAM enriched_orders AS
+  SELECT o.order_id, o.amount, c.name AS customer_name, c.city
+  FROM orders o
+  JOIN customers c ON o.customer_id = c.customer_id
+  EMIT CHANGES;
+
+  -- Stream-Stream join (correlate events within a time window)
+  CREATE STREAM login_purchases AS
+  SELECT l.user_id, l.login_time, p.product_id
+  FROM logins l
+  JOIN purchases p WITHIN 10 MINUTES ON l.user_id = p.user_id
+  EMIT CHANGES;
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. PUSH QUERIES vs PULL QUERIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PUSH QUERY (streaming query — continuous):
+  SELECT * FROM orders EMIT CHANGES;
+  -- Keeps the connection open and pushes every new record to the client
+  -- Never-ending until cancelled
+  -- Like a Kafka consumer subscription
+  -- Used for: real-time dashboards, streaming applications
+
+PULL QUERY (point-in-time query — request/response):
+  SELECT * FROM order_count_by_customer WHERE customer_id = 'C-42';
+  -- Returns the CURRENT value from the materialized state store
+  -- Completes immediately (like a regular SQL SELECT)
+  -- No EMIT CHANGES keyword
+  -- Used for: microservice lookups, on-demand reads
+
+  Pull queries require a TABLE (materialized view) with a state store.
+  They support equality filters on PRIMARY KEY only (no full table scans in default mode).
+
+  Scalable pull queries (Kafka 3.x):
+  - ksqlDB can route pull queries across a cluster of servers
+  - Query any server → it proxies to the server that owns the state store partition
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. KEY ksqlDB FUNCTIONS AND OPERATORS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Scalar functions:
+  UCASE(s), LCASE(s), TRIM(s), SUBSTRING(s, start, end)
+  CAST(expr AS type)
+  TIMESTAMPTOSTRING(ts, 'yyyy-MM-dd HH:mm:ss')
+  STRINGTOTIMESTAMP(s, format)
+  IF(condition, then_value, else_value)
+  COALESCE(v1, v2, ...)
+
+Aggregate functions:
+  COUNT(*), COUNT(column)
+  SUM(column), AVG(column), MIN(column), MAX(column)
+  COLLECT_LIST(column)    → array of all values (careful with large arrays)
+  COLLECT_SET(column)     → deduplicated array
+  HISTOGRAM(column)       → map of value → count
+  TOPK(column, N)         → top N values
+
+Array/Map functions:
+  ARRAY[1, 2, 3]
+  MAP('a' := 1, 'b' := 2)
+  ARRAY_LENGTH(arr)
+  ARRAY_CONTAINS(arr, value)
+  EXPLODE(arr)            → one row per array element
+
+UDFs (User-Defined Functions):
+  -- Implement in Java with @UdfDescription + @Udf annotations
+  -- Package as JAR and place in ksqlDB extension directory
+  -- Available to all ksqlDB queries once registered
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. KSQLDB vs KAFKA STREAMS vs FLINK SQL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────────────────┬──────────────────────┬────────────────────┬──────────────────────┐
+  │ Aspect               │ ksqlDB               │ Kafka Streams      │ Flink SQL             │
+  ├──────────────────────┼──────────────────────┼────────────────────┼──────────────────────┤
+  │ Language             │ SQL                  │ Java/Kotlin        │ SQL + Java            │
+  │ Deployment           │ Separate server      │ Embedded library   │ Flink cluster         │
+  │ Source/Sink          │ Kafka only           │ Kafka only         │ Many connectors       │
+  │ State mgmt           │ RocksDB (managed)    │ RocksDB (control)  │ RocksDB / memory      │
+  │ EOS                  │ Yes                  │ Yes (EOS v2)       │ Yes                   │
+  │ Schema Registry      │ First-class          │ Must configure     │ Must configure        │
+  │ Operational cost     │ Medium (ksqlDB svr)  │ Low (in-app)       │ High (cluster)        │
+  │ Push queries         │ Yes (WebSocket/HTTP) │ No (need own API)  │ Limited               │
+  │ Pull queries         │ Yes                  │ Interactive queries │ No direct equivalent  │
+  │ Maturity             │ High (Confluent)     │ Very high          │ Very high             │
+  └──────────────────────┴──────────────────────┴────────────────────┴──────────────────────┘
+
+When to use ksqlDB:
+  ✓ Non-Java teams who need streaming analytics
+  ✓ Rapid prototyping of streaming pipelines
+  ✓ Real-time dashboards with push queries
+  ✓ Business users writing SQL for Kafka
+  ✓ Already have Confluent Platform
+
+When NOT to use ksqlDB:
+  ✗ Need Java/code-based custom logic (use Kafka Streams)
+  ✗ Non-Kafka sources (use Flink)
+  ✗ Need fine-grained control over state management
+  ✗ Running OSS-only without Confluent Platform support
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the difference between a ksqlDB STREAM and TABLE?
+A: A STREAM maps to a KStream — it represents every event as an independent
+   append-only record (like an event log). A TABLE maps to a KTable — it maintains
+   the LATEST value per primary key, like a continuously-updated database table.
+   A null value in a TABLE is a tombstone (DELETE). STREAMS are appropriate for
+   event sequences (orders, clicks); TABLES for current state (user profiles,
+   inventory).
+
+Q: What is the difference between a push query and a pull query in ksqlDB?
+A: A PUSH QUERY (with EMIT CHANGES) keeps a long-lived connection open and pushes
+   new results to the client as they arrive — like a live subscription. A PULL QUERY
+   (no EMIT CHANGES) returns the current state from a materialized table immediately
+   and completes — like a regular REST request. Pull queries are useful for
+   microservice lookups; push queries for real-time dashboards.
+
+Q: How does ksqlDB relate to Kafka Streams internally?
+A: ksqlDB compiles SQL queries into Kafka Streams topologies internally. Every
+   CREATE STREAM AS SELECT or CREATE TABLE AS SELECT becomes a persistent Kafka
+   Streams application. The ksqlDB server IS a Kafka Streams application that also
+   provides a SQL parsing layer and REST/WebSocket API on top. You get all the
+   Kafka Streams features (RocksDB state, fault tolerance, EOS) with a SQL
+   interface.
+
+Q: When would you choose ksqlDB over Kafka Streams?
+A: ksqlDB is preferred when the team is more SQL-fluent than Java-fluent, for
+   rapid prototyping, for business analyst-written queries, and when Confluent
+   Platform is available. Kafka Streams is preferred for complex business logic
+   requiring Java code (custom serialization, intricate branching, Processor API
+   control), for embedding stream processing directly into a microservice, or when
+   a separate ksqlDB server would add unwanted operational complexity.
+
+Q: What is EMIT CHANGES in ksqlDB and when is it used?
+A: EMIT CHANGES turns a SELECT into a push query — results stream continuously to
+   the client as new records arrive in the source topic. Without it, a SELECT on
+   a TABLE becomes a pull query that returns current state and closes. EMIT CHANGES
+   is required for all CSAS (CREATE STREAM AS SELECT) and CTAS (CREATE TABLE AS
+   SELECT) persistent queries, since they must run indefinitely to process new data.

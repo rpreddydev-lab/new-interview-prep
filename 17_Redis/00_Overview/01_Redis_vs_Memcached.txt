@@ -1,0 +1,199 @@
+================================================================================
+REDIS vs MEMCACHED — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. HIGH-LEVEL COMPARISON
+─────────────────────────
+  Feature                 │ Redis                        │ Memcached
+  ────────────────────────┼──────────────────────────────┼──────────────────────
+  Data structures         │ Rich (String, List, Set,     │ Only flat key-value
+                          │ ZSet, Hash, Stream, Geo, …)  │ (string keys → blobs)
+  Persistence             │ Yes (RDB + AOF)              │ No (pure cache)
+  Replication             │ Yes (master-replica)         │ No built-in replication
+  Clustering              │ Yes (Redis Cluster, hash     │ Client-side sharding only
+                          │ slots)                       │
+  Pub/Sub                 │ Yes                          │ No
+  Lua scripting           │ Yes (EVAL, EVALSHA)          │ No
+  Transactions            │ Yes (MULTI/EXEC)             │ No
+  TTL granularity         │ Seconds AND milliseconds     │ Seconds only
+  Max value size          │ 512 MB                       │ 1 MB default
+  Threading model         │ Single-threaded cmd exec,    │ Multi-threaded (full)
+                          │ threaded I/O (v6+)           │
+  Memory efficiency       │ Slightly higher overhead per │ Lower overhead per item
+                          │ item (richer metadata)       │ (simpler structure)
+  CAS (Compare-And-Swap)  │ No native CAS, use WATCH     │ Yes (native CAS command)
+  Geospatial              │ Yes (GEOADD/GEORADIUS)       │ No
+  Streams                 │ Yes (XADD/XREAD)             │ No
+  HyperLogLog             │ Yes (PFADD/PFCOUNT)          │ No
+  License                 │ RSALv2/SSPLv1 (v7.4+)       │ BSD
+  Language                │ C                            │ C
+
+
+2. THREADING MODEL — CRITICAL DIFFERENCE
+─────────────────────────────────────────
+
+Redis (before v6):
+  - Single main thread handles all command processing AND networking I/O
+  - Predictable latency, no thread-safety concerns for commands
+  - CPU-bound: can only use 1 core effectively for commands
+
+Redis v6+:
+  - Multi-threaded I/O: multiple I/O threads read from sockets and write
+    responses (configurable via io-threads 4)
+  - Command execution STILL single-threaded
+  - Effectively scales with more CPU cores for I/O-heavy workloads
+
+Memcached:
+  - Fully multi-threaded from day one
+  - Each thread handles its own connections independently
+  - Can use ALL CPU cores efficiently
+  - Better for simple high-concurrency workloads with many cores
+  - Internal locking is needed (slightly more complexity)
+
+Interview insight:
+  "If you need to max out a 32-core machine for a pure string cache with
+   millions of small reads/writes, Memcached may edge out Redis on raw
+   throughput. For anything beyond strings, Redis wins."
+
+
+3. PERSISTENCE
+──────────────
+Redis:
+  - RDB (Redis Database): periodic snapshots to disk (fork + write)
+  - AOF (Append Only File): log of every write command
+  - Hybrid: RDB + AOF combined (Redis 4.0+)
+  - Data survives restarts, suitable as a primary store
+
+Memcached:
+  - ZERO persistence. All data lives in RAM only.
+  - On restart: completely empty cache (cold start)
+  - Purely a cache, never a database
+
+Implication:
+  Use Redis when you need the cache to survive crashes/restarts (e.g.,
+  session store). Memcached is fine for pure performance-critical caches
+  where data can be reloaded from the DB.
+
+
+4. REPLICATION
+──────────────
+Redis:
+  - Built-in asynchronous master-replica replication
+  - Replica can serve reads (read scaling)
+  - Redis Sentinel for automatic failover
+  - Redis Cluster for horizontal partitioning + replication
+
+Memcached:
+  - No built-in replication
+  - Relies entirely on the client library for consistent hashing / sharding
+  - Third-party solutions: mcrouter (Facebook), repcached
+  - Common pattern: write to all nodes, read from any → requires client logic
+
+
+5. DATA STRUCTURES — THE KEY REDIS ADVANTAGE
+─────────────────────────────────────────────
+Memcached only stores binary blobs (opaque byte arrays). Any structure
+(JSON, object) must be serialized/deserialized by the client.
+
+Redis natively supports:
+  - String:      Simple value, counters, binary data
+  - List:        Ordered sequences, message queues
+  - Set:         Unique membership, tags, unions/intersections
+  - Sorted Set:  Ranked data (leaderboards, scheduling)
+  - Hash:        Object fields (user profiles, config)
+  - Stream:      Append-only log, consumer groups (Kafka-like)
+  - Geo:         Proximity queries
+  - HyperLogLog: Cardinality estimation (unique visitor counts)
+  - Bitfield:    Space-efficient counters/flags
+
+With Redis you can do atomic operations ON the data structure server-side.
+Example: ZINCRBY leaderboard 10 "player1" — atomic increment in sorted set.
+With Memcached you'd need to GET → deserialize → modify → serialize → CAS.
+
+
+6. USE CASE DECISION GUIDE
+────────────────────────────
+  Scenario                              → Choose
+  ──────────────────────────────────────────────────────────────────────
+  Simple string/object cache, max perf  → Memcached (if no other needs)
+  Session store (must survive restarts) → Redis (persistence)
+  Leaderboard / ranking                 → Redis (Sorted Set)
+  Rate limiting                         → Redis (INCR + EXPIRE / Lua)
+  Message queue                         → Redis (List/Stream)
+  Pub/Sub fanout                        → Redis (Pub/Sub)
+  Distributed lock                      → Redis (SET NX PX)
+  Geo proximity search                  → Redis (GEO commands)
+  Analytics / unique counts             → Redis (HyperLogLog)
+  Multi-get performance (many keys)     → Memcached (strong multi-get)
+  Shared nothing, easy horizontal scale → Memcached (simple sharding)
+
+
+7. MEMORY EFFICIENCY
+─────────────────────
+Memcached:
+  - Slab allocator: memory divided into fixed-size slabs
+  - Each item uses minimal metadata (32 bytes overhead)
+  - Very memory-efficient for uniform-sized small values
+  - NO fragmentation between slabs (but wasted space within slabs)
+
+Redis:
+  - jemalloc by default
+  - Each robj has type, encoding, refcount, lru metadata
+  - Compact encodings (listpack, intset) for small data to save memory
+  - Can tune: hash-max-listpack-entries, set-max-intset-entries, etc.
+  - Generally uses 10-20% more memory per item than Memcached for plain strings
+
+Rule of thumb:
+  For 1 billion tiny (< 64 byte) string values → Memcached wins on memory.
+  For anything else (mixed sizes, complex types) → Redis is comparable or better.
+
+
+8. CONSISTENCY & ATOMICITY
+────────────────────────────
+Redis:
+  - Single-threaded: every command is atomic
+  - MULTI/EXEC transactions: batch commands, all-or-nothing (no rollback)
+  - Lua scripts: atomic execution of multi-step logic
+  - WATCH: optimistic locking for CAS-like patterns
+
+Memcached:
+  - Individual commands are atomic (GET, SET, ADD, CAS)
+  - CAS (Check-And-Set) for compare-and-swap
+  - No transactions
+  - No scripting
+
+
+9. OPERATIONAL ASPECTS
+───────────────────────
+  Aspect             │ Redis                      │ Memcached
+  ───────────────────┼────────────────────────────┼────────────────────────
+  Config complexity  │ Higher (many options)      │ Simpler
+  Monitoring         │ INFO command (rich stats)  │ stats command (basic)
+  Cloud offerings    │ ElastiCache, Azure Cache,  │ ElastiCache
+                     │ Redis Cloud, MemoryDB       │
+  Tooling ecosystem  │ Very rich                  │ Moderate
+  Active development │ Yes (Redis Ltd. + Valkey)  │ Minimal (stable, mature)
+
+
+10. INTERVIEW QUESTIONS & ANSWERS
+───────────────────────────────────
+  Q: When would you choose Memcached over Redis?
+  A: When you need a pure, simple string cache with maximum multi-core
+     throughput, no persistence requirement, and you're already using it.
+     Memcached has lower memory overhead per item and is fully multi-threaded.
+     In practice, Redis is chosen for new projects almost always.
+
+  Q: Redis is single-threaded, how does it handle 100K+ ops/sec?
+  A: Commands are processed in a tight in-memory event loop with no disk I/O
+     and no locking. The bottleneck is usually network I/O, not CPU.
+     Redis 6+ uses threaded I/O to handle the network layer in parallel.
+
+  Q: Does Memcached support replication?
+  A: Not natively. You'd use mcrouter or client-side logic. Redis has built-in
+     replication, Sentinel, and Cluster.
+
+  Q: Is Redis purely a cache?
+  A: No. Redis can serve as a cache, a primary database (with persistence),
+     a message broker (Pub/Sub, Streams), and more. Memcached is purely a cache.
+
+================================================================================

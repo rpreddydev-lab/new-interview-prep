@@ -1,0 +1,271 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DESIGN: URL SHORTENER (Like bit.ly / TinyURL)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FUNCTIONAL:
+  - Given a long URL, generate a short alias (e.g., bit.ly/abc123)
+  - Redirect short URL to original URL
+  - Custom aliases (optional: user chooses the slug)
+  - Link expiry (optional: links expire after N days)
+  - Analytics: click count, geographic breakdown, referrer (optional)
+
+NON-FUNCTIONAL:
+  - 100M URLs created per day
+  - 10:1 read/write ratio (1B redirects per day)
+  - Redirects must be very fast: p99 < 10ms (cached in CDN/Redis)
+  - Availability: 99.99% (downtime = broken links everywhere)
+  - Short codes: 7 characters (base62: a-z, A-Z, 0-9)
+  - Durability: Links should last years
+
+OUT OF SCOPE: User accounts, link management UI, real-time analytics
+
+
+2. ESTIMATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WRITE:
+  100M URLs/day → 100M / 86,400 ≈ 1,200 writes/second (peak: ~3K/s)
+
+READ (redirects):
+  1B redirects/day → 1B / 86,400 ≈ 11,600 reads/second (peak: ~30K/s)
+
+STORAGE:
+  One URL record: ~500 bytes (long URL ~200 chars + metadata)
+  Daily: 100M × 500 bytes = 50GB/day
+  5-year retention: 50GB × 365 × 5 ≈ 90TB
+
+SHORT CODE SPACE:
+  7 characters, base62 (a-z, A-Z, 0-9): 62^7 = 3.5 trillion combinations
+  At 100M/day: Would take 3.5T / 100M = 35,000 years to exhaust
+
+
+3. API DESIGN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+POST /api/v1/urls
+  Request:  { "longUrl": "https://www.example.com/very/long/path?param=value",
+              "customAlias": "my-link",          (optional)
+              "expiresAt": "2025-12-31T00:00:00Z" (optional) }
+  Response: { "shortUrl": "https://bit.ly/abc123",
+              "shortCode": "abc123",
+              "longUrl": "https://...",
+              "createdAt": "2024-01-15T..." }
+  Auth: API key required
+
+GET /{shortCode}
+  Response: HTTP 301 (permanent redirect) or 302 (temporary) to longUrl
+  HTTP 301: Browser caches → fewer requests to server (analytics missed)
+  HTTP 302: No browser cache → server sees every request (analytics accurate)
+  Recommendation: 301 for performance, 302 if analytics needed
+
+GET /api/v1/urls/{shortCode}/stats
+  Response: { "clicks": 1234, "countries": {...}, "referrers": {...} }
+
+
+4. HIGH-LEVEL ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Write Path:
+  Client → API Gateway → URL Shortener Service
+                              ↓
+                         ID Generator (distributed)
+                              ↓
+                         Database (write shortCode + longUrl)
+                              ↓
+                         Cache (warm cache entry)
+
+Redirect Path:
+  User → CDN (cache popular redirects) → Load Balancer
+             → Redirect Service → Redis Cache (shortCode → longUrl)
+             → Database (cache miss only)
+             → HTTP 302 Response
+             ↓ async
+             Analytics Kafka Topic → Analytics Service → Analytics DB
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ Client Browser                                                  │
+  └─────────────────┬───────────────────────────────────────────────┘
+                    │ GET /abc123
+  ┌─────────────────▼───────────────────────────────────────────────┐
+  │ CDN (CloudFront)  — caches hot redirects for ~60 seconds        │
+  └─────────────────┬───────────────────────────────────────────────┘
+                    │ cache miss
+  ┌─────────────────▼───────────────────────────────────────────────┐
+  │ Load Balancer (ALB)                                             │
+  └─────────────────┬───────────────────────────────────────────────┘
+                    │
+  ┌─────────────────▼───────────────────────────────────────────────┐
+  │ Redirect Service (stateless, horizontally scaled)               │
+  └─────┬──────────────────────────────────────────────┬────────────┘
+        │ lookup shortCode                             │ log click event
+  ┌─────▼─────────────┐    DB fallback          ┌──────▼────────────┐
+  │ Redis Cache       │ ────────────────────→  │ Primary DB        │
+  │ shortCode → URL   │                         │ (PostgreSQL)      │
+  │ TTL: 24 hours     │ ←──────────────────────  │                   │
+  └───────────────────┘   populate cache        └───────────────────┘
+
+
+5. SHORT CODE GENERATION — DEEP DIVE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+OPTION 1: MD5/SHA-256 Hash of Long URL
+  shortCode = base62(MD5(longUrl))[0:7]
+  
+  Pros: Deterministic (same URL always gets same short code)
+  Cons: Hash collisions (different URLs → same first 7 chars)
+        Collision probability: 1/62^7 = 1 in 3.5 trillion (rare but possible)
+  
+  Collision handling: If collision, append counter: MD5(longUrl + "1"), +2, etc.
+  PROBLEM: Multiple users shorten same URL → same short code
+    Option A: Return existing short code (deduplication)
+    Option B: Create new entry each time (wasteful)
+
+OPTION 2: UNIQUE ID GENERATOR + BASE62 ENCODE (RECOMMENDED)
+  1. Distributed ID generator creates unique monotonic integer (Snowflake-style)
+  2. Convert integer to base62 (a-z, A-Z, 0-9)
+  
+  Snowflake ID: 64-bit integer
+    - 41 bits: millisecond timestamp
+    - 10 bits: machine ID
+    - 12 bits: sequence number per machine per millisecond
+  
+  Base62 encoding:
+    characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    
+    def encode(id):
+        result = []
+        while id > 0:
+            result.append(characters[id % 62])
+            id //= 62
+        return ''.join(reversed(result))
+  
+  Integer 1234567890 → base62 "1LY7VK" (6 chars)
+  Pads to 7 chars with leading base-62 zero
+  
+  Pros: No collisions, fast, no DB lookup needed for generation
+        IDs are sortable by time (monotonic)
+  Cons: Cannot generate same short code for same URL (no deduplication)
+        Need to check for custom alias conflicts
+
+OPTION 3: COUNTER-BASED (Simple but single-point-of-failure)
+  Central counter in Redis or ZooKeeper
+  Each API server gets a range (1-1000, 1001-2000, etc.) — avoids contention
+  Batch allocation: Server requests 1000 IDs at a time
+  
+  PROBLEM: Counter is a SPOF; data loss on crash loses IDs
+
+RECOMMENDATION: Use Option 2 (Snowflake ID + Base62) for production systems
+
+
+6. DATA MODEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PRIMARY TABLE: urls
+  CREATE TABLE urls (
+    short_code  VARCHAR(10) PRIMARY KEY,
+    long_url    TEXT NOT NULL,
+    user_id     BIGINT,
+    created_at  TIMESTAMP DEFAULT NOW(),
+    expires_at  TIMESTAMP,
+    click_count BIGINT DEFAULT 0
+  );
+  
+  Index: CREATE INDEX idx_expires_at ON urls(expires_at) WHERE expires_at IS NOT NULL;
+  Use for: Cleanup job to remove expired URLs
+
+ANALYTICS TABLE: clicks (time-series)
+  CREATE TABLE clicks (
+    id         BIGINT PRIMARY KEY,
+    short_code VARCHAR(10) NOT NULL,
+    clicked_at TIMESTAMP NOT NULL,
+    ip_address INET,
+    country    VARCHAR(2),
+    referrer   TEXT,
+    user_agent TEXT
+  );
+  
+  Partitioned by: clicked_at (daily/monthly partitions)
+  WRITE: Async via Kafka (redirect service publishes event)
+  READ: Analytics service aggregates
+
+DATABASE CHOICE:
+  URLs table: PostgreSQL (need ACID for unique short codes)
+              Or DynamoDB with short_code as partition key (simpler scaling)
+  Clicks: Cassandra or TimescaleDB (high write volume, time-series)
+  Cache: Redis (shortCode → longUrl, TTL 24h)
+
+
+7. CACHING STRATEGY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CACHE WHAT: shortCode → longUrl mapping
+CACHE WHERE: Redis (L1), CDN (L2)
+CACHE TTL: 24 hours (balance freshness vs hit rate)
+
+HOT LINKS (viral URLs):
+  Top 20% of links get 80% of traffic (Pareto)
+  Hot links hit Redis cache 99%+ of the time
+  Cache hit rate target: 95%+ (reduces DB load by 20×)
+
+CACHE INVALIDATION:
+  Link deleted: DEL key from Redis + cache-control: no-store at CDN
+  Link expired: Background job removes expired links + Redis TTL handles cache
+
+CDN CACHING:
+  CloudFront caches 302 responses for 60 seconds
+  Cache-Control: public, max-age=60
+  CloudFront edge: ~100-200 ms round trip globally for cache hits
+  Redis (same AZ as app): ~1ms latency for cache hits
+
+
+8. ANALYTICS DESIGN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WRITE PATH (async, non-blocking):
+  Redirect Service → Kafka topic "url-clicks"
+  Consumer group: Analytics Consumer
+  Aggregation: Every minute, aggregate clicks per short_code
+  Storage: TimescaleDB or Cassandra for time-series
+
+  Why async?
+  - Redirect must be <10ms
+  - Analytics write can tolerate seconds of lag
+  - Kafka buffers peak traffic
+
+AGGREGATION (avoid storing every click):
+  Pre-aggregate in Kafka Streams or Flink:
+    Per minute: clicks_last_minute per short_code
+    Per hour: clicks_last_hour
+    Per day: clicks_last_day
+  Store pre-aggregated data — don't store every raw click
+  (At 1B clicks/day = 11K clicks/second: raw storage = 50GB+ per day of click logs)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWER — "Walk me through your URL shortener design"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"The core challenge is that the redirect path is extremely read-heavy —
+10:1 read/write — and must be ultra-fast (under 10ms).
+
+For short code generation: I use a Snowflake-style 64-bit ID, encoded
+in base62 to get a 7-character code. 62^7 = 3.5 trillion unique codes
+— that's 35,000 years of runway at 100M URLs/day.
+
+For reads (the hot path): CDN caches popular redirect responses for 60
+seconds. On CDN miss, the redirect service checks Redis (1ms). On Redis
+miss (rare), it queries the primary database and warms the cache.
+
+The database is PostgreSQL with short_code as primary key. At 30K
+redirects/second peak, Redis handles 99%+ of traffic — the DB only
+serves ~300 QPS (1% of peak).
+
+For analytics: clicks are published to Kafka asynchronously — no blocking
+the redirect response. A consumer aggregates per short_code per minute.
+
+The main trade-off: 301 vs 302 redirects. 301 is cached by browsers
+(no server hit on repeat visits — great for performance, bad for analytics).
+I'd use 302 by default for analytics, with an opt-in for 301."

@@ -1,0 +1,807 @@
+================================================================================
+LOG AGGREGATION STRATEGIES AND DISTRIBUTED TRACING
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Log Aggregation Fundamentals
+2. Fluent Bit and Fluentd
+3. Log Collection Patterns in Kubernetes
+4. Distributed Tracing Concepts
+5. OpenTelemetry for Tracing
+6. Jaeger
+7. Grafana Tempo
+8. Sampling Strategies
+9. Correlating Logs, Metrics, and Traces
+10. Common Interview Questions & Answers
+11. Quick Reference Cheat Sheet
+
+================================================================================
+1. LOG AGGREGATION FUNDAMENTALS
+================================================================================
+
+What is Log Aggregation?
+  Collecting logs from many sources, centralizing, and making them searchable.
+  
+  Without aggregation:
+  - 50 pods → 50 places to SSH and grep logs
+  - Logs lost when pods restart
+  - No cross-service correlation
+  
+  With aggregation:
+  - All logs in one place (Elasticsearch/Loki)
+  - Logs persisted beyond pod lifecycle
+  - Search and correlate across services
+
+Log Collection Architectures:
+  
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  1. Agent on Each Node (DaemonSet Pattern — K8s standard):       │
+  │                                                                    │
+  │  Pod A logs → /var/log/containers/                                │
+  │  Pod B logs → /var/log/containers/    → DaemonSet Agent → Storage│
+  │  Pod C logs → /var/log/containers/                                │
+  │                                                                    │
+  │  One agent per node reads ALL pod logs from shared path.         │
+  │  Agents: Fluent Bit, Filebeat                                    │
+  └──────────────────────────────────────────────────────────────────┘
+  
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  2. Sidecar Pattern (per pod):                                    │
+  │                                                                    │
+  │  [App Container] → shared volume → [Log Sidecar] → Storage       │
+  │                                                                    │
+  │  Use when: App can only write to file (not stdout).              │
+  │  More resource overhead (sidecar per pod).                       │
+  └──────────────────────────────────────────────────────────────────┘
+  
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  3. Application-Direct (no agent):                                │
+  │                                                                    │
+  │  App SDK → Loki/Elasticsearch directly via HTTP                  │
+  │                                                                    │
+  │  Simple but app depends on log storage availability.             │
+  └──────────────────────────────────────────────────────────────────┘
+
+Best Practice: K8s Applications Should Log to STDOUT.
+  Kubernetes captures stdout/stderr and writes to /var/log/containers/.
+  DaemonSet agent picks it up automatically.
+  No file management inside containers.
+  "Twelve-Factor App" principle: Treat logs as event streams.
+
+================================================================================
+2. FLUENT BIT AND FLUENTD
+================================================================================
+
+Fluent Bit:
+  Lightweight log processor written in C.
+  Low memory footprint (~450KB binary).
+  Designed for containers and embedded systems.
+  Plugin ecosystem: inputs, filters, outputs.
+  
+  Typical roles: K8s DaemonSet log collector.
+
+Fluentd:
+  Full-featured log collection daemon written in Ruby.
+  Larger ecosystem (~700 plugins).
+  Higher memory usage (~40MB).
+  
+  Typical roles: Log aggregation tier (receives from Fluent Bit, processes, routes).
+
+Common Pattern: Fluent Bit (collectors) → Fluentd (aggregation) → Storage
+
+Fluent Bit Configuration (K8s DaemonSet):
+  # fluent-bit-config.yaml:
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: fluent-bit-config
+    namespace: logging
+  data:
+    fluent-bit.conf: |
+      [SERVICE]
+          Flush          5
+          Daemon         Off
+          Log_Level      info
+          Parsers_File   parsers.conf
+      
+      # INPUT: Read container logs:
+      [INPUT]
+          Name              tail
+          Path              /var/log/containers/*.log
+          Exclude_Path      /var/log/containers/*fluent*.log
+          Parser            docker
+          Tag               kube.*
+          Refresh_Interval  5
+          Mem_Buf_Limit     50MB
+          Skip_Long_Lines   On
+      
+      # FILTER: Enrich with Kubernetes metadata:
+      [FILTER]
+          Name                kubernetes
+          Match               kube.*
+          Kube_URL            https://kubernetes.default.svc:443
+          Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
+          Kube_Tag_Prefix     kube.var.log.containers.
+          Merge_Log           On       # Parse JSON logs into fields
+          Merge_Log_Key       log      # JSON log goes into "log" key
+          Keep_Log            Off      # Remove raw log after merge
+          Annotations         Off      # Don't add pod annotations to log
+          Labels              On       # Add pod labels to log
+      
+      # FILTER: Drop debug/trace logs (cost reduction):
+      [FILTER]
+          Name    grep
+          Match   kube.*
+          Exclude level debug
+      
+      # FILTER: Add cluster info:
+      [FILTER]
+          Name    record_modifier
+          Match   kube.*
+          Record  cluster my-cluster
+          Record  environment production
+      
+      # OUTPUT: Send to Loki:
+      [OUTPUT]
+          Name             loki
+          Match            kube.*
+          Host             loki.monitoring.svc.cluster.local
+          Port             3100
+          Labels           job=fluentbit, namespace=$kubernetes['namespace_name'], pod=$kubernetes['pod_name'], container=$kubernetes['container_name'], node=$kubernetes['host']
+          Label_Keys       level,service,trace_id
+          BatchWait        1
+          BatchSize        10240
+      
+      # OUTPUT: Also send errors to Elasticsearch:
+      [OUTPUT]
+          Name            es
+          Match           kube.*
+          Host            elasticsearch.logging.svc
+          Port            9200
+          Logstash_Format On
+          Logstash_Prefix logs
+          Include_Tag_Key On
+          Tag_Key         fluentbit_tag
+    
+    parsers.conf: |
+      [PARSER]
+          Name        docker
+          Format      json
+          Time_Key    time
+          Time_Format %Y-%m-%dT%H:%M:%S.%LZ
+
+Fluent Bit Helm Install:
+  helm repo add fluent https://fluent.github.io/helm-charts
+  helm install fluent-bit fluent/fluent-bit \
+    --namespace logging \
+    --create-namespace \
+    --set config.outputs="[OUTPUT]..."
+
+================================================================================
+3. LOG COLLECTION PATTERNS IN KUBERNETES
+================================================================================
+
+Multi-Tenant Log Isolation:
+  In multi-tenant clusters, ensure teams can only see their own logs.
+  
+  Option 1: Loki multi-tenancy (X-Scope-OrgID header)
+  Option 2: Elasticsearch with RBAC per-index
+  Option 3: Separate Loki/ES per tenant
+
+Log Parsing Pipeline:
+  Raw log (stdout) → Parse → Enrich → Filter → Ship → Store
+  
+  Parse:   Identify JSON vs plain text, extract fields
+  Enrich:  Add K8s metadata (namespace, pod name, node), cluster info
+  Filter:  Drop debug logs, drop noisy lines (health checks)
+  Ship:    Compress and batch before sending
+  Store:   Elasticsearch (search) or Loki (cost-efficient)
+
+Health Check Log Filtering:
+  Kubernetes probes generate /healthz, /readyz requests every 10 seconds.
+  These pollute logs with "GET /healthz 200 0.001s".
+  
+  Filter out in Fluent Bit:
+  [FILTER]
+      Name    grep
+      Match   kube.*
+      Exclude path /healthz|/readyz|/livez|/metrics
+
+Log Rate Limiting (circuit breaker):
+  If a service generates 10,000 log lines/second, buffer can overflow.
+  
+  [FILTER]
+      Name        throttle
+      Match       kube.*
+      Rate        500         # Allow up to 500 lines per second
+      Window      3           # Sliding window of 3 seconds
+      Interval    1s
+      Print_Status true
+
+================================================================================
+4. DISTRIBUTED TRACING CONCEPTS
+================================================================================
+
+The Problem: Microservices Debugging
+  
+  User reports: "My checkout is slow"
+  
+  Request path:
+  Client → API Gateway → Auth Service → Cart Service → Inventory Service → Payment Service
+  
+  Without tracing: SSH into each service, grep logs for the request.
+  With tracing: One click → see the entire request flow with timing.
+
+Core Concepts:
+  
+  Trace:       An entire end-to-end request journey.
+               Identified by a unique Trace ID (e.g., "abc123def456").
+  
+  Span:        A single unit of work within a trace.
+               Example: "cart-service: check inventory" (50ms span).
+               Has: start time, duration, service, operation, attributes, status.
+  
+  Parent Span: A span that contains other spans.
+               API Gateway span contains downstream service spans.
+  
+  Root Span:   First span in a trace (from the edge/API gateway).
+  
+  Context Propagation:
+               Trace ID + Span ID passed between services via HTTP headers.
+               W3C standard header: traceparent
+               00-abc123def456-ghij789-01
+               (version-traceId-parentSpanId-flags)
+
+Trace Visualization:
+  
+  Trace: abc123 — User checkout — Total: 450ms
+  
+  ├── API Gateway (25ms)
+  │   ├── Auth Service (30ms)
+  │   │   └── DB Query: SELECT user (15ms)
+  │   └── Cart Service (200ms)
+  │       ├── Redis: GET cart:user456 (5ms)
+  │       ├── Inventory Service (150ms)  ← BOTTLENECK
+  │       │   └── DB Query: SELECT inventory (140ms)  ← SLOW QUERY
+  │       └── Cart Service total computation (45ms)
+  └── Payment Service (195ms)
+      └── Stripe API call (180ms)
+  
+  Immediately visible: Inventory service DB query is slow (missing index?).
+
+Span Attributes (OTel Semantic Conventions):
+  HTTP spans:    http.method, http.url, http.status_code, http.route
+  DB spans:      db.system, db.name, db.statement, db.operation
+  Messaging:     messaging.system, messaging.destination, messaging.operation
+  Custom:        user.id, order.id, payment.amount (business context)
+
+================================================================================
+5. OPENTELEMETRY FOR TRACING
+================================================================================
+
+OTel Architecture:
+  
+  Application → OTel SDK → OTel Collector → Tracing Backend
+  (Jaeger / Tempo / Zipkin / Datadog / Honeycomb)
+
+Manual Instrumentation (Python):
+  from opentelemetry import trace
+  from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+  
+  tracer = trace.get_tracer(__name__)
+  
+  def get_cart(user_id: str) -> dict:
+      with tracer.start_as_current_span("get_cart") as span:
+          span.set_attribute("user.id", user_id)
+          
+          # Nested span for Redis call:
+          with tracer.start_as_current_span("redis.get") as redis_span:
+              redis_span.set_attribute("db.system", "redis")
+              redis_span.set_attribute("db.statement", f"GET cart:{user_id}")
+              cart = redis_client.get(f"cart:{user_id}")
+          
+          if not cart:
+              with tracer.start_as_current_span("db.fetch_cart"):
+                  cart = db.query("SELECT * FROM carts WHERE user_id = ?", user_id)
+              
+              # Record an event (like a log within a span):
+              span.add_event("cache miss", {"user_id": user_id})
+          
+          return cart
+
+Auto-Instrumentation (Go):
+  import (
+      "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+  )
+  
+  // Wrap HTTP handler:
+  handler := otelhttp.NewHandler(myHandler, "checkout-service")
+  http.ListenAndServe(":8080", handler)
+  
+  // Wrap outgoing HTTP client:
+  client := &http.Client{
+      Transport: otelhttp.NewTransport(http.DefaultTransport),
+  }
+
+Java Auto-Instrumentation (no code change):
+  # Add java agent to JVM startup:
+  java -javaagent:opentelemetry-javaagent.jar \
+       -Dotel.service.name=inventory-service \
+       -Dotel.exporter.otlp.endpoint=http://otel-collector:4317 \
+       -jar my-app.jar
+  
+  # Auto-instruments: Spring, Hibernate, JDBC, gRPC, Kafka, Redis, and 100+ more.
+
+Context Propagation (HTTP):
+  # Outgoing request (inject context):
+  from opentelemetry.propagate import inject
+  
+  headers = {}
+  inject(headers)   # Adds "traceparent: 00-traceId-spanId-01" header
+  requests.post("http://payment-service/charge", headers=headers)
+  
+  # Incoming request (extract context):
+  from opentelemetry.propagate import extract
+  
+  context = extract(request.headers)   # Reads traceparent header
+  # OTel auto-instrumentation handles this automatically for Flask/FastAPI
+
+Kafka Context Propagation:
+  # Producer (inject trace into message headers):
+  from opentelemetry.propagate import inject
+  
+  headers = {}
+  inject(headers)
+  producer.produce(
+      topic="orders",
+      value=json.dumps(order),
+      headers=[(k, v.encode()) for k, v in headers.items()]
+  )
+  
+  # Consumer (extract trace from message headers):
+  from opentelemetry.propagate import extract
+  
+  msg_headers = {k: v.decode() for k, v in msg.headers()}
+  context = extract(msg_headers)
+  
+  with tracer.start_as_current_span("process_order", context=context) as span:
+      process_order(msg.value())
+
+================================================================================
+6. JAEGER
+================================================================================
+
+What is Jaeger?
+  Open-source distributed tracing platform (CNCF project).
+  Originally developed by Uber. Now widely used.
+
+Architecture:
+  
+  App (OTel SDK) → Jaeger Collector → Storage → Jaeger Query → UI
+  
+  Components:
+  jaeger-collector:  Receives traces from applications via OTLP, Thrift.
+  jaeger-query:      API + UI for viewing traces.
+  Storage:           Cassandra (production), Elasticsearch, Badger (development).
+
+Kubernetes Deployment (Jaeger Operator):
+  # Install Jaeger Operator:
+  kubectl apply -f https://github.com/jaegertracing/jaeger-operator/releases/latest/download/jaeger-operator.yaml
+  
+  # Create Jaeger instance:
+  apiVersion: jaegertracing.io/v1
+  kind: Jaeger
+  metadata:
+    name: jaeger
+    namespace: observability
+  spec:
+    strategy: production          # production / allinone (dev)
+    
+    collector:
+      options:
+        collector.num-workers: 50
+    
+    storage:
+      type: elasticsearch
+      elasticsearch:
+        serverUrls: https://elasticsearch:9200
+        secretName: jaeger-es-secret
+        indexPrefix: jaeger
+    
+    query:
+      serviceType: ClusterIP
+    
+    ingester:
+      enabled: false
+
+Jaeger UI Features:
+  Search:      Search by service, operation, tag, min/max duration
+  Trace view:  Gantt chart of all spans in a trace
+  Comparison:  Compare two traces side-by-side
+  Service graph: (newer versions) visual service dependencies
+
+Retention:
+  Elasticsearch ILM for Jaeger indices (same as log retention).
+  Typical: 7-30 days (traces are verbose — use sampling to control volume).
+
+================================================================================
+7. GRAFANA TEMPO
+================================================================================
+
+What is Grafana Tempo?
+  Cost-efficient distributed tracing backend.
+  Stores traces in object storage (S3/GCS) — very cheap.
+  No search index (search via trace ID or via Loki logs → trace link).
+  Integrates natively with Grafana.
+
+Key Differentiator vs Jaeger/Elasticsearch:
+  
+  ┌──────────────────┬───────────────────────────────┬───────────────────────┐
+  │ Feature          │ Jaeger + Elasticsearch         │ Grafana Tempo         │
+  ├──────────────────┼───────────────────────────────┼───────────────────────┤
+  │ Storage cost     │ High (ES is expensive)         │ Very low (S3 pennies) │
+  │ Search           │ Full search (by tag, duration) │ Only by Trace ID      │
+  │ Grafana native   │ Plugin needed                  │ Native integration    │
+  │ Trace discovery  │ Jaeger UI search               │ TraceQL or via Loki   │
+  │ Ops complexity   │ ES cluster to manage           │ Just object storage   │
+  └──────────────────┴───────────────────────────────┴───────────────────────┘
+
+Tempo Installation (Helm):
+  helm repo add grafana https://grafana.github.io/helm-charts
+  helm install tempo grafana/tempo \
+    --namespace observability \
+    --set storage.trace.backend=s3 \
+    --set storage.trace.s3.bucket=my-traces \
+    --set storage.trace.s3.region=us-east-1
+
+TraceQL (Tempo Query Language):
+  # Find slow traces:
+  { duration > 1s && span.service.name = "payment-service" }
+  
+  # Find traces with errors:
+  { status = error && span.service.name = "checkout-service" }
+  
+  # Find traces with specific attribute:
+  { span.order.id = "order-123" }
+  
+  # Find traces with specific operation exceeding duration:
+  { span.name = "charge_card" && duration > 500ms }
+
+Exemplars: Connecting Metrics to Traces:
+  Prometheus supports exemplars — attaching a trace_id to a metric data point.
+  
+  # Python (Prometheus client with exemplars):
+  REQUEST_DURATION = Histogram('request_duration_seconds', 'Request duration')
+  
+  def process_request():
+      with REQUEST_DURATION.time() as t:
+          result = handle()
+          # Attach trace_id as exemplar:
+          t.set_exemplar({"trace_id": get_current_trace_id()})
+      return result
+  
+  # In Grafana: Click on a data point in a histogram → opens the trace.
+  # Connects metrics → traces seamlessly.
+
+================================================================================
+8. SAMPLING STRATEGIES
+================================================================================
+
+Why Sample?
+  Every request traced = massive data volume and cost.
+  Typical sampling: 1-10% in production.
+
+Head-Based Sampling:
+  Decision made at the START of the request (before we know what happens).
+  
+  Probabilistic: Sample 10% of requests uniformly.
+  Rate-limiting: Sample 100 requests/second regardless of traffic.
+  
+  Problem: Drops 90% of traces, including potentially important slow/error traces.
+
+Tail-Based Sampling:
+  Decision made AFTER the trace is complete.
+  Collector buffers all spans, then decides based on full trace context.
+  
+  Rules:
+  - Always sample: status = error
+  - Always sample: duration > 2 seconds (slow traces)
+  - Always sample: service = payment-service (critical service)
+  - Sample 1% of all other traces
+  
+  Result: 100% of error and slow traces captured, 1% of normal traffic.
+  Requires stateful collector (OTel Collector tail-based processor).
+
+OTel Collector Tail-Based Sampling:
+  processors:
+    tail_sampling:
+      decision_wait:       10s     # Buffer spans for 10s before deciding
+      num_traces:          10000   # Max traces in buffer
+      expected_new_traces_per_sec: 1000
+      policies:
+        - name: error-policy
+          type: status_code
+          status_code: { status_codes: [ERROR] }
+        
+        - name: slow-traces
+          type: latency
+          latency: { threshold_ms: 2000 }
+        
+        - name: critical-services
+          type: string_attribute
+          string_attribute:
+            key: service.name
+            values: ["payment-service", "auth-service"]
+        
+        - name: probabilistic-fallback
+          type: probabilistic
+          probabilistic: { sampling_percentage: 1 }  # 1% of everything else
+      
+      decision_rules:
+        operator: or    # Any matching policy = sample the trace
+
+================================================================================
+9. CORRELATING LOGS, METRICS, AND TRACES
+================================================================================
+
+The "Three Pillars" in Action:
+  
+  Alert: "Payment service p99 latency > 2s" [METRIC]
+                │
+                ▼
+  Dashboard: Error rate 15%, latency spike at 10:23 [METRIC]
+                │
+                ▼
+  Logs: "ERROR: DB connection pool exhausted, trace_id: abc123" [LOG]
+                │
+                ▼
+  Trace: abc123 → DB span 2500ms → connection pool wait [TRACE]
+                │
+                ▼
+  Root cause: DB connection pool too small / connection leak
+
+Key Correlation Fields:
+  trace_id:    Links logs to traces
+  span_id:     Links a specific log line to a specific span
+  service:     Links all three pillars to the same service
+  
+  Every log line in production SHOULD include trace_id.
+
+Injecting Trace ID into Logs (Python):
+  import logging
+  from opentelemetry import trace
+  
+  class TraceIDFilter(logging.Filter):
+      def filter(self, record):
+          span = trace.get_current_span()
+          if span and span.get_span_context().is_valid:
+              record.trace_id = format(span.get_span_context().trace_id, '032x')
+              record.span_id  = format(span.get_span_context().span_id, '016x')
+          else:
+              record.trace_id = "unknown"
+              record.span_id  = "unknown"
+          return True
+  
+  # Configure logger:
+  logger = logging.getLogger("payment-service")
+  logger.addFilter(TraceIDFilter())
+  
+  # Formatter:
+  formatter = logging.Formatter(
+      '{"timestamp": "%(asctime)s", "level": "%(levelname)s", '
+      '"service": "payment-service", "trace_id": "%(trace_id)s", '
+      '"span_id": "%(span_id)s", "message": "%(message)s"}'
+  )
+
+Grafana Unified Observability:
+  Grafana can correlate all three from one UI:
+  
+  1. Grafana Explore: Query Prometheus metrics → see a latency spike
+  2. Click on a data point → Grafana shows Loki logs for that time window
+  3. Click trace_id in a log line → opens the trace in Tempo
+  
+  # Configure Loki data source with derived field for trace links:
+  # In Grafana data source settings for Loki:
+  derivedFields:
+  - name: TraceID
+    matcherRegex: '"trace_id":"([^"]+)"'
+    url: '$${__value.raw}'
+    datasourceUid: tempo    # Link to Tempo data source
+
+================================================================================
+10. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: What is distributed tracing and why is it important for microservices?
+A: Distributed tracing is the ability to follow a single request as it flows through
+   multiple services in a microservices architecture.
+   
+   The core problem it solves:
+   A user's checkout request hits API Gateway, then Auth Service, Cart Service,
+   Inventory Service, and Payment Service. If the user says "checkout is slow,"
+   without tracing you'd have to SSH into 5 services and grep for request logs,
+   manually correlating timestamps. Even then, you might miss the bottleneck.
+   
+   With distributed tracing:
+   - Each service generates "spans" tagged with a common Trace ID
+   - Spans are correlated into a single trace
+   - A flame graph shows the entire request timeline: which service took how long
+   - If DB query in Inventory Service took 140ms, you see it immediately
+   
+   How context propagation works:
+   - Service A starts a span, generates trace_id + span_id
+   - Service A calls Service B, passing headers: traceparent: 00-traceId-spanId-01
+   - Service B reads headers, creates a child span linked to Service A's span
+   - Service B calls Service C — passes headers — and so on
+   - All spans share the same trace_id, linking them together
+   
+   Without distributed tracing, debugging microservices performance at scale is
+   nearly impossible. It's a fundamental observability requirement.
+
+Q2: How does OpenTelemetry relate to Jaeger, Zipkin, and Datadog?
+A: OpenTelemetry (OTel) is the INSTRUMENTATION standard — how you collect telemetry.
+   Jaeger, Zipkin, Datadog are BACKENDS — where you store and query telemetry.
+   
+   OTel provides:
+   - SDKs for 10+ languages (Python, Go, Java, Node.js, .NET, etc.)
+   - Semantic conventions for attribute naming
+   - OTLP protocol for sending telemetry
+   - Collector for receiving, processing, and exporting telemetry
+   
+   The relationship:
+   App code uses OTel SDK → generates OTLP spans →
+   OTel Collector receives spans → exports to chosen backend(s):
+   - Jaeger (open source, good search)
+   - Grafana Tempo (cheap object storage)
+   - Datadog (commercial, full-featured)
+   - Honeycomb (advanced analytics)
+   - Zipkin (older open source)
+   
+   Key benefit: vendor portability.
+   Instrument once with OTel, switch backends by changing Collector configuration.
+   No code changes needed to switch from Jaeger to Tempo.
+   
+   Historical context:
+   Before OTel, you had to choose your tracing SDK vendor first:
+   Jaeger had its own SDK (jaeger-client), Zipkin had Brave, etc.
+   Switching backends required re-instrumenting all services.
+   OTel unified this — it's now the industry standard.
+
+Q3: What is the difference between head-based and tail-based sampling?
+A: Sampling determines which traces to keep (100% tracing is too expensive).
+   
+   Head-based sampling: Decision made at the START of a request.
+   
+   Probabilistic: "Keep 10% of all requests" — random sampling at the root span.
+   Each request has a 10% chance of being traced.
+   
+   Pros: Simple, low overhead, no coordination needed.
+   Cons: Randomly drops 90% including slow/error traces you actually care about.
+         If errors are 0.1% of traffic and you sample 1%, you lose 99% of errors.
+   
+   Tail-based sampling: Decision made AFTER the trace is complete.
+   
+   The OTel Collector buffers all spans for a trace window (10-30 seconds).
+   After the trace completes, evaluate rules:
+   - Error span? → Keep (100%)
+   - Duration > 2s? → Keep (100%)
+   - Critical service (payment)? → Keep (100%)
+   - Everything else → Keep 1%
+   
+   Pros: Never miss errors or slow traces.
+   Cons: Stateful collector required. If multiple collector instances, a trace
+         can be split across instances (need consistent hashing/load balancing).
+         Higher memory usage (buffering all in-flight spans).
+   
+   Best practice:
+   Start with head-based sampling for simplicity (5-10%).
+   Graduate to tail-based as scale grows and you want 100% error capture.
+
+Q4: How do you correlate logs with traces?
+A: Correlation is done via trace_id — the same identifier appears in both the log
+   line and the trace spans.
+   
+   Implementation:
+   1. Add trace_id to every log line using a logging filter that reads from OTel context
+   2. Configure structured JSON logging with trace_id field
+   3. Configure Grafana/Kibana to make trace_id a clickable link to the trace
+   
+   Code example (Python):
+   The OTel SDK maintains trace context in thread-local/async context.
+   A logging filter reads trace.get_current_span().get_span_context().trace_id
+   and injects it into the log record.
+   Result: log line looks like {"trace_id": "abc123...", "level": "ERROR", "message": "..."}
+   
+   In Grafana:
+   - Add Loki as data source
+   - Configure "Derived Fields" — regex to extract trace_id from log messages
+   - Point derived field URL to Tempo data source
+   - When you see a log line with trace_id, there's a clickable link to the trace
+   
+   In Kibana:
+   - Similar: configure url_template in Kibana that links trace_id to Jaeger UI
+   
+   This creates the "three pillars" workflow:
+   Alert (metric) → Logs (what happened) → Trace (exactly where it happened)
+
+Q5: Explain the Fluent Bit vs Fluentd vs Logstash choice for Kubernetes.
+A: All three collect and process logs, but differ significantly in resource use and use case:
+   
+   Fluent Bit:
+   Written in C, ~450KB binary, ~50MB RAM.
+   Designed for K8s DaemonSet (one per node, many nodes).
+   Native K8s metadata enrichment plugin.
+   Fast, lightweight, handles basic parsing and filtering.
+   Best for: K8s log collection (standard choice for DaemonSet agent).
+   
+   Fluentd:
+   Written in Ruby, ~40MB binary, ~200-300MB RAM.
+   Rich plugin ecosystem (~700 plugins).
+   Better at complex routing, buffering, aggregation.
+   Often deployed as a central aggregation tier.
+   Best for: Central aggregation layer receiving from Fluent Bit, complex routing rules.
+   
+   Logstash:
+   Written in Java, JVM overhead (~200MB+ RAM).
+   Most powerful parsing (Grok patterns, complex filters).
+   Tight integration with Elasticsearch (part of ELK).
+   Input/filter/output pipeline model.
+   Best for: Parsing complex legacy log formats, heavy processing pipelines,
+             integration with Elasticsearch ecosystem.
+   
+   Recommendation:
+   K8s-native (Loki backend): Fluent Bit DaemonSet → Loki (simplest, cheapest)
+   ELK stack: Filebeat DaemonSet → Logstash (if complex parsing needed) → Elasticsearch
+   Large scale: Fluent Bit DaemonSet → Kafka → Logstash → Elasticsearch
+               (Kafka absorbs log bursts, prevents Elasticsearch overload)
+
+================================================================================
+11. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+LOG COLLECTION (KUBERNETES):
+  DaemonSet pattern  One agent per node reads /var/log/containers/
+  Fluent Bit         Lightweight (C), K8s native, 50MB RAM DaemonSet
+  Fluentd            Heavy (Ruby), central aggregation, 700+ plugins
+  Logstash           JVM, complex parsing, ELK integration
+
+DISTRIBUTED TRACING:
+  Trace       End-to-end request journey (unique Trace ID)
+  Span        Single unit of work (service + operation + duration)
+  Parent span Root/container span containing child spans
+  Propagation W3C traceparent header (passed between services)
+
+KEY TOOLS:
+  OTel SDK        Instrument code (or auto-instrument)
+  OTel Collector  Receive → process → export telemetry
+  Jaeger          Open source tracing UI + search (ES storage)
+  Tempo           Cheap object storage tracing (S3, query via TraceQL)
+  Zipkin          Simpler open source alternative to Jaeger
+
+TRACEQL (TEMPO):
+  { duration > 1s }                   Slow traces
+  { status = error }                  Error traces
+  { span.service.name = "payment" }   Specific service
+  { span.http.status_code = 500 }     HTTP 500 spans
+
+SAMPLING:
+  Head-based      Decision at start (probabilistic, simple)
+  Tail-based      Decision after trace complete (keep all errors/slow)
+  Recommended     Tail-based: 100% errors, 100% slow, 1% baseline
+
+CORRELATION:
+  trace_id in logs   → Link from logs to trace
+  Exemplars          → Link from metric data point to trace
+  Grafana derived fields → Clickable trace_id in Loki logs → Tempo trace
+
+FLUENT BIT KEY CONFIG SECTIONS:
+  [INPUT]    tail → /var/log/containers/*.log
+  [FILTER]   kubernetes → enrich with pod metadata
+  [FILTER]   grep → filter noisy/debug logs
+  [OUTPUT]   loki / es → send to storage
+
+================================================================================
+END OF FILE
+================================================================================

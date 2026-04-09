@@ -1,0 +1,237 @@
+================================================================================
+  KAFKA PRODUCER ACKNOWLEDGEMENTS (acks)
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. THE acks CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The acks (acknowledgements) setting controls how many broker replicas must
+confirm receipt of a message before the producer considers it "sent".
+
+This is the PRIMARY lever for the durability vs. throughput trade-off.
+
+Three possible values: acks=0, acks=1, acks=all (or acks=-1)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. acks=0 (FIRE AND FORGET)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Behavior:
+  - Producer does NOT wait for any acknowledgement from the broker
+  - Message is sent over the network and forgotten
+  - Producer assumes it's delivered if the TCP send buffer accepts it
+
+Durability: NONE
+  - Message can be lost if: broker is down, network failure, leader crash
+  - No retries on failure (nothing to retry — no ack failure reported)
+
+Throughput: MAXIMUM
+  - Zero latency overhead for acks
+  - Producer can send as fast as the network allows
+  - Callback still fires but exception will be null always (no ack = no error)
+
+Use cases:
+  - Application metrics/logs where some loss is acceptable
+  - Real-time analytics where you prefer speed over completeness
+  - High-frequency sensor data (losing 1 in 1000 readings is OK)
+
+Code:
+  props.put(ProducerConfig.ACKS_CONFIG, "0");
+  props.put(ProducerConfig.RETRIES_CONFIG, "0"); // retries are meaningless with acks=0
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. acks=1 (LEADER ACKNOWLEDGEMENT)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Behavior:
+  - Producer waits for the PARTITION LEADER to write the message to its local log
+  - Leader writes → ack sent → producer proceeds
+  - Follower replicas do NOT need to confirm before ack is sent
+
+Durability: PARTIAL
+  - Message is safe on the leader's disk
+  - BUT: if the leader crashes BEFORE followers replicate it → MESSAGE IS LOST
+    (new leader elected from ISR may not have the message)
+  - Risk window: time between leader ack and follower replication
+
+Throughput: HIGH
+  - One network round-trip to the leader only
+  - No waiting for follower replication
+
+Use cases:
+  - Default for many non-critical systems
+  - Suitable when some message loss is acceptable and throughput is critical
+  - Traditional message queue semantics
+
+Code:
+  props.put(ProducerConfig.ACKS_CONFIG, "1");
+
+Timeline:
+  Producer → [ProduceRequest] → Leader Broker
+             ←─────[Ack]──────                   ← producer proceeds here
+                       ↓ (async, AFTER ack)
+             Follower fetches records
+             (if leader crashes now: LOST!)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. acks=all (or acks=-1) — FULL DURABILITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Behavior:
+  - Producer waits for ALL ISR replicas to write the message
+  - Leader waits until all followers in ISR have fetched and acked the record
+  - Only then does the leader send ack to the producer
+  - HW (high-watermark) advances to include the new record
+
+Durability: MAXIMUM (no data loss as long as min.insync.replicas is met)
+  - Even if the leader crashes after acking, ALL ISR followers have the record
+  - New leader election from ISR → no data loss
+
+Throughput: LOWER than acks=1
+  - Extra round-trips: producer → leader → followers → leader → producer
+  - Latency increases by the replication lag (usually < 10ms on LAN)
+
+Critical companion setting: min.insync.replicas (broker/topic config)
+  - acks=all ALONE is not enough. If only 1 ISR replica exists (the leader),
+    acks=all is equivalent to acks=1 (only the leader needs to ack!)
+  - min.insync.replicas=2: ensures at least 2 replicas must be in ISR
+    Before the write is accepted. If ISR < 2: broker rejects with
+    NotEnoughReplicasException (producer gets an error)
+
+Code:
+  props.put(ProducerConfig.ACKS_CONFIG, "all"); // or "-1"
+  // On broker / topic:
+  min.insync.replicas=2
+
+Timeline:
+  Producer → [ProduceRequest] → Leader
+                                Leader appends to log (LEO advances)
+                                Follower 1 fetches → acks to leader
+                                Follower 2 fetches → acks to leader
+                                Leader: all ISR acked → HW advances
+             ←──────[Ack]──────  ← producer proceeds here
+                                (ALL ISR have the record — very durable)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. COMPARISON TABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Setting    Ack from           Data Loss Risk    Throughput   Latency   Use Case
+─────────────────────────────────────────────────────────────────────────────────
+acks=0     Nobody             Highest           Maximum      Lowest    Metrics, logs
+acks=1     Leader only        Moderate          High         Low       Default, moderate
+acks=all   All ISR replicas   Lowest            Moderate     Higher    Financial, critical
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. min.insync.replicas DEEP DIVE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+min.insync.replicas can be set at: broker level (default for all topics) OR topic level
+
+Scenario analysis: RF=3, min.ISR=2:
+  State                           Behavior
+  ──────────────────────────────────────────────────────────────────────────
+  3/3 replicas healthy            acks=all succeeds (3 ISR ≥ min.ISR=2)
+  2/3 replicas healthy (1 down)   acks=all succeeds (2 ISR == min.ISR=2)
+  1/3 replicas healthy (2 down)   acks=all FAILS: NotEnoughReplicasException
+                                  (1 ISR < min.ISR=2, broker rejects write)
+                                  acks=1 still works (leader is up)
+
+Scenario analysis: RF=3, min.ISR=1 (insecure):
+  State                           Behavior
+  ──────────────────────────────────────────────────────────────────────────
+  3/3 replicas healthy            acks=all: waits for 3 (= min.ISR? NO)
+  Actually: acks=all waits for ALL ISR. If ISR=3, waits for 3.
+  If one replica falls out of ISR (becomes slow): ISR=2
+    → acks=all now waits for only 2 (the current ISR)
+  If min.ISR=1 and ISR=1: acks=all = acks=1 (only leader in ISR)
+  → With RF=3, min.ISR=1: the "all" in acks=all is deceptively unsafe
+
+Correct production config:
+  replication.factor=3
+  min.insync.replicas=2
+  acks=all
+  enable.idempotence=true
+
+This means:
+  - 3 copies of each partition
+  - Write blocked if < 2 ISR (protects data)
+  - acks=all: leader waits for all ISR (currently 2 or 3) to confirm
+  - Idempotent: no duplicates on retry
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. acks AND RETRIES INTERACTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+With acks=0: No retries possible (no ack = no failure signal)
+With acks=1 or acks=all + retries enabled:
+  - On timeout or transient error: producer re-sends the message
+  - RISK: If the original was received (but ack lost in transit):
+    retrying causes DUPLICATE MESSAGE in the partition
+  - Solution: enable.idempotence=true
+    → producer assigns PID (Producer ID) + sequence number per partition
+    → broker deduplicates based on (PID, partition, sequence)
+    → exactly-once per partition, even with retries
+
+NotEnoughReplicasException (with acks=all, min.ISR=2, 1 broker down):
+  - Producer receives this exception
+  - With retries enabled: producer will retry up to delivery.timeout.ms
+  - This is correct behavior: REJECT the write rather than risk data loss
+  - Client should handle this gracefully (circuit breaker, alert, DLQ)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. LATENCY IMPACT OF acks=all
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Typical replication lag (intra-datacenter, well-tuned):
+  - Follower fetches within 1-5ms of leader write
+  - acks=all adds ~2-10ms of latency vs acks=1
+
+Replication lag spikes when:
+  - GC pause on follower broker (stop-the-world)
+  - Disk I/O saturation on follower
+  - Network congestion
+  - Consumer fetch backlog competing with replication
+
+Monitoring replication lag:
+  kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions
+  → Should be 0; non-zero = replication is lagging
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What are the three acks settings and when would you use each?
+A: acks=0: No ack — maximum throughput, no durability guarantee. Use for
+   non-critical metrics/logs. acks=1: Leader ack — moderate durability (can
+   lose data if leader crashes before replication). Common default for many apps.
+   acks=all: All ISR ack — maximum durability. Use for financial transactions,
+   critical events. Must pair with min.insync.replicas >= 2 for real protection.
+
+Q: If acks=all is set, can you still lose data?
+A: Yes, if min.insync.replicas is not set properly. If only 1 replica is in ISR
+   (the leader), acks=all only requires the leader to ack — equivalent to acks=1.
+   To truly protect against data loss: acks=all + min.insync.replicas=2 + RF=3.
+   Even then, if the broker crashes between writing to disk and fsync, the OS
+   buffer may not persist to disk. Kafka relies on OS fsync (configurable with
+   flush.ms) for the final durability guarantee.
+
+Q: What is NotEnoughReplicasException?
+A: Thrown when a producer tries to write with acks=all but the ISR count is below
+   min.insync.replicas. This is intentional: Kafka rejects the write rather than
+   risk data loss. The producer should retry (Kafka does this automatically with
+   retries + enable.idempotence) or the application should alert and handle.
+
+Q: What happens if acks=1 and the leader crashes between ack and replication?
+A: The message is lost. The leader wrote the record to its log and sent the ack
+   to the producer. But before any follower fetched it, the leader crashed. The
+   new leader (elected from ISR) doesn't have the record. The producer thinks it
+   was delivered. The consumer never sees the record. This is at-most-once behavior.
+
+Q: How does min.insync.replicas interact with acks?
+A: min.insync.replicas is a broker/topic constraint that defines the minimum ISR
+   size. It only takes effect when acks=all. If current ISR < min.ISR: the broker
+   rejects writes with NotEnoughReplicasException (regardless of acks setting,
+   the broker checks this for acks=all). acks=1 ignores min.ISR (only leader ack matters).

@@ -1,0 +1,396 @@
+================================================================================
+  MEMORY LEAKS & GARBAGE COLLECTION — Complete Interview Reference
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+1. GARBAGE COLLECTION FUNDAMENTALS
+────────────────────────────────────────────────────────────────────────────────
+
+  JavaScript is a garbage-collected language: memory is automatically
+  allocated when objects are created and freed when no longer reachable.
+
+  Key algorithm: Mark-and-Sweep (modern engines use generational variants)
+  
+  Core Concept — REACHABILITY:
+    An object is "reachable" if it can be accessed from a GC root.
+    GC Roots:
+      • Global object (window in browser, global in Node.js)
+      • Currently executing function's local variables and parameters
+      • Nested functions in the current call chain
+      • Other internal references
+
+    Unreachable objects → eligible for garbage collection.
+
+  Reference Counting (old algorithm, obsolete):
+    Track how many references point to each object.
+    When count = 0, object can be collected.
+    Problem: Circular references cause memory leaks.
+    
+    // Reference counting FAILS here:
+    function circularLeak() {
+      let a = {};
+      let b = {};
+      a.other = b; // a references b (count=1)
+      b.other = a; // b references a (count=1)
+      // Function exits but circular refs keep counts at 1 → leak!
+    }
+    // Modern JS uses reachability instead, so this IS collected.
+
+────────────────────────────────────────────────────────────────────────────────
+2. V8 GARBAGE COLLECTOR (ORINOCO)
+────────────────────────────────────────────────────────────────────────────────
+
+  V8 divides heap into generations:
+
+  NEW SPACE (Young Generation):
+    • Small (~1-8MB), holds recently allocated objects
+    • Minor GC: Scavenger algorithm — fast copying GC
+    • Most objects die here ("infant mortality" hypothesis)
+    
+    Scavenger:
+      • From-space: active allocations
+      • To-space: free
+      • Mark live objects in From-space, copy to To-space
+      • Swap From/To; Free-space swept
+      • Objects surviving 2 GCs → promoted to Old Space
+      • Very fast: proportional to live objects, not total space
+
+  OLD SPACE (Old Generation):
+    • Larger (~several hundred MB to GB)
+    • Major GC: Mark-Sweep-Compact
+    
+    Mark phase: Walk reachability graph, mark all live objects
+    Sweep phase: Free unmarked objects
+    Compact phase: Defragment (move objects together) — not always done
+
+  V8 GC Optimizations:
+
+    Incremental Marking:
+      Instead of one big mark pause ("stop-the-world"), marking is done
+      in small increments interleaved with JS execution.
+      Reduces max pause time from ~1s to ~few ms.
+
+    Concurrent Marking (Orinoco):
+      Marking runs on helper threads concurrently with JS execution.
+      Main thread can run while background threads mark objects.
+      Write barriers track any references changed during concurrent marking.
+
+    Parallel Scavenging:
+      Multiple threads participate in minor GC (scavenger).
+
+    Lazy Sweeping:
+      Sweeping runs concurrently on background threads.
+
+  Memory Pressure:
+    GC runs automatically but developers can hint:
+    // Chrome DevTools: "Collect garbage" button
+    // No programmatic way to force GC in production
+
+────────────────────────────────────────────────────────────────────────────────
+3. COMMON MEMORY LEAKS
+────────────────────────────────────────────────────────────────────────────────
+
+  3.1 ACCIDENTAL GLOBALS
+    Assigning without `var`/`let`/`const` in non-strict mode:
+    
+    function leak() {
+      accidentalGlobal = 'this is leaked'; // window.accidentalGlobal
+    }
+    
+    Fix: 'use strict' → ReferenceError; always declare variables.
+
+  3.2 FORGOTTEN EVENT LISTENERS
+    Adding listeners without removing them on cleanup.
+    
+    // LEAK: button removed from DOM but listener still holds reference
+    const button = document.getElementById('btn');
+    button.addEventListener('click', expensiveHandler);
+    document.body.removeChild(button);
+    // expensiveHandler and its closures still in memory!
+    
+    Fix:
+    button.removeEventListener('click', expensiveHandler);
+    // OR use AbortController:
+    const controller = new AbortController();
+    button.addEventListener('click', handler, { signal: controller.signal });
+    controller.abort(); // removes listener
+
+  3.3 CLOSURES RETAINING LARGE OBJECTS
+    Closures capture the entire enclosing scope.
+    
+    function createHeavyClosure() {
+      const largeData = new Array(1000000).fill('data');
+      return function() {
+        console.log(largeData[0]); // only uses first element
+        // but ALL 1M elements are retained!
+      };
+    }
+    const fn = createHeavyClosure(); // largeData kept alive forever
+    
+    Fix:
+    function createHeavyClosure() {
+      const largeData = new Array(1000000).fill('data');
+      const firstElement = largeData[0]; // extract what you need
+      // largeData can now be collected
+      return function() { console.log(firstElement); };
+    }
+
+  3.4 DETACHED DOM NODES
+    DOM node removed from tree but still referenced in JS.
+    
+    let detachedRef;
+    function createDetached() {
+      const el = document.createElement('div');
+      document.body.appendChild(el);
+      detachedRef = el; // keep reference
+      document.body.removeChild(el); // removed from DOM but still referenced!
+    }
+    // detachedRef keeps the div (and all children) alive in memory.
+    
+    Fix: null out references when done: detachedRef = null;
+
+  3.5 FORGOTTEN TIMERS
+    setInterval with a reference that holds data alive.
+    
+    function startTimer() {
+      const data = fetchHugeDataset();
+      setInterval(() => {
+        processData(data); // data referenced by interval
+      }, 1000);
+    }
+    // Even if nothing else holds `data`, interval keeps it alive.
+    
+    Fix:
+    const intervalId = setInterval(...);
+    clearInterval(intervalId); // when done
+    // In React: return clearInterval from useEffect cleanup
+
+  3.6 UNBOUNDED CACHES / ARRAYS
+    Storing data without eviction policy.
+    
+    const cache = {};
+    function memoize(id, value) {
+      cache[id] = value; // cache grows forever!
+    }
+    
+    Fix: Use Map with size limit, LRU cache, or WeakMap.
+
+  3.7 PROMISE CHAINS NOT RESOLVED
+    Unresolved/rejected Promises can hold references to their context.
+
+────────────────────────────────────────────────────────────────────────────────
+4. DETECTING MEMORY LEAKS
+────────────────────────────────────────────────────────────────────────────────
+
+  Chrome DevTools:
+
+  4.1 Memory Tab → Heap Snapshot:
+    • Take snapshot before and after an action
+    • Compare snapshots: look for objects that grew/persisted
+    • Filter by "comparison" to see what was added
+    • Retained Size = memory kept alive by this object
+    • Shallow Size = memory of the object itself
+
+  4.2 Memory Tab → Allocation Timeline:
+    • Record allocations over time
+    • Blue bars = allocations
+    • Look for allocations that are not freed
+
+  4.3 Memory Tab → Allocation Sampling:
+    • Low overhead sampling of allocations
+    • Shows call stacks of allocating functions
+
+  4.4 Performance Tab:
+    • Check heap size in memory chart (blue area)
+    • Healthy: heap grows during actions, then GC reclaims
+    • Leak: heap grows without coming back down
+
+  Key Indicators of a Leak:
+    • Heap never returns to baseline after repeated operations
+    • "Detached HTMLElement" nodes in heap snapshot
+    • EventListener count keeps growing
+
+────────────────────────────────────────────────────────────────────────────────
+5. WEAKMAP, WEAKSET, WEAKREF
+────────────────────────────────────────────────────────────────────────────────
+
+  5.1 WeakMap:
+    Keys must be objects. Key-value pairs are weakly held.
+    If the key object has no other references, the entry can be GC'd.
+    
+    Use case: Attach metadata to DOM elements without causing leaks.
+    
+    const metadata = new WeakMap();
+    function process(element) {
+      metadata.set(element, { processed: true, timestamp: Date.now() });
+      // When element is GC'd, metadata entry is also GC'd automatically
+    }
+    
+    // Not iterable (can't get list of keys — GC could remove them at any time)
+
+  5.2 WeakSet:
+    Set of objects, weakly held. No primitives.
+    
+    const visited = new WeakSet();
+    function visit(node) {
+      if (visited.has(node)) return;
+      visited.add(node);
+      // process...
+    }
+
+  5.3 WeakRef (ES2021):
+    Hold a weak reference to an object without preventing GC.
+    
+    let obj = { data: 'important' };
+    const weakRef = new WeakRef(obj);
+    
+    obj = null; // original ref gone
+    
+    // Later...
+    const ref = weakRef.deref();
+    if (ref) {
+      console.log(ref.data); // might still be there
+    } else {
+      console.log('object was GC\'d');
+    }
+
+  5.4 FinalizationRegistry (ES2021):
+    Register a callback to be called when an object is GC'd.
+    
+    const registry = new FinalizationRegistry((value) => {
+      console.log(`Object with value ${value} was collected`);
+    });
+    
+    let target = { name: 'test' };
+    registry.register(target, 'test-data');
+    target = null; // eventually: "Object with value test-data was collected"
+    
+    Warning: GC timing is non-deterministic. Don't rely on this for correctness.
+
+────────────────────────────────────────────────────────────────────────────────
+6. MEMORY-EFFICIENT PATTERNS
+────────────────────────────────────────────────────────────────────────────────
+
+  6.1 Object Pooling:
+    Reuse objects instead of allocating new ones in hot paths.
+    
+    class VectorPool {
+      constructor(size) {
+        this.pool = Array.from({ length: size }, () => ({ x: 0, y: 0 }));
+        this.index = 0;
+      }
+      acquire() {
+        const v = this.pool[this.index++ % this.pool.length];
+        v.x = 0; v.y = 0;
+        return v;
+      }
+    }
+
+  6.2 Use Typed Arrays for Numeric Data:
+    TypedArrays (Float32Array, Int32Array, etc.) are contiguous memory,
+    no boxing overhead, GC-friendly.
+    
+    // Instead of:
+    const points = Array.from({ length: 10000 }, () => ({ x: 0, y: 0 }));
+    // Use:
+    const points = new Float32Array(20000); // x0, y0, x1, y1...
+
+  6.3 Avoid Growing Closures in Loops:
+    function addHandlers(buttons) {
+      // BAD: each handler closes over `buttons` array
+      buttons.forEach((btn, i) => {
+        btn.addEventListener('click', () => console.log(buttons[i]));
+      });
+      // BETTER: close over only what's needed
+      buttons.forEach((btn, i) => {
+        btn.addEventListener('click', () => console.log(i));
+      });
+    }
+
+  6.4 Cleanup in Component Unmount (React):
+    useEffect(() => {
+      const subscription = api.subscribe(handler);
+      const interval = setInterval(tick, 1000);
+      return () => {
+        subscription.unsubscribe(); // cleanup!
+        clearInterval(interval);
+      };
+    }, []);
+
+  6.5 Avoid String Concatenation in Loops:
+    // BAD: creates many intermediate strings
+    let result = '';
+    for (let i = 0; i < 10000; i++) result += items[i];
+    // GOOD:
+    const result = items.join('');
+
+────────────────────────────────────────────────────────────────────────────────
+7. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────────────────────────────────────────────────
+
+Q: How does JavaScript garbage collection work?
+A: Modern JS engines (V8) use a generational Mark-and-Sweep algorithm.
+   Objects are allocated in the young generation (New Space) first. A
+   Scavenger GC runs frequently to collect short-lived objects. Survivors
+   are promoted to Old Space. Old Space is collected less frequently with
+   Mark-Sweep-Compact. V8 uses concurrent/incremental marking to minimize
+   pause times.
+
+Q: What causes memory leaks in JavaScript?
+A: Common causes: (1) Accidental globals (undeclared variables in non-strict
+   mode), (2) Forgotten event listeners on removed DOM nodes, (3) Closures
+   retaining large scope objects unintentionally, (4) Detached DOM nodes
+   held in JS variables, (5) Forgotten setInterval references, (6) Unbounded
+   caches/arrays without eviction policies.
+
+Q: What is a detached DOM node?
+A: A DOM element that has been removed from the document tree but is still
+   referenced in JavaScript. The element (and all its children) remain in
+   memory because the JS reference prevents GC. Fix: null out JS references
+   to removed elements, or use WeakRef/WeakMap.
+
+Q: What is the difference between WeakMap, WeakSet, and WeakRef?
+A: WeakMap: Map where keys are weakly held — entry removed when key is GC'd.
+   Good for metadata keyed on objects. WeakSet: Set of objects, weakly held.
+   WeakRef: Holds a weak reference to an object; deref() returns it or
+   undefined if GC'd. All three allow GC to collect objects that would
+   otherwise be kept alive by strong references.
+
+Q: How would you find a memory leak in a web app?
+A: Use Chrome DevTools Memory tab. Take heap snapshots before and after
+   repeated actions (e.g., open/close a modal 10 times). Compare snapshots
+   to see retained objects. Look for "Detached HTMLElement" or growing
+   arrays/caches. Also check the Performance tab's memory chart — a healthy
+   app shows a sawtooth pattern (alloc then GC); a leak shows a staircase.
+
+Q: What is the difference between shallow size and retained size?
+A: Shallow size = memory occupied by the object itself (not its children).
+   Retained size = total memory freed if this object were GC'd (including
+   all objects reachable only through it). Retained size is what matters for
+   identifying leak impact.
+
+Q: How does V8's incremental marking improve performance?
+A: Instead of stopping JS execution for the entire marking phase (could take
+   100s of ms for large heaps), V8 does marking in small increments
+   interleaved with JS execution. This reduces the maximum GC pause time
+   significantly, keeping animations and interactions smooth.
+
+Q: Why is setInterval a common source of memory leaks?
+A: setInterval holds a strong reference to its callback. If the callback
+   closes over any objects (data, DOM elements), those objects are kept
+   alive as long as the interval runs. If the interval is never cleared
+   (e.g., in a component that unmounts), everything it references leaks
+   for the lifetime of the page.
+
+================================================================================
+  KEY TAKEAWAYS
+================================================================================
+  • GC algorithm: Generational Mark-and-Sweep (Scavenger for young, 
+    Mark-Sweep-Compact for old)
+  • V8 uses incremental/concurrent marking to minimize pause times
+  • Memory leaks: accidental globals, forgotten listeners, detached DOM,
+    forgotten timers, unbounded caches, closures retaining large scopes
+  • WeakMap/WeakSet/WeakRef allow GC-friendly references
+  • Detect leaks: heap snapshots comparison in DevTools Memory tab
+  • Object pooling and typed arrays help reduce GC pressure
+================================================================================

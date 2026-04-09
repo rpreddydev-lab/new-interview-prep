@@ -1,0 +1,373 @@
+================================================================
+INTEGRATION TESTING — DATABASE INTEGRATION TESTS
+Complete Interview Preparation Guide
+================================================================
+
+1. DATABASE INTEGRATION TEST GOALS
+================================================================
+
+Database integration tests verify:
+  - Custom JPQL / HQL queries return correct results
+  - Native SQL queries work as expected
+  - Pagination (Page, Slice) works correctly
+  - Transaction boundaries (commit/rollback/propagation)
+  - Optimistic locking (@Version)
+  - Auditing (@CreatedDate, @LastModifiedDate)
+  - Cascade operations (CascadeType.ALL, orphanRemoval)
+  - Fetch strategies (EAGER vs LAZY)
+  - Constraint violations (unique, not-null, FK)
+
+================================================================
+2. SETUP — H2 vs TESTCONTAINERS
+================================================================
+
+H2 IN-MEMORY (fast, limited SQL compatibility):
+  @DataJpaTest
+  class UserRepositoryH2Test {
+      // H2 auto-configured — no additional setup
+      @Autowired UserRepository userRepository;
+      @Autowired TestEntityManager em;
+  }
+
+TESTCONTAINERS POSTGRESQL (real DB, full compatibility):
+  @DataJpaTest
+  @AutoConfigureTestDatabase(replace = Replace.NONE)
+  @Testcontainers
+  class UserRepositoryPgTest {
+      
+      @Container
+      @ServiceConnection  // Spring Boot 3.1+
+      static PostgreSQLContainer<?> pg = new PostgreSQLContainer<>("postgres:15");
+      
+      @Autowired UserRepository userRepository;
+      @Autowired TestEntityManager em;
+  }
+
+CHOOSING H2 vs TESTCONTAINERS:
+  H2:
+    ✅ No Docker needed
+    ✅ Starts in milliseconds
+    ❌ Doesn't support all PostgreSQL features
+    ❌ Different behavior for some SQL
+  
+  Testcontainers:
+    ✅ Real database — same as production
+    ✅ All SQL features work
+    ❌ Requires Docker
+    ❌ Slower startup (~5-10s first time, fast with reuse)
+
+================================================================
+3. TESTING CUSTOM QUERIES
+================================================================
+
+Entity:
+  @Entity
+  @Table(name = "products")
+  public class Product {
+      @Id @GeneratedValue
+      private Long id;
+      
+      private String name;
+      private String category;
+      private BigDecimal price;
+      private boolean active;
+      
+      @Column(name = "stock_count")
+      private int stockCount;
+      
+      @CreatedDate
+      private LocalDateTime createdAt;
+  }
+
+Repository:
+  public interface ProductRepository extends JpaRepository<Product, Long> {
+      
+      List<Product> findByCategoryAndActiveTrueOrderByPriceAsc(String category);
+      
+      @Query("SELECT p FROM Product p WHERE p.price BETWEEN :min AND :max AND p.active = true")
+      List<Product> findByPriceRange(@Param("min") BigDecimal min, @Param("max") BigDecimal max);
+      
+      @Query("SELECT p FROM Product p WHERE p.stockCount < :threshold")
+      List<Product> findLowStock(@Param("threshold") int threshold);
+      
+      @Modifying
+      @Query("UPDATE Product p SET p.active = false WHERE p.category = :category")
+      int deactivateCategory(@Param("category") String category);
+      
+      @Query(value = "SELECT * FROM products WHERE lower(name) LIKE lower(:pattern)",
+             nativeQuery = true)
+      List<Product> searchByNamePattern(@Param("pattern") String pattern);
+      
+      Page<Product> findByCategory(String category, Pageable pageable);
+  }
+
+Tests:
+  @DataJpaTest
+  class ProductRepositoryTest {
+      
+      @Autowired ProductRepository productRepository;
+      @Autowired TestEntityManager em;
+      
+      @BeforeEach
+      void setUpProducts() {
+          em.persist(new Product("Laptop Pro", "Electronics", new BigDecimal("1299.99"), true, 5));
+          em.persist(new Product("Laptop Basic", "Electronics", new BigDecimal("699.99"), true, 15));
+          em.persist(new Product("Headphones", "Electronics", new BigDecimal("149.99"), true, 3));
+          em.persist(new Product("Old Tablet", "Electronics", new BigDecimal("99.99"), false, 0));
+          em.persist(new Product("Coffee Mug", "Kitchen", new BigDecimal("14.99"), true, 50));
+          em.flush();
+      }
+      
+      @Test
+      void findByCategoryAndActive_shouldReturnSortedActiveOnly() {
+          List<Product> results = productRepository
+              .findByCategoryAndActiveTrueOrderByPriceAsc("Electronics");
+          
+          assertEquals(3, results.size());  // old tablet excluded (active=false)
+          assertEquals("Headphones", results.get(0).getName());  // cheapest first
+          assertEquals("Laptop Pro", results.get(2).getName());  // most expensive last
+          assertTrue(results.stream().allMatch(Product::isActive));
+      }
+      
+      @Test
+      void findByPriceRange_shouldReturnProductsInRange() {
+          List<Product> results = productRepository.findByPriceRange(
+              new BigDecimal("100.00"), new BigDecimal("800.00")
+          );
+          
+          assertEquals(2, results.size());
+          assertTrue(results.stream()
+              .allMatch(p -> p.getPrice().compareTo(new BigDecimal("100.00")) >= 0 
+                          && p.getPrice().compareTo(new BigDecimal("800.00")) <= 0));
+      }
+      
+      @Test
+      void findLowStock_shouldReturnProductsBelowThreshold() {
+          List<Product> lowStock = productRepository.findLowStock(5);
+          
+          assertEquals(2, lowStock.size());
+          assertTrue(lowStock.stream().anyMatch(p -> p.getName().equals("Headphones")));
+      }
+      
+      @Test
+      void deactivateCategory_shouldUpdateAllMatchingProducts() {
+          int updated = productRepository.deactivateCategory("Electronics");
+          em.flush();
+          em.clear();  // clear L1 cache to re-read from DB
+          
+          assertEquals(4, updated);  // all 4 electronics deactivated
+          
+          List<Product> electronics = productRepository
+              .findByCategoryAndActiveTrueOrderByPriceAsc("Electronics");
+          assertTrue(electronics.isEmpty());
+      }
+      
+      @Test
+      void findByCategory_shouldReturnPagedResults() {
+          Pageable pageable = PageRequest.of(0, 2, Sort.by("price").ascending());
+          
+          Page<Product> page = productRepository.findByCategory("Electronics", pageable);
+          
+          assertEquals(4, page.getTotalElements());  // 4 electronics (including inactive)
+          assertEquals(2, page.getTotalPages());
+          assertEquals(2, page.getContent().size());
+      }
+  }
+
+================================================================
+4. TESTING TRANSACTIONS
+================================================================
+
+  @SpringBootTest
+  class TransactionIT {
+      
+      @Autowired UserService userService;
+      @Autowired UserRepository userRepository;
+      @Autowired OrderRepository orderRepository;
+      
+      @Test
+      @Transactional
+      void createUserWithOrders_shouldRollbackOnError() {
+          // Arrange
+          CreateUserRequest request = new CreateUserRequest("alice@test.com");
+          
+          // Force error during order creation
+          doThrow(new RuntimeException("Order service unavailable"))
+              .when(orderService).createInitialOrder(any());
+          
+          // Act + Assert
+          assertThrows(RuntimeException.class, 
+              () -> userService.registerWithInitialOrder(request));
+          
+          // Rollback → no user saved
+          assertFalse(userRepository.existsByEmail("alice@test.com"));
+      }
+      
+      @Test
+      void transactionPropagationRequired_shouldJoinExistingTransaction() {
+          // Test REQUIRED propagation: inner transaction joins outer
+          // This tests the JOIN behavior — no rollback unless outer rolls back
+          userService.createInNewTransaction("user@test.com");
+          
+          assertTrue(userRepository.existsByEmail("user@test.com"));
+      }
+  }
+
+================================================================
+5. TESTING OPTIMISTIC LOCKING
+================================================================
+
+  @Entity
+  class Account {
+      @Id Long id;
+      BigDecimal balance;
+      
+      @Version
+      int version;  // Hibernate manages this
+  }
+  
+  @Test
+  void shouldThrowOptimisticLockExceptionOnConcurrentUpdate() {
+      Account account = em.persistAndFlush(new Account(new BigDecimal("100.00")));
+      Long id = account.getId();
+      em.clear();
+      
+      // Load same entity twice (simulates two concurrent sessions)
+      Account session1 = accountRepository.findById(id).orElseThrow();
+      Account session2 = accountRepository.findById(id).orElseThrow();
+      
+      // First update succeeds
+      session1.setBalance(new BigDecimal("90.00"));
+      accountRepository.saveAndFlush(session1);
+      
+      // Second update FAILS — stale version
+      session2.setBalance(new BigDecimal("80.00"));
+      
+      assertThrows(ObjectOptimisticLockingFailureException.class,
+          () -> accountRepository.saveAndFlush(session2));
+  }
+
+================================================================
+6. TESTING JPA CASCADES AND ORPHAN REMOVAL
+================================================================
+
+  @Entity
+  class Order {
+      @Id String id;
+      
+      @OneToMany(mappedBy = "order", cascade = CascadeType.ALL, orphanRemoval = true)
+      List<OrderItem> items = new ArrayList<>();
+  }
+  
+  @Test
+  void deleteOrder_shouldCascadeToItems() {
+      Order order = new Order("ord-1");
+      order.addItem(new OrderItem("SKU-001", 2));
+      order.addItem(new OrderItem("SKU-002", 1));
+      em.persistAndFlush(order);
+      
+      assertEquals(2, orderItemRepository.count());
+      
+      // Delete parent
+      orderRepository.deleteById("ord-1");
+      em.flush();
+      
+      // Orphan removal — items also deleted
+      assertEquals(0, orderItemRepository.count());
+  }
+
+================================================================
+7. TESTING UNIQUE CONSTRAINTS
+================================================================
+
+  @Test
+  void shouldThrowWhenEmailDuplicated() {
+      em.persistAndFlush(new User("alice@test.com", "Alice"));
+      
+      User duplicate = new User("alice@test.com", "Alice2");
+      
+      assertThrows(DataIntegrityViolationException.class,
+          () -> { userRepository.saveAndFlush(duplicate); });
+  }
+
+================================================================
+8. SQL TEST DATA WITH @Sql
+================================================================
+
+  // src/test/resources/sql/product-test-data.sql
+  INSERT INTO categories (id, name) VALUES (1, 'Electronics'), (2, 'Kitchen');
+  INSERT INTO products (id, name, category_id, price, active, stock_count) VALUES
+    (1, 'Laptop', 1, 1299.99, true, 5),
+    (2, 'Headphones', 1, 149.99, true, 20),
+    (3, 'Coffee Maker', 2, 79.99, true, 15);
+  
+  @DataJpaTest
+  @Sql("/sql/product-test-data.sql")
+  class ProductRepositoryTest {
+      
+      @Test
+      void shouldFindAllActiveProducts() {
+          List<Product> products = productRepository.findByActiveTrueOrderByName();
+          assertEquals(3, products.size());
+      }
+  }
+
+================================================================
+9. TESTING SPRING DATA JPA SPECIFICATIONS
+================================================================
+
+  @Test
+  void shouldFilterWithSpecification() {
+      em.persist(new Product("Laptop", "Electronics", new BigDecimal("1299"), true));
+      em.persist(new Product("Phone", "Electronics", new BigDecimal("599"), true));
+      em.persist(new Product("Coffee Maker", "Kitchen", new BigDecimal("89"), true));
+      em.flush();
+      
+      Specification<Product> spec = Specification
+          .where(ProductSpecifications.hasCategory("Electronics"))
+          .and(ProductSpecifications.priceGreaterThan(new BigDecimal("600")));
+      
+      List<Product> results = productRepository.findAll(spec);
+      
+      assertEquals(1, results.size());
+      assertEquals("Laptop", results.get(0).getName());
+  }
+
+================================================================
+10. INTERVIEW QUESTIONS
+================================================================
+
+Q: Why do you test database queries in integration tests rather than unit tests?
+A: Database queries involve SQL syntax, type mappings, join behavior, and
+   database-specific features that can't be verified with mocks. An in-memory
+   mock returns what you tell it to — it can't catch a broken JPQL query or
+   missing index. Integration tests against a real DB catch real issues.
+
+Q: What is the difference between flush() and commit() in JPA tests?
+A: flush() writes pending changes to the database within the current transaction
+   (they're visible to subsequent queries in the same session). commit() closes
+   the transaction and persists changes permanently. In @Transactional tests,
+   flush() is used to force SQL execution; commit() is avoided (default rollback).
+
+Q: Why call entityManager.clear() in tests?
+A: To evict the first-level (L1) cache. Without clear(), Hibernate may return
+   the in-memory entity instead of re-querying the database. clear() ensures
+   the next findById() hits the actual DB — important for verifying persistence.
+
+Q: How do you test a @Modifying query?
+A: Execute the query, then flush() + clear() to ensure the UPDATE is sent and
+   the L1 cache is evicted. Then re-query to verify the updated state.
+
+Q: How do you test optimistic locking?
+A: Load the same entity twice (simulating concurrent sessions), update and save
+   one version, then try to save the other — it should throw
+   ObjectOptimisticLockingFailureException (Spring) or
+   OptimisticLockException (JPA).
+
+Q: What is the difference between @DataJpaTest and @SpringBootTest for DB tests?
+A: @DataJpaTest loads only JPA components (entities, repositories, datasource).
+   It's fast, focused, and auto-configures H2 by default.
+   @SpringBootTest loads everything — use for testing DB interactions through
+   service layer or when you need the full context.
+
+================================================================

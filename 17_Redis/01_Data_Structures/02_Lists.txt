@@ -1,0 +1,238 @@
+================================================================================
+REDIS LISTS — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. OVERVIEW
+────────────
+A Redis List is an ordered sequence of strings. It is a doubly-linked list
+(quicklist of listpack nodes), allowing:
+  - O(1) push/pop at both HEAD and TAIL
+  - O(N) access by index
+  - Max length: 2^32 - 1 elements (~4 billion)
+
+Use lists when ORDER matters and you need efficient head/tail access.
+
+
+2. INTERNAL ENCODING
+─────────────────────
+  listpack (compact): when list has ≤ 128 elements AND each element ≤ 64 bytes
+    - Contiguous memory block
+    - Very cache-friendly
+    - OBJECT ENCODING key → "listpack"
+
+  quicklist (full): default encoding for larger lists
+    - A doubly-linked list of listpack nodes
+    - Each node is a compressed/uncompressed listpack chunk
+    - Balance between memory efficiency and random access speed
+    - OBJECT ENCODING key → "quicklist"
+    - Configurable: list-max-listpack-size -2  (each node up to 8KB)
+    - Compression: list-compress-depth 0 (0=none, 1=compress middle nodes)
+
+  Thresholds (redis.conf):
+    list-max-listpack-size  128   # max elements before upgrade
+    list-max-ziplist-size   -2    # node size limit (deprecated alias)
+
+
+3. CORE COMMANDS
+─────────────────
+
+  Push / Add:
+    LPUSH key value [value …]    → push to LEFT (head). Returns new length.
+    RPUSH key value [value …]    → push to RIGHT (tail). Returns new length.
+    LINSERT key BEFORE|AFTER pivot value  → insert relative to pivot. O(N).
+    LSET key index value          → set element at index. O(N).
+
+  Pop / Remove:
+    LPOP key [count]              → pop from LEFT. Returns value(s) or nil.
+    RPOP key [count]              → pop from RIGHT.
+    LREM key count value          → remove 'count' occurrences of value.
+                                    count > 0: remove from head
+                                    count < 0: remove from tail
+                                    count = 0: remove all
+
+  Blocking Pop (essential for queues!):
+    BLPOP key [key …] timeout     → block until element available or timeout
+    BRPOP key [key …] timeout     → same but from right
+    BLMOVE src dst LEFT|RIGHT LEFT|RIGHT timeout  → atomic move + block
+
+  Read / Query:
+    LLEN key                      → length O(1)
+    LINDEX key index               → element at index (0-based, -1=last). O(N)
+    LRANGE key start stop          → sublist (inclusive). O(S+N)
+    LPOS key value [RANK r] [COUNT c] [MAXLEN m]  → find position(s)
+
+  Modify:
+    LTRIM key start stop           → keep only elements in range. O(N)
+    LMOVE src dst LEFT|RIGHT LEFT|RIGHT  → atomic move between lists
+
+
+4. QUEUE PATTERNS
+──────────────────
+
+4a. FIFO Queue (First In, First Out):
+  Producer:  RPUSH queue:jobs "job1"  → add to right (tail)
+  Consumer:  LPOP  queue:jobs         → remove from left (head)
+
+  Blocking consumer (no polling!):
+  Consumer:  BLPOP queue:jobs 0       → 0 = wait forever
+
+  BLPOP is highly efficient — the consumer thread sleeps in the OS and is
+  awakened instantly when data arrives. No CPU spin, no polling loop.
+
+4b. LIFO Stack (Last In, First Out):
+  Producer:  LPUSH stack "item1"
+  Consumer:  LPOP  stack
+
+4c. Reliable Queue (Pending List Pattern):
+  Problem: what if consumer crashes after LPOP but before processing?
+  Message is lost.
+
+  Solution: LMOVE (or legacy RPOPLPUSH)
+    LMOVE queue:jobs queue:processing LEFT LEFT   # atomic move
+    # process job ...
+    LREM queue:processing 1 "job1"                # remove after success
+    # On crash: jobs remain in queue:processing
+    # Recovery: LRANGE queue:processing 0 -1 → re-queue them
+
+4d. Capped Log:
+  LPUSH log:events "event"
+  LTRIM log:events 0 999    # keep latest 1000 events
+  # Efficient: listpack encoding for small lists
+
+4e. Activity Feed / Timeline:
+  LPUSH user:42:feed "post:123"  # newest first
+  LRANGE user:42:feed 0 19       # get latest 20 items
+
+
+5. BLOCKING COMMANDS IN DETAIL
+────────────────────────────────
+  BLPOP key [key…] timeout
+    - Checks keys left to right
+    - Returns the FIRST key that has data
+    - Multiple keys: priority queue effect
+    - timeout=0: wait indefinitely
+    - timeout=5: return nil after 5 seconds
+
+  Use case: task dispatcher
+    BLPOP queue:high queue:medium queue:low 0
+    → checks high priority first, falls to medium, then low
+
+  BRPOPLPUSH src dst timeout  (deprecated in 6.2, use BLMOVE)
+  BLMOVE src dst LEFT|RIGHT LEFT|RIGHT timeout
+    → atomic pop + push between lists + blocking if src empty
+    → perfect for reliable queue pattern
+
+
+6. LPOS — FINDING ELEMENTS
+────────────────────────────
+  LPOS mylist "needle"                → position of first occurrence
+  LPOS mylist "needle" RANK 2         → position of second occurrence
+  LPOS mylist "needle" COUNT 0        → ALL positions
+  LPOS mylist "needle" MAXLEN 100     → only scan first 100 elements
+
+  Returns nil if not found, integer index if found.
+  Example:
+    RPUSH letters a b c a b c a
+    LPOS letters "a"              → 0
+    LPOS letters "a" RANK 2      → 3
+    LPOS letters "a" COUNT 0     → [0, 3, 6]
+
+
+7. LMPOP (Redis 7.0+)
+──────────────────────
+  LMPOP numkeys key [key…] LEFT|RIGHT [COUNT count]
+    → Pop from FIRST non-empty key in the list
+    → Returns [key, [elements]]
+    → Useful for multi-queue polling without BLPOP round trips
+
+
+8. PERFORMANCE & COMPLEXITY
+────────────────────────────
+  Command       │ Complexity │ Notes
+  ──────────────┼────────────┼──────────────────────────────────────
+  LPUSH/RPUSH   │ O(1)       │ Constant time head/tail access
+  LPOP/RPOP     │ O(1)       │
+  LLEN          │ O(1)       │ Length stored separately
+  LINDEX        │ O(N)       │ Traverse from head or tail (closer side)
+  LRANGE        │ O(S+N)     │ S=start distance, N=range size
+  LINSERT       │ O(N)       │ Must find pivot first
+  LREM          │ O(N)       │ Full scan needed
+  LSET          │ O(N)       │ Must find index
+  LTRIM         │ O(N)       │ Removes elements outside range
+  BLPOP         │ O(N keys)  │ N = number of keys provided
+
+
+9. MEMORY TIPS
+───────────────
+  - Lists with ≤128 elements, each ≤64 bytes: listpack (very compact)
+  - Beyond that: quicklist — still efficient but uses more memory
+  - Tune: list-max-listpack-size 128
+  - For large queues, monitor LLEN and use LTRIM to cap length
+  - Use UNLINK (async DEL) to delete large lists without blocking
+
+
+10. ANTI-PATTERNS TO AVOID
+────────────────────────────
+  ✗ Using LINDEX to access by position in a large list
+    → O(N) traversal. Use Sorted Set if you need random access by score.
+
+  ✗ Using LREM to delete from a large list
+    → O(N) full scan. Better: use Streams or Sets for membership-based removal.
+
+  ✗ Using LRANGE 0 -1 to read the entire list every time
+    → Loads entire list to client. Better: paginate or use a different structure.
+
+  ✗ Not using BLPOP in consumers
+    → Polling loop (LPOP in a while loop) wastes CPU. Always BLPOP with timeout.
+
+  ✗ Not handling the reliable queue pattern
+    → LPOP + process crash = lost message. Always use LMOVE for critical tasks.
+
+
+11. REAL-WORLD USE CASES
+─────────────────────────
+  ┌──────────────────────────────────────────────────────────────┐
+  │ Use Case              │ Pattern                              │
+  ├───────────────────────┼──────────────────────────────────────┤
+  │ Simple task queue     │ RPUSH + BLPOP                        │
+  │ Reliable task queue   │ RPUSH + BLMOVE + LREM               │
+  │ Multi-priority queue  │ BLPOP queue:high queue:low 0        │
+  │ Activity feed         │ LPUSH + LRANGE (capped with LTRIM)  │
+  │ Recent items (N)      │ LPUSH + LTRIM 0 N-1                 │
+  │ Chat message history  │ RPUSH + LRANGE (paginated)          │
+  │ Stack (undo/redo)     │ LPUSH + LPOP                        │
+  │ Capped event log      │ LPUSH + LTRIM                       │
+  └──────────────────────────────────────────────────────────────┘
+
+
+12. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: What is the time complexity of LRANGE?
+  A: O(S + N) where S is the distance of the start index from the nearest end,
+     and N is the number of elements in the range. It's not just O(N) because
+     Redis traverses from whichever end (head or tail) is closer to start.
+
+  Q: What's the difference between LPOP and BLPOP?
+  A: LPOP is non-blocking: if the list is empty, it returns nil immediately.
+     BLPOP is blocking: if the list is empty, the client blocks (sleeps) until
+     a new element is pushed or the timeout expires. BLPOP is far more efficient
+     for consumers (no polling).
+
+  Q: How do you implement a reliable queue with Redis Lists?
+  A: Use LMOVE (or RPOPLPUSH) to atomically move a job from the job queue to a
+     processing queue. After successful processing, remove from the processing
+     queue with LREM. If the consumer crashes, jobs remain in the processing queue
+     for a recovery process to re-queue them.
+
+  Q: What is the internal structure of a Redis List?
+  A: A quicklist — a doubly-linked list where each node is a listpack (compact
+     contiguous memory block). Small lists use a single listpack node. This gives
+     O(1) head/tail access and memory-efficient storage for small values.
+
+  Q: When would you use a List vs a Stream for a message queue?
+  A: List is simpler but lacks acknowledgment semantics — once popped, the message
+     is gone. If the consumer crashes, the message is lost (without the LMOVE
+     reliable pattern). Redis Streams support consumer groups, acknowledgment
+     (XACK), and message replay, making them better for durable messaging.
+
+================================================================================

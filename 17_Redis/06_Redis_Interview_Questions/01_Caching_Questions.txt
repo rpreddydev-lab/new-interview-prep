@@ -1,0 +1,179 @@
+================================================================================
+REDIS CACHING INTERVIEW QUESTIONS
+================================================================================
+
+Q1: What is cache stampede and how do you prevent it?
+──────────────────────────────────────────────────────
+  Cache stampede (thundering herd): when a popular cache key expires, hundreds
+  of concurrent requests all go to the DB simultaneously.
+
+  Prevention strategies:
+    1. Mutex lock: only one request rebuilds the cache; others wait or get stale.
+       SET lock:<key> 1 NX PX 5000
+       If lock acquired: fetch from DB, populate cache, release lock.
+       If not acquired: return stale value (if available) or wait.
+
+    2. TTL jitter: randomize TTL to prevent synchronized expiry.
+       ttl = base_ttl + random(0, base_ttl * 0.1)
+
+    3. XFetch (probabilistic early expiry):
+       Proactively refresh before TTL expires with probability based on:
+       recompute_cost * beta * -log(random()) > time_to_expire
+       Early refreshes happen with increasing probability as expiry approaches.
+
+    4. Background refresh: on cache hit with low TTL, trigger async refresh.
+       Return current value immediately; refresh happens in background thread.
+
+    5. Never expire + external invalidation: no TTL, explicit invalidation on write.
+
+
+Q2: What are the differences between the 8 Redis eviction policies?
+─────────────────────────────────────────────────────────────────────
+  noeviction:       return error on writes when memory full. Default. Good for DB role.
+  allkeys-lru:      evict any key using LRU approximation. Best for general cache.
+  volatile-lru:     evict only keys WITH a TTL, using LRU. Good if mixing cache+persistent.
+  allkeys-lfu:      evict any key using LFU (frequency). Best for skewed access patterns.
+  volatile-lfu:     evict only TTL keys, using LFU.
+  allkeys-random:   evict a random key. Rarely useful.
+  volatile-random:  evict a random TTL key. Rarely useful.
+  volatile-ttl:     evict the key with the SHORTEST TTL. Evicts keys expiring soonest.
+
+  LRU vs LFU:
+    LRU: keeps recently accessed keys. Hot key accessed once recently stays.
+    LFU: keeps frequently accessed keys. Key accessed 1000 times/day stays over
+         key accessed once yesterday.
+    LFU is better for workloads with consistent hot keys.
+    Tune with lfu-log-factor (how aggressive promotion) and lfu-decay-time (decay rate).
+
+
+Q3: What's the difference between Cache-Aside, Read-Through, and Write-Through?
+─────────────────────────────────────────────────────────────────────────────────
+  Cache-Aside (Lazy Loading):
+    App: check cache → miss → query DB → populate cache → return.
+    App: on write → write to DB → invalidate/update cache.
+    Pros: cache only populated data, resilient to cache failure.
+    Cons: initial cache miss latency; risk of stale data (race condition on write).
+
+  Read-Through:
+    App queries cache layer.
+    On miss: cache layer fetches from DB and stores it (transparent to app).
+    Pros: cache always up-to-date on reads; simpler application code.
+    Cons: cold start misses; cache must implement DB integration.
+
+  Write-Through:
+    On every write: write to BOTH DB and cache synchronously.
+    Pros: cache always consistent with DB.
+    Cons: write latency (2 writes); wasted memory (write data even if never read).
+    ⚠ Write order: DB first, then cache. If cache write fails → delete cache.
+
+
+Q4: What is Write-Behind caching and when is it dangerous?
+────────────────────────────────────────────────────────────
+  Write-Behind: writes go to cache immediately; DB is updated asynchronously.
+    App writes to cache → async worker flushes to DB with delay.
+    Pros: very low write latency; write coalescing (multiple writes → one DB write).
+    Cons: data in cache may not be in DB. On Redis crash → data lost.
+
+  Safe for: high-frequency counters (analytics, gaming scores, view counts).
+  DANGEROUS for: financial transactions, order confirmations, inventory.
+  Never use write-behind where data loss is unacceptable.
+
+
+Q5: How do you handle cache invalidation? What makes it hard?
+──────────────────────────────────────────────────────────────
+  Invalidation strategies:
+    1. TTL expiry: simplest, eventual consistency. Old data served until TTL.
+    2. Explicit delete on write: DEL cache key when DB record changes.
+       Race: what if write happens between cache check and cache set?
+    3. Event-based: emit event on DB change → all services invalidate.
+    4. Versioned keys: change key when data changes (cache:product:42:v5).
+
+  Why it's hard:
+    - Race conditions: write to DB, crash before deleting cache → stale forever.
+    - Distributed: multiple service instances must all receive invalidation.
+    - Consistency: what to do between deletion and re-population? Serve stale?
+    - Thundering herd on invalidation of hot keys.
+
+  Phil Karlton quote: "There are only two hard things in CS:
+  cache invalidation and naming things."
+
+
+Q6: What is negative caching and why is it important?
+──────────────────────────────────────────────────────
+  Negative caching: cache the fact that a key does NOT exist in the DB.
+  
+  Problem: "user:999" doesn't exist in DB.
+  Without negative caching: every request for user:999 misses cache → hits DB.
+  Attacker can abuse this: request millions of non-existent keys → DB overwhelm.
+
+  Solution: SET user:999 "__NULL__" EX 300  (cache the miss with short TTL)
+  Application: if cached value == "__NULL__" → return null/404 without DB query.
+
+  Also use Bloom Filters: fast probabilistic set membership test.
+  If key not in Bloom Filter → definitely doesn't exist → return immediately.
+  If in Bloom Filter → might exist → check cache/DB.
+
+
+Q7: What is the cache hit rate formula and what's a healthy hit rate?
+──────────────────────────────────────────────────────────────────────
+  Hit Rate = keyspace_hits / (keyspace_hits + keyspace_misses) * 100
+
+  From Redis:
+    INFO stats | grep keyspace_hits
+    INFO stats | grep keyspace_misses
+
+  Healthy hit rate: > 95% for most production caches.
+  < 80%: cache is ineffective; review TTLs, cache size, and eviction policy.
+
+  Also watch:
+    evicted_keys: if > 0, cache is under memory pressure (increase maxmemory or reduce TTL)
+    expired_keys: normal (TTL expiry); monitor for spikes
+
+
+Q8: What is the difference between allkeys-lru and volatile-lru eviction?
+──────────────────────────────────────────────────────────────────────────
+  allkeys-lru: evicts ANY key (with or without TTL) using LRU approximation.
+    Use when ALL keys are cache data (pure cache role).
+
+  volatile-lru: evicts only keys that HAVE a TTL set.
+    Keys without TTL are NEVER evicted.
+    Use when Redis stores a mix: cache data (with TTL) + persistent data (no TTL).
+    Persistent data survives; cache data is evicted when memory is full.
+
+
+Q9: How do you implement cache warming?
+─────────────────────────────────────────
+  Cache warming: pre-populate cache before traffic hits, avoiding cold start misses.
+
+  Strategies:
+    1. DB dump + pipeline: batch-load top N records into Redis on startup.
+       for item in top_items: pipeline.set(key, value)
+       pipeline.execute()
+
+    2. Replay production traffic: capture real traffic and replay against new instance.
+
+    3. Canary deployment: warm new instance with 5% traffic before full cutover.
+
+    4. Background thread: application startup triggers async cache fill.
+
+    5. RDB snapshot: save warmed Redis state to RDB, restore on new instance.
+       redis-cli DEBUG RELOAD / BGSAVE + copy .rdb file.
+
+
+Q10: How would you cache a paginated result set?
+─────────────────────────────────────────────────
+  Option 1 — Cache per page:
+    Key: search:results:<query_hash>:page:2
+    TTL: 5 minutes
+    Problem: if data changes mid-pagination, different pages are inconsistent.
+
+  Option 2 — Cache entire result list as a Redis List or Sorted Set:
+    Key: search:results:<query_hash>
+    RPUSH all results; LRANGE for page N: LRANGE key (page-1)*size page*size-1
+    TTL: 5 minutes
+    Pros: consistent pagination. Cons: large lists.
+
+  Option 3 — Cursor-based pagination (no page caching):
+    Use last-seen ID or SCAN cursor. No page number → no stale page problem.
+
+================================================================================

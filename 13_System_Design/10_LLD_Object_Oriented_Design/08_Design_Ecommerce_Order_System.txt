@@ -1,0 +1,545 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LLD: DESIGN AN E-COMMERCE ORDER SYSTEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CLARIFICATIONS:
+  - Single vs multiple sellers? Multiple (like Amazon marketplace)
+  - Cart persistence? Yes — survives browser close (stored in DB/Redis)
+  - Payment methods? Credit card, PayPal, gift card
+  - Order tracking? Yes — CREATED → PAID → SHIPPED → DELIVERED
+  - Cancellation? Before SHIPPED only
+  - Returns/refunds? Within 30 days of delivery
+  - Inventory management? Yes — prevent overselling
+
+ENTITIES:
+  Product, ProductVariant (size/color), Inventory, Cart, CartItem,
+  Order, OrderItem, Customer, Address, Payment, Shipment, Coupon
+
+
+2. CLASS DESIGN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+enum OrderStatus   { CREATED, PAYMENT_PENDING, PAID, FULFILLING, SHIPPED, DELIVERED, CANCELLED, REFUNDED }
+enum PaymentStatus { PENDING, COMPLETED, FAILED, REFUNDED }
+enum PaymentMethod { CREDIT_CARD, PAYPAL, GIFT_CARD, WALLET }
+
+// --- Product & ProductVariant ---
+
+class Product {
+    private String productId;
+    private String name;
+    private String description;
+    private String category;
+    private double basePrice;
+    private String sellerId;
+    private List<ProductVariant> variants;  // S/M/L, Red/Blue
+    private boolean isActive;
+    
+    Product(String productId, String name, double basePrice, String sellerId) {
+        this.productId = productId;
+        this.name = name;
+        this.basePrice = basePrice;
+        this.sellerId = sellerId;
+        this.variants = new ArrayList<>();
+        this.isActive = true;
+    }
+    
+    void addVariant(ProductVariant variant) { variants.add(variant); }
+    Optional<ProductVariant> findVariant(String variantId) {
+        return variants.stream().filter(v -> v.getVariantId().equals(variantId)).findFirst();
+    }
+    
+    String getProductId() { return productId; }
+    String getName()      { return name; }
+    double getBasePrice() { return basePrice; }
+}
+
+class ProductVariant {
+    private String variantId;
+    private String productId;
+    private String size;
+    private String color;
+    private double additionalPrice;   // basePrice + additionalPrice = final price
+    
+    double getFinalPrice(double basePrice) { return basePrice + additionalPrice; }
+    
+    String getVariantId() { return variantId; }
+}
+
+// --- Inventory (separate from Product to allow warehouse management) ---
+
+class Inventory {
+    private String variantId;
+    private int quantity;
+    private int reservedQuantity;     // quantity reserved but not yet confirmed
+    private int version;              // for optimistic locking
+    
+    Inventory(String variantId, int quantity) {
+        this.variantId = variantId;
+        this.quantity = quantity;
+        this.reservedQuantity = 0;
+        this.version = 0;
+    }
+    
+    int getAvailableQuantity() { return quantity - reservedQuantity; }
+    
+    // Reserve stock when item added to cart
+    synchronized boolean reserve(int qty) {
+        if (getAvailableQuantity() < qty) return false;
+        reservedQuantity += qty;
+        return true;
+    }
+    
+    // Release reservation (cart abandoned, item removed)
+    synchronized void releaseReservation(int qty) {
+        reservedQuantity = Math.max(0, reservedQuantity - qty);
+    }
+    
+    // Confirm deduction (when payment is made)
+    synchronized boolean confirm(int qty) {
+        if (quantity < qty) return false;
+        quantity -= qty;
+        reservedQuantity = Math.max(0, reservedQuantity - qty);
+        version++;
+        return true;
+    }
+    
+    String getVariantId() { return variantId; }
+    int getQuantity()     { return quantity; }
+    int getVersion()      { return version; }
+}
+
+// --- Cart ---
+
+class Cart {
+    private String cartId;
+    private String customerId;
+    private List<CartItem> items;
+    private LocalDateTime lastUpdated;
+    private LocalDateTime expiresAt;    // cart expires after 7 days of inactivity
+    
+    Cart(String cartId, String customerId) {
+        this.cartId = cartId;
+        this.customerId = customerId;
+        this.items = new ArrayList<>();
+        this.lastUpdated = LocalDateTime.now();
+        this.expiresAt = LocalDateTime.now().plusDays(7);
+    }
+    
+    void addItem(CartItem item) {
+        // Check if variant already in cart — increment quantity
+        Optional<CartItem> existing = items.stream()
+            .filter(i -> i.getVariantId().equals(item.getVariantId()))
+            .findFirst();
+        
+        if (existing.isPresent()) {
+            existing.get().increaseQuantity(item.getQuantity());
+        } else {
+            items.add(item);
+        }
+        touch();
+    }
+    
+    void removeItem(String variantId) {
+        items.removeIf(i -> i.getVariantId().equals(variantId));
+        touch();
+    }
+    
+    double getSubtotal() {
+        return items.stream().mapToDouble(CartItem::getLineTotal).sum();
+    }
+    
+    void clear() { items.clear(); }
+    
+    private void touch() {
+        this.lastUpdated = LocalDateTime.now();
+        this.expiresAt = LocalDateTime.now().plusDays(7);
+    }
+    
+    boolean isExpired() { return LocalDateTime.now().isAfter(expiresAt); }
+    
+    List<CartItem> getItems() { return Collections.unmodifiableList(items); }
+    String getCartId()        { return cartId; }
+    String getCustomerId()    { return customerId; }
+}
+
+class CartItem {
+    private String variantId;
+    private String productId;
+    private String productName;
+    private int quantity;
+    private double unitPrice;         // price at time item was added to cart
+    
+    CartItem(String variantId, String productId, String productName, int quantity, double unitPrice) {
+        this.variantId = variantId;
+        this.productId = productId;
+        this.productName = productName;
+        this.quantity = quantity;
+        this.unitPrice = unitPrice;
+    }
+    
+    void increaseQuantity(int delta) { this.quantity += delta; }
+    double getLineTotal() { return quantity * unitPrice; }
+    
+    String getVariantId() { return variantId; }
+    int getQuantity()     { return quantity; }
+    double getUnitPrice() { return unitPrice; }
+}
+
+// --- Order ---
+
+class Order {
+    private String orderId;
+    private String customerId;
+    private List<OrderItem> items;
+    private Address shippingAddress;
+    private Address billingAddress;
+    private double subtotal;
+    private double tax;
+    private double shippingFee;
+    private double discount;          // coupon/promotion discount
+    private double totalAmount;
+    private OrderStatus status;
+    private Payment payment;
+    private Shipment shipment;
+    private LocalDateTime createdAt;
+    private LocalDateTime updatedAt;
+    private String couponCode;
+    
+    Order(String orderId, String customerId, List<CartItem> cartItems,
+          Address shippingAddress, Address billingAddress) {
+        this.orderId = orderId;
+        this.customerId = customerId;
+        this.shippingAddress = shippingAddress;
+        this.billingAddress = billingAddress;
+        this.status = OrderStatus.CREATED;
+        this.createdAt = LocalDateTime.now();
+        
+        // Snapshot cart items into order items (prices locked at order time)
+        this.items = cartItems.stream()
+            .map(ci -> new OrderItem(ci.getVariantId(), ci.getProductId(),
+                                     ci.getProductName(), ci.getQuantity(), ci.getUnitPrice()))
+            .collect(Collectors.toList());
+        
+        calculateTotals();
+    }
+    
+    private void calculateTotals() {
+        this.subtotal = items.stream().mapToDouble(OrderItem::getLineTotal).sum();
+        this.tax = subtotal * 0.08;          // 8% tax
+        this.shippingFee = subtotal > 50 ? 0 : 5.99;  // free shipping over $50
+        this.totalAmount = subtotal + tax + shippingFee - discount;
+    }
+    
+    void applyDiscount(double amount) {
+        this.discount = amount;
+        calculateTotals();
+    }
+    
+    boolean canCancel() {
+        return status == OrderStatus.CREATED
+            || status == OrderStatus.PAYMENT_PENDING
+            || status == OrderStatus.PAID;  // before FULFILLING
+    }
+    
+    void cancel() {
+        if (!canCancel()) throw new IllegalStateException("Order cannot be cancelled in state: " + status);
+        this.status = OrderStatus.CANCELLED;
+    }
+    
+    void transitionTo(OrderStatus newStatus) {
+        validateTransition(this.status, newStatus);
+        this.status = newStatus;
+        this.updatedAt = LocalDateTime.now();
+    }
+    
+    private void validateTransition(OrderStatus from, OrderStatus to) {
+        // State machine rules:
+        Map<OrderStatus, Set<OrderStatus>> validTransitions = new EnumMap<>(OrderStatus.class);
+        validTransitions.put(OrderStatus.CREATED,         Set.of(OrderStatus.PAYMENT_PENDING, OrderStatus.CANCELLED));
+        validTransitions.put(OrderStatus.PAYMENT_PENDING, Set.of(OrderStatus.PAID, OrderStatus.CANCELLED));
+        validTransitions.put(OrderStatus.PAID,            Set.of(OrderStatus.FULFILLING, OrderStatus.CANCELLED));
+        validTransitions.put(OrderStatus.FULFILLING,      Set.of(OrderStatus.SHIPPED));
+        validTransitions.put(OrderStatus.SHIPPED,         Set.of(OrderStatus.DELIVERED));
+        validTransitions.put(OrderStatus.DELIVERED,       Set.of(OrderStatus.REFUNDED));
+        
+        if (!validTransitions.getOrDefault(from, Set.of()).contains(to)) {
+            throw new IllegalStateException("Invalid transition: " + from + " → " + to);
+        }
+    }
+    
+    String getOrderId()       { return orderId; }
+    OrderStatus getStatus()   { return status; }
+    double getTotalAmount()   { return totalAmount; }
+    List<OrderItem> getItems(){ return Collections.unmodifiableList(items); }
+}
+
+class OrderItem {
+    private String variantId;
+    private String productId;
+    private String productName;
+    private int quantity;
+    private double unitPrice;    // price snapshot at time of order
+    
+    OrderItem(String variantId, String productId, String productName,
+              int quantity, double unitPrice) {
+        this.variantId = variantId;
+        this.productId = productId;
+        this.productName = productName;
+        this.quantity = quantity;
+        this.unitPrice = unitPrice;
+    }
+    
+    double getLineTotal() { return quantity * unitPrice; }
+    String getVariantId() { return variantId; }
+    int getQuantity()     { return quantity; }
+}
+
+// --- Coupon ---
+
+class Coupon {
+    enum DiscountType { PERCENTAGE, FIXED_AMOUNT }
+    
+    private String code;
+    private DiscountType discountType;
+    private double discountValue;      // 20% or $10 off
+    private double minimumOrderValue;
+    private LocalDate expiryDate;
+    private int usageLimit;
+    private int usageCount;
+    
+    double calculateDiscount(double orderSubtotal) {
+        if (orderSubtotal < minimumOrderValue) return 0;
+        if (LocalDate.now().isAfter(expiryDate)) return 0;
+        if (usageCount >= usageLimit) return 0;
+        
+        if (discountType == DiscountType.PERCENTAGE) {
+            return orderSubtotal * (discountValue / 100);
+        }
+        return Math.min(discountValue, orderSubtotal);  // can't discount more than order total
+    }
+    
+    synchronized void use() {
+        if (usageCount >= usageLimit) throw new IllegalStateException("Coupon limit reached");
+        usageCount++;
+    }
+}
+
+// --- OrderService (Facade + Orchestrator) ---
+
+class OrderService {
+    private Map<String, Order> orders;
+    private Map<String, Cart> carts;
+    private Map<String, Inventory> inventory;
+    private Map<String, Coupon> coupons;
+    private PaymentGateway paymentGateway;
+    private List<OrderEventListener> listeners;
+    private AtomicInteger orderCounter;
+    
+    OrderService() {
+        orders = new ConcurrentHashMap<>();
+        carts = new ConcurrentHashMap<>();
+        inventory = new ConcurrentHashMap<>();
+        coupons = new HashMap<>();
+        listeners = new ArrayList<>();
+        orderCounter = new AtomicInteger(1000);
+    }
+    
+    // Add to cart with inventory reservation
+    void addToCart(String customerId, String variantId, String productId,
+                   String productName, int qty, double unitPrice) {
+        
+        Inventory inv = inventory.getOrDefault(variantId, new Inventory(variantId, 0));
+        if (!inv.reserve(qty)) {
+            throw new InsufficientInventoryException("Only " + inv.getAvailableQuantity() + " available");
+        }
+        
+        Cart cart = carts.computeIfAbsent(customerId, id -> new Cart("CART-" + id, id));
+        cart.addItem(new CartItem(variantId, productId, productName, qty, unitPrice));
+    }
+    
+    // Checkout: Cart → Order
+    Order checkout(String customerId, Address shippingAddress, Address billingAddress) {
+        Cart cart = carts.get(customerId);
+        if (cart == null || cart.getItems().isEmpty()) throw new IllegalStateException("Cart is empty");
+        
+        String orderId = "ORD-" + orderCounter.incrementAndGet();
+        Order order = new Order(orderId, customerId, cart.getItems(), shippingAddress, billingAddress);
+        orders.put(orderId, order);
+        order.transitionTo(OrderStatus.PAYMENT_PENDING);
+        
+        notifyListeners(order, OrderStatus.PAYMENT_PENDING);
+        return order;
+    }
+    
+    // Apply coupon before payment
+    void applyCoupon(String orderId, String couponCode) {
+        Order order = getOrderOrThrow(orderId);
+        Coupon coupon = coupons.get(couponCode);
+        if (coupon == null) throw new InvalidCouponException("Coupon not found: " + couponCode);
+        
+        double discount = coupon.calculateDiscount(order.getTotalAmount());
+        if (discount == 0) throw new InvalidCouponException("Coupon conditions not met");
+        
+        order.applyDiscount(discount);
+    }
+    
+    // Process payment and confirm inventory deduction
+    boolean processPayment(String orderId, String paymentMethodToken) {
+        Order order = getOrderOrThrow(orderId);
+        
+        boolean paid = paymentGateway.charge(paymentMethodToken, order.getTotalAmount(), orderId);
+        if (!paid) {
+            // Release inventory reservations
+            order.getItems().forEach(item -> {
+                Inventory inv = inventory.get(item.getVariantId());
+                if (inv != null) inv.releaseReservation(item.getQuantity());
+            });
+            order.transitionTo(OrderStatus.CANCELLED);
+            notifyListeners(order, OrderStatus.CANCELLED);
+            return false;
+        }
+        
+        // Confirm inventory deduction (convert reservation to actual deduction)
+        order.getItems().forEach(item -> {
+            Inventory inv = inventory.get(item.getVariantId());
+            if (inv != null) inv.confirm(item.getQuantity());
+        });
+        
+        order.transitionTo(OrderStatus.PAID);
+        carts.get(order.getCustomerId()).clear();    // clear cart after payment
+        notifyListeners(order, OrderStatus.PAID);
+        return true;
+    }
+    
+    void cancelOrder(String orderId) {
+        Order order = getOrderOrThrow(orderId);
+        order.cancel();
+        
+        // Release inventory
+        order.getItems().forEach(item -> {
+            Inventory inv = inventory.get(item.getVariantId());
+            if (inv != null) inv.releaseReservation(item.getQuantity());
+        });
+        
+        notifyListeners(order, OrderStatus.CANCELLED);
+    }
+    
+    private Order getOrderOrThrow(String orderId) {
+        return Optional.ofNullable(orders.get(orderId))
+            .orElseThrow(() -> new NotFoundException("Order not found: " + orderId));
+    }
+    
+    void addEventListener(OrderEventListener listener) { listeners.add(listener); }
+    
+    private void notifyListeners(Order order, OrderStatus status) {
+        listeners.forEach(l -> l.onOrderStatusChanged(order, status));
+    }
+}
+
+// --- Observer: Order event listeners ---
+
+interface OrderEventListener {
+    void onOrderStatusChanged(Order order, OrderStatus newStatus);
+}
+
+class EmailNotificationListener implements OrderEventListener {
+    @Override
+    public void onOrderStatusChanged(Order order, OrderStatus newStatus) {
+        switch (newStatus) {
+            case PAID:      sendEmail(order, "Order Confirmed — " + order.getOrderId()); break;
+            case SHIPPED:   sendEmail(order, "Your order has shipped!"); break;
+            case DELIVERED: sendEmail(order, "Your order has been delivered!"); break;
+            case CANCELLED: sendEmail(order, "Your order has been cancelled."); break;
+        }
+    }
+    private void sendEmail(Order order, String subject) {
+        System.out.println("Email sent for order " + order.getOrderId() + ": " + subject);
+    }
+}
+
+class WarehouseNotificationListener implements OrderEventListener {
+    @Override
+    public void onOrderStatusChanged(Order order, OrderStatus newStatus) {
+        if (newStatus == OrderStatus.PAID) {
+            System.out.println("Warehouse notified to fulfill order: " + order.getOrderId());
+        }
+    }
+}
+
+
+3. CONCURRENCY: PREVENTING OVERSELL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROBLEM: 1000 users add last item to cart simultaneously
+
+TWO-PHASE INVENTORY MANAGEMENT:
+  Phase 1 — Add to Cart: reserve() → reservedQuantity++
+    available = quantity - reservedQuantity
+    If available < 0 → reject add-to-cart
+    Reservation expires if cart abandoned (background cleanup job)
+
+  Phase 2 — Payment Complete: confirm() → quantity--, reservedQuantity--
+    Actual stock deduction happens only after successful payment
+
+DATABASE APPROACH (production):
+  UPDATE inventory
+  SET reserved_quantity = reserved_quantity + ?
+  WHERE variant_id = ?
+  AND (quantity - reserved_quantity) >= ?
+  
+  Check rows affected = 1; if 0, stock insufficient.
+
+OPTIMISTIC LOCKING (alternative):
+  Read version=5 from inventory
+  UPDATE inventory SET quantity=quantity-1, version=6 WHERE variant_id=? AND version=5
+  Retry if 0 rows updated (someone else modified it)
+
+
+4. DESIGN PATTERNS SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+OBSERVER: OrderEventListener → email/SMS/warehouse on state changes
+  Decouple order state machine from notification/fulfillment logic
+
+FACADE: OrderService.checkout() hides cart→order conversion, inventory confirm, coupon, payment
+
+STATE (via explicit transition map): Order.transitionTo(status)
+  EnumMap of valid transitions prevents illegal state changes
+
+STRATEGY: Coupon.DiscountType + calculateDiscount()
+  PERCENTAGE or FIXED_AMOUNT coupon strategies
+
+TEMPLATE METHOD: Payment processing
+  charge(token, amount, orderId) → abstract; implemented by CreditCardGateway, PayPalGateway
+
+FACTORY: OrderFactory.create(customerId, cart, addresses) → Order
+
+
+5. INTERVIEW ANSWER — WHAT TO SAY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"The core design challenge here is: Cart → Order → Payment → Fulfillment,
+with inventory management preventing overselling.
+
+I separate Product (catalog info) from Inventory (stock counts) because
+they have different lifecycle and ownership.
+
+For overselling prevention, I use a two-phase approach: when an item is
+added to the cart, I immediately reserve stock (reservedQuantity++) but
+don't deduct it yet. If the user abandons the cart, a background job
+releases those reservations. When payment succeeds, I confirm the deduction.
+
+The Order has an explicit state machine with an EnumMap of valid transitions.
+Calling transitionTo() with an invalid transition throws immediately.
+
+I use the Observer pattern so email, SMS, and warehouse notifications are
+completely decoupled from the OrderService. Adding a new notification type
+(push notification) just means adding a new listener — no changes to core logic.
+
+Cart items snapshot prices at add-to-cart time so price changes during
+checkout don't surprise the customer. The order records the historical
+unit price, not the live catalog price."

@@ -1,0 +1,373 @@
+================================================================
+TESTING GRAPHQL IN SPRING — IN DEPTH
+================================================================
+
+1. TESTING STRATEGIES
+----------------------
+Spring for GraphQL provides GraphQlTester, a fluent API for testing
+GraphQL operations. Tests can be:
+
+  a) Slice tests with @GraphQlTest (fast, mocks service layer)
+  b) Integration tests with @SpringBootTest + HttpGraphQlTester
+  c) Unit tests for individual resolvers with mocked dependencies
+  d) MockMvc / WebTestClient based tests
+
+2. @GRAPHQLTEST — SLICE TEST
+------------------------------
+@GraphQlTest loads only GraphQL-related beans (controllers, scalars,
+directives, exception resolvers) and mocks the rest.
+
+```java
+@GraphQlTest(UserController.class)  // Only loads UserController
+@MockBean  // Mock the service layer
+class UserControllerTest {
+
+  @Autowired
+  private GraphQlTester graphQlTester;
+
+  @MockBean
+  private UserService userService;
+
+  @Test
+  void user_returnsUser_whenFound() {
+    // Arrange
+    User user = new User(1L, "Alice", "alice@example.com");
+    when(userService.findById(1L)).thenReturn(Optional.of(user));
+
+    // Act + Assert
+    graphQlTester.document("""
+      query {
+        user(id: "1") {
+          id
+          name
+          email
+        }
+      }
+      """)
+      .execute()
+      .path("user.id").entity(String.class).isEqualTo("1")
+      .path("user.name").entity(String.class).isEqualTo("Alice")
+      .path("user.email").entity(String.class).isEqualTo("alice@example.com");
+  }
+
+  @Test
+  void user_returnsError_whenNotFound() {
+    when(userService.findById(99L)).thenThrow(
+      new ResourceNotFoundException("User", "99"));
+
+    graphQlTester.document("""
+      query { user(id: "99") { id name } }
+      """)
+      .execute()
+      .errors()
+        .satisfy(errors -> {
+          assertThat(errors).hasSize(1);
+          assertThat(errors.get(0).getMessage()).contains("not found");
+        });
+  }
+}
+```
+
+3. GRAPHQLTESTER FLUENT API
+-----------------------------
+  3.1 Basic Execution
+  --------------------
+  ```java
+  graphQlTester.document("{ users { id name } }")
+    .execute();
+  ```
+
+  3.2 Using Named Documents / Query Files
+  ----------------------------------------
+  ```java
+  // Load from classpath: src/test/resources/graphql-test/getUser.graphql
+  graphQlTester.documentName("getUser")
+    .variable("id", "1")
+    .execute()
+    .path("user.name").entity(String.class).isEqualTo("Alice");
+  ```
+
+  3.3 Verifying Paths
+  --------------------
+  ```java
+  graphQlTester.document("{ users { id name posts { title } } }")
+    .execute()
+    // Check a scalar field
+    .path("users[0].name").entity(String.class).isEqualTo("Alice")
+    // Check a list
+    .path("users").entityList(User.class).hasSize(3)
+    // Check nested
+    .path("users[0].posts[0].title").entity(String.class).isEqualTo("First Post")
+    // Check exists
+    .path("users[0].email").pathExists()
+    // Check does not exist
+    .path("users[0].internalPassword").pathDoesNotExist();
+  ```
+
+  3.4 With Variables
+  -------------------
+  ```java
+  graphQlTester.document("""
+    query GetUser($id: ID!) {
+      user(id: $id) { name email }
+    }
+    """)
+    .variable("id", "1")
+    .execute()
+    .path("user.name").entity(String.class).isEqualTo("Alice");
+  ```
+
+  3.5 Checking Errors
+  --------------------
+  ```java
+  // Assert NO errors
+  graphQlTester.document("{ users { id } }")
+    .execute()
+    .errors().verify();  // Throws if any errors
+
+  // Assert specific errors
+  graphQlTester.document("{ invalidField }")
+    .execute()
+    .errors()
+      .expect(error -> error.getErrorType() == ErrorType.NOT_FOUND)
+      .verify();
+
+  // Satisfy (custom assertion on errors list)
+  .errors().satisfy(errors -> assertThat(errors).hasSize(1));
+  ```
+
+  3.6 Testing Mutations
+  ----------------------
+  ```java
+  @Test
+  void createUser_success() {
+    User saved = new User(5L, "Bob", "bob@example.com");
+    when(userService.create(any())).thenReturn(saved);
+
+    graphQlTester.document("""
+      mutation CreateUser($input: CreateUserInput!) {
+        createUser(input: $input) {
+          user { id name }
+          userErrors { message code }
+        }
+      }
+      """)
+      .variable("input", Map.of("name", "Bob", "email", "bob@example.com"))
+      .execute()
+      .path("createUser.user.id").entity(String.class).isEqualTo("5")
+      .path("createUser.userErrors").entityList(UserError.class).hasSize(0);
+  }
+  ```
+
+  3.7 Testing Subscriptions
+  --------------------------
+  ```java
+  @Test
+  void messageAdded_emitsMessages() {
+    // Use a Flux that emits test messages
+    Flux<Message> messageFlux = Flux.just(
+      new Message("Hello"),
+      new Message("World")
+    ).delayElements(Duration.ofMillis(50));
+
+    when(messageService.streamMessages(anyLong())).thenReturn(messageFlux);
+
+    graphQlTester.document("""
+      subscription {
+        messageAdded(roomId: "1") { content }
+      }
+      """)
+      .executeSubscription()
+      .toFlux("messageAdded.content", String.class)
+      .as(StepVerifier::create)
+      .expectNext("Hello", "World")
+      .verifyComplete();
+  }
+  ```
+
+4. INTEGRATION TESTS WITH @SPRINGBOOTTEST
+-------------------------------------------
+```java
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+class UserIntegrationTest {
+
+  @Autowired
+  private HttpGraphQlTester httpGraphQlTester;    // makes real HTTP calls
+
+  @Autowired
+  private UserRepository userRepository;
+
+  @BeforeEach
+  void setup() {
+    userRepository.deleteAll();
+    userRepository.save(new UserEntity(null, "Alice", "alice@example.com"));
+  }
+
+  @Test
+  void users_returnsAllUsers() {
+    httpGraphQlTester.document("{ users { name email } }")
+      .execute()
+      .path("users").entityList(User.class).hasSize(1)
+      .path("users[0].name").entity(String.class).isEqualTo("Alice");
+  }
+}
+```
+
+5. WEBSOCKET TESTS FOR SUBSCRIPTIONS
+---------------------------------------
+```java
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+class SubscriptionIntegrationTest {
+
+  @Autowired
+  private WebSocketGraphQlTester webSocketTester;
+
+  @Test
+  void subscription_receivesMessages() {
+    webSocketTester.document("""
+      subscription {
+        messageAdded(roomId: "1") { content }
+      }
+      """)
+      .executeSubscription()
+      .toFlux("messageAdded.content", String.class)
+      .as(StepVerifier::create)
+      .expectNextCount(3)
+      .thenCancel()
+      .verify();
+  }
+}
+```
+
+6. TESTING WITH AUTHENTICATION CONTEXT
+-----------------------------------------
+```java
+@GraphQlTest(UserController.class)
+class AuthenticatedTest {
+
+  @Autowired
+  private GraphQlTester graphQlTester;
+
+  @MockBean
+  private UserService userService;
+
+  @Test
+  @WithMockUser(username = "alice", roles = "USER")  // Spring Security mock
+  void myProfile_returnsCurrentUser() {
+    User alice = new User(1L, "Alice", "alice@example.com");
+    when(userService.findByUsername("alice")).thenReturn(alice);
+
+    graphQlTester.document("{ me { name } }")
+      .execute()
+      .path("me.name").entity(String.class).isEqualTo("Alice");
+  }
+
+  // Or inject context manually
+  @Test
+  void myPosts_withInjectedContext() {
+    graphQlTester
+      .mutate()
+      .headers(h -> h.add(HttpHeaders.AUTHORIZATION, "Bearer test-token"))
+      .build()
+      .document("{ myPosts { title } }")
+      .execute();
+  }
+}
+```
+
+7. TESTING CUSTOM SCALARS
+---------------------------
+```java
+@GraphQlTest
+class CustomScalarTest {
+
+  @Autowired
+  private GraphQlTester graphQlTester;
+
+  @MockBean
+  private EventService eventService;
+
+  @Test
+  void event_returnsDateField() {
+    Event event = Event.builder()
+      .id(1L)
+      .name("JavaConf")
+      .date(LocalDate.of(2024, 6, 15))
+      .build();
+    when(eventService.findById(1L)).thenReturn(Optional.of(event));
+
+    graphQlTester.document("""
+      query { event(id: "1") { name date } }
+      """)
+      .execute()
+      .path("event.date").entity(String.class).isEqualTo("2024-06-15");
+  }
+}
+```
+
+8. BEST PRACTICES
+------------------
+  ✅ Use @GraphQlTest (slice) for fast unit-style tests of resolvers
+  ✅ Store queries in separate .graphql files (src/test/resources/graphql-test/)
+  ✅ Use @SpringBootTest sparingly for integration tests
+  ✅ Test both success paths AND error paths
+  ✅ Test input validation (missing required fields, invalid types)
+  ✅ Use StepVerifier for subscription tests
+  ✅ Use @WithMockUser or inject headers for auth tests
+
+9. TEST QUERY DOCUMENTS
+------------------------
+Store reusable test queries in files:
+```
+src/test/resources/
+  graphql-test/
+    getUser.graphql
+    createUser.graphql
+    userSubscription.graphql
+```
+
+```java
+// Reference by file name (without extension)
+graphQlTester.documentName("getUser")
+  .variable("id", "1")
+  .execute();
+```
+
+10. INTERVIEW QUESTIONS & ANSWERS
+-----------------------------------
+
+Q: What is @GraphQlTest and what does it load?
+A: @GraphQlTest is a test slice annotation (like @WebMvcTest for MVC) that
+   loads only GraphQL-related beans: @Controller classes, @SchemaMapping
+   methods, @BatchMapping methods, scalar configurations, and exception
+   resolvers. Services, repositories, and other beans must be @MockBean'd.
+   It makes tests faster than @SpringBootTest by not loading the full context.
+
+Q: How do you test errors in GraphQL with GraphQlTester?
+A: Use `.execute().errors()` chain. `.verify()` asserts no errors exist.
+   `.expect(predicate)` asserts specific errors match. `.satisfy(consumer)`
+   takes a Consumer<List<ResponseError>> for custom assertions. You can
+   also check that specific paths are null when errors occur.
+
+Q: How do you test subscriptions in Spring for GraphQL?
+A: Use `.executeSubscription()` instead of `.execute()`. This returns a
+   SubscriptionSpec. Chain `.toFlux(path, type)` to get a Flux of values,
+   then use Project Reactor's StepVerifier to assert on the emitted values,
+   their order, and completion. For WebSocket, use WebSocketGraphQlTester.
+
+Q: How do you inject authentication context in GraphQL tests?
+A: Multiple options: (1) Use @WithMockUser from Spring Security Test —
+   sets the SecurityContext for the test. (2) Mutate the tester with
+   `.mutate().headers(...)` to add Authorization headers. (3) Use a
+   MockWebGraphQlInterceptor to directly populate the GraphQL context.
+
+Q: What is the difference between HttpGraphQlTester and GraphQlTester?
+A: GraphQlTester is the base testing interface that works without HTTP
+   (directly against the GraphQL execution engine). HttpGraphQlTester sends
+   real HTTP requests to the server endpoint. Use GraphQlTester with
+   @GraphQlTest for fast slice tests; use HttpGraphQlTester with
+   @SpringBootTest for full integration tests with actual HTTP.
+
+================================================================
+END OF FILE
+================================================================

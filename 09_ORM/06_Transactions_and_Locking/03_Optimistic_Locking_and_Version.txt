@@ -1,0 +1,157 @@
+================================================================
+Optimistic Locking and @Version
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHAT IS OPTIMISTIC LOCKING?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Optimistic locking assumes that conflicts are rare. It does NOT
+acquire a DB lock on read. Instead, it detects conflicts at WRITE time.
+
+How it works:
+1. Load entity — read @Version value (e.g., version = 3)
+2. Modify entity in memory
+3. On flush/commit:
+   UPDATE ... SET ..., version = 4 WHERE id = ? AND version = 3
+4. If another transaction already updated (version ≠ 3):
+   → 0 rows affected → Hibernate throws OptimisticLockException
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. @VERSION ANNOTATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Entity
+public class Product {
+    @Id @GeneratedValue private Long id;
+    private String name;
+    private int stock;
+
+    @Version
+    private Long version;   // automatically managed by Hibernate
+    // Supported types: int, Integer, long, Long, short, Short, java.sql.Timestamp
+}
+
+The @Version field is:
+  - Auto-incremented by Hibernate on every UPDATE
+  - Never manually set — Hibernate controls it
+  - Initialized to 0 or null on new entities (set to 1 on first persist)
+  - Included in UPDATE WHERE clause automatically
+
+Generated UPDATE:
+  UPDATE products SET name=?, stock=?, version=4 WHERE id=? AND version=3
+  -- If rows_affected = 0 → OptimisticLockException
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. HANDLING OPTIMISTICLOCKEXCEPTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When a conflict is detected, the transaction is rolled back.
+The application must retry or inform the user.
+
+// Retry pattern:
+@Service
+public class ProductService {
+    @Retryable(
+        retryFor = OptimisticLockingFailureException.class,
+        maxAttempts = 3,
+        backoff = @Backoff(delay = 100, multiplier = 2)
+    )
+    @Transactional
+    public void decreaseStock(Long productId, int quantity) {
+        Product p = productRepo.findById(productId).orElseThrow();
+        if (p.getStock() < quantity) throw new InsufficientStockException();
+        p.setStock(p.getStock() - quantity);
+        productRepo.save(p);
+    }
+
+    @Recover
+    public void recover(OptimisticLockingFailureException e, Long id, int qty) {
+        log.error("Optimistic lock failed for product {}", id);
+        throw new RuntimeException("Could not update stock after retries", e);
+    }
+}
+
+Exception hierarchy:
+  jakarta.persistence.OptimisticLockException   (JPA)
+    ↓ wrapped into
+  org.springframework.dao.OptimisticLockingFailureException  (Spring)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. LOCKING MODES FOR EXPLICIT OPTIMISTIC LOCK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+You can explicitly request an optimistic version check:
+
+// Force version check at END of tx even if entity wasn't modified:
+em.lock(entity, LockModeType.OPTIMISTIC);
+// or:
+em.lock(entity, LockModeType.OPTIMISTIC_FORCE_INCREMENT);  // bumps version even if no change
+
+// Spring Data JPA:
+@Lock(LockModeType.OPTIMISTIC)
+Optional<Product> findById(Long id);
+
+LockModeType values (optimistic):
+  OPTIMISTIC                 — check version at tx end (no UPDATE if no change)
+  OPTIMISTIC_FORCE_INCREMENT — bump version even if entity unchanged (useful to "touch")
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. USE CASES FOR OPTIMISTIC LOCKING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✓ High read, low write conflict:  product catalog updates
+✓ Long-running edit forms: user editing a document (read, edit for minutes, save)
+✓ Stateless REST APIs: read in GET, write in PUT with version check
+✓ Microservices: no shared DB locks across service boundaries
+
+REST API with version check:
+  // GET /products/1 → returns { id: 1, name: "Widget", version: 5 }
+  // PUT /products/1 → body: { name: "Widget Pro", version: 5 }
+
+  @Transactional
+  public Product updateProduct(Long id, ProductUpdateRequest req) {
+      Product p = productRepo.findById(id).orElseThrow();
+      // If req.version != p.version → HTTP 409 Conflict
+      if (!req.getVersion().equals(p.getVersion())) {
+          throw new ConflictException("Product was modified by another user");
+      }
+      p.setName(req.getName());
+      return productRepo.save(p);
+      // @Version auto-incremented on save; next request must use version=6
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. INTERVIEW QUICK HITS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is optimistic locking in JPA?
+A: Optimistic locking allows multiple transactions to read the same data
+   without locking, but detects conflicts at write time using a @Version
+   column. The UPDATE statement includes AND version = ? in the WHERE clause.
+   If another transaction updated the row (version changed), 0 rows are affected
+   and Hibernate throws OptimisticLockException, rolling back the transaction.
+
+Q: What happens if you manually set the @Version field?
+A: Never manually set the @Version field. Hibernate manages it exclusively.
+   Manually setting it would break version tracking and could cause false
+   conflict detections or allow conflicting updates to silently succeed.
+
+Q: What is the difference between OptimisticLockException and StaleObjectStateException?
+A: StaleObjectStateException is a Hibernate-specific subclass of
+   OptimisticLockException. Both indicate a version conflict.
+   Spring wraps them as OptimisticLockingFailureException (DataAccessException).
+   You can catch OptimisticLockingFailureException in Spring service layer.
+
+Q: How would you implement optimistic locking in a REST API?
+A: Include the @Version field in the entity's DTO response. On updates,
+   require the client to send back the version. Compare server version with
+   client version before updating. If they differ, return HTTP 409 Conflict.
+   Hibernate's @Version also provides the automatic DB-level check during
+   the UPDATE statement.
+
+Q: What is OPTIMISTIC_FORCE_INCREMENT?
+A: It increments the entity's @Version even if no changes were made to the
+   entity itself. Useful when you want to "touch" an entity to signal that
+   something logically related changed (e.g., you changed a child entity and
+   want to invalidate the parent's version for external systems).

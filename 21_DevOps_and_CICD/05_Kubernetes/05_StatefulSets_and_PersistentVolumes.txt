@@ -1,0 +1,791 @@
+================================================================================
+STATEFULSETS AND PERSISTENT VOLUMES — KUBERNETES STORAGE GUIDE
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. StatefulSets — Stateful Application Management
+2. Headless Services for StatefulSets
+3. StatefulSet Lifecycle and Ordering
+4. Persistent Volumes (PV)
+5. PersistentVolumeClaims (PVC)
+6. StorageClass — Dynamic Provisioning
+7. Access Modes and Reclaim Policies
+8. CSI Drivers
+9. Volume Snapshots
+10. Storage Patterns and Best Practices
+11. Common Interview Questions & Answers
+12. Quick Reference Cheat Sheet
+
+================================================================================
+1. STATEFULSETS — STATEFUL APPLICATION MANAGEMENT
+================================================================================
+
+Why StatefulSet?
+  Regular Deployments give pods random names and no stable storage.
+  StatefulSets provide:
+  
+  1. STABLE, UNIQUE NETWORK IDENTITIES:
+     Pod names are predictable: pod-0, pod-1, pod-2 (not pod-xyz7b)
+     DNS hostname per pod: pod-0.headless-svc.namespace.svc.cluster.local
+     Pods get the same name on restart (unlike Deployment pods)
+  
+  2. STABLE PERSISTENT STORAGE:
+     Each pod gets its own PVC that follows it across rescheduling.
+     pod-0 always gets data-pod-0, pod-1 always gets data-pod-1.
+     PVCs survive pod deletion (data preserved).
+  
+  3. ORDERED DEPLOYMENT AND SCALING:
+     Pods start in order: 0 → 1 → 2 (each must be Running/Ready before next)
+     Pods stop in reverse order: 2 → 1 → 0
+     Ensures primaries start before replicas.
+
+Use Cases:
+  - Databases: MySQL, PostgreSQL, MongoDB, CockroachDB
+  - Message queues: Kafka (broker IDs), RabbitMQ
+  - Coordination: ZooKeeper, etcd, Consul
+  - Search engines: Elasticsearch, Solr
+  - Caches that require persistence: Redis (with AOF/RDB)
+
+StatefulSet YAML:
+  
+  apiVersion: apps/v1
+  kind: StatefulSet
+  metadata:
+    name: postgres
+    namespace: production
+  spec:
+    serviceName: "postgres-headless"    # REQUIRED: headless service name
+    replicas: 3
+    
+    selector:
+      matchLabels:
+        app: postgres
+    
+    # Ordering policy (default: OrderedReady)
+    podManagementPolicy: OrderedReady   # OrderedReady | Parallel
+    
+    # Update strategy
+    updateStrategy:
+      type: RollingUpdate
+      rollingUpdate:
+        partition: 0    # Only update pods >= partition (canary: set to 2, then 1, then 0)
+    
+    template:
+      metadata:
+        labels:
+          app: postgres
+      spec:
+        containers:
+        - name: postgres
+          image: postgres:15
+          ports:
+          - containerPort: 5432
+          env:
+          - name: POSTGRES_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: postgres-secret
+                key: password
+          - name: PGDATA
+            value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+          - name: postgres-data
+            mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+    
+    # VolumeClaimTemplates: Creates one PVC per pod
+    volumeClaimTemplates:
+    - metadata:
+        name: postgres-data              # Name used in volumeMounts
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: "fast-ssd"
+        resources:
+          requests:
+            storage: 100Gi
+
+Pod Identity in StatefulSet:
+  StatefulSet name: postgres
+  Pods: postgres-0, postgres-1, postgres-2
+  
+  PVCs created automatically:
+  postgres-data-postgres-0  (data-<pod-name>)
+  postgres-data-postgres-1
+  postgres-data-postgres-2
+  
+  DNS (with headless service postgres-headless):
+  postgres-0.postgres-headless.production.svc.cluster.local
+  postgres-1.postgres-headless.production.svc.cluster.local
+  postgres-2.postgres-headless.production.svc.cluster.local
+  
+  These DNS names remain stable even if the pod is rescheduled to a different node.
+  This is how replicas find the primary — by stable DNS name.
+
+StatefulSet vs Deployment Comparison:
+  
+  ATTRIBUTE          DEPLOYMENT          STATEFULSET
+  ─────────────────────────────────────────────────────────
+  Pod names          Random (abc-xyz7b)  Ordered (web-0, web-1)
+  DNS per pod        No                  Yes (via headless svc)
+  Storage per pod    Shared PVC          Individual PVC per pod
+  Scale order        Parallel (all at once)  Sequential
+  Stop order         Random              Reverse order
+  Use case           Stateless apps      Databases, queues
+  Rolling update     Can be parallel     Sequential (per partition)
+  Pod replacement    New pod = new PVC   New pod = SAME PVC
+
+================================================================================
+2. HEADLESS SERVICES FOR STATEFULSETS
+================================================================================
+
+Why Headless Service?
+  Regular Service: DNS → ClusterIP (virtual IP, kube-proxy load balances)
+  Headless Service: DNS → All pod IPs directly (no ClusterIP, no load balancing)
+  
+  StatefulSet pods need DNS names to address each other INDIVIDUALLY.
+  A regular Service would hide which pod is which.
+
+Headless Service YAML:
+  
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: postgres-headless
+    namespace: production
+  spec:
+    clusterIP: None          # THIS makes it headless
+    selector:
+      app: postgres
+    ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+    publishNotReadyAddresses: true   # Include not-ready pods in DNS (for discovery during startup)
+
+DNS Query Results:
+  # Regular Service (returns ClusterIP):
+  nslookup postgres-service → 10.96.100.50
+  
+  # Headless Service (returns all pod IPs):
+  nslookup postgres-headless → 10.0.1.1, 10.0.1.2, 10.0.1.3
+  
+  # Per-pod DNS (only works with headless service):
+  nslookup postgres-0.postgres-headless.production.svc.cluster.local → 10.0.1.1 (specific pod!)
+
+Client Service (for external access):
+  For clients that don't know about replication topology,
+  create a regular ClusterIP Service pointing to the primary (by label):
+  
+  # Application pods connect to regular service (load balanced or to primary):
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: postgres-primary
+  spec:
+    selector:
+      app: postgres
+      role: primary            # Operator sets this label on the primary pod
+    ports:
+    - port: 5432
+
+================================================================================
+3. STATEFULSET LIFECYCLE AND ORDERING
+================================================================================
+
+Ordered Deployment (OrderedReady):
+  Create: 0 starts first → must be Running+Ready → 1 starts → must be Ready → 2
+  Delete: 2 deleted → must be gone → 1 deleted → must be gone → 0
+  
+  This ensures:
+  - Primary (pod-0) starts before replicas
+  - Replicas start one at a time
+  - Clean shutdown in reverse order
+
+Parallel Policy:
+  podManagementPolicy: Parallel
+  All pods start/stop simultaneously.
+  Use when: Order doesn't matter (e.g., multiple independent shards)
+
+Partition Rolling Updates:
+  updateStrategy.rollingUpdate.partition: N
+  Only pods with index >= N are updated.
+  Pods with index < N keep the old version.
+  
+  Use for canary updates:
+  partition: 2 → only pod-2 updated (test it)
+  partition: 1 → pod-1 and pod-2 updated
+  partition: 0 → all pods updated
+
+StatefulSet Scaling:
+  Scale up:   pods added at the end (web-3, web-4...)
+  Scale down: pods removed from the end (web-4, web-3...)
+  
+  CAUTION: Never scale down below quorum for databases!
+  Kafka: Don't scale below RF (replication factor)
+  ZooKeeper: Don't scale below quorum (3→1 would lose quorum)
+
+================================================================================
+4. PERSISTENT VOLUMES (PV)
+================================================================================
+
+Storage Abstraction Layers:
+  
+  PersistentVolume (PV):
+    Cluster-level storage resource. Represents actual storage.
+    Created by admin (static) or automatically (dynamic provisioning).
+    Has lifecycle independent of pods.
+    
+  PersistentVolumeClaim (PVC):
+    Namespace-level request for storage.
+    Pod claims storage via PVC.
+    PVC binds to a PV that satisfies its requirements.
+    
+  StorageClass:
+    Blueprint for dynamic PV provisioning.
+    When PVC specifies a StorageClass → provisioner creates PV automatically.
+  
+  Relationship:
+  Pod → PVC → (binds to) → PV → (uses) → actual storage
+
+Static PV Example (manually created by admin):
+  
+  apiVersion: v1
+  kind: PersistentVolume
+  metadata:
+    name: pv-nfs-001
+    labels:
+      type: nfs
+  spec:
+    capacity:
+      storage: 50Gi
+    volumeMode: Filesystem       # Filesystem (default) or Block
+    accessModes:
+    - ReadWriteMany              # Multiple nodes can mount read-write
+    persistentVolumeReclaimPolicy: Retain  # Don't delete data when PVC released
+    storageClassName: nfs-storage
+    nfs:
+      server: 10.0.0.100
+      path: /exports/data
+    # Other volume types:
+    # hostPath: {path: /data}   # Node local (testing only!)
+    # awsElasticBlockStore: {volumeID: vol-xxx, fsType: ext4}
+    # gcePersistentDisk: {pdName: my-disk, fsType: ext4}
+    # azureDisk: {diskName: my-disk, diskURI: /subscriptions/...}
+    # csi:  # Modern way using CSI drivers
+    #   driver: ebs.csi.aws.com
+    #   volumeHandle: vol-xxxx
+    #   fsType: ext4
+
+PV Phases:
+  Available    Not bound to any PVC (ready to be claimed)
+  Bound        Bound to a PVC
+  Released     PVC deleted, but data retained (Retain policy)
+  Failed       PV had an error during reclamation
+
+================================================================================
+5. PERSISTENTVOLUMECLAIMS (PVC)
+================================================================================
+
+PVC YAML:
+  
+  apiVersion: v1
+  kind: PersistentVolumeClaim
+  metadata:
+    name: postgres-data
+    namespace: production
+  spec:
+    accessModes:
+    - ReadWriteOnce           # Must match available PV
+    storageClassName: fast-ssd   # Dynamic provisioning via StorageClass
+    resources:
+      requests:
+        storage: 100Gi
+    # Selector to bind to specific PV:
+    # selector:
+    #   matchLabels:
+    #     type: ssd
+    volumeMode: Filesystem    # Filesystem or Block
+
+PVC Binding:
+  K8s finds a PV that satisfies:
+  1. Same storageClassName
+  2. Requested access modes are subset of PV's access modes
+  3. Requested storage <= PV storage
+  4. Label selector matches (if specified)
+  5. PV is in Available state
+  
+  If no matching PV: PVC stays Pending until one becomes available.
+  With dynamic provisioning (StorageClass): PVC pending → creates PV automatically.
+
+Using PVC in a Pod:
+  
+  spec:
+    containers:
+    - name: app
+      volumeMounts:
+      - name: data
+        mountPath: /data
+    volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: postgres-data
+        readOnly: false
+
+PVC Lifecycle:
+  PVC deleted → PV reclaim policy determines what happens to data.
+  
+  RETAIN:  PV becomes "Released". Data preserved. Admin must manually recycle.
+  DELETE:  PV and underlying storage deleted (cloud: EBS volume deleted!)
+  RECYCLE: (deprecated) wipes volume with `rm -rf` and makes Available again.
+
+Expanding PVCs (volume expansion):
+  # Must be supported by StorageClass (allowVolumeExpansion: true)
+  kubectl patch pvc my-pvc -p '{"spec":{"resources":{"requests":{"storage":"200Gi"}}}}'
+  
+  For most drivers: Can expand online (running pod).
+  For some (EBS gp2): Must detach first (stop pod).
+
+================================================================================
+6. STORAGECLASS — DYNAMIC PROVISIONING
+================================================================================
+
+What is StorageClass?
+  Defines how PVs are dynamically provisioned.
+  When a PVC specifies a StorageClass, the provisioner creates a PV on demand.
+  No manual PV creation required.
+
+StorageClass YAML:
+  
+  apiVersion: storage.k8s.io/v1
+  kind: StorageClass
+  metadata:
+    name: fast-ssd
+    annotations:
+      storageclass.kubernetes.io/is-default-class: "true"  # Default for PVCs without storageClassName
+  provisioner: ebs.csi.aws.com          # CSI driver
+  volumeBindingMode: WaitForFirstConsumer  # Provision when pod is scheduled (important for zone affinity!)
+  reclaimPolicy: Delete                 # What happens when PVC is deleted
+  allowVolumeExpansion: true            # Allow PVC resize
+  parameters:                           # Driver-specific parameters
+    type: gp3
+    iops: "3000"
+    throughput: "125"
+    encrypted: "true"
+    kmsKeyId: "arn:aws:kms:..."
+
+Common StorageClass Examples:
+  
+  # AWS EBS gp3 (high performance):
+  provisioner: ebs.csi.aws.com
+  parameters: {type: gp3, iops: "3000", encrypted: "true"}
+  
+  # GCP SSD Persistent Disk:
+  provisioner: pd.csi.storage.gke.io
+  parameters: {type: pd-ssd}
+  
+  # Azure Premium SSD:
+  provisioner: disk.csi.azure.com
+  parameters: {skuName: Premium_LRS}
+  
+  # Local NFS (using nfs-subdir-external-provisioner):
+  provisioner: cluster.local/nfs-subdir-external-provisioner
+  parameters: {archiveOnDelete: "false"}
+
+VolumeBindingMode:
+  Immediate:              PV created as soon as PVC created.
+                          Problem: PV might be in different zone than pod!
+  WaitForFirstConsumer:   PV created only when pod is scheduled.
+                          PV created in same zone as pod. RECOMMENDED.
+
+================================================================================
+7. ACCESS MODES AND RECLAIM POLICIES
+================================================================================
+
+Access Modes:
+  MODE               ABBREVIATION   DESCRIPTION
+  ─────────────────────────────────────────────────────────────────────────
+  ReadWriteOnce      RWO            Mounted read-write by ONE node at a time
+  ReadOnlyMany       ROX            Mounted read-only by MANY nodes
+  ReadWriteMany      RWX            Mounted read-write by MANY nodes simultaneously
+  ReadWriteOncePod   RWOP           Mounted read-write by ONE POD (K8s 1.22+)
+  
+  Access mode support by storage type:
+  TYPE              RWO    ROX    RWX    RWOP
+  ─────────────────────────────────────────────
+  AWS EBS           ✓      -      -      ✓
+  GCP PD            ✓      ✓      -      -
+  Azure Disk        ✓      -      -      -
+  NFS               ✓      ✓      ✓      -
+  CephFS (Rook)     ✓      ✓      ✓      -
+  HostPath          ✓      -      -      -
+  emptyDir          N/A (ephemeral, pod-local)
+  
+  IMPORTANT: RWO means one NODE, not one pod.
+  Multiple pods on the SAME node can mount an RWO volume.
+  RWOP restricts to one pod on one node.
+
+Reclaim Policies:
+  RETAIN:  PV is not deleted when PVC is deleted. Status → Released.
+           Data preserved. Admin must manually inspect and delete/reuse.
+           Use for: Databases, important data you don't want auto-deleted.
+  
+  DELETE:  PV AND underlying storage deleted when PVC is deleted.
+           Cloud: EBS volume deleted, GCP PD deleted, etc.
+           Use for: Ephemeral workloads, test environments.
+           DANGER: Can cause permanent data loss if PVC deleted accidentally!
+  
+  RECYCLE: (Deprecated) Runs rm -rf on volume, makes Available again.
+           Only for NFS and HostPath. Replaced by dynamic provisioning.
+
+Choosing Reclaim Policy:
+  Production databases → RETAIN (prevents accidental data loss)
+  Staging/dev → DELETE (avoid accumulating unused volumes and costs)
+  Stateful sets with auto-backup → DELETE (data in backup, not in PV)
+
+================================================================================
+8. CSI DRIVERS
+================================================================================
+
+CSI (Container Storage Interface) Overview:
+  Standard interface for storage plugins.
+  Storage vendors write CSI drivers, installed separately from K8s.
+  Replaced in-tree volume plugins (deprecated from K8s 1.21+).
+
+CSI Driver Components:
+  CONTROLLER (Deployment/StatefulSet):
+    - CreateVolume: Create EBS volume
+    - DeleteVolume: Delete EBS volume
+    - ControllerPublishVolume: Attach EBS to EC2 instance
+    - ControllerUnpublishVolume: Detach EBS from EC2
+  
+  NODE (DaemonSet — runs on every node):
+    - NodeStageVolume: Format + mount to staging path
+    - NodePublishVolume: Bind mount to pod path
+    - NodeUnpublishVolume: Unmount from pod
+
+Popular CSI Drivers:
+  aws-ebs-csi-driver         EBS volumes for EKS
+    github.com/kubernetes-sigs/aws-ebs-csi-driver
+  gce-pd-csi-driver           GCP Persistent Disk for GKE
+  azuredisk-csi-driver        Azure Disk for AKS
+  nfs-subdir-external-provisioner  NFS shares
+  rook-ceph                   In-cluster Ceph storage (object, block, file)
+  longhorn                    Lightweight distributed block storage (Rancher)
+  secrets-store-csi-driver    Mount secrets from Vault/AWS SSM as files
+
+CSI Secrets Store:
+  Allows mounting secrets from external stores as volume:
+  
+  apiVersion: secrets-store.csi.x-k8s.io/v1
+  kind: SecretProviderClass
+  metadata:
+    name: aws-secrets
+  spec:
+    provider: aws
+    parameters:
+      objects: |
+        - objectName: "prod/db/password"
+          objectType: "secretsmanager"
+  ---
+  spec:
+    volumes:
+    - name: secrets
+      csi:
+        driver: secrets-store.csi.k8s.io
+        readOnly: true
+        volumeAttributes:
+          secretProviderClass: "aws-secrets"
+
+================================================================================
+9. VOLUME SNAPSHOTS
+================================================================================
+
+Volume Snapshot API (K8s 1.20+ stable):
+  
+  VolumeSnapshotClass:  Like StorageClass but for snapshots
+  VolumeSnapshot:       Request to snapshot a PVC
+  VolumeSnapshotContent: The actual snapshot (like PV is to PVC)
+
+Creating a Snapshot:
+  
+  # VolumeSnapshotClass (one-time setup):
+  apiVersion: snapshot.storage.k8s.io/v1
+  kind: VolumeSnapshotClass
+  metadata:
+    name: ebs-vsc
+  driver: ebs.csi.aws.com
+  deletionPolicy: Delete
+  ---
+  # Create snapshot of a PVC:
+  apiVersion: snapshot.storage.k8s.io/v1
+  kind: VolumeSnapshot
+  metadata:
+    name: postgres-backup-2024-01-15
+  spec:
+    volumeSnapshotClassName: ebs-vsc
+    source:
+      persistentVolumeClaimName: postgres-data-postgres-0   # StatefulSet PVC
+
+Restoring from Snapshot:
+  
+  apiVersion: v1
+  kind: PersistentVolumeClaim
+  metadata:
+    name: postgres-restored
+  spec:
+    storageClassName: fast-ssd
+    accessModes: [ReadWriteOnce]
+    resources:
+      requests:
+        storage: 100Gi
+    dataSource:                           # Restore from snapshot
+      name: postgres-backup-2024-01-15
+      kind: VolumeSnapshot
+      apiGroup: snapshot.storage.k8s.io
+
+================================================================================
+10. STORAGE PATTERNS AND BEST PRACTICES
+================================================================================
+
+Database on Kubernetes Best Practices:
+  
+  1. Use StatefulSet (NOT Deployment):
+     Stable identity, ordered operations, per-pod PVC.
+  
+  2. Use separate StorageClass with RETAIN policy:
+     Prevent accidental data loss.
+  
+  3. VolumeClaimTemplates (not shared PVC):
+     Each replica needs its own storage.
+  
+  4. Anti-affinity for pods:
+     Spread DB pods across failure domains.
+     spec.affinity.podAntiAffinity:
+       requiredDuringSchedulingIgnoredDuringExecution:
+         topologyKey: kubernetes.io/hostname
+  
+  5. Request appropriate resources:
+     Databases are resource-intensive. Set CPU/memory requests/limits.
+  
+  6. Use Kubernetes Operators for complex DBs:
+     postgres-operator (Zalando/CloudNativePG)
+     mysql-operator (MySQL/Oracle)
+     MongoDB Community Operator
+     Operators understand DB-specific lifecycle (failover, backup, restore)
+  
+  7. Backup regularly:
+     VolumeSnapshots for point-in-time recovery.
+     Logical backups (pg_dump, mysqldump) to object storage.
+     Test restores!
+
+emptyDir vs PVC:
+  emptyDir:
+    Ephemeral. Tied to pod lifetime.
+    Deleted when pod is deleted/evicted.
+    Use for: scratch space, caches, shared files between containers in pod.
+    medium: Memory → tmpfs (faster, in RAM)
+  
+  PVC:
+    Persistent across pod restarts and rescheduling.
+    Use for: Any data that must survive pod restarts.
+    Required for: Databases, file uploads, state.
+
+hostPath (avoid in production!):
+  Mounts a directory from the node's filesystem.
+  Problems:
+  - Tied to specific node (pod can't be rescheduled to another node)
+  - Security risk (can access host files)
+  - No replication or HA
+  
+  Legitimate uses:
+  - DaemonSets reading host metrics/logs (node-exporter, Fluentd)
+  - Access to /dev or /sys for node-level tools
+  - Single-node dev environments
+
+================================================================================
+11. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: What is the difference between a StatefulSet and a Deployment?
+A: Both manage pods, but for different types of applications:
+   
+   DEPLOYMENT (stateless applications):
+   - Pods are interchangeable: any pod can be replaced with any other
+   - Random pod names: myapp-abc12, myapp-xyz34
+   - No stable network identity per pod
+   - Shared PVCs or no persistence
+   - Parallel scale up/down
+   - Use for: API servers, web apps, microservices
+   
+   STATEFULSET (stateful applications):
+   - Pods have identity: they know WHO they are
+   - Ordered names: db-0, db-1, db-2
+   - Stable DNS per pod via headless service:
+     db-0.db-headless.ns.svc.cluster.local (survives rescheduling)
+   - Each pod has its own PVC (data-db-0, data-db-1...)
+   - Sequential scale up (0→1→2) and scale down (2→1→0)
+   - Use for: MySQL, PostgreSQL, Kafka, ZooKeeper, etcd
+   
+   Key insight: A StatefulSet pod that crashes and restarts on a different node
+   will have the SAME name, SAME DNS name, and SAME persistent storage.
+   This is essential for database primaries and replicas to find each other.
+
+Q2: What is the difference between PersistentVolume, PersistentVolumeClaim, and StorageClass?
+A: They are three layers of storage abstraction:
+   
+   PersistentVolume (PV): The actual storage.
+   - Cluster-scoped resource representing real storage (EBS volume, NFS share, etc.)
+   - Created by admin (static) or automatically (dynamic via StorageClass)
+   - Has capacity, access modes, reclaim policy
+   - Independent lifecycle from pods
+   
+   PersistentVolumeClaim (PVC): The request for storage.
+   - Namespace-scoped resource requesting storage
+   - Specifies size, access mode, StorageClass
+   - Binds to a matching PV (K8s finds best match)
+   - Pods reference PVCs, not PVs directly
+   
+   StorageClass: The blueprint for dynamic provisioning.
+   - Defines provisioner (which driver creates volumes), parameters (disk type,
+     IOPS), and reclaim policy
+   - When PVC references a StorageClass, provisioner creates a PV automatically
+   - No manual PV creation needed (the whole point)
+   
+   Analogy: StorageClass = catalog of storage options, PVC = order form,
+   PV = the actual item delivered, Pod = customer who uses it.
+
+Q3: Explain RWO, ROX, and RWX access modes and when you'd use each.
+A: Access modes define how a volume can be mounted by nodes:
+   
+   ReadWriteOnce (RWO): One node read-write at a time.
+   - Most block storage: AWS EBS, Azure Disk, GCP PD
+   - Database use case: Only one pod should write to the database files
+   - StatefulSet pods: Each pod has its own RWO PVC (different volumes)
+   - Gotcha: "Once" = one NODE, not one pod. Multiple pods on same node
+     can all mount the same RWO volume.
+   
+   ReadOnlyMany (ROX): Many nodes read-only simultaneously.
+   - Use case: Static content served by multiple replicas
+   - Pre-populated data volumes (once written, serve read-only)
+   
+   ReadWriteMany (RWX): Many nodes read-write simultaneously.
+   - Network filesystems: NFS, CephFS, Azure Files, EFS (AWS)
+   - EXPENSIVE: Block storage (EBS) does NOT support RWX
+   - Use case: Shared uploads folder, shared cache across pods
+   - CAUTION: Application must handle concurrent writes properly
+   
+   RWOP (ReadWriteOncePod, K8s 1.22+): One pod read-write.
+   - Stricter than RWO (one pod, not one node)
+   - Use when you truly need exclusive access by a single pod
+
+Q4: What happens to the PVC when you delete a StatefulSet?
+A: The PVCs created by VolumeClaimTemplates are NOT deleted when the StatefulSet
+   is deleted. This is intentional to prevent data loss.
+   
+   Behavior:
+   kubectl delete statefulset postgres → Pods are deleted. PVCs remain.
+   
+   The PVCs persist with names like: data-postgres-0, data-postgres-1
+   
+   This means:
+   - If you recreate the StatefulSet with the same name, pods rebind to same PVCs
+   - Data survives the StatefulSet deletion
+   - But you're paying for the storage volumes even without the StatefulSet
+   
+   To delete PVCs manually:
+   kubectl delete pvc -l app=postgres  # By label
+   kubectl delete pvc data-postgres-0 data-postgres-1 data-postgres-2
+   
+   K8s 1.27+ feature: StatefulSet PVC retention policy:
+   spec:
+     persistentVolumeClaimRetentionPolicy:
+       whenDeleted: Delete    # Delete PVCs when StatefulSet deleted
+       whenScaled: Retain     # Keep PVCs when scaled down
+   
+   Use with CAUTION — whenDeleted: Delete will destroy your data!
+
+Q5: What is the WaitForFirstConsumer volume binding mode and why is it important?
+A: WaitForFirstConsumer delays PV creation until a pod is scheduled.
+   
+   Problem with Immediate binding:
+   - PVC created → StorageClass immediately creates PV in arbitrary zone (us-east-1a)
+   - Pod is scheduled to a node in us-east-1b (different zone)
+   - EBS volume can't be attached across zones!
+   - Pod stays Pending forever with "volume not found" error
+   
+   WaitForFirstConsumer solution:
+   - PVC created → stays Pending (no PV created yet)
+   - Pod is scheduled to a node in us-east-1b
+   - StorageClass sees pod is in us-east-1b → creates EBS volume in us-east-1b
+   - PV created in same zone → PVC binds → pod starts successfully
+   
+   This is CRITICAL for zone-aware storage (EBS, Azure Disk, GCP PD).
+   These storage types are zone-scoped — must be in same zone as node.
+   
+   NFS and other multi-zone storage: Immediate binding is fine.
+   Cloud block storage: ALWAYS use WaitForFirstConsumer.
+
+================================================================================
+12. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+STATEFULSET KEY POINTS:
+  serviceName        Required: headless service name
+  volumeClaimTemplates  Creates one PVC per pod (data-pod-0, data-pod-1...)
+  podManagementPolicy   OrderedReady (sequential) | Parallel
+  updateStrategy.partition  For staged/canary updates
+
+ACCESS MODES:
+  RWO  ReadWriteOnce   One node r/w    EBS, Azure Disk, GCP PD
+  ROX  ReadOnlyMany    Many nodes read-only
+  RWX  ReadWriteMany   Many nodes r/w  NFS, CephFS, EFS, Azure Files
+  RWOP ReadWriteOncePod  One pod r/w (K8s 1.22+)
+
+RECLAIM POLICIES:
+  Retain   Keep data → manual cleanup   Use for: production databases
+  Delete   Delete PV + storage          Use for: dev/test, ephemeral
+  Recycle  Deprecated
+
+VOLUME BINDING MODES:
+  Immediate              PV created when PVC created (zone mismatch risk)
+  WaitForFirstConsumer   PV created when pod scheduled (correct zone)
+
+STATEFULSET POD IDENTITY:
+  Pod name:     <statefulset>-<ordinal>    e.g., postgres-0
+  DNS name:     <pod>.<headless-svc>.<ns>.svc.cluster.local
+  PVC name:     <claim-template>-<pod>    e.g., data-postgres-0
+
+KUBECTL COMMANDS:
+  kubectl get pv                          # All PersistentVolumes
+  kubectl get pvc -n production           # PVCs in namespace
+  kubectl get sc                          # StorageClasses
+  kubectl describe pvc my-pvc            # PVC details + events
+  kubectl get volumesnapshot              # Snapshots
+
+STORAGE SELECTION GUIDE:
+  Single pod DB (MySQL)   → RWO PVC + StatefulSet + RETAIN policy
+  Multiple pods read-only → ROX PVC or ConfigMap/emptyDir
+  Shared uploads          → RWX PVC (NFS/CephFS/EFS)
+  Scratch/cache           → emptyDir (no persistence)
+  Node metrics/logs       → hostPath (DaemonSet only)
+
+================================================================================
+END OF FILE
+================================================================================

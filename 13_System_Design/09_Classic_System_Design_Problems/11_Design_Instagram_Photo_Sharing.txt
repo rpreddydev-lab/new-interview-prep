@@ -1,0 +1,226 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DESIGN: INSTAGRAM / PHOTO SHARING PLATFORM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FUNCTIONAL:
+  - Upload photos/videos with captions, tags, location
+  - Home feed: photos from followed accounts (chronological + ranked)
+  - User profile: grid of posts
+  - Like, comment, share posts
+  - Follow/unfollow users
+  - Explore page: discover new content (trending, recommendations)
+  - Stories: 24-hour temporary content (bonus)
+  - Instagram Reels: short-form video (bonus)
+
+NON-FUNCTIONAL:
+  - 1B DAU, 100M photos uploaded per day
+  - Read-heavy: 10:1 read/write ratio
+  - Feed load: 1B DAU × 10 feed checks/day = 10B feed operations/day
+  - Photo upload latency: p99 < 3 seconds (including processing)
+  - Feed load latency: p99 < 500ms
+  - High availability: 99.99%
+  - Durability: 99.999999999% (photos are precious memories — never lose)
+
+SCALE:
+  100M uploads/day / 86,400 = 1,160 uploads/second
+  Each photo: original + multiple sizes = ~4MB total storage
+  Storage: 100M × 4MB = 400TB/day raw
+
+
+2. ESTIMATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STORAGE:
+  100M uploads/day × 4MB = 400TB/day
+  10 years: 400TB × 3,650 = 1.46 EB
+
+FEED OPERATIONS:
+  10B operations/day / 86,400 = 115,740 feed reads/second
+  Peak: ~300,000 feed reads/second
+
+CDN BANDWIDTH:
+  300K feed reads/sec × 20 photos × 100KB avg thumbnail = 600GB/second
+  (This is why CDN is MANDATORY — no origin can handle this)
+
+
+3. HIGH-LEVEL ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WRITE PATH (Photo Upload):
+  Client → API Gateway → Upload Service
+                              → Generate upload ID
+                              → Return presigned S3 URL
+  
+  Client → S3 (direct upload)
+         ↓ S3 event
+  Photo Processing Pipeline:
+    └→ Validate (not CSAM, not illegal content)
+    └→ Generate thumbnails (150px, 320px, 640px, 1080px)
+    └→ Generate blurhash placeholder
+    └→ EXIF stripping (remove GPS data unless user opts in)
+    └→ Store variants in S3
+    └→ Update photo metadata in DB (status: ready)
+    └→ Publish to Kafka: "photo-published"
+  
+  Fan-out Worker (consumes "photo-published"):
+    → Push photo ID to followers' feed caches (Redis, push model)
+    → For large accounts: queue in async fan-out (celebrity problem)
+
+READ PATH (Home Feed):
+  Client → Feed Service
+               → Read pre-populated Redis feed (sorted set)
+               → Hydrate: fetch photo metadata from cache/DB
+               → Fetch CDN URLs for thumbnails
+               → Return paginated feed
+
+
+4. PHOTO PROCESSING — THUMBNAILS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WHY MULTIPLE SIZES?
+  - Profile grid: 150×150px (tiny thumbnail)
+  - Feed post: 320×320 or 640×640px (primary viewing size)
+  - Detail view: 1080px wide (full quality mobile)
+  - Desktop: up to 1200px
+  
+  Serving correct size = less bandwidth, faster loading
+
+THUMBNAIL GENERATION:
+  Original uploaded: any dimensions, any format (HEIC, PNG, RAW, JPEG)
+  Processing:
+    1. Format conversion: all → JPEG or WebP (WebP ~30% smaller)
+    2. Resize to each target dimension (lanczos resampling)
+    3. Apply compression (quality 85% for JPEG, near-lossless WebP)
+    4. Write to S3 with content-addressed key
+  
+  S3 Path Structure:
+    s3://instagram-photos/{user_id}/{photo_id}/original.jpg
+    s3://instagram-photos/{user_id}/{photo_id}/150.jpg
+    s3://instagram-photos/{user_id}/{photo_id}/640.jpg
+    s3://instagram-photos/{user_id}/{photo_id}/1080.jpg
+
+BLURHASH PLACEHOLDER:
+  Tiny representation of photo (30-40 chars) rendered before real photo loads
+  Computed from original image using DCT-like transform
+  Gives users a preview immediately while full image downloads
+
+
+5. DATA MODEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PHOTOS TABLE (Cassandra — high write throughput):
+  photo_id     BIGINT PRIMARY KEY (Snowflake ID)
+  user_id      BIGINT
+  caption      TEXT
+  location     TEXT
+  tags         SET<TEXT>
+  status       VARCHAR(20)  -- processing / ready / deleted
+  width        INT
+  height       INT
+  blurhash     VARCHAR(50)
+  like_count   BIGINT       -- updated async
+  comment_count BIGINT
+  created_at   TIMESTAMP
+
+USER PHOTOS (for profile grid):
+  Cassandra wide row:
+    Partition key: user_id
+    Clustering key: photo_id DESC (newest first)
+    
+  SELECT photo_id FROM user_photos WHERE user_id = ? LIMIT 24;
+
+FOLLOWS GRAPH:
+  Cassandra (high read/write on follow/unfollow):
+    follows table: (follower_id, followee_id)
+    followers table: (followee_id, follower_id)  ← denormalized for reverse lookup
+  
+  OR: Redis Sets for in-memory follow graph
+    SADD following:{user_id} followee_id
+    SADD followers:{followee_id} user_id
+
+FEED CACHE (Redis Sorted Set):
+  Key: "feed:{user_id}"
+  Score: unix timestamp (of photo post time)
+  Member: photo_id
+  Max entries: 800 per user (trim on insert)
+  
+  ZADD feed:{user_id} {timestamp} {photo_id}  # fan-out write
+  ZREVRANGE feed:{user_id} 0 19               # fetch top 20
+
+LIKES:
+  Cassandra: (photo_id, user_id, created_at)
+    Partition: photo_id → fast "did user X like photo Y?"
+  
+  Redis counter: INCR likes:{photo_id}
+  Async flush to Cassandra in batches
+
+
+6. CELEBRITY PROBLEM — HYBRID FEED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Same problem as Twitter — Kim Kardashian (300M followers) posts:
+  Pushing to 300M Redis keys = hours of lag
+
+HYBRID APPROACH:
+  Regular users (<= 1M followers): push model
+  Celebrities (> 1M followers): pull model at read time
+  
+  Feed build at read time:
+    1. Fetch user's pre-populated Redis feed (push model posts)
+    2. Check list of celebrities user follows (cached in Redis per user)
+    3. For each celebrity: ZREVRANGE celebrity_feed:{celeb_id} 0 5 (latest 5)
+    4. Merge all streams by timestamp
+    5. Return top 20 results
+
+CELEBRITY CLASSIFICATION:
+  Background job runs hourly: SELECT user_id FROM users WHERE follower_count > 1M
+  Store in Redis SET "celebrities" (small set, manageable)
+
+
+7. EXPLORE PAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TRENDING CONTENT:
+  Photos with high engagement in last 24 hours:
+    engagement_score = like_count × 1.0 + comment_count × 2.0 + share_count × 3.0
+    (weighted: comments/shares signal stronger interest than likes)
+  
+  Flink streaming job: compute scores per photo over sliding 1-hour window
+  Store top 1000 trending photos in Redis sorted set: "trending:global"
+
+PERSONALIZED RECOMMENDATIONS (ML):
+  Two-tower model: user embedding + content embedding → similarity score
+  Training: based on likes, saves, time-spent-viewing, follows
+  Serving: approximate nearest neighbor (Faiss/ScaNN) on embedding space
+  
+  Pre-compute: once per hour, run inference for active users
+  Store recommendations: Redis list per user (top 200 recommended posts)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWER — "Design Instagram"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"Instagram's primary challenges are: (1) massive write throughput for
+photo uploads, (2) fast feed generation at 300K reads/second, and
+(3) the celebrity fan-out problem.
+
+Photo upload: client gets presigned S3 URL and uploads directly (bypassing
+app servers). S3 triggers async processing: thumbnail generation in 4 sizes,
+format conversion to WebP, EXIF stripping, and blurhash computation.
+
+Feed: I use a hybrid push-pull model. For regular users' posts, a fan-out
+worker pushes photo IDs into followers' Redis sorted sets on every upload.
+Feed reads are O(1) sorted set lookups. For celebrities (>1M followers),
+we skip the push — instead, at read time we fetch their recent posts
+directly and merge with the pre-populated push-model feed.
+
+Storage: photos in Cassandra (optimized for time-series writes per user),
+follow graph in Redis sets (fast O(1) follow/unfollow and member lookups),
+like counts as Redis counters flushed asynchronously to Cassandra.
+
+CDN is non-negotiable: 300K × 20 thumbnails × 100KB = 600GB/second of
+thumbnail bandwidth. 99%+ must be served from CDN edge nodes — origin
+cannot handle this at any cost."

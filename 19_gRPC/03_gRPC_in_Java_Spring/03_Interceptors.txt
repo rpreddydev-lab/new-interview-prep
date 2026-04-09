@@ -1,0 +1,392 @@
+================================================================
+gRPC INTERCEPTORS IN SPRING BOOT
+================================================================
+
+----------------------------------------------------------------
+1. WHAT ARE INTERCEPTORS?
+----------------------------------------------------------------
+
+gRPC interceptors are middleware components that sit between the
+transport layer and the service/client logic.
+
+Server-side interceptor chain:
+  Client Request
+    ↓
+  [Netty I/O]
+    ↓
+  ServerInterceptor 1 (e.g., Auth)
+    ↓
+  ServerInterceptor 2 (e.g., Logging)
+    ↓
+  Service Method (OrderServiceImpl.createOrder)
+    ↑
+  ServerInterceptor 2 (response path)
+    ↑
+  ServerInterceptor 1 (response path)
+    ↑
+  [Netty I/O → Client]
+
+Client-side interceptor chain:
+  Application code
+    ↓
+  ClientInterceptor 1 (e.g., Auth headers)
+    ↓
+  ClientInterceptor 2 (e.g., Logging)
+    ↓
+  [Netty I/O → Server]
+
+Key interfaces:
+  - ServerInterceptor: Server side
+  - ClientInterceptor: Client side
+  - Both extend the interceptCall / interceptCall pattern
+
+Use cases:
+  ✅ Authentication and authorization (check JWT tokens)
+  ✅ Request/response logging and tracing
+  ✅ Distributed tracing (inject/extract trace IDs)
+  ✅ Metrics collection (count calls, record latency)
+  ✅ Rate limiting
+  ✅ Request validation
+  ✅ Response transformation
+  ✅ Propagating context (tenant ID, user ID)
+
+----------------------------------------------------------------
+2. SERVER INTERCEPTOR
+----------------------------------------------------------------
+
+Interface:
+  public interface ServerInterceptor {
+    <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+        ServerCall<ReqT, RespT> call,
+        Metadata headers,
+        ServerCallHandler<ReqT, RespT> next);
+  }
+
+Parameters:
+  - call:    represents the current RPC call (can send messages, close with status)
+  - headers: the request metadata (like HTTP headers)
+  - next:    the next interceptor or the service method (call next.startCall to continue)
+
+// ── AUTHENTICATION INTERCEPTOR ────────────────────────────────
+
+@GrpcGlobalServerInterceptor
+@Order(Ordered.HIGHEST_PRECEDENCE)  // run auth first
+@Slf4j
+public class JwtAuthInterceptor implements ServerInterceptor {
+  
+  private static final Metadata.Key<String> AUTHORIZATION_KEY =
+      Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER);
+  
+  // Context key to store the authenticated user
+  public static final Context.Key<UserPrincipal> USER_CONTEXT_KEY =
+      Context.key("authenticated-user");
+  
+  // Methods that don't require auth
+  private static final Set<String> PUBLIC_METHODS = Set.of(
+      "grpc.health.v1.Health/Check",
+      "grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo"
+  );
+  
+  private final JwtService jwtService;
+  
+  @Override
+  public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+      ServerCall<ReqT, RespT> call,
+      Metadata headers,
+      ServerCallHandler<ReqT, RespT> next) {
+    
+    String fullMethodName = call.getMethodDescriptor().getFullMethodName();
+    
+    // Skip auth for public methods
+    if (PUBLIC_METHODS.contains(fullMethodName)) {
+      return next.startCall(call, headers);
+    }
+    
+    String authHeader = headers.get(AUTHORIZATION_KEY);
+    
+    if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+      call.close(
+          Status.UNAUTHENTICATED.withDescription("Missing or invalid authorization header"),
+          new Metadata());
+      return new ServerCall.Listener<>() {};  // empty listener — call already closed
+    }
+    
+    String token = authHeader.substring(7);  // strip "Bearer "
+    
+    try {
+      UserPrincipal principal = jwtService.validateAndParse(token);
+      
+      // Attach principal to gRPC Context for access in service methods
+      Context ctx = Context.current().withValue(USER_CONTEXT_KEY, principal);
+      return Contexts.interceptCall(ctx, call, headers, next);
+      
+    } catch (JwtException e) {
+      call.close(
+          Status.UNAUTHENTICATED.withDescription("Invalid token: " + e.getMessage()),
+          new Metadata());
+      return new ServerCall.Listener<>() {};
+    }
+  }
+}
+
+// ── LOGGING INTERCEPTOR ───────────────────────────────────────
+
+@GrpcGlobalServerInterceptor
+@Order(100)
+@Slf4j
+public class GrpcLoggingInterceptor implements ServerInterceptor {
+  
+  @Override
+  public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+      ServerCall<ReqT, RespT> call,
+      Metadata headers,
+      ServerCallHandler<ReqT, RespT> next) {
+    
+    String method = call.getMethodDescriptor().getFullMethodName();
+    long startTime = System.currentTimeMillis();
+    
+    log.info("gRPC call started: {}", method);
+    
+    // Wrap the call to intercept close() and log the status
+    ServerCall<ReqT, RespT> loggingCall = new ForwardingServerCall
+        .SimpleForwardingServerCall<>(call) {
+      
+      @Override
+      public void close(Status status, Metadata trailers) {
+        long elapsed = System.currentTimeMillis() - startTime;
+        log.info("gRPC call completed: {} status={} duration={}ms",
+            method, status.getCode(), elapsed);
+        super.close(status, trailers);
+      }
+    };
+    
+    // Wrap the listener to log message receipt
+    ServerCall.Listener<ReqT> listener = next.startCall(loggingCall, headers);
+    
+    return new ForwardingServerCallListener.SimpleForwardingServerCallListener<>(listener) {
+      @Override
+      public void onMessage(ReqT message) {
+        log.debug("gRPC request message: method={}", method);
+        super.onMessage(message);
+      }
+    };
+  }
+}
+
+// ── TRACING INTERCEPTOR (OpenTelemetry) ──────────────────────
+
+@GrpcGlobalServerInterceptor
+@Order(50)
+public class TracingServerInterceptor implements ServerInterceptor {
+  
+  private static final Metadata.Key<String> TRACE_ID_KEY =
+      Metadata.Key.of("x-trace-id", Metadata.ASCII_STRING_MARSHALLER);
+  private static final Metadata.Key<String> SPAN_ID_KEY =
+      Metadata.Key.of("x-span-id", Metadata.ASCII_STRING_MARSHALLER);
+  
+  public static final Context.Key<String> TRACE_CONTEXT = Context.key("trace-id");
+  
+  @Override
+  public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+      ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
+    
+    String traceId = headers.get(TRACE_ID_KEY);
+    if (traceId == null) {
+      traceId = UUID.randomUUID().toString();
+    }
+    
+    MDC.put("traceId", traceId);  // for log correlation
+    Context ctx = Context.current().withValue(TRACE_CONTEXT, traceId);
+    
+    return Contexts.interceptCall(ctx, call, headers, next);
+  }
+}
+
+----------------------------------------------------------------
+3. CLIENT INTERCEPTOR
+----------------------------------------------------------------
+
+Interface:
+  public interface ClientInterceptor {
+    <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+        MethodDescriptor<ReqT, RespT> method,
+        CallOptions callOptions,
+        Channel next);
+  }
+
+// ── AUTH CLIENT INTERCEPTOR ───────────────────────────────────
+
+@GrpcGlobalClientInterceptor
+@Slf4j
+public class JwtClientInterceptor implements ClientInterceptor {
+  
+  private static final Metadata.Key<String> AUTHORIZATION_KEY =
+      Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER);
+  
+  private final TokenProvider tokenProvider;
+  
+  @Override
+  public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+      MethodDescriptor<ReqT, RespT> method,
+      CallOptions callOptions,
+      Channel next) {
+    
+    // Create the next call in the chain
+    ClientCall<ReqT, RespT> call = next.newCall(method, callOptions);
+    
+    // Wrap it to inject auth header
+    return new ForwardingClientCall.SimpleForwardingClientCall<>(call) {
+      
+      @Override
+      public void start(Listener<RespT> responseListener, Metadata headers) {
+        // Add auth header before starting the call
+        headers.put(AUTHORIZATION_KEY, "Bearer " + tokenProvider.getToken());
+        super.start(responseListener, headers);
+      }
+    };
+  }
+}
+
+// ── TRACE PROPAGATION CLIENT INTERCEPTOR ─────────────────────
+
+@GrpcGlobalClientInterceptor
+public class TraceClientInterceptor implements ClientInterceptor {
+  
+  private static final Metadata.Key<String> TRACE_ID_KEY =
+      Metadata.Key.of("x-trace-id", Metadata.ASCII_STRING_MARSHALLER);
+  
+  @Override
+  public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+      MethodDescriptor<ReqT, RespT> method,
+      CallOptions callOptions,
+      Channel next) {
+    
+    ClientCall<ReqT, RespT> call = next.newCall(method, callOptions);
+    
+    return new ForwardingClientCall.SimpleForwardingClientCall<>(call) {
+      @Override
+      public void start(Listener<RespT> responseListener, Metadata headers) {
+        // Propagate trace ID from current gRPC context to outgoing request
+        String traceId = TracingServerInterceptor.TRACE_CONTEXT.get();
+        if (traceId != null) {
+          headers.put(TRACE_ID_KEY, traceId);
+        }
+        super.start(responseListener, headers);
+      }
+    };
+  }
+}
+
+----------------------------------------------------------------
+4. ACCESSING CONTEXT IN SERVICE METHODS
+----------------------------------------------------------------
+
+After the interceptor sets context values, the service method reads them:
+
+@GrpcService
+public class OrderServiceImpl extends OrderServiceGrpc.OrderServiceImplBase {
+  
+  @Override
+  public void createOrder(CreateOrderRequest request,
+                          StreamObserver<CreateOrderResponse> responseObserver) {
+    
+    // Read from Context — set by JwtAuthInterceptor
+    UserPrincipal user = JwtAuthInterceptor.USER_CONTEXT_KEY.get();
+    
+    if (!user.hasRole("ORDER_CREATE")) {
+      responseObserver.onError(
+          Status.PERMISSION_DENIED
+              .withDescription("User does not have ORDER_CREATE role")
+              .asException());
+      return;
+    }
+    
+    // Access trace ID (set by TracingServerInterceptor)
+    String traceId = TracingServerInterceptor.TRACE_CONTEXT.get();
+    log.info("Creating order, traceId={}, userId={}", traceId, user.getId());
+    
+    // ... rest of logic
+  }
+}
+
+----------------------------------------------------------------
+5. INTERCEPTOR ORDERING
+----------------------------------------------------------------
+
+Order matters for interceptors. With @Order:
+  - Lower number = outer layer (runs first on incoming request)
+  - Higher number = inner layer (runs last on incoming request)
+  - On the response path, order is reversed
+
+Example execution order:
+  @Order(10) → Auth (must run first to populate context)
+  @Order(50) → Tracing (needs to run before logging)
+  @Order(100) → Logging (outermost for complete timing)
+
+  On request: Auth(10) → Tracing(50) → Logging(100) → Service
+  On response: Service → Logging(100) → Tracing(50) → Auth(10)
+
+Without @Order, order is not guaranteed (Spring default ordering).
+
+----------------------------------------------------------------
+6. INTERCEPTOR SCOPE — GLOBAL vs PER-SERVICE
+----------------------------------------------------------------
+
+Global (applies to ALL services):
+  @GrpcGlobalServerInterceptor  ← annotation on the bean
+  public class AuthInterceptor implements ServerInterceptor { ... }
+
+Per-service (applies to ONE service):
+  @GrpcService(interceptors = {RateLimitInterceptor.class})
+  public class OrderServiceImpl extends ... { ... }
+  
+  // interceptors list = Class objects, not Spring beans
+  // The framework instantiates them; they don't get Spring DI
+  
+Better pattern for per-service with Spring DI:
+  @GrpcService(interceptorNames = {"rateLimitInterceptor"})
+  public class OrderServiceImpl extends ... { ... }
+  
+  // Uses Spring bean name — full DI support
+
+----------------------------------------------------------------
+7. INTERVIEW KEY POINTS
+----------------------------------------------------------------
+
+Q: How do you implement authorization in a gRPC interceptor?
+A: Implement ServerInterceptor. In interceptCall(), extract the
+   authorization header from Metadata. Parse and validate the token.
+   If valid, attach the principal to the gRPC Context using
+   Context.current().withValue() and call Contexts.interceptCall()
+   to continue the chain with the enriched context. If invalid,
+   call call.close(Status.UNAUTHENTICATED, new Metadata()) and return
+   an empty ServerCall.Listener.
+
+Q: What is the difference between @GrpcGlobalServerInterceptor and
+   interceptors in @GrpcService?
+A: @GrpcGlobalServerInterceptor registers a Spring bean as an
+   interceptor applied to ALL services. @GrpcService(interceptors=X)
+   specifies interceptor classes (not beans) only for that one service.
+   For interceptors that need Spring DI (injected dependencies),
+   use @GrpcGlobalServerInterceptor or @GrpcService(interceptorNames="beanName").
+
+Q: How do you pass data from a server interceptor to the service method?
+A: Use gRPC's Context mechanism. Define a static Context.Key<T> in the
+   interceptor (or a shared constants class). In the interceptor, call
+   Context.current().withValue(key, value) and then use
+   Contexts.interceptCall(ctx, call, headers, next) to continue with
+   the enriched context. In the service method, call key.get() on the
+   current context to read the value.
+
+Q: Can you modify the request or response message in a gRPC interceptor?
+A: Not easily — gRPC interceptors operate at the transport layer before
+   deserialization is complete (in most implementations). Technically
+   you can wrap the ServerCall to intercept messages, but modifying
+   proto messages in interceptors is unusual and fragile. The standard
+   approach is to put business logic (request validation, transformation)
+   in the service method itself, and use interceptors for cross-cutting
+   concerns like auth, logging, and metrics.
+
+================================================================
+END OF FILE
+================================================================

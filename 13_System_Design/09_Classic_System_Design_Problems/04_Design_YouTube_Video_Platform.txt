@@ -1,0 +1,277 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DESIGN: YOUTUBE / VIDEO STREAMING PLATFORM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FUNCTIONAL:
+  - Upload videos (any format, up to 1GB initially)
+  - Stream videos (adaptive bitrate)
+  - Video metadata: title, description, thumbnail, tags, category
+  - Search videos by title, description, tags
+  - Like/dislike, comment on videos
+  - Subscribe to channels, home feed with subscriptions
+  - View count, analytics per video
+
+NON-FUNCTIONAL:
+  - 2B DAU, 500 hours of video uploaded per minute
+  - Reads >> Writes (100:1 view/upload ratio)
+  - Video start time p99 < 2 seconds (buffering within 500ms)
+  - Availability: 99.99%
+  - Global users: CDN required (serve from edge near user)
+  - Durability: Videos must never be lost (permanent content)
+  - Adaptive bitrate: Serve 240p to 4K depending on user's bandwidth
+
+SCALE:
+  500 hours/minute = 30,000 hours/hour of video uploaded
+  Average video: 10 minutes → 3,000 videos uploaded per minute = 50/second
+
+STORAGE:
+  1 minute of 1080p video ≈ 150MB
+  500 hours/minute × 60 min × 150MB = 4.5 TB/minute raw video
+  After transcoding (multiple resolutions + compression): ~2TB/minute
+
+
+2. ESTIMATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+UPLOAD:
+  50 video uploads/second
+  Average size per video after processing: 5 resolutions × 500MB = 2.5GB
+  Daily: 50 × 86,400 × 2.5GB = 10.8 PB/day
+
+VIEW:
+  2B DAU × 30 min watch time/day = 60B minutes/day
+  60B minutes / 86,400 = 694K streaming minutes/second
+  Average stream bandwidth: 4 Mbps (1080p)
+  Total egress bandwidth: 694K × 4 Mbps = 2.78 Tbps (peak)
+
+METADATA:
+  Video record: ~1KB
+  50 uploads/sec × 86,400 = 4.3M videos/day
+  Storage: 4.3M × 1KB ≈ 4GB/day metadata (tiny compared to video)
+
+
+3. API DESIGN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+UPLOAD:
+  POST /api/v1/videos/upload-url
+    Response: { "uploadUrl": "https://s3.../presigned", "videoId": "xyz" }
+  
+  PUT {uploadUrl}   ← Client uploads directly to S3
+  
+  POST /api/v1/videos/{videoId}/metadata
+    Body: { "title": "My video", "description": "...", "tags": [...] }
+
+STREAMING:
+  GET /api/v1/videos/{videoId}
+    Response: { "videoId": ..., "title": ..., "manifestUrl": "https://cdn.youtube.com/v/xyz/manifest.m3u8" }
+  
+  GET {manifestUrl}  ← Client fetches HLS manifest (list of video segments)
+
+METADATA / SOCIAL:
+  GET /api/v1/search?q=keyword&page=&limit=
+  POST /api/v1/videos/{videoId}/like
+  POST /api/v1/videos/{videoId}/comments
+  GET /api/v1/feed/home?cursor=
+
+
+4. HIGH-LEVEL ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+UPLOAD PIPELINE:
+  User → API Gateway → Upload Service
+                            → Request presigned S3 URL
+                            → Return URL to client
+  
+  User → S3 (direct upload, bypasses app servers)
+            ↓ S3 event notification
+         Transcoding Queue (SQS/Kafka)
+            ↓
+         Transcoding Workers (GPU instances, auto-scaling)
+            ├→ Transcode to 240p, 360p, 480p, 720p, 1080p, 4K
+            ├→ Generate thumbnail
+            ├→ Extract audio track (for captions)
+            └→ Store all variants in S3
+            ↓
+         Video Service (update video status: "processing" → "ready")
+         Notification Service (notify uploader: "Your video is ready")
+
+STREAMING PIPELINE:
+  User browser → CDN (CloudFront/Akamai) → Origin S3
+  
+  1. Video page loads: fetch video metadata from Video Service
+  2. Video player fetches HLS manifest from CDN
+  3. Player starts with lowest bitrate segment
+  4. Player monitors download speed, switches resolution (ABR algorithm)
+  5. All segments served from CDN edge (no origin hit for hot content)
+
+
+5. VIDEO TRANSCODING — DEEP DIVE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WHY TRANSCODE?
+  - User uploads in any format (MOV, AVI, MKV, MP4)
+  - Must serve in web-friendly formats (H.264/MP4, H.265/HEVC, VP9, AV1)
+  - Multiple resolutions for adaptive bitrate streaming
+  - Reduce file size (compress) without perceptible quality loss
+
+TRANSCODING PROCESS:
+  Input: raw_video.mov (1080p, 5GB)
+  
+  Transcode to:
+    240p:  H.264, 400 Kbps  → ~30MB/hour
+    360p:  H.264, 750 Kbps  → ~55MB/hour
+    480p:  H.264, 1.5 Mbps  → ~100MB/hour
+    720p:  H.264, 3 Mbps    → ~200MB/hour
+    1080p: H.264, 5 Mbps    → ~350MB/hour
+    4K:    H.265, 15 Mbps   → ~1GB/hour
+  
+  1 hour of original video → ~1.7GB of transcoded output (all resolutions)
+
+ADAPTIVE BITRATE STREAMING (ABR):
+  Protocol: HLS (HTTP Live Streaming) or MPEG-DASH
+  
+  How HLS works:
+    1. Video split into 6-second segments (.ts files)
+    2. Manifest file (playlist.m3u8) lists all segments for all quality levels
+    3. Client player downloads manifest
+    4. Player starts downloading segments
+    5. Player monitors download speed:
+       Fast connection → switch to higher quality segments
+       Slow connection → switch to lower quality segments
+    6. Smooth switching: Buffer 15-30 seconds ahead
+  
+  manifest.m3u8:
+    #EXTM3U
+    #EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=426x240
+    240p/segment_list.m3u8
+    #EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=854x480
+    480p/segment_list.m3u8
+    #EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+    1080p/segment_list.m3u8
+
+SCALABLE TRANSCODING:
+  Problem: Transcoding 1 hour of 4K video takes ~1-3 hours on a CPU
+           At 500 hours/minute upload rate: need MASSIVE parallel compute
+  
+  Solution: DAG-based parallel transcoding
+    1. Split video into 1-minute chunks
+    2. Transcode each chunk in parallel (different workers)
+    3. Merge transcoded chunks at the end
+    
+    YouTube's approach: Breaks 1-hour video into 60 × 1-minute chunks
+    60 workers process in parallel: 60-minute video transcodes in ~2-5 minutes
+  
+  Infrastructure:
+    AWS MediaConvert or custom transcoding pipeline
+    GPU instances (g4dn.xlarge) for hardware-accelerated H.265 encoding
+    Auto-scaling: Scale transcoding workers based on queue depth
+
+
+6. CDN STRATEGY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+YOUTUBE'S CDN STRATEGY (Google's own CDN + ISP partnerships):
+  Tier 1: Google's global CDN (Akamai-equivalent)
+  Tier 2: ISP-level caching (Google servers inside ISPs data centers)
+           When you watch YouTube, the video often never leaves the ISP!
+  
+  CACHE WARMTH:
+    Hot videos (< 24 hours old, viral): Proactively pushed to all CDN PoPs
+    Warm videos (popular, older): Cached on demand, long TTL
+    Cold videos (low view count): Served from origin (S3 + CloudFront on-demand)
+  
+  Cache key: s3_key + quality_level + segment_id
+  CDN hit rate target: 99%+ for popular content
+
+  PARTIAL CONTENT / BYTE RANGE REQUESTS:
+    HTTP Range: bytes=0-5242880 (first 5MB)
+    Player requests only the segment it needs right now
+    CDN caches individual segments, not entire files
+    User can seek to any position (O(1) — jump to that segment)
+
+
+7. DATA MODEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+VIDEOS TABLE (PostgreSQL or Cassandra):
+  video_id     BIGINT PRIMARY KEY (Snowflake ID)
+  channel_id   BIGINT
+  title        TEXT
+  description  TEXT
+  status       VARCHAR(20)  -- uploading/processing/ready/deleted
+  duration_sec INT
+  thumbnail_url TEXT
+  view_count   BIGINT       -- approximate (updated async)
+  like_count   BIGINT
+  created_at   TIMESTAMP
+  tags         TEXT[]
+
+VIDEO SEGMENTS (S3 path structure):
+  s3://video-bucket/videos/{video_id}/1080p/segment_{000..999}.ts
+  s3://video-bucket/videos/{video_id}/manifest.m3u8
+
+SEARCH (Elasticsearch):
+  Index: "videos"
+  Fields: title (analyzed, boosted 3×), description (analyzed), tags (keyword)
+  
+  Full-text query on search:
+  {
+    "query": {
+      "multi_match": {
+        "query": "cute cats",
+        "fields": ["title^3", "description", "tags"],
+        "type": "best_fields"
+      }
+    },
+    "sort": [{"view_count": "desc"}]
+  }
+
+
+8. VIEW COUNT — APPROXIMATE COUNTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+NAIVE: Increment view_count in DB on every view
+  Problem: 694K streams/second × 1 DB write = DB bottleneck
+
+SOLUTION: Approximate counter with batching
+  1. Every view event → Kafka topic "video-views"
+  2. Spark Streaming / Flink aggregates: count views per video_id per minute
+  3. Batch update: UPDATE videos SET view_count = view_count + N
+                   WHERE video_id = X (once per minute per video)
+  
+  Result: view_count accurate to within 1 minute
+  DB write load: Reduced from 694K/s to 1 update per minute per popular video
+  (A viral video with 10K views/second still only 1 DB write per minute)
+
+REDIS COUNTER (for very hot videos):
+  INCR view_count:{video_id}  → atomic counter in Redis
+  Every 60 seconds: flush Redis counter to DB
+  Redis handles the burst; DB receives batched updates
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWER — "Walk through how video upload and streaming works"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"Upload: The client gets a presigned S3 URL and uploads directly to S3 —
+no traffic through our servers. S3 triggers a transcoding event.
+Transcoding workers split the video into 1-minute chunks, process in parallel,
+then reassemble. A 1-hour video transcodes to all resolutions in 2-5 minutes
+rather than hours. Workers auto-scale based on SQS queue depth.
+
+Streaming: We use HLS — video is split into 6-second segments.
+The manifest file lists all quality levels. The player downloads the manifest,
+starts with low quality, monitors download speed, and switches quality levels
+(adaptive bitrate). All segments are served from CDN edge nodes — 2.78 Tbps
+of egress bandwidth would be impossible without a CDN.
+
+The key optimization for video start time: serve the first segment immediately
+(even low quality), then buffer higher quality in the background. Users
+perceive playback start within 500ms even for 4K content.
+
+For view counts at scale: views flow through Kafka, aggregated per minute in
+Flink, then batch-updated to the database. This reduces DB writes from
+694K/second to 1 write per minute per video."

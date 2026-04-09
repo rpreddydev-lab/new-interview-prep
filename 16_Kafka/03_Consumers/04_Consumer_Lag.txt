@@ -1,0 +1,255 @@
+================================================================================
+  KAFKA CONSUMER LAG
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHAT IS CONSUMER LAG?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Consumer lag is the number of messages that a consumer group has NOT yet processed.
+It measures how far behind the consumer is relative to the latest data in the partition.
+
+  LAG = Log End Offset (LEO) - Consumer Committed Offset
+        (how many messages exist)   (how far consumer has gotten)
+
+Example:
+  Partition 0:
+    Log End Offset (LEO):          10,000  (last produced message)
+    Consumer Committed Offset:      9,500  (last confirmed-processed offset)
+    LAG:                              500  (500 messages pending)
+
+Why lag matters:
+  - High lag = consumer is falling behind = data processing is delayed
+  - For real-time systems (fraud detection, alerting), lag = latency
+  - For batch-like processing, some lag is normal and acceptable
+  - Unbounded growing lag = consumer will never catch up → critical alert
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. MEASURING LAG
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+─── kafka-consumer-groups.sh ──────────────────────────────────────────────────
+  kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+    --group my-consumer-group \
+    --describe
+
+  Output columns:
+    TOPIC      PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG   CONSUMER-ID
+    orders     0          9500            10000           500   consumer-1-abc
+    orders     1          12000           12000           0     consumer-2-def
+    orders     2          7800            8200            400   consumer-3-ghi
+
+  Total lag = sum of LAG across all partitions (900 in this case)
+
+  List all consumer groups:
+    kafka-consumer-groups.sh --bootstrap-server localhost:9092 --list
+
+  Show all groups and their lag summary:
+    kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --all-groups
+
+─── JMX Metric ────────────────────────────────────────────────────────────────
+  Kafka exposes a JMX metric per consumer:
+    kafka.consumer:type=consumer-fetch-manager-metrics,client-id=consumer-1
+    Attribute: records-lag-max
+
+  records-lag-max = maximum lag across all assigned partitions
+  Use this to alert when any partition falls behind a threshold
+
+─── Programmatic Access ───────────────────────────────────────────────────────
+  KafkaConsumer exposes per-partition metrics via consumer.metrics():
+
+  Map<MetricName, ? extends Metric> metrics = consumer.metrics();
+  metrics.forEach((name, metric) -> {
+    if (name.name().equals("records-lag-max")) {
+      System.out.println("Max lag: " + metric.metricValue());
+    }
+  });
+
+  Or use AdminClient to get end offsets vs committed offsets:
+
+  AdminClient admin = AdminClient.create(props);
+  
+  // Get log end offsets for all partitions
+  Map<TopicPartition, Long> endOffsets = consumer.endOffsets(partitions);
+  
+  // Get committed offsets for the group
+  Map<TopicPartition, OffsetAndMetadata> committed = consumer.committed(partitions);
+  
+  // Calculate lag per partition
+  for (TopicPartition tp : partitions) {
+    long end = endOffsets.get(tp);
+    long committed = committed.get(tp).offset();
+    long lag = end - committed;
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. LAG MONITORING TOOLS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+─── Burrow (LinkedIn) ─────────────────────────────────────────────────────────
+  - Dedicated Kafka consumer lag monitoring service
+  - Evaluates whether lag is "working" (decreasing) or "stuck/increasing"
+  - Does NOT alert on a static lag threshold (avoids false positives on restarts)
+  - Provides HTTP API for lag status per group/topic/partition
+  - Categorizes consumer state: OK, WARNING, ERROR, STALLED, STOPPED
+
+─── Prometheus + kafka-exporter ───────────────────────────────────────────────
+  - kafka-exporter scrapes Kafka broker metrics (including consumer group offsets)
+  - Exposes as Prometheus metrics:
+      kafka_consumergroup_lag{consumergroup="my-group", topic="orders", partition="0"}
+  
+  Alert rule example:
+    - alert: KafkaConsumerLagHigh
+      expr: kafka_consumergroup_lag > 10000
+      for: 5m
+      labels:
+        severity: warning
+
+─── Grafana Dashboard ─────────────────────────────────────────────────────────
+  - Visualize kafka_consumergroup_lag per group and partition
+  - Track lag trends over time (is it growing? shrinking? stable?)
+  - Alert on: lag > threshold AND lag.rate > 0 (growing)
+
+─── Confluent Control Center ──────────────────────────────────────────────────
+  - Built-in consumer group monitoring in Confluent Platform
+  - Shows lag time (seconds behind) not just message count
+  - More useful: "you're 30 seconds behind" vs "you're 10,000 messages behind"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. CAUSES OF CONSUMER LAG
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. SLOW PROCESSING
+   - Consumer processing is slower than producer ingestion rate
+   - CPU-bound: complex transformations, ML inference, regex matching
+   - I/O-bound: database writes, HTTP API calls per record
+   - Fix: parallelize processing, cache lookups, batch DB writes
+
+2. TOO FEW CONSUMERS
+   - Not enough parallelism to handle the partition load
+   - Each consumer handles too many partitions
+   - Fix: add consumers up to partition count
+
+3. REBALANCES
+   - Frequent rebalances (bad config, rolling deployments) cause processing pauses
+   - Each rebalance = all-stop in eager mode
+   - Fix: CooperativeStickyAssignor, static group membership, tune heartbeat/session timeouts
+
+4. GC PAUSES
+   - Long JVM GC pauses (Stop-The-World) delay poll() calls
+   - session.timeout.ms exceeded during GC → consumer kicked out → rebalance
+   - Fix: tune JVM heap, use G1GC or ZGC, increase session.timeout.ms
+
+5. NETWORK ISSUES
+   - Slow broker connections, network congestion
+   - Consumer can't fetch fast enough
+   - Fix: check fetch.min.bytes, fetch.max.wait.ms, network throughput
+
+6. SMALL BATCHES
+   - Consumer fetching too few records per poll (fetch.min.bytes too low)
+   - High overhead per record
+   - Fix: increase fetch.min.bytes, max.poll.records
+
+7. MAX.POLL.INTERVAL.MS EXCEEDED
+   - Consumer is alive but processing a batch takes too long
+   - Gets kicked from group → rebalance → further lag
+   - Fix: reduce max.poll.records, increase max.poll.interval.ms, or
+          move slow work off the poll thread (async processing)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. DIAGNOSING AND REMEDIATING LAG
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 1: Identify which partitions are lagging
+  kafka-consumer-groups.sh --describe → find high-lag partitions
+
+Step 2: Check if lag is growing or stable
+  - Growing lag → consumer falling further behind → critical
+  - Stable lag → consumer keeping up but delayed at steady state → monitor
+
+Step 3: Check consumer throughput
+  - consumer.metrics() → records-consumed-rate, fetch-rate, bytes-consumed-rate
+  - If records-consumed-rate is low → processing is the bottleneck
+
+Step 4: Check broker throughput
+  - Is producer ingestion rate normal? Any burst traffic?
+  - Is the broker overwhelmed? Check network + disk I/O
+
+Remediation Options:
+  ┌──────────────────────────────────────┬────────────────────────────────────┐
+  │ Problem                              │ Fix                                │
+  ├──────────────────────────────────────┼────────────────────────────────────┤
+  │ Slow processing (I/O per record)     │ Async processing, batch writes     │
+  │ Not enough consumers                 │ Scale out (add consumers/replicas) │
+  │ Too few partitions                   │ Increase partitions (repartition)  │
+  │ Frequent rebalances                  │ CooperativeStickyAssignor, static  │
+  │ GC pauses                            │ JVM tuning, ZGC                    │
+  │ max.poll.interval exceeded           │ Reduce max.poll.records            │
+  │ Temporary spike in producer output   │ Monitor; acceptable if self-healing│
+  │ Dead consumer (STOPPED group)        │ Restart consumer service           │
+  └──────────────────────────────────────┴────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. LAG VS LAG TIME
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Message count lag vs time lag:
+  - Count lag: "10,000 messages behind" — depends on message rate
+  - Time lag: "45 seconds behind" — more meaningful for business SLAs
+
+  10,000 messages lag at:
+    100 msg/s → 100 seconds behind (BAD)
+    100,000 msg/s → 0.1 seconds behind (FINE)
+
+  Time lag formula:
+    Time lag ≈ lag (messages) / consumer throughput (messages/sec)
+
+  Better: use timestamp from the latest UNCONSUMED record
+    ConsumerRecord has field: timestampType + timestamp
+    Lag time = System.currentTimeMillis() - lastUnconsumedRecord.timestamp()
+
+  Confluent Control Center computes this automatically.
+  With Prometheus: can approximate using message timestamp if records have event time.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is consumer lag and how do you calculate it?
+A: Consumer lag = Log End Offset (LEO) - committed consumer offset. It represents
+   how many messages exist in a partition that the consumer hasn't processed yet.
+   You can view it with kafka-consumer-groups.sh --describe, via the JMX metric
+   records-lag-max, or by querying AdminClient for end offsets vs committed offsets.
+
+Q: A consumer group shows growing lag. How do you diagnose it?
+A: First identify which partitions are lagging. Then check if processing rate
+   (records-consumed-rate metric) is lower than producer ingestion. If yes, look
+   at processing time per record (I/O calls, slow downstream systems). Check for
+   rebalances in logs (cause temporary stops). Verify consumer count vs partition
+   count — add consumers if under-scaled. Check for GC pauses or poll interval
+   violations in logs. Ultimately: either speed up processing or scale out consumers.
+
+Q: Why can consumer lag appear even when the consumer is "caught up"?
+A: With isolation.level=read_committed, the consumer can only advance to the Last
+   Stable Offset (LSO), not the High Watermark. If there's an open (uncommitted)
+   transaction ahead of the LSO, the consumer appears to have lag even though no
+   new committed messages exist beyond its current position. This is a false lag
+   signal. Fix: ensure transactions are committed or aborted promptly (tune
+   transaction.timeout.ms).
+
+Q: How is message-count lag different from time lag, and which is more useful?
+A: Message-count lag tells you how many messages are unprocessed. Time lag tells
+   you how many seconds of data are unprocessed. 10,000-message lag at 100 msg/s
+   means 100 seconds of latency (critical), but at 1M msg/s it's just 10ms
+   (irrelevant). Time lag is generally more business-meaningful for SLAs, since
+   it directly measures processing latency. Tools like Confluent Control Center
+   and custom timestamp-based calculations surface time lag.
+
+Q: What is Burrow and why is it better than simple threshold-based lag alerting?
+A: Burrow (from LinkedIn) evaluates consumer lag trends, not just static levels.
+   A consumer may show lag=5000 right after a restart (normal) or lag=5000 and
+   growing fast (critical). Simple threshold alerts fire on both. Burrow categorizes
+   each consumer as OK, WARNING, STALLED, or STOPPED based on whether lag is
+   growing, stable, or decreasing — eliminating false positives during expected
+   lag events like deployments and rebalances.

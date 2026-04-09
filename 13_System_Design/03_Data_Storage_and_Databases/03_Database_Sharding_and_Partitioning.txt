@@ -1,0 +1,240 @@
+================================================================
+DATABASE SHARDING AND PARTITIONING
+================================================================
+
+(See also: 01_Scalability/05_Database_Scaling for foundational concepts)
+
+PARTITIONING (Within One DB Server)
+--------------------------------------
+Partitioning splits a large table into smaller physical segments
+within the same database server.
+Benefits: Query pruning (scan only relevant partitions), easier maintenance.
+
+RANGE PARTITIONING:
+  Partition by value range.
+  orders_2024: orders WHERE created_at BETWEEN '2024-01-01' AND '2024-12-31'
+  orders_2025: orders WHERE created_at BETWEEN '2025-01-01' AND '2025-12-31'
+  
+  Good for: Time-series data, archive/purge old partitions easily.
+
+LIST PARTITIONING:
+  Partition by discrete values.
+  orders_us: orders WHERE country = 'US'
+  orders_eu: orders WHERE country IN ('UK', 'DE', 'FR')
+  
+  Good for: Geographic separation, category-based separation.
+
+HASH PARTITIONING:
+  Partition by hash of a key.
+  partition = hash(user_id) % num_partitions
+  
+  Good for: Even distribution when natural range partitioning is uneven.
+
+COMPOSITE PARTITIONING:
+  Combination of above strategies.
+  Partition by year first (range), then by hash within year.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SHARDING (Across Multiple DB Servers)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Sharding splits data across multiple separate database servers.
+Each server (shard) holds a distinct subset of the data.
+
+Why shard?
+  - Dataset exceeds what fits on a single server
+  - Write throughput exceeds single server capacity
+  - Need geographic distribution of data
+
+SHARD KEY SELECTION (Critical Decision):
+  The shard key determines data distribution and query patterns.
+  
+  Requirements for a good shard key:
+  ✓ High cardinality (many unique values → even distribution)
+  ✓ Uniformly distributed (no hot partitions)
+  ✓ Aligns with query patterns (queries should hit 1 shard, not N)
+  ✓ Immutable (don't use values that change — would require moving data)
+
+SHARDING STRATEGIES:
+
+1. HASH SHARDING:
+   shard_id = hash(shard_key) % num_shards
+   
+   Example:
+   user_id=12345 → MD5("12345") = "827ccb0e..." → 0x827... % 4 = 3 → Shard 3
+   
+   Pros:
+   ✓ Even distribution (if hash is uniform)
+   ✓ Simple routing logic
+   
+   Cons:
+   ✗ Range queries hit ALL shards (scatter-gather)
+   ✗ Resharding when adding shards: must rehash all keys
+      (use consistent hashing to mitigate this)
+
+2. RANGE SHARDING:
+   Shard by value ranges.
+   user_id 0–999999 → Shard A
+   user_id 1M–1.99M → Shard B
+   
+   Pros:
+   ✓ Range queries are efficient (scan one or few shards)
+   
+   Cons:
+   ✗ Hot shards if data is not uniformly distributed
+      (e.g., if user_ids are sequential, new writes all go to last shard)
+
+3. CONSISTENT HASHING:
+   Arrange shard nodes on a ring by hashing their IDs.
+   Each key maps to the nearest node clockwise.
+   
+   Adding/removing a node: only remaps ~1/N of keys (minimal disruption).
+   Virtual nodes: each physical node has multiple positions on the ring
+                  for better distribution.
+   
+   Used by: Amazon DynamoDB, Apache Cassandra, Redis Cluster
+   
+   Pros:
+   ✓ Minimal resharding when nodes are added/removed
+   ✓ Good load distribution with virtual nodes
+   
+   Cons:
+   ✗ More complex to implement than simple hash
+
+4. DIRECTORY SHARDING:
+   Centralized lookup table: key → shard mapping.
+   
+   shard_directory = {"user:123": "shard2", "user:456": "shard1", ...}
+   
+   Pros:
+   ✓ Maximum flexibility — move specific keys to specific shards
+   ✓ Supports uneven shard sizes
+   
+   Cons:
+   ✗ Directory service is a bottleneck and SPOF
+   ✗ Requires aggressive caching of directory
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SHARD KEY ANTI-PATTERNS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+❌ Monotonically Increasing Keys (e.g., auto-increment ID, timestamp):
+   All new inserts go to the LAST shard → hot write shard.
+   Fix: Hash the key before using as shard key.
+
+❌ Low-Cardinality Keys (e.g., status, country code):
+   Only a few unique values → can't distribute across many shards.
+   Fix: Use composite shard key (country + user_id).
+
+❌ Celebrity/Hot Keys (e.g., Elon Musk's tweet_id as shard key):
+   One key receives disproportionate traffic → hot shard.
+   Fix: Add random suffix to hot keys (tweet_id_0 to tweet_id_N).
+        Aggregate on read.
+
+❌ Mutable Shard Key:
+   If user changes their username and you shard by username → must move record.
+   Fix: Always shard by immutable ID.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CROSS-SHARD OPERATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SCATTER-GATHER:
+  For queries that must hit multiple shards:
+  1. Scatter: Send query to ALL shards in parallel
+  2. Gather: Collect and merge results
+  3. Sort/filter/aggregate merged results
+  
+  Problem: Slow (latency = slowest shard), expensive (hits all shards)
+  
+  Mitigation:
+  - Design shard key so most queries hit one shard
+  - Use separate analytics DB (Redshift, BigQuery) for cross-shard queries
+
+DISTRIBUTED TRANSACTIONS:
+  A transaction spans multiple shards — hard to maintain ACID.
+  
+  Two-Phase Commit (2PC):
+  1. Prepare phase: coordinator asks all shards to prepare (lock resources)
+  2. Commit phase: if all prepared → commit; else → abort
+  
+  Problems with 2PC:
+  - Slow (2 round trips)
+  - Blocking: if coordinator fails during commit → shards stuck locked
+  
+  Better alternative for cross-shard writes:
+  - Saga pattern (see Microservices section)
+  - Avoid cross-shard transactions by co-locating related data on same shard
+
+CO-LOCATION:
+  Ensure data that is frequently accessed together is on the same shard.
+  
+  Example: E-commerce
+  - Shard orders AND order_items by order_id (same shard)
+  - A query for "order 123 + its items" hits ONE shard
+  - Without co-location: order on shard 2, items on shard 7 → cross-shard join
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RESHARDING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When shards grow too large or too hot, you must reshard.
+This is painful and should be planned for.
+
+APPROACHES:
+
+1. Double the shards (shard splitting):
+   Split Shard A → Shard A1 + Shard A2
+   Simple, but still requires data migration.
+
+2. Add new shards (consistent hashing):
+   With consistent hashing: only 1/N of keys need to move.
+   Much less disruptive.
+
+3. Virtual sharding (recommended design):
+   Start with far more virtual shards than physical shards.
+   Map virtual shards to physical shards.
+   To reshard: reassign virtual shards to new physical shards.
+   
+   Example:
+   1000 virtual shards → 4 physical shards
+   Virtual shards 0-249 → Physical shard 1
+   Virtual shards 250-499 → Physical shard 2
+   ...
+   
+   Adding physical shard 5:
+   Move virtual shards 200-249 + 450-499 + ... → Physical shard 5
+   No data movement for other virtual shards!
+
+ONLINE RESHARDING PROCESS:
+  1. Create new shard
+  2. Start dual-write: write to old and new shard
+  3. Backfill: copy data from old shard to new shard
+  4. Verify: compare old and new shard data
+  5. Switch reads to new shard
+  6. Stop dual-write; only write to new shard
+  7. Delete data from old shard
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SHARDING IN INTERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Key questions to answer:
+  1. "What is your shard key?" — justify the choice
+  2. "How many shards will you start with?" — estimate based on load
+  3. "How do you handle cross-shard queries?" — scatter-gather or analytics DB
+  4. "How do you handle resharding?" — consistent hashing + virtual nodes
+  5. "How do you handle transactions?" — avoid or use Saga pattern
+
+Example for Twitter:
+  Tweet table sharded by user_id:
+  - All tweets by user X on same shard
+  - Reading a user's tweet history = single shard query (efficient)
+  - Downside: reading home timeline = fan-out across multiple shards
+
+  Alternative: Shard by tweet_id:
+  - Evenly distributes tweets
+  - Downside: user's tweets are scattered → inefficient user history queries
+  
+  Real Twitter uses user_id-based sharding for user data +
+  separate time-based indexing for global queries.

@@ -1,0 +1,393 @@
+================================================================================
+RESILIENCE4J IN PRACTICE — COMPREHENSIVE GUIDE
+================================================================================
+
+OVERVIEW
+--------
+Resilience4j is the go-to resilience library for Java microservices.
+It replaced the deprecated Netflix Hystrix and provides:
+  - Circuit Breaker
+  - Rate Limiter
+  - Retry
+  - Bulkhead (Semaphore + ThreadPool)
+  - Time Limiter
+  - Cache
+
+Key advantages over Hystrix:
+  - Lightweight (functional, no reflection)
+  - Modular (use only what you need)
+  - Reactive (full CompletableFuture and Project Reactor support)
+  - Spring Boot 3 compatible
+  - Better metrics (Micrometer integration)
+
+────────────────────────────────────────────────────────────────────────────────
+
+SETUP
+======
+
+pom.xml:
+  <!-- Spring Boot 3 Resilience4j starter -->
+  <dependency>
+    <groupId>io.github.resilience4j</groupId>
+    <artifactId>resilience4j-spring-boot3</artifactId>
+    <version>2.2.0</version>
+  </dependency>
+  <!-- Required for @CircuitBreaker, @Retry annotations -->
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-aop</artifactId>
+  </dependency>
+  <!-- Actuator for metrics exposure -->
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
+  </dependency>
+  <!-- Micrometer Prometheus (for metrics) -->
+  <dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-registry-prometheus</artifactId>
+  </dependency>
+
+────────────────────────────────────────────────────────────────────────────────
+
+COMPLETE CONFIGURATION EXAMPLE
+================================
+
+application.yml:
+
+  resilience4j:
+
+    # ── CIRCUIT BREAKER ────────────────────────────────────────────────────────
+    circuitbreaker:
+      instances:
+        orderService:
+          sliding-window-type: COUNT_BASED
+          sliding-window-size: 10
+          minimum-number-of-calls: 5
+          failure-rate-threshold: 50
+          slow-call-rate-threshold: 80
+          slow-call-duration-threshold: 2s
+          wait-duration-in-open-state: 10s
+          permitted-number-of-calls-in-half-open-state: 3
+          register-health-indicator: true      # Expose to /actuator/health
+          record-exceptions:
+            - java.io.IOException
+            - java.util.concurrent.TimeoutException
+          ignore-exceptions:
+            - com.example.exceptions.BusinessValidationException
+
+        paymentService:
+          sliding-window-type: TIME_BASED
+          sliding-window-size: 60              # Last 60 seconds
+          failure-rate-threshold: 30           # Stricter (payment is critical)
+          wait-duration-in-open-state: 30s
+
+    # ── RETRY ────────────────────────────────────────────────────────────────
+    retry:
+      instances:
+        orderService:
+          max-attempts: 3
+          wait-duration: 500ms
+          enable-exponential-backoff: true
+          exponential-backoff-multiplier: 2
+          exponential-max-wait-duration: 5s
+          retry-exceptions:
+            - java.io.IOException
+            - feign.RetryableException
+          ignore-exceptions:
+            - com.example.exceptions.BusinessException
+
+        inventoryService:
+          max-attempts: 2                # Only 1 retry (sensitive operation)
+          wait-duration: 1s
+
+    # ── BULKHEAD (Semaphore) ───────────────────────────────────────────────
+    bulkhead:
+      instances:
+        orderService:
+          max-concurrent-calls: 50
+          max-wait-duration: 0ms          # Don't wait — fail fast if full
+
+        reportService:
+          max-concurrent-calls: 5         # Low — reports are heavy
+          max-wait-duration: 100ms
+
+    # ── THREAD POOL BULKHEAD ────────────────────────────────────────────────
+    thread-pool-bulkhead:
+      instances:
+        externalApiService:
+          max-thread-pool-size: 10
+          core-thread-pool-size: 5
+          queue-capacity: 20
+          keep-alive-duration: 20ms
+
+    # ── TIME LIMITER ────────────────────────────────────────────────────────
+    timelimiter:
+      instances:
+        orderService:
+          timeout-duration: 3s
+          cancel-running-future: true
+
+        paymentService:
+          timeout-duration: 10s           # Payment needs more time
+
+    # ── RATE LIMITER ────────────────────────────────────────────────────────
+    ratelimiter:
+      instances:
+        externalPaymentGateway:
+          limit-for-period: 100           # 100 calls per refresh period
+          limit-refresh-period: 1s        # Refresh every second
+          timeout-duration: 500ms         # Wait up to 500ms for a permit
+
+  # Actuator exposure
+  management:
+    health:
+      circuitbreakers:
+        enabled: true
+      ratelimiters:
+        enabled: true
+    endpoints:
+      web:
+        exposure:
+          include: health,metrics,prometheus
+    metrics:
+      tags:
+        application: ${spring.application.name}
+
+────────────────────────────────────────────────────────────────────────────────
+
+COMPLETE SERVICE EXAMPLE — ORDER PLACEMENT
+============================================
+
+@Service
+@Slf4j
+public class OrderService {
+
+  @Autowired private InventoryClient inventoryClient;
+  @Autowired private PricingClient pricingClient;
+  @Autowired private PaymentClient paymentClient;
+  @Autowired private NotificationClient notificationClient;
+  @Autowired private CacheService cacheService;
+
+  /**
+   * Complete order placement with full resilience:
+   * 1. Check inventory (CB + Retry + Fallback)
+   * 2. Get pricing (CB + Retry + Fallback)
+   * 3. Process payment (CB + TimeLimiter, NO Retry for payment)
+   * 4. Send notification (fail silent)
+   */
+  public OrderDTO placeOrder(PlaceOrderRequest request) {
+
+    // Step 1: Check inventory — allow degradation
+    InventoryDTO inventory = checkInventory(request.getProductId(), request.getQuantity());
+    if (!inventory.isAvailable()) {
+      throw new InsufficientStockException(request.getProductId());
+    }
+
+    // Step 2: Get price — allow stale cache
+    BigDecimal price = getPrice(request.getProductId());
+
+    // Step 3: Process payment — critical, no degradation
+    PaymentDTO payment = processPayment(request, price);
+
+    // Step 4: Create order
+    Order order = orderRepository.save(Order.from(request, price, payment.getPaymentId()));
+
+    // Step 5: Send confirmation — fire and forget, failure acceptable
+    sendNotificationAsync(order);
+
+    return OrderDTO.from(order);
+  }
+
+  // ── INVENTORY CHECK (Retry + Circuit Breaker + Cache Fallback) ──────────────
+  @CircuitBreaker(name = "orderService", fallbackMethod = "inventoryFromCache")
+  @Retry(name = "orderService", fallbackMethod = "inventoryFromCache")
+  @Bulkhead(name = "orderService")
+  private InventoryDTO checkInventory(Long productId, int quantity) {
+    return inventoryClient.checkAvailability(productId, quantity);
+  }
+
+  private InventoryDTO inventoryFromCache(Long productId, int quantity, Exception ex) {
+    log.warn("Inventory service failed, checking cache. ProductId={}, err={}",
+        productId, ex.getMessage());
+    return cacheService.getInventory(productId)
+      .map(cached -> {
+        log.info("Serving inventory from cache for product {}", productId);
+        return cached;
+      })
+      .orElseGet(() -> {
+        // If no cache, we can't safely proceed — throw exception
+        log.error("No cached inventory for product {}", productId);
+        throw new ServiceUnavailableException("Inventory service unavailable");
+      });
+  }
+
+  // ── PRICING (Retry + Circuit Breaker + Cache Fallback) ──────────────────────
+  @CircuitBreaker(name = "orderService", fallbackMethod = "priceFromCache")
+  @Retry(name = "orderService", fallbackMethod = "priceFromCache")
+  private BigDecimal getPrice(Long productId) {
+    BigDecimal price = pricingClient.getPrice(productId);
+    cacheService.setPrice(productId, price, Duration.ofMinutes(5));
+    return price;
+  }
+
+  private BigDecimal priceFromCache(Long productId, Exception ex) {
+    log.warn("Pricing service failed for product {}, using cache", productId, ex);
+    return cacheService.getPrice(productId)
+      .orElseThrow(() -> new ServiceUnavailableException("Cannot get price"));
+  }
+
+  // ── PAYMENT (Circuit Breaker + TimeLimiter, NO RETRY) ───────────────────────
+  // Why no Retry? Payment could have been charged on first attempt.
+  // Retry would cause double charge. Use idempotency key instead.
+  @CircuitBreaker(name = "paymentService", fallbackMethod = "paymentFailed")
+  @TimeLimiter(name = "paymentService")
+  private CompletableFuture<PaymentDTO> processPaymentAsync(
+      PlaceOrderRequest request, BigDecimal price) {
+    String idempotencyKey = request.getIdempotencyKey();
+    return CompletableFuture.supplyAsync(() ->
+      paymentClient.charge(new PaymentRequest(
+        request.getUserId(), price, request.getPaymentMethodId(), idempotencyKey
+      ))
+    );
+  }
+
+  private PaymentDTO processPayment(PlaceOrderRequest request, BigDecimal price) {
+    try {
+      return processPaymentAsync(request, price).get();
+    } catch (Exception e) {
+      throw new PaymentFailedException("Payment processing failed", e);
+    }
+  }
+
+  private CompletableFuture<PaymentDTO> paymentFailed(
+      PlaceOrderRequest request, BigDecimal price, Exception ex) {
+    log.error("Payment service unavailable: {}", ex.getMessage());
+    // Payment CANNOT degrade — must fail with clear error
+    CompletableFuture<PaymentDTO> failed = new CompletableFuture<>();
+    failed.completeExceptionally(
+      new PaymentServiceException("Payment service temporarily unavailable")
+    );
+    return failed;
+  }
+
+  // ── NOTIFICATION (Fire and Forget, Fail Silent) ───────────────────────────
+  private void sendNotificationAsync(Order order) {
+    CompletableFuture.runAsync(() -> {
+      try {
+        notificationClient.sendOrderConfirmation(order.getUserId(), order.getId());
+      } catch (Exception e) {
+        // Intentional: notification failure should NOT fail the order
+        log.warn("Failed to send notification for order {}: {}", order.getId(), e.getMessage());
+      }
+    });
+  }
+}
+
+────────────────────────────────────────────────────────────────────────────────
+
+RESILIENCE4J METRICS AND MONITORING
+======================================
+
+Metrics exposed to Prometheus (via /actuator/prometheus):
+
+Circuit Breaker metrics:
+  resilience4j_circuitbreaker_state{name="orderService"}
+    # Gauge: 0=CLOSED, 1=OPEN, 2=HALF_OPEN, 3=DISABLED, 4=FORCED_OPEN
+  
+  resilience4j_circuitbreaker_failure_rate{name="orderService"}
+    # Gauge: current failure rate %
+
+  resilience4j_circuitbreaker_calls_total{name, kind}
+    # kind: successful, failed, not_permitted, ignored
+
+Retry metrics:
+  resilience4j_retry_calls_total{name, kind}
+    # kind: successful_without_retry, successful_with_retry, failed_with_retry, failed_without_retry
+
+Bulkhead metrics:
+  resilience4j_bulkhead_available_concurrent_calls{name}
+  resilience4j_bulkhead_max_allowed_concurrent_calls{name}
+
+Grafana Dashboard Alert Examples:
+  # Alert: Circuit breaker opened
+  resilience4j_circuitbreaker_state{name="paymentService"} == 1
+  
+  # Alert: High failure rate
+  resilience4j_circuitbreaker_failure_rate{name="orderService"} > 30
+
+  # Alert: Retry rate too high
+  rate(resilience4j_retry_calls_total{kind="failed_with_retry"}[5m]) > 10
+
+────────────────────────────────────────────────────────────────────────────────
+
+ACTUATOR HEALTH INTEGRATION
+=============================
+  # application.yml
+  resilience4j:
+    circuitbreaker:
+      instances:
+        orderService:
+          register-health-indicator: true
+
+  # GET /actuator/health output:
+  {
+    "status": "UP",
+    "components": {
+      "circuitBreakers": {
+        "status": "UP",
+        "details": {
+          "orderService": {
+            "status": "UP",
+            "details": {
+              "failureRate": "0.0%",
+              "failureRateThreshold": "50.0%",
+              "slowCallRate": "0.0%",
+              "state": "CLOSED"
+            }
+          },
+          "paymentService": {
+            "status": "CIRCUIT_OPEN",  → Health = DOWN if circuit is OPEN
+            "details": { "state": "OPEN" }
+          }
+        }
+      }
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is Resilience4j and why was it chosen over Hystrix?
+A: Resilience4j is a lightweight, functional resilience library. Hystrix was
+   deprecated in 2018 and is built on the heavier command pattern. Resilience4j
+   is modular, non-blocking, Spring Boot 3 compatible, has better metrics via
+   Micrometer, and supports reactive programming (Project Reactor).
+
+Q: In what ORDER are Resilience4j annotations applied?
+A: Retry → TimeLimiter → Bulkhead → CircuitBreaker (inner to outer)
+   Actually: execution order outer-to-inner is:
+   RateLimiter → CircuitBreaker → Retry → TimeLimiter → Bulkhead
+   Meaning: Rate Limiter checked first, then CB, then Retry attempts, each
+   with TimeLimiter, running via Bulkhead.
+
+Q: Why would you NOT add Retry on a payment call?
+A: A payment call may succeed server-side even if the client times out.
+   Retrying would cause a duplicate charge. Instead, use idempotency keys:
+   the payment service detects and returns the original result on retry.
+
+Q: How do you monitor Resilience4j in production?
+A: Metrics exposed via Micrometer to Prometheus, visualized in Grafana.
+   Key metrics: circuit breaker state, failure rate, rejected calls, retry count.
+   Actuator /health shows circuit breaker status. Alert on circuit opening,
+   high failure rates, or sustained retry increases.
+
+Q: What's the difference between @Bulkhead(type=SEMAPHORE) and THREADPOOL?
+A: Semaphore: limits concurrent calls but runs on caller's thread (blocks caller).
+   ThreadPool: runs in separate thread pool — full isolation, caller doesn't block.
+   ThreadPool is better for I/O-bound external calls; Semaphore for lighter-weight
+   limits.
+
+================================================================================

@@ -1,0 +1,273 @@
+================================================================================
+  KAFKA LOG SEGMENTS AND OFFSETS
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. KAFKA'S PHYSICAL LOG STRUCTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Each Kafka partition is stored as a directory of files on the broker disk.
+
+Directory structure:
+  /var/kafka/data/
+  └── orders-0/                           ← Partition 0 of topic "orders"
+      ├── 00000000000000000000.log         ← Segment: offsets 0 to 999
+      ├── 00000000000000000000.index       ← Offset index for above segment
+      ├── 00000000000000000000.timeindex   ← Timestamp index for above segment
+      ├── 00000000000000001000.log         ← Segment: offsets 1000 to 1999
+      ├── 00000000000000001000.index
+      ├── 00000000000000001000.timeindex
+      ├── 00000000000000002000.log         ← Active (current) segment
+      ├── 00000000000000002000.index
+      ├── 00000000000000002000.timeindex
+      └── leader-epoch-checkpoint          ← Leader epoch history
+
+Filename = BASE OFFSET of the first message in that segment (20-digit zero-padded)
+  00000000000000001000.log → first offset in this segment is 1000
+  00000000000000002000.log → first offset is 2000
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. LOG SEGMENT FILES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+.log file (the data file):
+  - Binary format containing actual message records
+  - Append-only; written sequentially
+  - Multiple records packed together (record batch format)
+  - Not human-readable; use kafka-dump-log.sh to inspect
+
+Record batch format (Kafka 0.11+):
+  RecordBatch {
+    baseOffset:           int64    // offset of first record in batch
+    partitionLeaderEpoch: int32    // leader epoch (for detecting stale data)
+    magic:                int8     // message format version (currently 2)
+    crc:                  int32    // CRC32C checksum of batch data
+    attributes:           int16    // compression type, timestamp type, etc.
+    lastOffsetDelta:      int32    // last offset - base offset
+    firstTimestamp:       int64    // timestamp of first record
+    maxTimestamp:         int64    // max timestamp in batch
+    producerId:           int64    // for idempotent/transactional producers
+    producerEpoch:        int16    // for idempotent/transactional producers
+    baseSequence:         int32    // sequence number for idempotent delivery
+    records:              [Record] // the actual messages
+  }
+
+Individual Record:
+  Record {
+    length:         varint
+    attributes:     int8     // currently unused
+    timestampDelta: varint   // offset from batch firstTimestamp
+    offsetDelta:    varint   // offset from batch baseOffset
+    keyLength:      varint
+    key:            bytes
+    valueLength:    varint
+    value:          bytes
+    headers:        [Header] // key-value pairs
+  }
+
+.index file (offset index):
+  - Maps relative offsets to physical byte positions in the .log file
+  - SPARSE index: not every offset has an entry (configurable density)
+  - Default: entry every 4096 bytes (index.interval.bytes)
+  - Each entry: 8 bytes (4 relative offset + 4 physical position)
+  - Used to do fast binary search: "where in the .log is offset 1500?"
+
+.timeindex file (timestamp index):
+  - Maps timestamps to offsets
+  - Used by: seekToBeginning(timestamp), KafkaConsumer.offsetsForTimes()
+  - Same sparse structure as the offset index
+  - Each entry: 12 bytes (8 timestamp + 4 relative offset)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. SEGMENT ROLLING (WHEN NEW SEGMENT IS CREATED)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A new segment is rolled (old closed, new opened) when:
+  1. segment.bytes exceeded (default: 1 GB per segment)
+  2. segment.ms exceeded (default: 7 days) — even if size not reached
+  3. Any single message is larger than segment.bytes (edge case)
+  4. Index file is full (max.index.size.in.bytes is hit)
+
+Active segment:
+  - The most recently opened segment; still being written to
+  - NOT eligible for deletion (even if retention.ms is exceeded)
+  - Closing a segment is an atomic fsync operation
+
+Segment lifecycle:
+  [Active]    → written to → 
+  [Closed]    → eligible for compaction/deletion if retention exceeded →
+  [Deleted]   → after file.delete.delay.ms
+
+Why multiple segments?
+  - Enables efficient retention deletion: delete old segment files as a whole
+    (O(1) operation) instead of deleting individual records
+  - Enables compaction: clean one segment at a time
+  - Allows OS page cache to age out cold segments naturally
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. HOW KAFKA READS A MESSAGE BY OFFSET (SEEK)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Consumer seeks to offset 1542 in partition 0:
+
+  Step 1: Find the correct segment
+    - Broker has a list of segment base offsets: [0, 1000, 2000, ...]
+    - Binary search: offset 1542 → segment 1000 (base=1000, next base=2000)
+    - Open 00000000000000001000.index
+
+  Step 2: Search the index
+    - .index has sparse entries: e.g., (0, 0), (50, 4096), (100, 8192), ...
+      where (relativeOffset, bytePosition)
+    - relativeOffset for 1542 = 1542 - 1000 = 542
+    - Binary search for largest entry ≤ 542: e.g., (500, 40960)
+    - Physical byte position in .log: 40960
+
+  Step 3: Sequential scan in .log
+    - Open 00000000000000001000.log
+    - Seek to byte position 40960
+    - Read record batches sequentially until offset 1542 is found
+
+  Step 4: Return the record to consumer
+
+This is why Kafka reads are fast even without a heap-based index:
+  - OS page cache keeps hot segments in RAM
+  - Binary search in the index is O(log n)
+  - Sequential scan from index entry to target is short (within 4096 bytes typical)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. OFFSETS IN DEPTH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Types of offsets:
+
+  LOG END OFFSET (LEO):
+    - The offset of the NEXT record to be produced
+    - = (last written offset) + 1
+    - Tracks how far the partition log has grown
+    - Each replica has its own LEO
+
+  HIGH WATERMARK (HW):
+    - The last offset that has been fully replicated to ALL ISR replicas
+    - Consumers can only read up to HW - 1 (records up to and including HW-1)
+    - Advances when all ISR followers have fetched a record
+    - Ensures consumers only see "committed" (durable) data
+
+  CONSUMER OFFSET:
+    - The position of a consumer group in a partition
+    - Committed to __consumer_offsets topic
+    - = (last processed offset) + 1 (the NEXT offset to fetch)
+
+  LEADER EPOCH OFFSET:
+    - A per-leader-epoch tracking of LEO at the start of each epoch
+    - Used to prevent stale data during leader failover
+    - Stored in leader-epoch-checkpoint file
+
+Offset relationships:
+  LEO ≥ HW ≥ Consumer Offset (for committed offsets)
+
+  Producer writes → LEO advances (leader only)
+  Followers fetch → Follower LEOs advance
+  All ISR at same offset → HW advances
+  Consumer commits → Consumer Offset advances
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. LEADER EPOCH AND FENCING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Problem without leader epoch:
+  - Old leader (before failover) might still be alive and accepting writes
+  - "Zombie leader" issue: old leader writes divergent data that new leader doesn't have
+  - When old leader tries to rejoin: log divergence causes incorrect data
+
+Leader epoch solution:
+  - Each time a new leader is elected, the leader epoch increments
+  - Each record batch is stamped with the leader epoch at write time
+  - On follower catch-up: follower asks "what was the last offset at epoch N?"
+  - If follower has records from a higher epoch: they are truncated (invalid data)
+  - Ensures correctness during network partitions and leader bounces
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. LOG RETENTION AND CLEANUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Retention triggers (whichever applies):
+
+  Time-based (retention.ms, default 7 days):
+    - Segments whose latest message timestamp is older than retention.ms are deleted
+    - Active segment is NEVER deleted (even if older than retention.ms)
+
+  Size-based (retention.bytes, default -1 = disabled):
+    - If total partition size exceeds retention.bytes: delete oldest segments first
+    - Enforced at the partition level (per partition, not per topic)
+
+Deletion process:
+  1. Background thread (LogManager) checks each partition periodically
+  2. Identifies segments eligible for deletion (all records older than retention.ms)
+  3. Marks them as ".deleted" (atomic rename)
+  4. After file.delete.delay.ms (1 min default): actual file deletion
+
+Why delay deletion?
+  - Consumers/threads may have open file handles to the segment
+  - Gives them time to finish reading before the file disappears
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. INSPECTING KAFKA LOG FILES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Dump a log segment (human-readable):
+  kafka-dump-log.sh \
+    --files /var/kafka/data/orders-0/00000000000000000000.log \
+    --print-data-log
+
+  Output example:
+  Dumping /var/kafka/data/orders-0/00000000000000000000.log
+  Starting offset: 0
+  baseOffset: 0 lastOffset: 0 count: 1 baseSequence: -1 lastSequence: -1 
+    producerId: -1 producerEpoch: -1 partitionLeaderEpoch: 0 isTransactional: false 
+    isControl: false position: 0 CreateTime: 1711234567000 size: 156 magic: 2 
+    compresscodec: NONE crc: 1234567890 isvalid: true
+  | offset: 0 CreateTime: 1711234567000 keySize: 8 valueSize: 100 
+      sequence: -1 headerKeys: [] key: order-1 payload: {...}
+
+Check offset index:
+  kafka-dump-log.sh \
+    --files /var/kafka/data/orders-0/00000000000000000000.index \
+    --index-sanity-check
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: How does Kafka store messages on disk?
+A: Each partition is stored as a directory of segment files. Each segment has
+   a .log file (binary message data), a .index file (sparse offset → byte position
+   map), and a .timeindex file (timestamp → offset map). New records are always
+   appended to the active segment. When the segment reaches segment.bytes (1 GB
+   default) or segment.ms, it is rolled and a new active segment begins.
+
+Q: What is the difference between LEO and the High Watermark?
+A: LEO (Log End Offset) is the next offset to be written — it advances on every
+   write to ANY replica. The High Watermark is the last offset replicated to ALL
+   ISR replicas. Consumers can only read up to the HW. This ensures that consumers
+   only see fully replicated, durable data. LEO >= HW always.
+
+Q: How does Kafka find a message by offset quickly?
+A: Binary search on segment filenames to find the right .log file. Then binary
+   search in the sparse .index file to find the approximate byte position.
+   Then sequential scan in the .log file from that position. Total cost:
+   O(log S) + O(log I) + O(index.interval.bytes) where S = number of segments.
+
+Q: Why does Kafka not delete the active segment even if retention.ms is exceeded?
+A: The active segment is still open for writes. Deleting it while a producer
+   is appending would cause data corruption. Kafka only deletes closed segments.
+   This means the actual retention on disk can slightly exceed retention.ms —
+   up to (retention.ms + max active segment age).
+
+Q: What is a leader epoch and why is it important?
+A: The leader epoch is a monotonically increasing counter that increments on each
+   new leader election. Records are stamped with the epoch when written. When a
+   new leader takes over, it uses epoch information to determine which follower
+   records are valid and which should be truncated (data from a "zombie" old
+   leader in a different partition leader epoch). This prevents data divergence
+   during network partitions.

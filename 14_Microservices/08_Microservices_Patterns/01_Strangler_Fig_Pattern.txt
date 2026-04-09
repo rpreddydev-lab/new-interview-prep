@@ -1,0 +1,210 @@
+================================================================================
+STRANGLER FIG PATTERN
+================================================================================
+
+WHAT IS THE STRANGLER FIG PATTERN?
+------------------------------------
+Named after the strangler fig tree that gradually envelops and replaces its host.
+The pattern describes incrementally replacing a monolith with microservices,
+without a "big bang" rewrite.
+
+The Problem:
+  "We need to migrate our 10-year-old monolith to microservices.
+   We cannot stop development for 2 years while we rewrite.
+   We cannot risk a big-bang cutover."
+
+The Solution:
+  Build new services alongside the monolith. Gradually route functionality
+  from the monolith to new services. Eventually, the monolith is gone.
+
+────────────────────────────────────────────────────────────────────────────────
+
+HOW IT WORKS
+=============
+
+Phase 1 — Intercept:
+  Place a routing façade (API Gateway or proxy) in front of the monolith.
+  All traffic flows through the façade. 100% → Monolith.
+
+Phase 2 — Build:
+  Extract a piece of functionality into a new microservice.
+  The monolith still has the old functionality running.
+
+Phase 3 — Route:
+  Update the façade to route the extracted functionality to the new microservice.
+  Route everything else to the monolith.
+  Gradually shift traffic.
+
+Phase 4 — Retire:
+  Once all functionality is extracted, decommission the monolith.
+
+  ┌──────────────────────────────────────────────────────────┐
+  │  BEFORE                                                  │
+  │  Users → [Monolith] (orders, payments, inventory, users) │
+  └──────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  DURING                                                          │
+  │  Users → [API Gateway/Façade]                                   │
+  │               ├── /api/payments  → [Payment Service] (NEW)      │
+  │               ├── /api/orders    → [Order Service] (NEW)        │
+  │               └── /api/*         → [Monolith] (everything else) │
+  └──────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  AFTER                                                                  │
+  │  Users → [API Gateway]                                                  │
+  │               ├── /api/payments  → [Payment Service]                   │
+  │               ├── /api/orders    → [Order Service]                     │
+  │               ├── /api/inventory → [Inventory Service]                 │
+  │               ├── /api/users     → [User Service]                      │
+  │               └── [Monolith is retired]                                │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+────────────────────────────────────────────────────────────────────────────────
+
+IMPLEMENTATION WITH SPRING CLOUD GATEWAY
+==========================================
+
+# Spring Cloud Gateway as the strangler façade
+# application.yml
+
+spring:
+  cloud:
+    gateway:
+      routes:
+      # New Payment Service (strangled)
+      - id: payment-service
+        uri: http://payment-service:8080
+        predicates:
+        - Path=/api/payments/**
+        filters:
+        - StripPrefix=1
+
+      # New Order Service (strangled)
+      - id: order-service
+        uri: http://order-service:8080
+        predicates:
+        - Path=/api/orders/**
+
+      # All other routes go to the monolith
+      - id: monolith-fallback
+        uri: http://legacy-monolith:8080
+        predicates:
+        - Path=/api/**    # Catch-all
+
+Weight-based migration (gradual traffic shift):
+  spring:
+    cloud:
+      gateway:
+        routes:
+        # 90% of order requests still go to monolith
+        - id: order-monolith
+          uri: http://legacy-monolith:8080
+          predicates:
+          - Path=/api/orders/**
+          - Weight=order-group,9  # Weight 9 out of 10
+
+        # 10% of order requests go to new service (canary-style)
+        - id: order-new
+          uri: http://order-service:8080
+          predicates:
+          - Path=/api/orders/**
+          - Weight=order-group,1  # Weight 1 out of 10
+
+Shift traffic gradually:
+  Week 1:  10% → new service, 90% → monolith
+  Week 2:  25% → new service, 75% → monolith
+  Week 4:  50% → new service, 50% → monolith
+  Week 8: 100% → new service, monolith route removed
+
+────────────────────────────────────────────────────────────────────────────────
+
+ANTI-CORRUPTION LAYER DURING STRANGLING
+========================================
+
+The new service must not adopt the monolith's domain model.
+
+  Monolith has: CustomerAccount with 50 fields (legacy schema)
+  New service needs: User with 5 relevant fields
+
+  // Bad: new service imports monolith's CustomerAccount type
+  // Good: Anti-Corruption Layer translates
+
+  @Component
+  public class CustomerAdapter {  // ACL between old and new domain
+
+    @Autowired private LegacyMonolithClient legacyClient;
+
+    // Translate monolith's CustomerAccount to our clean User domain
+    public User getUser(Long userId) {
+      LegacyCustomerAccount account = legacyClient.getAccount(userId);
+      return User.builder()
+        .id(account.getCustomerId())
+        .email(account.getEmailAddress())  // Different field name
+        .name(account.getFirstName() + " " + account.getLastName())
+        .build();
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+DATA MIGRATION STRATEGY
+========================
+
+Problem: Monolith has one big shared database. Each new service needs its own.
+
+Steps:
+  1. Create new database for the extracted service
+  2. Sync data: replicate data from monolith DB to new DB (CDC / dual-write)
+  3. New service reads and writes its own DB
+  4. Old monolith routes no longer used → data sync can stop
+
+  SYNC APPROACHES:
+  a) Dual-write: Monolith writes to both old DB and new DB (temporary)
+  b) CDC: Debezium reads monolith's DB changelog → publishes events → service consumes
+  c) Script-based migration: one-time data copy + sync
+
+────────────────────────────────────────────────────────────────────────────────
+
+WHEN TO USE STRANGLER FIG
+===========================
+
+✓ Migrating a large, actively developed monolith
+✓ Cannot do a "big bang" rewrite (too risky)
+✓ Business demands continued feature development during migration
+✓ Teams want to extract high-value/high-pain modules first
+
+✗ NOT suitable if monolith is too tightly coupled (shared DB everywhere)
+✗ NOT if you have time/resources to do a complete rewrite
+
+Migration order recommendation:
+  Start with: Bounded contexts at the EDGES (user-facing APIs, few dependencies)
+  Leave for last: Core domain (most coupled, most business logic)
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is the Strangler Fig pattern?
+A: A migration pattern for replacing a monolith with microservices incrementally.
+   A routing façade (API Gateway) is placed in front of the monolith. New
+   functionality is built as microservices and traffic is gradually rerouted.
+   Eventually all functionality is extracted and the monolith is decommissioned.
+   Avoids the risk of big-bang rewrites.
+
+Q: What are the risks of the Strangler Fig pattern?
+A: Data migration complexity (monolith has one DB, services need their own).
+   Both versions running simultaneously requires backward compatibility. Two
+   codebases to maintain during transition. Risk of "never finishing" — some
+   companies get stuck with half-migrated systems. Clear milestones and
+   deadlines are essential.
+
+Q: How do you decide what to extract first from a monolith?
+A: Extract modules that are: (1) High-pain — causing most deployment friction.
+   (2) Well-bounded — minimal database sharing with other modules. (3) High-value
+   — business justification for independent scalability. (4) Edge modules —
+   fewer dependencies = easier extraction. Avoid extracting the core domain first.
+
+================================================================================

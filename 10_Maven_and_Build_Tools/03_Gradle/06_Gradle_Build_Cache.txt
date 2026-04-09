@@ -1,0 +1,273 @@
+================================================================================
+  GRADLE BUILD CACHE — LOCAL, REMOTE, CONFIGURATION CACHE
+================================================================================
+
+OVERVIEW
+─────────
+Gradle has two distinct caching mechanisms:
+
+  1. Build Cache      — caches TASK OUTPUTS (files produced by tasks)
+  2. Configuration Cache — caches the TASK GRAPH (result of configuration phase)
+
+Both aim at the same goal: avoid redundant work.
+
+─────────────────────────────────────────────────────────────────────────────────
+1. BUILD CACHE — HOW IT WORKS
+─────────────────────────────────────────────────────────────────────────────────
+
+  When Gradle runs a task, it:
+  1. Computes a CACHE KEY from:
+       • All declared @Input values (properties, env vars)
+       • All @InputFile contents (hashed)
+       • @InputDirectory contents
+       • Gradle version
+       • JDK version
+       • Plugin versions
+  2. Looks up the cache key in the cache store
+  3. If found (CACHE HIT): restores the @Output files — skips execution
+  4. If not found (CACHE MISS): runs the task, stores outputs in cache
+
+  This allows:
+  • CI runner A stores build output → CI runner B or developer laptop gets a hit
+  • Switching branches and back → previous task outputs are restored from cache
+  • Running tests locally after CI already ran them → FROM-CACHE
+
+─────────────────────────────────────────────────────────────────────────────────
+LOCAL BUILD CACHE
+─────────────────────────────────────────────────────────────────────────────────
+
+  Enabled by default in Gradle 8+.
+  Stores cached outputs in: ~/.gradle/caches/build-cache/
+
+  Enable explicitly:
+  ────────────────────
+  // gradle.properties
+  org.gradle.caching=true
+
+  // OR command line:
+  ./gradlew build --build-cache
+
+  Disable for a single run:
+  ./gradlew build --no-build-cache
+
+  Local cache configuration (settings.gradle.kts):
+  ──────────────────────────────────────────────────
+  buildCache {
+      local {
+          isEnabled = true
+          directory = file("${rootDir}/.gradle/build-cache")
+          removeUnusedEntriesAfterDays = 7   // default 7 days
+      }
+  }
+
+─────────────────────────────────────────────────────────────────────────────────
+REMOTE BUILD CACHE
+─────────────────────────────────────────────────────────────────────────────────
+
+  Remote cache enables cache sharing across the team and CI.
+  If your CI publishes cache entries, all developers get cache hits.
+
+  Options:
+  • Develocity (formerly Gradle Enterprise) — official Gradle product
+  • Gradle Build Cache Node — standalone open-source cache server
+  • AWS S3 / GCS / Azure Blob — via community plugins
+  • Hazelcast, NFS — via community plugins
+
+  Configuration (settings.gradle.kts):
+  ──────────────────────────────────────
+  buildCache {
+      local {
+          isEnabled = true
+      }
+      remote<HttpBuildCache> {
+          url = uri("https://cache.example.com/cache/")
+          isEnabled = true
+          isPush = System.getenv("CI") == "true"   // Only CI pushes to cache
+          credentials {
+              username = System.getenv("CACHE_USER")
+              password = System.getenv("CACHE_PASSWORD")
+          }
+      }
+  }
+
+  Key principle: Developers PULL from remote cache (read-only by default).
+  CI builds PUSH to remote cache after a successful build.
+  isPush = System.getenv("CI") == "true" ensures only CI writes.
+
+  Self-hosted cache server (Docker):
+  ────────────────────────────────────
+  docker run -d \
+    --name gradle-build-cache \
+    -p 5071:5071 \
+    -v /data/build-cache:/data \
+    gradle/build-cache-node:latest
+
+─────────────────────────────────────────────────────────────────────────────────
+MAKING TASKS CACHEABLE
+─────────────────────────────────────────────────────────────────────────────────
+
+  For a task to be cached, it must:
+  1. Be annotated with @CacheableTask  (or the task type is cacheable by default)
+  2. Declare all inputs with @Input, @InputFile, @InputDirectory, @Classpath
+  3. Declare all outputs with @OutputFile, @OutputDirectory, @OutputFiles
+
+  Default cacheable task types: JavaCompile, Test, AbstractArchiveTask (Jar/Zip), Javadoc
+  NOT cacheable by default: Exec, Copy (must annotate manually)
+
+  Example — custom cacheable task:
+  ──────────────────────────────────
+  @CacheableTask
+  abstract class TransformXml : DefaultTask() {
+
+      @get:InputFile
+      @get:PathSensitive(PathSensitivity.RELATIVE)  // Required for remote cache portability
+      abstract val inputFile: RegularFileProperty
+
+      @get:Input
+      abstract val format: Property<String>
+
+      @get:OutputFile
+      abstract val outputFile: RegularFileProperty
+
+      @TaskAction
+      fun transform() {
+          // ... transform logic
+          outputFile.asFile.get().writeText("result")
+      }
+  }
+
+  @PathSensitive is crucial for remote cache: it controls how file paths
+  contribute to the cache key. RELATIVE means only the relative path matters
+  (not the absolute path, which varies by machine). Options:
+  • ABSOLUTE      — full path included (defeats remote cache)
+  • RELATIVE      — relative path included (works cross-machine)
+  • NAME_ONLY     — only the filename
+  • NONE          — file content only, not path (for classpath elements)
+
+─────────────────────────────────────────────────────────────────────────────────
+2. CONFIGURATION CACHE
+─────────────────────────────────────────────────────────────────────────────────
+
+  The configuration cache stores the result of the CONFIGURATION PHASE
+  (evaluating build scripts, resolving task graphs) so it doesn't need to run
+  on every invocation.
+
+  Enable (Gradle 8.1+, stable):
+  ──────────────────────────────
+  // gradle.properties
+  org.gradle.configuration-cache=true
+
+  // OR command line:
+  ./gradlew build --configuration-cache
+
+  How it works:
+  1. First run: Gradle evaluates all build scripts → builds task graph → serializes
+     it to .gradle/configuration-cache/
+  2. Subsequent runs: Gradle deserializes the cached task graph (avoids running
+     Groovy/Kotlin DSL) → directly executes tasks
+  3. Cache is invalidated when build scripts or config-impacting files change
+
+  Restrictions:
+  • Build scripts must be "configuration cache compatible" (no external state access)
+  • Some APIs are not allowed (System.getenv() in configuration phase, file reads, etc.)
+  • Most major plugins now support it, but check compatibility
+
+  Check compatibility:
+  ./gradlew build --configuration-cache
+  // Gradle reports problems and stores them in an HTML report
+
+─────────────────────────────────────────────────────────────────────────────────
+BUILD CACHE DIAGNOSTICS
+─────────────────────────────────────────────────────────────────────────────────
+
+  Understand why a task wasn't cached:
+  ./gradlew build --build-cache --info 2>&1 | grep -E "UP-TO-DATE|FROM-CACHE|MISS"
+
+  Build scan for cache analysis:
+  ./gradlew build --build-cache --scan
+  // Open the scan URL → Timeline → Filter by "FROM-CACHE", "UP-TO-DATE", "EXECUTED"
+
+  Task outcome states:
+  ────────────────────
+  UP-TO-DATE    — inputs/outputs match last run (incremental, no cache needed)
+  FROM-CACHE    — outputs restored from build cache
+  EXECUTED      — task actually ran
+  SKIPPED       — onlyIf condition was false
+  NO-SOURCE     — no input sources (e.g., empty source directory)
+
+  Common reasons for cache misses:
+  • @Input property changed (version number, env var, flag)
+  • @InputFile content changed
+  • Non-repeatable task action (calls System.currentTimeMillis(), random UUIDs)
+  • Missing @PathSensitive annotation (absolute paths differ across machines)
+  • Task not annotated with @CacheableTask
+  • Volatile inputs (timestamps in resources, generated headers with dates)
+
+─────────────────────────────────────────────────────────────────────────────────
+ARCHIVE REPRODUCIBILITY (Required for reliable cache hits)
+─────────────────────────────────────────────────────────────────────────────────
+
+  ZIP/JAR files include file timestamps by default → different timestamp = cache miss.
+  Fix by configuring reproducible archives:
+
+  tasks.withType<AbstractArchiveTask>().configureEach {
+      isPreserveFileTimestamps = false
+      isReproducibleFileOrder = true
+  }
+
+  This ensures the same JAR content always produces the same hash.
+  Add this to your root build script or convention plugin.
+
+─────────────────────────────────────────────────────────────────────────────────
+GRADLE WRAPPER AND CACHE KEYS
+─────────────────────────────────────────────────────────────────────────────────
+
+  The Gradle version is part of the cache key. Using the Gradle Wrapper ensures
+  all developers and CI use exactly the same Gradle version → consistent cache keys.
+
+  Gradle toolchain (JDK) is also part of the cache key:
+  ───────────────────────────────────────────────────────
+  java {
+      toolchain {
+          languageVersion.set(JavaLanguageVersion.of(21))
+          vendor.set(JvmVendorSpec.ADOPTIUM)
+      }
+  }
+
+  This pins the JDK, making the compile task's cache key consistent across machines
+  (all use the same JDK version and vendor, downloaded by Gradle automatically).
+
+─────────────────────────────────────────────────────────────────────────────────
+INTERVIEW QUICK-HITS
+─────────────────────────────────────────────────────────────────────────────────
+
+Q: What is the Gradle build cache and how does it differ from UP-TO-DATE checking?
+A: Both avoid rerunning tasks unnecessarily. UP-TO-DATE checking is local —
+   Gradle checks if the task's inputs/outputs have changed since the last run
+   on the same machine. Build cache is broader — it stores task outputs keyed
+   by a hash of all inputs, allowing cache hits across machines, after clean,
+   and on different branches. UP-TO-DATE: "did I already do this here?" Build
+   cache: "has anyone done this exact computation before?"
+
+Q: What is the Gradle configuration cache?
+A: The configuration cache stores the task execution graph (the result of evaluating
+   all build scripts) to disk. Subsequent builds with unchanged build scripts skip
+   the configuration phase entirely, directly executing tasks. For large projects
+   with complex build scripts this can save 5-30+ seconds per run. It's stable
+   in Gradle 8.1+ but requires build scripts to be "configuration cache compatible"
+   (no arbitrary side effects during configuration).
+
+Q: What is @CacheableTask and when should you use it?
+A: It marks a custom task as safe to cache. For a task to be cached, its outputs
+   must be purely a function of its declared inputs (no side effects like network
+   calls, timestamps, random). You declare inputs with @Input/@InputFile/@InputDirectory
+   and outputs with @OutputFile/@OutputDirectory. Also use @PathSensitive with
+   RELATIVE or NAME_ONLY so the cache key is portable across machines.
+
+Q: Why might a task miss the build cache even though its code hasn't changed?
+A: Common causes: (1) @PathSensitive not set, so absolute paths differ across
+   machines, (2) a volatile @Input like System.currentTimeMillis() or a timestamp,
+   (3) a new file added to an @InputDirectory, (4) the task is not @CacheableTask,
+   (5) JAR files with non-reproducible timestamps (fix with isPreserveFileTimestamps=false),
+   (6) Gradle version or JDK version changed (both are part of the cache key).
+================================================================================

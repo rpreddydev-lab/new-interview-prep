@@ -1,0 +1,314 @@
+================================================================
+  SPRING CLOUD — LOAD BALANCING AND FEIGN CLIENT
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. CLIENT-SIDE LOAD BALANCING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Traditional (server-side) load balancing: a dedicated LB (Nginx, HAProxy,
+ELB) sits in front of services and distributes traffic.
+
+Client-side load balancing: the calling service itself holds a list of
+available instances and picks one before making the call.
+
+Advantages: no single LB bottleneck, lower latency (no extra hop),
+LB decisions can be smarter (health-aware, zone-aware).
+
+Spring Cloud LoadBalancer (replacement for Netflix Ribbon):
+  - Fetches instance list from service registry (Eureka/Consul)
+  - Provides LoadBalancerClient for manual lookups
+  - Integrates with @LoadBalanced RestTemplate/WebClient and Feign
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. SPRING CLOUD LOADBALANCER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Included transitively with most Spring Cloud starters.
+
+Built-in algorithms:
+  RoundRobinLoadBalancer    → default; cycles through instances
+  RandomLoadBalancer         → picks a random instance
+
+Custom algorithm:
+
+@Bean
+@Primary
+public ReactorLoadBalancer<ServiceInstance> customLoadBalancer(
+        Environment environment,
+        LoadBalancerClientFactory factory) {
+    String name = environment.getProperty(LoadBalancerClientFactory.PROPERTY_NAME);
+    return new RandomLoadBalancer(
+        factory.getLazyProvider(name, ServiceInstanceListSupplier.class), name);
+}
+
+// Service-specific load balancer config:
+@Configuration
+@LoadBalancerClient(name = "order-service", configuration = OrderServiceLBConfig.class)
+public class LBConfig {}
+
+@Configuration
+class OrderServiceLBConfig {
+    @Bean
+    public ReactorLoadBalancer<ServiceInstance> orderServiceLB(
+            Environment env, LoadBalancerClientFactory factory) {
+        String name = env.getProperty(LoadBalancerClientFactory.PROPERTY_NAME);
+        return new RoundRobinLoadBalancer(
+            factory.getLazyProvider(name, ServiceInstanceListSupplier.class), name);
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. @LoadBalanced RestTemplate / WebClient
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Configuration
+public class HttpClientConfig {
+
+    @Bean
+    @LoadBalanced    // Spring LB intercepts calls, resolves service names
+    public RestTemplate restTemplate() {
+        return new RestTemplate();
+    }
+
+    @Bean
+    @LoadBalanced
+    public WebClient.Builder webClientBuilder() {
+        return WebClient.builder();
+    }
+}
+
+@Service
+public class OrderService {
+
+    private final RestTemplate restTemplate;
+    private final WebClient.Builder webClientBuilder;
+
+    // RestTemplate (blocking)
+    public Inventory getInventory(Long productId) {
+        return restTemplate.getForObject(
+            "http://inventory-service/api/inventory/{id}",
+            Inventory.class, productId
+        );
+    }
+
+    // WebClient (reactive)
+    public Mono<Inventory> getInventoryReactive(Long productId) {
+        return webClientBuilder.build()
+            .get()
+            .uri("http://inventory-service/api/inventory/{id}", productId)
+            .retrieve()
+            .bodyToMono(Inventory.class);
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. OPENFEIGN — DECLARATIVE HTTP CLIENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Feign lets you define HTTP clients as interfaces — no manual RestTemplate/
+WebClient calls needed.
+
+<!-- pom.xml -->
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-openfeign</artifactId>
+</dependency>
+
+@SpringBootApplication
+@EnableFeignClients   // enable scanning for @FeignClient
+public class OrderServiceApplication { ... }
+
+// Define the Feign client interface
+@FeignClient(
+    name = "inventory-service",     // ← service name from registry
+    path = "/api/inventory",        // optional base path
+    fallback = InventoryFallback.class    // fallback on error/CB open
+)
+public interface InventoryClient {
+
+    @GetMapping("/{productId}")
+    Inventory getInventory(@PathVariable("productId") Long productId);
+
+    @GetMapping
+    List<Inventory> getAll(@RequestParam("category") String category);
+
+    @PostMapping
+    @ResponseStatus(HttpStatus.CREATED)
+    Inventory createInventory(@RequestBody CreateInventoryRequest request);
+
+    @PutMapping("/{id}")
+    Inventory update(@PathVariable("id") Long id,
+                     @RequestBody UpdateInventoryRequest request);
+
+    @DeleteMapping("/{id}")
+    void delete(@PathVariable("id") Long id);
+}
+
+// Fallback implementation
+@Component
+public class InventoryFallback implements InventoryClient {
+
+    @Override
+    public Inventory getInventory(Long productId) {
+        return Inventory.unavailable(productId);
+    }
+
+    @Override
+    public List<Inventory> getAll(String category) {
+        return Collections.emptyList();
+    }
+
+    // ... other fallbacks
+}
+
+// Inject and use
+@Service
+public class OrderService {
+
+    private final InventoryClient inventoryClient;
+
+    public OrderService(InventoryClient inventoryClient) {
+        this.inventoryClient = inventoryClient;
+    }
+
+    public Order placeOrder(CreateOrderRequest request) {
+        Inventory stock = inventoryClient.getInventory(request.getProductId());
+        if (stock.getQuantity() < request.getQuantity()) {
+            throw new InsufficientStockException();
+        }
+        // continue order creation
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. FEIGN CONFIGURATION — INTERCEPTORS, LOGGING, TIMEOUTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Global Feign config
+@Configuration
+public class FeignGlobalConfig {
+
+    // Logging level (use BASIC or FULL for debugging only)
+    @Bean
+    public Logger.Level feignLoggerLevel() {
+        return Logger.Level.BASIC;  // NONE, BASIC, HEADERS, FULL
+    }
+
+    // Timeout config
+    @Bean
+    public Request.Options feignOptions() {
+        return new Request.Options(
+            Duration.ofSeconds(2),   // connect timeout
+            Duration.ofSeconds(5),   // read timeout
+            true                     // followRedirects
+        );
+    }
+
+    // Add auth header to all Feign requests
+    @Bean
+    public RequestInterceptor authInterceptor() {
+        return requestTemplate -> {
+            // Pass through JWT from current request context
+            String token = SecurityContextHolder.getContext()
+                .getAuthentication().getCredentials().toString();
+            requestTemplate.header("Authorization", "Bearer " + token);
+        };
+    }
+}
+
+// Per-client config:
+@FeignClient(name = "payment-service", configuration = PaymentFeignConfig.class)
+public interface PaymentClient { ... }
+
+@Configuration
+public class PaymentFeignConfig {
+    @Bean
+    public Retryer retryer() {
+        return new Retryer.Default(100, 500, 3);  // period, maxPeriod, maxAttempts
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. FEIGN + RESILIENCE4J CIRCUIT BREAKER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Enable circuit breaker for Feign:
+
+# application.yml
+spring:
+  cloud:
+    openfeign:
+      circuitbreaker:
+        enabled: true    # wraps Feign calls with Resilience4j CB
+
+@FeignClient(
+    name = "inventory-service",
+    fallback = InventoryFallback.class   # used when CB is open
+)
+public interface InventoryClient { ... }
+
+# Resilience4j config for Feign clients:
+resilience4j:
+  circuitbreaker:
+    instances:
+      # Convention: ClassName#methodName(argType)
+      InventoryClient#getInventory(Long):
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. FEIGN vs RestTemplate vs WebClient
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Feature              | Feign           | RestTemplate   | WebClient
+---------------------|-----------------|----------------|----------------
+Programming model    | Declarative     | Imperative     | Reactive
+Boilerplate          | Minimal         | Verbose        | Moderate
+Load balancing       | Yes (auto)      | Yes (@LB)      | Yes (@LB)
+Circuit breaker      | Yes (config)    | Manual         | Manual
+Error handling       | FeignException  | Manual         | Manual/reactive
+Async/reactive       | No (blocking)   | No (blocking)  | Yes
+Best for             | Service-to-svc  | Simple calls   | Reactive stacks
+
+Spring 6+ introduces HttpInterface (similar to Feign but native Spring):
+  @HttpExchange("/api/inventory")
+  public interface InventoryClient {
+      @GetExchange("/{id}")
+      Inventory getInventory(@PathVariable Long id);
+  }
+  // Create proxy via HttpServiceProxyFactory + WebClient
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the benefit of OpenFeign over RestTemplate?
+A: Feign is declarative — you define the HTTP API as a Java interface with
+   annotations. No boilerplate (no building URIs, no response extraction).
+   It integrates automatically with Spring Cloud LoadBalancer, Resilience4j
+   circuit breaker, and logging. Easier to test by mocking the interface.
+
+Q: How does Feign perform load balancing?
+A: Feign uses the service name specified in @FeignClient(name=...) with
+   Spring Cloud LoadBalancer. When you make a call, LoadBalancer resolves
+   the service name to a list of instances from the registry and picks
+   one using the configured algorithm (round-robin by default).
+
+Q: What replaced Netflix Ribbon?
+A: Spring Cloud LoadBalancer replaced Ribbon. Ribbon was Netflix-based
+   and became maintenance-only. Spring Cloud LoadBalancer is part of the
+   Spring ecosystem, supports reactive stacks, and has simpler extension
+   points.
+
+Q: How do you handle errors in Feign clients?
+A: Option 1: Define a fallback class implementing the Feign interface.
+   Option 2: Implement ErrorDecoder to map HTTP status codes to exceptions.
+   Option 3: Use @CircuitBreaker on a service method that calls Feign.
+   FeignException is thrown by default on non-2xx responses.
+
+Q: What is Spring 6's HttpInterface and how does it compare to Feign?
+A: HttpInterface is Spring's native alternative to Feign. You annotate
+   an interface with @HttpExchange, @GetExchange, etc. A WebClient-backed
+   proxy is generated via HttpServiceProxyFactory. It's reactive (backed
+   by WebClient), doesn't need Spring Cloud, and is part of Spring Framework 6+.

@@ -1,0 +1,439 @@
+================================================================================
+SPRING CLOUD GATEWAY — IN DEPTH
+================================================================================
+
+OVERVIEW
+---------
+Spring Cloud Gateway (SCG) is the standard API Gateway in the Spring ecosystem.
+Built on:
+  - Spring Boot 3.x
+  - Spring WebFlux (reactive, non-blocking)
+  - Reactor Netty (HTTP server)
+  - Project Reactor (Mono/Flux)
+
+Key concepts:
+  Route     : A destination with predicates (when to match) and filters (how to modify)
+  Predicate : A condition that matches the incoming request
+  Filter    : Pre/post processing of request or response
+
+================================================================================
+1. DEPENDENCY & SETUP
+================================================================================
+
+  <dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-gateway</artifactId>
+  </dependency>
+
+  <!-- For service discovery -->
+  <dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-netflix-eureka-client</artifactId>
+  </dependency>
+
+  <!-- For circuit breaker -->
+  <dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-circuitbreaker-resilience4j</artifactId>
+  </dependency>
+
+  <!-- For rate limiting -->
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis-reactive</artifactId>
+  </dependency>
+
+IMPORTANT: SCG is reactive; do NOT add spring-boot-starter-web (blocking).
+Add spring-boot-starter-webflux only if you need custom @RestController endpoints.
+
+================================================================================
+2. COMPLETE APPLICATION.YML
+================================================================================
+
+spring:
+  application:
+    name: api-gateway
+  cloud:
+    gateway:
+      # Default filters applied to all routes
+      default-filters:
+        - AddResponseHeader=X-Gateway, spring-cloud-gateway
+        - name: RequestRateLimiter
+          args:
+            redis-rate-limiter.replenishRate: 100
+            redis-rate-limiter.burstCapacity: 200
+            key-resolver: "#{@ipKeyResolver}"
+
+      # Route definitions
+      routes:
+        # ── USER SERVICE ──────────────────────────────────────────────────────
+        - id: user-service
+          uri: lb://USER-SERVICE              # load balanced via Eureka
+          predicates:
+            - Path=/api/v1/users/**
+          filters:
+            - StripPrefix=2                   # strips /api/v1
+            - name: CircuitBreaker
+              args:
+                name: userServiceCB
+                fallbackUri: forward:/fallback/users
+            - name: Retry
+              args:
+                retries: 3
+                statuses: SERVICE_UNAVAILABLE, GATEWAY_TIMEOUT
+                methods: GET
+                backoff:
+                  firstBackoff: 100ms
+                  maxBackoff: 2s
+                  factor: 2
+                  basedOnPreviousValue: false
+
+        # ── ORDER SERVICE ─────────────────────────────────────────────────────
+        - id: order-service
+          uri: lb://ORDER-SERVICE
+          predicates:
+            - Path=/api/v1/orders/**
+            - Method=GET,POST,PUT,PATCH,DELETE
+          filters:
+            - StripPrefix=2
+            - AddRequestHeader=X-Internal-Call, true
+            - name: CircuitBreaker
+              args:
+                name: orderServiceCB
+                fallbackUri: forward:/fallback/orders
+
+        # ── PUBLIC HEALTH ─────────────────────────────────────────────────────
+        - id: health
+          uri: lb://USER-SERVICE
+          predicates:
+            - Path=/health
+          filters:
+            - SetPath=/actuator/health
+
+        # ── VERSIONED ROUTE ───────────────────────────────────────────────────
+        - id: user-service-v2
+          uri: lb://USER-SERVICE-V2
+          predicates:
+            - Path=/api/v2/users/**
+          filters:
+            - StripPrefix=2
+
+        # ── CANARY DEPLOYMENT ─────────────────────────────────────────────────
+        - id: product-service-canary
+          uri: lb://PRODUCT-SERVICE-V2
+          predicates:
+            - Path=/api/v1/products/**
+            - Weight=canary, 10               # 10% of traffic
+          filters:
+            - StripPrefix=2
+
+        - id: product-service-stable
+          uri: lb://PRODUCT-SERVICE
+          predicates:
+            - Path=/api/v1/products/**
+            - Weight=canary, 90               # 90% of traffic
+          filters:
+            - StripPrefix=2
+
+      # Service discovery → auto-generate routes from Eureka
+      discovery:
+        locator:
+          enabled: true
+          lower-case-service-id: true         # /user-service/** auto-routed
+
+      # HTTP client settings
+      httpclient:
+        connect-timeout: 5000                 # 5s connect timeout
+        response-timeout: PT30S              # 30s response timeout
+        pool:
+          max-connections: 1000
+          acquire-timeout: PT5S
+
+# Resilience4j circuit breaker config
+resilience4j:
+  circuitbreaker:
+    instances:
+      userServiceCB:
+        slidingWindowSize: 10
+        failureRateThreshold: 50
+        waitDurationInOpenState: 10s
+        permittedNumberOfCallsInHalfOpenState: 3
+      orderServiceCB:
+        slidingWindowSize: 20
+        failureRateThreshold: 60
+        waitDurationInOpenState: 30s
+
+================================================================================
+3. GLOBAL PRE/POST FILTERS
+================================================================================
+
+// Logging filter — runs on every request
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class RequestLoggingFilter implements GlobalFilter {
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        ServerHttpRequest req = exchange.getRequest();
+        String requestId = UUID.randomUUID().toString();
+        long startTime = System.currentTimeMillis();
+
+        // Inject request ID into downstream services
+        exchange = exchange.mutate()
+            .request(req.mutate()
+                .header("X-Request-Id", requestId)
+                .build())
+            .build();
+
+        log.info("→ {} {} [{}]", req.getMethod(), req.getPath(), requestId);
+
+        return chain.filter(exchange)
+            .doFinally(signalType -> {
+                long elapsed = System.currentTimeMillis() - startTime;
+                log.info("← {} {} {}ms [{}]",
+                    exchange.getResponse().getStatusCode(),
+                    req.getPath(), elapsed, requestId);
+            });
+    }
+}
+
+// JWT Authentication filter
+@Component
+@Order(-1)
+public class JwtAuthFilter implements GlobalFilter {
+
+    private static final Set<String> PUBLIC_PATHS = Set.of(
+        "/auth/login", "/auth/register", "/health", "/actuator/health"
+    );
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String path = exchange.getRequest().getPath().value();
+        
+        if (PUBLIC_PATHS.stream().anyMatch(path::startsWith)) {
+            return chain.filter(exchange);
+        }
+        
+        String authHeader = exchange.getRequest().getHeaders().getFirst("Authorization");
+        
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            return unauthorized(exchange);
+        }
+        
+        return jwtService.parseToken(authHeader.substring(7))
+            .flatMap(claims -> {
+                ServerHttpRequest mutated = exchange.getRequest().mutate()
+                    .header("X-User-Id", claims.getSubject())
+                    .header("X-User-Email", claims.getEmail())
+                    .header("X-User-Roles", String.join(",", claims.getRoles()))
+                    .build();
+                return chain.filter(exchange.mutate().request(mutated).build());
+            })
+            .onErrorResume(JwtException.class, e -> unauthorized(exchange));
+    }
+
+    private Mono<Void> unauthorized(ServerWebExchange exchange) {
+        exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+        byte[] bytes = """
+            {"error":"UNAUTHORIZED","message":"Valid Bearer token required"}
+            """.getBytes();
+        DataBuffer buffer = exchange.getResponse().bufferFactory().wrap(bytes);
+        exchange.getResponse().getHeaders().setContentType(MediaType.APPLICATION_JSON);
+        return exchange.getResponse().writeWith(Mono.just(buffer));
+    }
+}
+
+================================================================================
+4. CUSTOM GATEWAY FILTER FACTORY
+================================================================================
+
+// Custom filter factory — reusable across routes
+@Component
+public class ApiKeyGatewayFilterFactory
+        extends AbstractGatewayFilterFactory<ApiKeyGatewayFilterFactory.Config> {
+
+    public ApiKeyGatewayFilterFactory() {
+        super(Config.class);
+    }
+
+    @Override
+    public GatewayFilter apply(Config config) {
+        return (exchange, chain) -> {
+            String apiKey = exchange.getRequest()
+                .getHeaders().getFirst("X-Api-Key");
+            
+            if (apiKey == null || apiKey.isBlank()) {
+                exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+                return exchange.getResponse().setComplete();
+            }
+            
+            return apiKeyService.validateAndGetTier(apiKey)
+                .flatMap(tier -> {
+                    ServerHttpRequest mutated = exchange.getRequest().mutate()
+                        .header("X-Api-Tier", tier)
+                        .build();
+                    return chain.filter(exchange.mutate().request(mutated).build());
+                })
+                .onErrorResume(e -> {
+                    exchange.getResponse().setStatusCode(HttpStatus.FORBIDDEN);
+                    return exchange.getResponse().setComplete();
+                });
+        };
+    }
+
+    @Data
+    public static class Config {
+        private boolean required = true;
+    }
+}
+
+// Use in YAML:
+// filters:
+//   - name: ApiKey
+//     args:
+//       required: true
+
+================================================================================
+5. ROUTE CONFIGURATION IN JAVA
+================================================================================
+
+@Configuration
+public class GatewayConfig {
+
+    @Bean
+    public RouteLocator gatewayRoutes(RouteLocatorBuilder builder,
+                                      JwtAuthFilter jwtFilter) {
+        return builder.routes()
+            
+            // Users API
+            .route("users", r -> r
+                .path("/api/v1/users/**")
+                .filters(f -> f
+                    .stripPrefix(2)
+                    .filter(jwtFilter)
+                    .circuitBreaker(c -> c.setName("usersCB")
+                        .setFallbackUri("forward:/fallback/users"))
+                    .retry(c -> c.setRetries(3)
+                        .setStatuses(HttpStatus.SERVICE_UNAVAILABLE)
+                        .setMethods(HttpMethod.GET)))
+                .uri("lb://USER-SERVICE"))
+            
+            // Rewrite path for legacy service
+            .route("legacy", r -> r
+                .path("/v1/legacy/**")
+                .filters(f -> f
+                    .rewritePath("/v1/legacy/(?<rest>.*)", "/api/v2/${rest}"))
+                .uri("http://legacy.internal:8090"))
+            
+            // CORS preflight passthrough
+            .route("cors-preflight", r -> r
+                .method(HttpMethod.OPTIONS)
+                .filters(f -> f
+                    .setStatus(200)
+                    .addResponseHeader("Access-Control-Allow-Origin", "*")
+                    .addResponseHeader("Access-Control-Allow-Methods", 
+                        "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+                    .addResponseHeader("Access-Control-Allow-Headers",
+                        "Authorization,Content-Type,X-Request-Id"))
+                .uri("no://op"))
+            
+            .build();
+    }
+}
+
+================================================================================
+6. ACTUATOR ENDPOINTS
+================================================================================
+
+Enable gateway management endpoints:
+  management:
+    endpoints:
+      web:
+        exposure:
+          include: gateway, health, info, metrics
+    endpoint:
+      gateway:
+        enabled: true
+
+Useful endpoints:
+  GET /actuator/gateway/routes          → list all routes
+  GET /actuator/gateway/routes/{id}     → specific route details
+  GET /actuator/gateway/globalfilters   → all global filters with order
+  GET /actuator/gateway/routefilters    → all route filter factories
+  POST /actuator/gateway/refresh        → reload route definitions
+  DELETE /actuator/gateway/routes/{id} → remove a route at runtime
+
+================================================================================
+7. CORS CONFIGURATION
+================================================================================
+
+spring:
+  cloud:
+    gateway:
+      globalcors:
+        cors-configurations:
+          '[/**]':
+            allowedOriginPatterns:
+              - "https://*.example.com"
+              - "http://localhost:[*]"
+            allowedMethods:
+              - GET
+              - POST
+              - PUT
+              - PATCH
+              - DELETE
+              - OPTIONS
+            allowedHeaders:
+              - Authorization
+              - Content-Type
+              - X-Request-Id
+            allowCredentials: true
+            maxAge: 3600
+
+================================================================================
+8. INTERVIEW QUESTIONS — SPRING CLOUD GATEWAY
+================================================================================
+
+Q1: How does Spring Cloud Gateway differ from Netflix Zuul?
+    Zuul 1.x is blocking — uses servlet threads (one thread per request).
+    Spring Cloud Gateway is reactive — uses Netty event loop with Mono/Flux.
+    Gateway handles more concurrent connections with fewer threads, making it
+    better suited for high-throughput environments. SCG supports WebSockets;
+    Zuul does not. SCG integrates natively with Spring reactive ecosystem
+    (WebFlux, Reactor). Zuul is in maintenance mode as of Spring Cloud 2021.
+
+Q2: What is the order of filter execution in SCG?
+    Global filters and route-specific filters are ordered. Filters with lower
+    order values run first in pre-processing (before routing) and last in
+    post-processing (after response). Global filters run alongside route filters.
+    Default order of built-in filters is defined internally; custom GlobalFilter
+    can set priority via @Order or implementing Ordered. Gateway filter chain:
+    GlobalFilter 1 → GlobalFilter 2 → Route Filters → Route → (reverse on way back).
+
+Q3: How would you implement request body modification in SCG?
+    By default SCG is a streaming proxy — it doesn't buffer request bodies.
+    To modify the body, use ModifyRequestBody filter:
+    .modifyRequestBody(String.class, EnrichedRequest.class, MediaType.APPLICATION_JSON,
+        (exchange, body) -> Mono.just(enrichWith(body, exchange)));
+    This buffers the body, transforms it, and forwards the new body. Be careful
+    about memory — set requestSize limits to prevent OOM.
+
+Q4: What are Predicates in Spring Cloud Gateway?
+    Predicates are conditions that must be true for a route to match.
+    Built-in: Path, Method, Header, Query, Host, Before, After, Between, Weight,
+    RemoteAddr, Cookie. They combine with AND by default (all must match).
+    Custom predicates implement RoutePredicateFactory. Example: route only requests
+    with a specific User-Agent to a mobile-optimized backend.
+
+Q5: How do you implement rate limiting per user rather than per IP?
+    Implement a custom KeyResolver bean that extracts the user ID from the request
+    (e.g., from a JWT, X-User-Id header injected by auth filter):
+    @Bean KeyResolver userKeyResolver() {
+        return exchange -> Mono.justOrEmpty(
+            exchange.getRequest().getHeaders().getFirst("X-User-Id"))
+            .defaultIfEmpty("anonymous");
+    }
+    Reference it in route filter: key-resolver: "#{@userKeyResolver}".
+    The Redis rate limiter will then use this key for per-user limits.
+
+================================================================================

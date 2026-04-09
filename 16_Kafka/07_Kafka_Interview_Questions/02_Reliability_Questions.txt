@@ -1,0 +1,223 @@
+================================================================================
+  KAFKA INTERVIEW QUESTIONS — RELIABILITY
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DELIVERY GUARANTEES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q1: What are the three delivery semantics? How do you achieve each in Kafka?
+
+A: AT-MOST-ONCE: message is delivered zero or one time. Never duplicated, but may be lost.
+   - Producer: acks=0 (no wait for broker confirmation)
+   - Consumer: commit offset BEFORE processing (if crash during processing → message lost)
+   - Use: metrics aggregation, click-tracking where small loss is acceptable
+
+   AT-LEAST-ONCE: message is delivered one or more times. Never lost, but may be duplicated.
+   - Producer: acks=all + retries (on timeout, retry may cause duplicate on broker)
+   - Consumer: commit offset AFTER successful processing (crash → re-read same message)
+   - Use: most business applications with idempotent downstream systems
+
+   EXACTLY-ONCE: delivered precisely once, end-to-end.
+   - Producer: enable.idempotence=true (deduplicates per-partition retries)
+   - Kafka-to-Kafka: Kafka transactions (sendOffsetsToTransaction)
+   - Kafka-to-DB: idempotent upserts or offset tracking in same DB transaction
+   - Use: financial transactions, inventory updates, deduplication-critical systems
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q2: What is min.insync.replicas and how does it interact with acks=all?
+
+A: min.insync.replicas (ISR): the minimum number of ISR replicas that must
+   acknowledge a write for it to succeed when acks=all.
+
+   If ISR size drops below min.insync.replicas, the broker returns
+   NotEnoughReplicasException, and the producer's write fails.
+
+   Example with RF=3, min.insync.replicas=2:
+   - Normal: 3 in ISR → writes succeed ✓
+   - One replica down: 2 in ISR → writes succeed ✓ (still meets minimum)
+   - Two replicas down: 1 in ISR → writes FAIL ✗ (below minimum)
+   - This means: tolerate 1 failure, not 2
+
+   min.insync.replicas=1 with acks=all: equivalent to acks=1 (only leader must ack).
+   min.insync.replicas=RF: all replicas must be in ISR → zero tolerance for failures.
+
+   Best practice: RF=3, min.insync.replicas=2 → survives 1 broker failure with
+   full durability.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q3: What is unclean leader election? When is it dangerous?
+
+A: Unclean leader election (unclean.leader.election.enable=true) allows an out-of-sync
+   replica (one NOT in ISR) to become the leader when all ISR replicas are unavailable.
+
+   WHY DANGEROUS:
+   - Out-of-sync replica lacks recent records (behind the HW)
+   - Electing it as leader means those records are permanently LOST
+   - Subsequent leaders have a lower LEO — records that consumers may have already
+     read are now gone → inconsistency
+
+   WHEN TO USE:
+   - High availability over durability: systems where service continuity matters more
+     than losing a few recent records (e.g., real-time dashboards, sensor streams)
+   - NEVER use for financial, audit, or transactional data
+
+   Default (Kafka 0.11+): unclean.leader.election.enable=false.
+   With KRaft: still configurable per-topic via cleanup.policy or topic-level override.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q4: Explain the sequence of events in a Kafka transaction (produce + offset commit atomically).
+
+A: Sequence (consume-process-produce pattern):
+   1. Producer calls initTransactions() on startup.
+      → Registers with a Transaction Coordinator, gets a PID and epoch.
+   2. beginTransaction(): marks start of a new transaction in memory.
+   3. Producer sends records to output partitions within the transaction.
+      → Transaction coordinator tracks all partitions involved.
+   4. sendOffsetsToTransaction(offsets, consumerGroupMetadata):
+      → Atomically includes consumer offset commit in the same transaction.
+      → Coordinates with the group coordinator to record these offsets.
+   5. commitTransaction():
+      → Two-phase commit: coordinator writes PREPARE_COMMIT to __transaction_state.
+      → WriteTxnMarker (COMMIT) sent to all involved partitions and offset partitions.
+      → Coordinator writes COMPLETE_COMMIT to __transaction_state.
+   6. Consumers with isolation.level=read_committed now see the new records AND
+      the consumer group offset is advanced — atomically.
+
+   If crash at step 3 or 4:
+      → Coordinator sees incomplete transaction, sends ABORT markers on recovery.
+      → Consumers never see those records. Input offset not advanced.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q5: What is zombie fencing in Kafka? Why is it important for EOS?
+
+A: Zombie fencing prevents an old producer instance (a "zombie") from producing
+   records after a newer instance has taken over.
+
+   Problem scenario:
+   - Producer P1 with transactional.id="order-producer" starts, begins TX.
+   - P1 is paused (GC pause, network partition).
+   - P2 starts with same transactional.id="order-producer". Broker assigns new epoch.
+   - P1 resumes, tries to commit its transaction.
+   → Without fencing: P1 could commit stale/duplicate data. Split-brain.
+
+   Kafka's solution:
+   - Each transactional.id has a monotonically increasing epoch on the broker.
+   - When P2 calls initTransactions(), broker increments epoch.
+   - P1's subsequent produce/commit requests carry the old epoch.
+   - Transaction Coordinator REJECTS requests with old epoch → P1 gets
+     FencedInstanceIdException.
+   - P1 is "fenced" (killed). Only P2 can commit.
+
+   This guarantees: at most one live producer per transactional.id at any time.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REPLICATION AND DURABILITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q6: Can messages be lost in Kafka even with acks=all and RF=3? Name the scenarios.
+
+A: Yes, rare but possible:
+   1. ALL BROKERS DIE SIMULTANEOUSLY (power outage): data in page cache not yet flushed
+      to disk is lost. Kafka doesn't force fsync by default (log.flush.interval.messages
+      is very high). Mitigation: use UPS, flush.messages=1 (extreme performance cost).
+   2. UNCLEAN LEADER ELECTION: if enabled, an out-of-sync replica becomes leader
+      and already-committed records are lost. Mitigation: disable unclean election.
+   3. TOPIC DELETION: intentional or accidental. Mitigation: restrict delete ACLs.
+   4. LOG COMPACTION OR RETENTION: if retention.ms is too short, records older than
+      the window are purged. Mitigation: configure appropriate retention.
+   5. CONSUMER SIDE: consumer reads a record, processes it, fails before doing
+      anything durable with it. The record is still in Kafka but the processing result
+      is lost — this is application-level, not Kafka durability.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q7: What is the impact of too many partitions on a Kafka cluster?
+
+A: Resource impacts:
+   - FILE DESCRIPTORS: each partition has multiple log segment files. Too many
+     partitions exhaust OS ulimit (nofile). Default: 100k. Raise with ulimit -n.
+   - MEMORY: leader/follower metadata + ISR tracking per partition held in memory.
+   - CONTROLLER OVERHEAD: on any metadata change or broker failure, controller must
+     process O(partitions) leader elections. Large partition counts → slow recovery.
+   - REPLICATION THREADS: brokers maintain one replication thread per source broker
+     per partition. More partitions = more threads = more CPU.
+   - CLIENT METADATA: producers and consumers must cache metadata for each partition.
+     Very large partition counts bloat client memory.
+
+   Rule of thumb: ≤4000 partitions/broker (ZK mode), much higher with KRaft.
+   Don't pre-create more partitions than you need; increase later as needed.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q8: How does Kafka handle message ordering? When can ordering be violated?
+
+A: Ordering guarantees:
+   - WITHIN a single partition: strictly ordered (append-only log with monotonic offsets).
+   - ACROSS partitions: NO ordering guarantee. Different partitions may be at
+     different positions; consumers process partitions independently.
+
+   Ordering violations:
+   1. PRODUCER WITH RETRIES (without idempotence): if batch 1 fails and batch 2 succeeds,
+      then batch 1 retries → records from batch 1 appear after batch 2.
+      Fix: enable.idempotence=true (sequences guarantees order per partition).
+   2. max.in.flight > 1 without idempotence: multiple outstanding requests; an earlier
+      one retrying after a later one commits.
+   3. MULTIPLE PRODUCERS to same partition: interleaved records from different producers.
+   4. KEY-PARTITION AFFINITY BROKEN: if you change partition count, same key may
+      hash to different partition. Old records on partition X, new on partition Y.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q9: What is consumer lag and how do you monitor and alert on it?
+
+A: Consumer lag = partition LEO − consumer's committed offset.
+   High lag means the consumer is behind the producer; records are piling up unprocessed.
+
+   Monitoring:
+   - CLI: kafka-consumer-groups.sh --bootstrap-server ... --describe --group <group>
+     Shows LAG column per partition.
+   - JMX metric: kafka.consumer:type=consumer-fetch-manager-metrics,name=records-lag-max
+     Maximum lag across all assigned partitions for a consumer instance.
+   - Prometheus kafka-exporter: kafka_consumergroup_lag{consumergroup,topic,partition}
+   - Burrow (LinkedIn): monitors lag TRENDS — alerts when lag is growing, not just above threshold.
+     Avoids false alarms on healthy consumers that are just processing a burst.
+
+   Alerting guidelines:
+   - Alert on growing lag (rate of change) not just absolute value
+   - Different thresholds per topic based on SLA
+   - Combine: max_lag > threshold AND lag_is_growing for high-confidence alert
+
+   Root causes: slow processing, batch DB writes, downstream API timeouts, consumer
+   crashes/restarts, insufficient consumer instances vs partitions.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Q10: What is the difference between at-least-once and exactly-once in Kafka Streams?
+
+A: Kafka Streams has three processing guarantees configured via processing.guarantee:
+
+   at_least_once (default before 3.0):
+   - Consumer commits offsets separately from producing output records.
+   - On failure + restart, some records may be re-read and re-processed.
+   - Output may contain duplicates.
+
+   exactly_once (deprecated): Uses Kafka transactions but creates one transaction
+   per task per poll. Performance overhead.
+
+   exactly_once_v2 (default since Kafka 3.0):
+   - Uses EOS v2: one transactional producer PER SHARD (broker-epoch level fencing
+     instead of producer-epoch fencing). Reduces producer count dramatically.
+   - On recovery, zombie task's producer is fenced by epoch before new task starts.
+   - Each poll cycle wraps in a transaction: all output records + offset commits.
+   - If task crashes between transaction begin and commit → transaction aborts on restart.
+   - Consumers of output topics with isolation.level=read_committed see no duplicates.
+
+   Cost: lower throughput (transactions have overhead), higher latency.
+   Use: financial calculations, inventory management, any pipeline where duplicates
+   are unacceptable and idempotent downstream is not feasible.

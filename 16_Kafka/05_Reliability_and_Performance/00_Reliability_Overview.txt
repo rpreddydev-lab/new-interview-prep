@@ -1,0 +1,180 @@
+================================================================================
+  KAFKA RELIABILITY — OVERVIEW
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. RELIABILITY PILLARS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Kafka reliability is achieved through five interconnected pillars:
+
+  1. REPLICATION          → data survives broker failures
+  2. DURABILITY           → persisted data survives broker restarts
+  3. ACKNOWLEDGEMENTS     → producer control over write guarantees
+  4. CONSUMER SEMANTICS   → at-most / at-least / exactly-once delivery
+  5. MONITORING           → visibility into failure states before they become outages
+
+  These pillars must be configured deliberately — Kafka defaults are NOT production-safe
+  (replication.factor=1, acks=1, enable.auto.commit=true).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. REPLICATION AND ISR
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Every partition has N replicas: 1 leader + (N-1) followers.
+
+In-Sync Replicas (ISR):
+  - The set of replicas that are FULLY CAUGHT UP to the leader
+  - A replica must send FetchRequest to leader within replica.lag.time.max.ms (10s default)
+  - If a follower falls too far behind → removed from ISR
+  - When it catches up → re-added to ISR
+
+High Watermark (HW):
+  - Highest offset COMMITTED across all ISR replicas
+  - Consumers can only read up to HW (ensures replicated data)
+  - HW advances only when all ISR members have the offset
+
+Production replication settings:
+  replication.factor = 3       → survives 2 broker failures (1 continues serving)
+  min.insync.replicas = 2      → producer acks=all: requires 2 ISR acks
+  acks = all                   → producer waits for all ISR (min.insync.replicas)
+  unclean.leader.election = false  → never elect out-of-ISR broker as leader (prevents data loss)
+
+Failure scenarios:
+  - Broker dies: one of the ISR followers is elected as new leader (automatic)
+  - All ISR replicas die: if unclean.leader.election=false → partition UNAVAILABLE
+    (preserves consistency); if true → elect out-of-ISR (may lose data)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. PRODUCER RELIABILITY CHECKLIST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌─────────────────────────────────────┬──────────────────────────────────────┐
+  │ Config                              │ Reliable Value                       │
+  ├─────────────────────────────────────┼──────────────────────────────────────┤
+  │ acks                                │ all                                  │
+  │ retries                             │ MAX_INT (default since Kafka 2.1)    │
+  │ max.in.flight.requests.per.conn     │ 1 (ordering) or 5 (idempotent)       │
+  │ enable.idempotence                  │ true                                 │
+  │ delivery.timeout.ms                 │ 120000 (2 min) — overall retry budget│
+  │ request.timeout.ms                  │ 30000 (30s)                          │
+  │ retry.backoff.ms                    │ 100ms minimum                        │
+  └─────────────────────────────────────┴──────────────────────────────────────┘
+
+  Callback-based error handling:
+    producer.send(record, (metadata, exception) -> {
+      if (exception != null) {
+        if (exception instanceof RetriableException) {
+          // safe to retry / will retry automatically
+        } else {
+          // non-retriable: log, alert, dead-letter
+          alertingService.alert(record, exception);
+        }
+      }
+    });
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. CONSUMER RELIABILITY CHECKLIST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌─────────────────────────────────────┬──────────────────────────────────────┐
+  │ Config                              │ Reliable Value                       │
+  ├─────────────────────────────────────┼──────────────────────────────────────┤
+  │ enable.auto.commit                  │ false (manual commit after processing)│
+  │ auto.offset.reset                   │ earliest (don't miss messages on new) │
+  │ max.poll.interval.ms                │ > max processing time per batch      │
+  │ max.poll.records                    │ Reduce to keep poll interval safe     │
+  │ session.timeout.ms                  │ 30-60s (longer for slow networks)    │
+  │ heartbeat.interval.ms               │ session.timeout.ms / 3               │
+  │ isolation.level                     │ read_committed (for EOS pipelines)   │
+  └─────────────────────────────────────┴──────────────────────────────────────┘
+
+  Reliability pattern:
+    while (true) {
+      records = consumer.poll(Duration.ofMillis(100));
+      for (record : records) { process(record); }
+      consumer.commitSync(); // after processing, not before
+    }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. BROKER RELIABILITY CHECKLIST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────────────────────────────────────┬───────────────────────────────┐
+  │ Config                                   │ Reliable Value                │
+  ├──────────────────────────────────────────┼───────────────────────────────┤
+  │ default.replication.factor               │ 3                             │
+  │ min.insync.replicas                      │ 2                             │
+  │ unclean.leader.election.enable           │ false                         │
+  │ log.flush.interval.messages              │ (rely on OS fsync, not forced)│
+  │ log.flush.interval.ms                    │ (rely on OS fsync)            │
+  │ offsets.topic.replication.factor         │ 3                             │
+  │ transaction.state.log.replication.factor │ 3                             │
+  │ num.replica.fetchers                     │ 2-4 (faster ISR catchup)      │
+  └──────────────────────────────────────────┴───────────────────────────────┘
+
+  Note on log.flush: Kafka relies on OS page cache + replica replication for
+  durability — NOT forced disk flushing (which is very slow). With RF=3 and
+  acks=all, data is in memory on 3 different servers → effectively durable.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. COMMON FAILURE MODES AND MITIGATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────────────────────────────┬───────────────────────────────────────────┐
+  │ Failure                          │ Mitigation                                │
+  ├──────────────────────────────────┼───────────────────────────────────────────┤
+  │ Broker crash                     │ RF=3, auto leader election                │
+  │ Broker disk full                 │ Retention policies, monitoring disk usage │
+  │ Network partition                │ ISR tracking, unclean.leader.election=false│
+  │ Zombie producer                  │ Idempotent producer + epoch fencing       │
+  │ Message loss on producer retry   │ acks=all, idempotent producer             │
+  │ Consumer offset commit failure   │ At-least-once + idempotent processing     │
+  │ Stale consumer (slow processing) │ Tune max.poll.interval.ms + max.poll.records│
+  │ Split-brain (old ZK)             │ KRaft mode (eliminates ZK split-brain)    │
+  │ Out-of-ISR election              │ unclean.leader.election.enable=false      │
+  └──────────────────────────────────┴───────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What are the minimum configs to prevent data loss in Kafka?
+A: On the broker: replication.factor=3, min.insync.replicas=2,
+   unclean.leader.election.enable=false. On the producer: acks=all,
+   enable.idempotence=true, retries=MAX_INT. On the consumer:
+   enable.auto.commit=false, manual commitSync() AFTER processing. Together
+   these ensure writes are replicated, producers retry correctly, and consumers
+   don't skip records.
+
+Q: What is the ISR and why does it matter for durability?
+A: The In-Sync Replicas (ISR) set contains replicas that are fully caught up
+   to the leader. With acks=all + min.insync.replicas=2, a write is only
+   acknowledged when at least 2 ISR replicas confirm it. If a broker dies, the
+   remaining ISR members have the data. If the ISR shrinks below min.insync.replicas,
+   the broker rejects new writes (NotEnoughReplicasException) rather than risking
+   data loss — the right trade-off for critical data.
+
+Q: Why should unclean.leader.election.enable be set to false?
+A: When all ISR replicas are unavailable, Kafka can elect an out-of-ISR replica
+   as leader (unclean election). That replica may be behind the old leader —
+   messages acknowledged by the old leader may not be present → DATA LOSS.
+   Setting unclean.leader.election.enable=false makes the partition UNAVAILABLE
+   instead, preserving consistency. Choose availability-over-consistency only
+   for non-critical topics where some loss is acceptable.
+
+Q: Does Kafka need forced disk flushing (log.flush.interval) for durability?
+A: No. Kafka's durability model relies on replication across multiple brokers,
+   not forced disk flushes. With RF=3 and acks=all, the data is in memory on
+   3 independent machines. Even if the OS hasn't flushed to disk yet on one
+   broker, the data is safe on the others. Forcing disk flushing on every write
+   would dramatically reduce throughput. Kafka's design explicitly avoids this
+   (this is a common misconception in interviews).
+
+Q: What is the relationship between min.insync.replicas and acks?
+A: They work together. acks=all means the producer waits for ALL ISR replicas.
+   min.insync.replicas=2 means the broker requires AT LEAST 2 replicas to be
+   in ISR to accept any write. If ISR drops to 1 → broker rejects writes.
+   Together they guarantee that writes are acknowledged by at least 2 replicas.
+   Setting min.insync.replicas=1 with acks=all gives similar durability to acks=1.

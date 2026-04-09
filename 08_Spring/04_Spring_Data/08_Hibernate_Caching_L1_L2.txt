@@ -1,0 +1,221 @@
+================================================================
+  HIBERNATE CACHING — L1 AND L2
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. CACHING OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Hibernate has three caching layers:
+
+  L1 Cache (First-Level)  → Persistence Context / EntityManager cache
+                             Per-transaction, always ON, non-configurable
+  L2 Cache (Second-Level) → Shared across sessions / transactions
+                             Opt-in, requires configuration
+  Query Cache             → Caches query RESULTS (not entities)
+                             Opt-in, works with L2 cache
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. L1 CACHE — FIRST-LEVEL CACHE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - Scope: single EntityManager / persistence context (one transaction)
+  - Always active — cannot be disabled
+  - Per-entity, identity-map based (identity-by-PK)
+
+Behavior:
+  @Transactional
+  public void example(Long id) {
+      Product p1 = productRepo.findById(id).get();  // → SELECT issued
+      Product p2 = productRepo.findById(id).get();  // → NO SELECT, from L1
+      assert p1 == p2;  // same object reference!
+  }
+
+  // L1 scoped to transaction:
+  Product p1, p2;
+  // In txn1:
+  p1 = productRepo.findById(id).get();
+  // In txn2 (different transaction):
+  p2 = productRepo.findById(id).get();  // new SELECT — different L1 cache
+  assert p1 != p2;   // different instances
+
+Evicting from L1:
+  entityManager.detach(entity);   // single entity
+  entityManager.clear();           // all entities in context
+  entityManager.refresh(entity);   // reload from DB
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. L2 CACHE — SECOND-LEVEL CACHE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - Scope: shared across ALL sessions (transactions) in the application
+  - Process-level (local JVM) or distributed (Redis, Infinispan, etc.)
+  - Opt-in: must be configured and enabled per entity
+
+Step 1: Add cache provider dependency (Ehcache example):
+  <dependency>
+      <groupId>org.hibernate.orm</groupId>
+      <artifactId>hibernate-jcache</artifactId>
+  </dependency>
+  <dependency>
+      <groupId>org.ehcache</groupId>
+      <artifactId>ehcache</artifactId>
+  </dependency>
+
+Step 2: Enable in application.properties:
+  spring.jpa.properties.hibernate.cache.use_second_level_cache=true
+  spring.jpa.properties.hibernate.cache.region.factory_class=
+      org.hibernate.cache.jcache.JCacheRegionFactory
+  spring.jpa.properties.javax.cache.provider=
+      org.ehcache.jsr107.EhcacheCachingProvider
+  spring.jpa.properties.hibernate.cache.use_query_cache=true  # optional
+
+Step 3: Annotate entities:
+  @Entity
+  @Cache(usage = CacheConcurrencyStrategy.READ_WRITE)
+  public class Product {
+      @Id @GeneratedValue
+      private Long id;
+      // ...
+  }
+
+  // Cache collection too
+  @OneToMany
+  @Cache(usage = CacheConcurrencyStrategy.READ_WRITE)
+  private List<Tag> tags;
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. CACHE CONCURRENCY STRATEGIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Strategy          | Reads | Writes | Use Case
+  ──────────────────┼───────┼────────┼──────────────────────────────────
+  READ_ONLY         | High  | None   | Immutable data (reference tables)
+  NONSTRICT_READ_WRITE | High | Low  | Rarely updated data, can tolerate
+                                       brief stale reads
+  READ_WRITE        | Med   | Med    | Frequently read, sometimes updated
+                                       (serializable via soft locks)
+  TRANSACTIONAL     | High  | High   | Full ACID, requires JTA (rare)
+
+Most common: READ_WRITE for mutable data, READ_ONLY for static data.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. QUERY CACHE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Caches query RESULT SETS (list of PKs → entity from L2 cache).
+
+Enable per query:
+  TypedQuery<Product> q = em.createQuery(
+      "SELECT p FROM Product p WHERE p.category = :cat", Product.class);
+  q.setParameter("cat", "Electronics");
+  q.setHint("org.hibernate.cacheable", true);
+  q.setHint("org.hibernate.cacheRegion", "product.byCategory");
+  List<Product> results = q.getResultList();
+
+  OR in Spring Data:
+  @QueryHints(@QueryHint(name = "org.hibernate.cacheable", value = "true"))
+  List<Product> findByCategory(Category cat);
+
+⚠️  Query cache stores (query string + params) → [list of PKs].
+    Entities are retrieved from L2 cache by PK.
+    If entities are NOT in L2 cache, each PK triggers a DB SELECT
+    → potentially worse than no cache. Both caches must be used together.
+
+    Also: Query cache is invalidated when ANY entity of that type is
+    modified — can have high invalidation churn on write-heavy tables.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. L2 CACHE WITH REDIS (DISTRIBUTED)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For clustered deployments, use Redisson as L2 cache:
+
+  <dependency>
+      <groupId>org.redisson</groupId>
+      <artifactId>redisson-hibernate-6</artifactId>
+  </dependency>
+
+  spring.jpa.properties.hibernate.cache.use_second_level_cache=true
+  spring.jpa.properties.hibernate.cache.region.factory_class=
+      org.redisson.hibernate.RedissonRegionFactory
+  spring.jpa.properties.hibernate.cache.redisson.config=redisson.yml
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. CACHE STATISTICS (DEBUGGING)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+spring.jpa.properties.hibernate.generate_statistics=true
+logging.level.org.hibernate.stat=DEBUG
+
+Statistics output:
+  HHH90000002: 51 nanoseconds spent acquiring 1 JDBC connections
+  HHH90000004: 10254 nanoseconds spent executing 3 JDBC statements
+  Second-level cache hits:    45
+  Second-level cache misses:  5
+  Second-level cache puts:    5
+
+Programmatic access:
+  SessionFactory sf = em.unwrap(Session.class).getSessionFactory();
+  Statistics stats = sf.getStatistics();
+  System.out.println("L2 Hit count: " + stats.getSecondLevelCacheHitCount());
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. CACHE EVICTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Hibernate auto-evicts L2 cache when an entity is updated/deleted
+via EntityManager (within Hibernate's knowledge).
+
+⚠️  Bulk @Modifying queries BYPASS L2 cache eviction!
+    Must evict manually:
+
+  @Modifying
+  @Transactional
+  @Query("UPDATE Product p SET p.price = p.price * :factor WHERE p.category = :cat")
+  int applyDiscount(@Param("factor") double factor, @Param("cat") Category cat);
+
+  // After bulk update, evict the region manually:
+  entityManager.getEntityManagerFactory()
+      .getCache()
+      .evict(Product.class);
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  9. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the L1 cache in Hibernate?
+A: The L1 cache is the EntityManager (persistence context) — an
+   identity map that tracks all managed entities within a single
+   transaction. It ensures that loading the same entity by ID twice
+   in the same transaction returns the same object reference, without
+   a second SQL query. It is always active and cannot be disabled.
+
+Q: What is the scope difference between L1 and L2 cache?
+A: L1 is transaction-scoped — cleared at the end of each transaction.
+   L2 is application/cluster-scoped — shared across all sessions and
+   transactions; survives transaction boundaries.
+
+Q: What cache strategy should be used for rarely changed reference data?
+A: READ_ONLY — offers the best performance since no lock coordination
+   is needed. Hibernate throws an error if you try to modify a
+   READ_ONLY cached entity.
+
+Q: Why is the query cache sometimes counterproductive?
+A: The query cache stores PKs. Each cached PK still requires an L2
+   cache lookup (or DB hit if not cached). Additionally, the entire
+   query cache region is invalidated whenever any entity of the
+   queried type changes, causing high churn on write-heavy tables.
+
+Q: How does a bulk JPQL UPDATE affect the L2 cache?
+A: Bulk DML operations bypass Hibernate's entity lifecycle callbacks
+   and L2 cache invalidation. After a bulk UPDATE/DELETE, the L2
+   cache may hold stale data. You must evict the affected entity
+   class manually via EntityManagerFactory.getCache().evict().
+
+Q: What is the difference between @Cache and @Cacheable in Spring?
+A: @Cache (org.hibernate.annotations) is Hibernate L2 cache configuration.
+   @Cacheable (Spring) is Spring Cache abstraction — typically backed by
+   Redis or Ehcache. They operate at different levels: Hibernate L2 caches
+   entity data within the ORM layer; Spring Cache caches method return
+   values at the service layer.

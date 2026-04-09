@@ -1,0 +1,257 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DESIGN: GOOGLE DRIVE / FILE STORAGE SYSTEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FUNCTIONAL:
+  - Upload/download files (any type: docs, images, videos, binaries)
+  - Folder structure (nested folders)
+  - Sync: changes on one device reflected on all devices
+  - File versioning (last 30 versions, restore any version)
+  - Sharing: share file/folder with specific users or via public link
+  - Permissions: viewer, commenter, editor
+  - Collaborative editing (bonus for Google Docs)
+  - Search by filename, file content (bonus)
+
+NON-FUNCTIONAL:
+  - 100M DAU, 50M files uploaded per day
+  - Max file size: 5GB per file
+  - Storage per user: 15GB free, scalable to TB with paid plans
+  - Total storage: 100M users × 15GB = 1.5 EB (exabytes)
+  - Download bandwidth: 100M DAU × 1 file downloaded/day × 1MB avg = 100TB/day
+  - Availability: 99.99%
+  - Durability: 99.999999999% (11 nines) — file loss is unacceptable
+  - Sync latency: changes reflected on other devices within 30 seconds
+
+
+2. ESTIMATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STORAGE:
+  1.5 EB total × 3 replication = 4.5 EB raw storage
+  Growth: +50M files/day × avg 2MB = 100TB/day new storage
+  Deduplication: identical files stored once → estimate 30% storage savings
+
+UPLOAD RATE:
+  50M uploads/day / 86,400 = 580 uploads/second
+  Peak: ~2,000 uploads/second
+
+METADATA OPS (MUCH higher than uploads):
+  100M DAU × 10 metadata ops/day (list folder, check sync) = 1B ops/day = 11,600 ops/sec
+
+
+3. HIGH-LEVEL ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SEPARATION OF CONCERNS:
+  Metadata Plane: Manages file hierarchy, permissions, versioning (PostgreSQL)
+  Data Plane: Manages actual file bytes (Object Storage — S3)
+  Sync Engine: Detects changes and propagates to all devices
+  
+  ┌─────────────────────────────────────────────────────────┐
+  │ Client Apps (Desktop, Mobile, Web)                      │
+  └──────────────────────┬──────────────────────────────────┘
+                         │ API
+  ┌──────────────────────▼──────────────────────────────────┐
+  │ API Gateway                                             │
+  └───────┬─────────────────────────────────────────────────┘
+          │
+  ┌───────┼──────────────────────────────┐
+  │       │                              │
+  ┌───────▼───────┐  ┌──────────────┐  ┌▼───────────────┐
+  │ Metadata      │  │ Upload       │  │ Sync           │
+  │ Service       │  │ Service      │  │ Service        │
+  │ - CRUD ops    │  │ - Chunking   │  │ - Event stream │
+  │ - Versioning  │  │ - Presigned  │  │ - Delta calc   │
+  │ - Permissions │  │   S3 URL     │  │ - Notify       │
+  └───────┬───────┘  └──────┬───────┘  └───────┬────────┘
+          │                 │                   │
+  ┌───────▼────────┐  ┌─────▼──────┐  ┌────────▼───────┐
+  │ PostgreSQL     │  │ S3 / Object│  │ Kafka          │
+  │ (Metadata DB)  │  │ Storage    │  │ (Change Events)│
+  └────────────────┘  └────────────┘  └────────────────┘
+
+
+4. FILE UPLOAD — CHUNKED UPLOAD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WHY CHUNKING?
+  - Large files (5GB video): upload over slow/unreliable connection
+  - If network drops at 99%: start over without chunking = painful
+  - With chunking: resume from last successful chunk
+  - Parallel upload: upload multiple chunks simultaneously → faster
+
+CHUNK SIZE: 5MB (S3 minimum multipart part size)
+
+UPLOAD FLOW:
+  1. Client: compute file checksum (SHA-256 of entire file)
+  2. Client: split file into 5MB chunks, compute SHA-256 of each chunk
+  
+  3. Client → API: POST /api/v1/uploads/initiate
+       { "filename": "video.mp4", "size": 2GB, "mimeType": "video/mp4",
+         "checksum": "abc123", "chunks": 400, "chunkHashes": [...] }
+     Response: { "uploadId": "upload-xyz", "presignedUrls": [...] }
+     (400 presigned S3 multipart upload URLs)
+  
+  4. Client: upload each chunk to its presigned URL (in parallel, 4 concurrent)
+     PUT https://s3.amazonaws.com/bucket/key?partNumber=1&uploadId=...
+  
+  5. Client → API: POST /api/v1/uploads/complete
+       { "uploadId": "upload-xyz", "parts": [{"partNumber": 1, "etag": "..."}, ...] }
+  
+  6. API: call S3 CompleteMultipartUpload → S3 assembles chunks into final object
+  7. API: create metadata record in PostgreSQL
+  8. API: publish "file-uploaded" event to Kafka
+
+RESUMABLE UPLOAD:
+  If client crashes at chunk 200/400:
+    Client asks: GET /api/v1/uploads/{uploadId}/status
+    Response: { "completedChunks": [1,2,...,200] }
+    Client: resume from chunk 201
+  
+  AWS S3 tracks which parts were uploaded → resume seamlessly
+
+DEDUPLICATION:
+  Before upload: client sends file checksum
+  API checks: SELECT * FROM file_blocks WHERE checksum = ?
+  If found: skip upload, just create metadata pointing to existing block
+  Storage savings: 20-40% for typical user files (documents, images)
+
+
+5. DATA MODEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FILES TABLE (PostgreSQL):
+  file_id       BIGINT PRIMARY KEY
+  parent_id     BIGINT REFERENCES files(file_id)  -- folder hierarchy (NULL = root)
+  owner_id      BIGINT
+  name          VARCHAR(1024)
+  type          VARCHAR(10)  -- 'file' or 'folder'
+  size          BIGINT
+  mime_type     VARCHAR(100)
+  checksum      VARCHAR(64)  -- SHA-256 of file content (for dedup)
+  storage_key   VARCHAR(500) -- S3 key for file content
+  created_at    TIMESTAMP
+  updated_at    TIMESTAMP
+  is_deleted    BOOLEAN      -- soft delete (for trash)
+
+FILE_VERSIONS TABLE:
+  version_id    BIGINT PRIMARY KEY
+  file_id       BIGINT
+  version_num   INT
+  storage_key   VARCHAR(500)
+  size          BIGINT
+  checksum      VARCHAR(64)
+  created_by    BIGINT
+  created_at    TIMESTAMP
+
+PERMISSIONS TABLE:
+  file_id       BIGINT
+  grantee_id    BIGINT       -- user or group ID (null = public link)
+  grantee_type  VARCHAR(10)  -- 'user', 'group', 'link'
+  access_level  VARCHAR(10)  -- 'viewer', 'commenter', 'editor'
+  token         VARCHAR(64)  -- for public share links
+  expires_at    TIMESTAMP
+
+HIERARCHICAL QUERIES (folder contents):
+  SELECT * FROM files WHERE parent_id = ? AND is_deleted = false;
+  
+  Breadcrumb path: Recursive CTE
+  WITH RECURSIVE path AS (
+    SELECT file_id, name, parent_id FROM files WHERE file_id = ?
+    UNION ALL
+    SELECT f.file_id, f.name, f.parent_id
+    FROM files f JOIN path p ON f.file_id = p.parent_id
+  )
+  SELECT * FROM path ORDER BY depth;
+
+
+6. SYNC MECHANISM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CHALLENGE: User has 3 devices. They edit a file on device 1.
+           How does device 2 and 3 see the change?
+
+EVENT-DRIVEN SYNC:
+  1. Device 1 saves file → Upload Service → metadata updated
+  2. Change event published to Kafka: "file-updated" { file_id, user_id, version }
+  3. Sync Service consumes event → look up all devices for user_id
+  4. Push notification to devices 2 and 3 via WebSocket / long-poll
+  5. Devices 2 and 3: download new version from API
+
+SYNC STATE (LOCAL TRACKING):
+  Each client maintains local sync state:
+    Last sync timestamp per folder
+    Checksums of locally cached files
+  
+  On app start / network reconnect:
+    GET /api/v1/changes?since=2024-01-15T10:00:00Z
+    Returns: list of changed files since that timestamp
+    Client: download changes, update local files
+
+CONFLICT RESOLUTION:
+  SCENARIO: User edits file on device 1 and device 2 simultaneously (offline)
+  
+  STRATEGY 1: LAST-WRITE-WINS (Dropbox approach)
+    Whichever write arrives at server later wins
+    Losing client: file renamed to "filename (conflicted copy)"
+    Simple, predictable, but potential data loss
+  
+  STRATEGY 2: OPERATIONAL TRANSFORM (Google Docs approach)
+    For text documents: transform concurrent edits to apply non-destructively
+    Complex algorithm but true concurrent editing without conflicts
+    Only feasible for text; doesn't work for binary files
+
+
+7. SHARING AND PERMISSIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SHARE FLOW:
+  POST /api/v1/files/{fileId}/permissions
+  Body: { "email": "alice@example.com", "access": "editor" }
+  
+  System: create permission record → send email to Alice
+
+PUBLIC LINK:
+  POST /api/v1/files/{fileId}/share-link
+  Response: { "url": "https://drive.google.com/file/d/abc123/view",
+              "token": "abc123", "access": "viewer" }
+  
+  On access: GET /api/v1/share/{token} → verify token → return file
+
+INHERITED PERMISSIONS:
+  Sharing a folder → all contents inherit parent permissions
+  Implemented by: check permissions of file → if none, check parent folder
+  (Walk up tree until permission found or reach root)
+  
+  Performance optimization: cache permission resolution in Redis with 5-min TTL
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWER — "Design Google Drive"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"I split this into two planes: the metadata plane (PostgreSQL for file
+hierarchy, permissions, versions) and the data plane (S3 for file bytes).
+
+For large files: chunked upload to S3 multipart API (5MB chunks, parallel).
+The client sends a checksum before uploading — if it's already stored,
+we skip the upload and just create a metadata pointer (deduplication saves
+20-40% storage). If the upload is interrupted, the client can resume by
+asking which chunks were already received.
+
+The data model uses a self-referential files table (parent_id for folder
+hierarchy) with a versions table for versioning history. Permissions are
+stored with inheritance: shared folder permissions propagate to children
+via a recursive lookup (cached in Redis to avoid recursive DB queries).
+
+Sync across devices: file changes publish to Kafka. The Sync Service
+consumes events and pushes WebSocket notifications to all user devices.
+On reconnect, clients request a delta: 'give me all changes since this
+timestamp.' This handles offline devices catching up on reconnect.
+
+Conflict resolution: I use last-write-wins for binary files (losing
+version renamed with conflict suffix) and operational transforms for
+text documents (like Google Docs does). Implementing OT for binary
+files isn't feasible — just surface the conflict to the user."

@@ -1,0 +1,309 @@
+================================================================================
+SAGA PATTERN — DISTRIBUTED TRANSACTIONS
+================================================================================
+
+THE PROBLEM: DISTRIBUTED TRANSACTIONS
+---------------------------------------
+In a monolith, a single database transaction can:
+  - Deduct inventory
+  - Create order
+  - Charge payment
+  - Send notification
+  All atomically. If any step fails, everything rolls back.
+
+In microservices with database-per-service, you CANNOT do this with a single
+ACID transaction. Each service has its own database. There is no global transaction.
+
+What you need: A way to execute a multi-step operation across services where:
+  - All steps eventually complete (happy path)
+  - On failure, previously completed steps are rolled back (compensating transactions)
+
+────────────────────────────────────────────────────────────────────────────────
+
+WHAT IS A SAGA?
+----------------
+A Saga is a sequence of local transactions where each local transaction:
+  1. Updates the service's own database
+  2. Publishes an event OR sends a message to trigger the next step
+
+If a step fails, the saga executes COMPENSATING TRANSACTIONS to undo
+previously completed steps.
+
+There is NO rollback of already-committed transactions — only forward compensation.
+
+────────────────────────────────────────────────────────────────────────────────
+
+SAGA IMPLEMENTATIONS: CHOREOGRAPHY vs ORCHESTRATION
+======================================================
+
+CHOREOGRAPHY (Event-Driven)
+  Services react to events from each other. No central coordinator.
+
+  Flow:
+  OrderService: Create Order (PENDING)
+    → emit OrderCreated event
+  InventoryService: listens to OrderCreated
+    → reserve inventory
+    → emit InventoryReserved event (or InventoryReservationFailed)
+  PaymentService: listens to InventoryReserved
+    → process payment
+    → emit PaymentProcessed event (or PaymentFailed)
+  OrderService: listens to PaymentProcessed
+    → update order to CONFIRMED
+    → emit OrderConfirmed event
+  NotificationService: listens to OrderConfirmed
+    → send confirmation email
+
+  Compensation (failure path):
+  PaymentService: emit PaymentFailed
+  InventoryService: listens to PaymentFailed → release inventory reservation
+
+       OrderService        InventoryService      PaymentService
+           │                     │                    │
+           │──OrderCreated──────>│                    │
+           │                     │──InventoryReserved─>│
+           │                     │                    │──PaymentProcessed──┐
+           │<───────────────────────────────────────────────────────────────┘
+           │ (OrderConfirmed)
+
+PROS:  Simple, no central coordinator, services stay loosely coupled
+CONS:  Hard to track overall status, difficult to debug, complex event chains
+
+ORCHESTRATION (Command-Driven)
+  A central Saga orchestrator directs each step and handles failures.
+
+  OrderSagaOrchestrator tells each service what to do:
+  1. → Tell InventoryService: "Reserve items for order #123"
+  2. ← InventoryService: "Reserved" 
+  3. → Tell PaymentService: "Charge $150 for order #123"
+  4. ← PaymentService: "Charged"
+  5. → Tell OrderService: "Confirm order #123"
+  6. ← OrderService: "Confirmed"
+
+  If step 3 fails:
+  4. ← PaymentService: "Payment Failed"
+  5. → Tell InventoryService: "Release reservation for order #123" (compensate)
+  6. → Tell OrderService: "Cancel order #123"
+
+PROS:  Clear saga state, easy to monitor, explicit error handling, easy to debug
+CONS:  Orchestrator becomes a coordination point, adds complexity
+
+────────────────────────────────────────────────────────────────────────────────
+
+SAGA IMPLEMENTATION WITH SPRING BOOT + KAFKA
+=============================================
+
+CHOREOGRAPHY APPROACH:
+
+Events:
+  public record OrderCreatedEvent(Long orderId, Long userId, List<Long> productIds, BigDecimal total) {}
+  public record InventoryReservedEvent(Long orderId) {}
+  public record InventoryFailedEvent(Long orderId, String reason) {}
+  public record PaymentProcessedEvent(Long orderId, String paymentId) {}
+  public record PaymentFailedEvent(Long orderId, String reason) {}
+
+OrderService (publishes event, listens for completion):
+  @Service
+  public class OrderService {
+    @Transactional
+    public Order createOrder(CreateOrderRequest request) {
+      Order order = Order.builder()
+        .status(OrderStatus.PENDING)
+        .userId(request.getUserId())
+        .build();
+      order = orderRepository.save(order);
+      
+      // Publish event after DB commit (Outbox pattern recommended)
+      eventPublisher.publish(new OrderCreatedEvent(
+        order.getId(), request.getUserId(), request.getProductIds(), request.getTotal()
+      ));
+      return order;
+    }
+
+    @KafkaListener(topics = "payment-processed")
+    public void onPaymentProcessed(PaymentProcessedEvent event) {
+      orderRepository.updateStatus(event.orderId(), OrderStatus.CONFIRMED);
+    }
+
+    @KafkaListener(topics = "payment-failed", "inventory-failed")
+    public void onSagaFailed(Object event) {
+      Long orderId = extractOrderId(event);
+      orderRepository.updateStatus(orderId, OrderStatus.CANCELLED);
+    }
+  }
+
+InventoryService (listens, reserves, publishes result):
+  @Service
+  public class InventoryService {
+    @KafkaListener(topics = "order-created")
+    @Transactional
+    public void onOrderCreated(OrderCreatedEvent event) {
+      try {
+        reserveInventory(event.orderId(), event.productIds());
+        kafkaTemplate.send("inventory-reserved", new InventoryReservedEvent(event.orderId()));
+      } catch (InsufficientStockException e) {
+        kafkaTemplate.send("inventory-failed", 
+          new InventoryFailedEvent(event.orderId(), e.getMessage()));
+      }
+    }
+
+    @KafkaListener(topics = "payment-failed")
+    @Transactional
+    public void onPaymentFailed(PaymentFailedEvent event) {
+      // COMPENSATION: Release reservation
+      releaseReservation(event.orderId());
+    }
+  }
+
+ORCHESTRATION APPROACH (with Axon Framework):
+  @Saga
+  public class OrderSaga {
+    
+    @Autowired @Transient
+    private CommandGateway commandGateway;
+    
+    @StartSaga
+    @SagaEventHandler(associationProperty = "orderId")
+    public void on(OrderCreatedEvent event) {
+      // Step 1: Reserve inventory
+      commandGateway.send(new ReserveInventoryCommand(event.orderId(), event.productIds()));
+    }
+
+    @SagaEventHandler(associationProperty = "orderId")
+    public void on(InventoryReservedEvent event) {
+      // Step 2: Process payment
+      commandGateway.send(new ProcessPaymentCommand(event.orderId(), event.amount()));
+    }
+
+    @SagaEventHandler(associationProperty = "orderId")
+    public void on(PaymentProcessedEvent event) {
+      // Step 3: Confirm order
+      commandGateway.send(new ConfirmOrderCommand(event.orderId()));
+    }
+
+    @EndSaga
+    @SagaEventHandler(associationProperty = "orderId")
+    public void on(OrderConfirmedEvent event) {
+      // Saga complete
+    }
+
+    @SagaEventHandler(associationProperty = "orderId")
+    public void on(PaymentFailedEvent event) {
+      // Compensation: Release inventory
+      commandGateway.send(new ReleaseInventoryCommand(event.orderId()));
+      commandGateway.send(new CancelOrderCommand(event.orderId(), "Payment failed"));
+    }
+
+    @EndSaga
+    @SagaEventHandler(associationProperty = "orderId")
+    public void on(OrderCancelledEvent event) {
+      log.warn("Order saga failed and compensated for order {}", event.orderId());
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+COMPENSATING TRANSACTIONS
+===========================
+
+Every Saga step must have a compensating transaction:
+
+T (Transaction)                  C (Compensation)
+─────────────────────────────────┼──────────────────────────────────────────
+Reserve inventory                │ Release/cancel inventory reservation
+Create order (PENDING)           │ Cancel order
+Charge payment                   │ Refund payment
+Send email notification          │ (cannot unsend — log/apologize, or skip)
+Generate invoice                 │ Issue credit note / void invoice
+Deduct loyalty points            │ Restore loyalty points
+
+Note: Compensating transactions must be IDEMPOTENT (safe to call multiple times
+due to message redelivery in Kafka/RabbitMQ).
+
+────────────────────────────────────────────────────────────────────────────────
+
+SAGA STATE TRACKING
+====================
+
+Each order's Saga state must be tracked:
+
+  CREATE TABLE order_saga_state (
+    order_id BIGINT PRIMARY KEY,
+    current_step VARCHAR(50),
+    status VARCHAR(20),   -- IN_PROGRESS, COMPLETED, COMPENSATING, FAILED
+    retry_count INT DEFAULT 0,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP
+  );
+
+Orchestrator updates state after each step:
+  "order #123 → INVENTORY_RESERVED → PAYMENT_PROCESSING → COMPLETED"
+
+────────────────────────────────────────────────────────────────────────────────
+
+SAGA FAILURE SCENARIOS
+========================
+
+1. Service unavailable during saga step:
+   - Retry with backoff (idempotent operations)
+   - Dead Letter Queue after max retries
+   - Manual intervention / alert
+
+2. Partial compensation failure:
+   - Retry the compensation
+   - Log to dead letter queue for manual review
+
+3. Pivot Transaction (point of no return):
+   Some steps can't be easily compensated (email sent, payment already settled).
+   These are the "pivot transactions" — identify them in design.
+
+────────────────────────────────────────────────────────────────────────────────
+
+CHOREOGRAPHY vs ORCHESTRATION COMPARISON
+==========================================
+
+Aspect                │ Choreography               │ Orchestration
+──────────────────────┼────────────────────────────┼────────────────────────────
+Coupling              │ Event-based (loose)         │ Orchestrator knows services
+State visibility      │ Hard — distributed          │ Easy — in one place
+Debugging             │ Difficult                   │ Easier (saga state table)
+Scalability           │ High                        │ Orchestrator may bottleneck
+Team autonomy         │ High (publish events)       │ Lower (orchestrator controls)
+Error handling        │ Complex (listen for failure │ Cleaner (explicit compensate)
+                      │ events per service)         │
+Best for              │ Simple, short sagas         │ Complex, long-running sagas
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is a Saga and why is it needed in microservices?
+A: A Saga is a sequence of local transactions with compensating transactions for
+   rollback. It's needed because microservices can't use single ACID transactions
+   across service boundaries. Each service commits locally and publishes events;
+   failures trigger compensating transactions to undo prior steps.
+
+Q: What's the difference between choreography and orchestration Saga?
+A: Choreography: services react to events from each other — decentralized, loose
+   coupling, but hard to track state and debug. Orchestration: a central
+   orchestrator sends commands and handles failures — easier to monitor and debug,
+   but the orchestrator is a coordination bottleneck.
+
+Q: What is a compensating transaction?
+A: A transaction that undoes the effect of a previous step when the saga fails.
+   For example, if payment fails after inventory was reserved, a compensation
+   releases the inventory reservation. Compensations must be idempotent.
+
+Q: Can you use 2-Phase Commit instead of Saga?
+A: 2PC is technically possible but generally avoided in microservices. 2PC requires
+   all participating services to lock resources until all agree, creating tight
+   coupling, scalability problems, and vulnerability to coordinator failure.
+   Saga provides better availability at the cost of eventual consistency.
+
+Q: How do you handle a saga that can't be compensated (email already sent)?
+A: Identify "pivot transactions" — steps that can't be undone. Design sagas so
+   irreversible operations happen last. If unavoidable, accept it as a known
+   side effect and handle it (e.g., send a follow-up correction email).
+
+================================================================================

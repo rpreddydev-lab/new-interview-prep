@@ -1,0 +1,921 @@
+================================================================================
+GITOPS — ARGOCD AND FLUXCD
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. GitOps Principles
+2. Push vs Pull Delivery Models
+3. ArgoCD Architecture
+4. ArgoCD Application CRD
+5. ArgoCD ApplicationSet
+6. ArgoCD Projects and RBAC
+7. ArgoCD Sync Policies and Resource Health
+8. ArgoCD Sync Hooks
+9. ArgoCD App-of-Apps Pattern
+10. FluxCD Architecture
+11. FluxCD CRDs
+12. ArgoCD vs FluxCD Comparison
+13. Secrets in GitOps
+14. Multi-cluster GitOps
+15. Common Interview Questions & Answers
+16. Quick Reference Cheat Sheet
+
+================================================================================
+1. GITOPS PRINCIPLES
+================================================================================
+
+GitOps Definition:
+  GitOps is an operational framework that uses Git as the SINGLE SOURCE OF TRUTH
+  for declarative infrastructure and application deployment.
+  
+  Coined by Weaveworks (2017).
+
+Four Core GitOps Principles (OpenGitOps):
+  
+  1. DECLARATIVE
+     The entire desired system state is expressed declaratively.
+     (Kubernetes YAML, Helm values, Kustomize overlays)
+  
+  2. VERSIONED AND IMMUTABLE
+     All desired state is stored in Git with full history.
+     Git is the source of truth — not the cluster.
+  
+  3. PULLED AUTOMATICALLY
+     Approved changes to Git are automatically applied.
+     Software agents pull changes (not pipelines pushing).
+  
+  4. CONTINUOUSLY RECONCILED
+     Software agents continuously observe actual state and reconcile
+     with desired state. Drift is detected and corrected.
+
+GitOps Advantages:
+  ✅ Audit log: Every change is a git commit with author + timestamp
+  ✅ Rollback: Roll back by reverting a git commit
+  ✅ Developer experience: PR workflow for production changes
+  ✅ Disaster recovery: Cluster died? New cluster syncs from Git in minutes
+  ✅ Drift detection: Manual kubectl changes get reverted automatically
+  ✅ Separation of duties: Infra team reviews before merge
+
+================================================================================
+2. PUSH VS PULL DELIVERY MODELS
+================================================================================
+
+Traditional Push Model (CI/CD pipelines):
+  
+  Developer → Push Code → CI builds/tests → CD PUSHES to cluster
+  
+  ┌────────┐   ┌──────┐   ┌─────────────┐   push   ┌──────────────┐
+  │ Dev    │──▶│ Git  │──▶│  CI/CD      │─────────▶│  Kubernetes  │
+  └────────┘   └──────┘   │  (Jenkins/  │          │  Cluster     │
+                           │  GH Actions)│          └──────────────┘
+                           └─────────────┘
+  
+  Problems:
+  - CI/CD system needs cluster credentials (security risk)
+  - No drift detection (manual kubectl apply not caught)
+  - Hard to know what's actually in the cluster
+
+GitOps Pull Model (ArgoCD/FluxCD):
+  
+  Developer → Push to Git → GitOps Controller PULLS and applies
+  
+  ┌────────┐   ┌──────┐          ┌──────────────────────────────┐
+  │ Dev    │──▶│ Git  │◀─ poll   │     Kubernetes Cluster       │
+  └────────┘   └──────┘          │                              │
+                                  │  ┌──────────────────────┐   │
+                                  │  │   ArgoCD / FluxCD    │   │
+                                  │  │   (GitOps Controller)│   │
+                                  │  └──────────┬───────────┘   │
+                                  │             │ reconcile      │
+                                  │  ┌──────────▼───────────┐   │
+                                  │  │   Desired State       │   │
+                                  │  └──────────────────────┘   │
+                                  └──────────────────────────────┘
+  
+  Benefits:
+  - GitOps controller lives IN the cluster (no external access needed)
+  - Controller constantly checks: actual = desired?
+  - Drift auto-corrected
+
+================================================================================
+3. ARGOCD ARCHITECTURE
+================================================================================
+
+ArgoCD Components:
+  
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                      Kubernetes Cluster                           │
+  │                                                                    │
+  │  ┌───────────────┐  ┌──────────────────┐  ┌────────────────────┐│
+  │  │  API Server   │  │  Repo Server     │  │ Application        ││
+  │  │  (argocd-     │  │  (argocd-repo-   │  │ Controller         ││
+  │  │   server)     │  │   server)        │  │ (argocd-app-       ││
+  │  │               │  │                  │  │  controller)       ││
+  │  │ REST/gRPC API │  │ Clones Git repos │  │ Reconciliation     ││
+  │  │ Web UI        │  │ Renders manifests│  │ loop               ││
+  │  │ RBAC          │  │ (Helm/Kustomize) │  │ Health checks      ││
+  │  └───────────────┘  └──────────────────┘  └────────────────────┘│
+  │                                                                    │
+  │  ┌──────────────────────────────────────────────┐                 │
+  │  │  Redis (argocd-redis)                        │                 │
+  │  │  Caches: Git commits, rendered manifests     │                 │
+  │  └──────────────────────────────────────────────┘                 │
+  │                                                                    │
+  │  ┌──────────────────────────────────────────────┐                 │
+  │  │  Dex (argocd-dex-server) — OIDC SSO          │                 │
+  └──┴──────────────────────────────────────────────┴─────────────────┘
+
+ArgoCD Installation:
+  kubectl create namespace argocd
+  kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+  
+  # Get initial admin password:
+  argocd admin initial-password -n argocd
+  
+  # CLI login:
+  argocd login argocd.example.com --username admin --password <pass>
+
+================================================================================
+4. ARGOCD APPLICATION CRD
+================================================================================
+
+Application is the core ArgoCD CRD.
+  Maps a Git source to a K8s destination cluster/namespace.
+  
+  # application.yaml:
+  apiVersion: argoproj.io/v1alpha1
+  kind: Application
+  metadata:
+    name: my-app-prod
+    namespace: argocd
+    labels:
+      environment: prod
+    finalizers:
+    - resources-finalizer.argocd.argoproj.io   # Cascade delete resources on App delete
+  spec:
+    project: my-team        # ArgoCD Project for RBAC/access control
+    
+    # Source: where the config lives
+    source:
+      repoURL: https://github.com/my-org/my-app
+      targetRevision: HEAD    # branch, tag, or commit SHA
+      path: k8s/overlays/prod # Path within the repo
+    
+    # Destination: where to deploy
+    destination:
+      server: https://kubernetes.default.svc  # In-cluster
+      namespace: my-app-prod
+    
+    # Sync policy
+    syncPolicy:
+      automated:
+        prune: true         # Delete resources removed from Git
+        selfHeal: true      # Revert manual kubectl changes
+        allowEmpty: false   # Fail if sync would result in empty app
+      syncOptions:
+      - CreateNamespace=true      # Create namespace if not exists
+      - PrunePropagationPolicy=foreground  # Delete order
+      - ApplyOutOfSyncOnly=true   # Only apply changed resources
+      retry:
+        limit: 5
+        backoff:
+          duration: 5s
+          factor: 2
+          maxDuration: 3m
+
+Helm Application:
+  source:
+    repoURL: https://charts.example.com
+    chart: my-chart
+    targetRevision: 1.2.3
+    helm:
+      releaseName: my-release
+      valueFiles:
+      - values.yaml
+      - values-prod.yaml
+      values: |
+        replicaCount: 3
+        image:
+          tag: "v2.0.0"
+
+Multi-Source Application (ArgoCD 2.6+):
+  sources:
+  - repoURL: https://charts.example.com
+    chart: my-chart
+    targetRevision: 1.2.3
+  - repoURL: https://github.com/my-org/my-app
+    targetRevision: HEAD
+    path: k8s/helm-values
+    ref: values           # Reference name for other sources
+  helm:
+    valueFiles:
+    - $values/prod/values.yaml
+
+================================================================================
+5. ARGOCD APPLICATIONSET
+================================================================================
+
+ApplicationSet automates creating Applications across multiple clusters/envs.
+  
+  # applicationset.yaml:
+  apiVersion: argoproj.io/v1alpha1
+  kind: ApplicationSet
+  metadata:
+    name: my-app-all-envs
+    namespace: argocd
+  spec:
+    generators:
+    
+    # Generator 1: List-based:
+    - list:
+        elements:
+        - cluster: dev
+          url: https://dev-cluster.example.com
+          values:
+            replicas: "1"
+        - cluster: staging
+          url: https://staging-cluster.example.com
+          values:
+            replicas: "2"
+        - cluster: prod
+          url: https://prod-cluster.example.com
+          values:
+            replicas: "5"
+    
+    # Generator 2: Git directory-based (one app per directory in repo):
+    # - git:
+    #     repoURL: https://github.com/my-org/apps
+    #     revision: HEAD
+    #     directories:
+    #     - path: apps/*
+    
+    template:
+      metadata:
+        name: "my-app-{{cluster}}"
+      spec:
+        project: my-team
+        source:
+          repoURL: https://github.com/my-org/my-app
+          targetRevision: HEAD
+          path: "k8s/{{cluster}}"
+        destination:
+          server: "{{url}}"
+          namespace: my-app
+        syncPolicy:
+          automated:
+            prune: true
+            selfHeal: true
+
+================================================================================
+6. ARGOCD PROJECTS AND RBAC
+================================================================================
+
+AppProject defines boundaries for Applications:
+  
+  # project.yaml:
+  apiVersion: argoproj.io/v1alpha1
+  kind: AppProject
+  metadata:
+    name: my-team
+    namespace: argocd
+  spec:
+    description: "My Team Applications"
+    
+    # What source repos are allowed:
+    sourceRepos:
+    - "https://github.com/my-org/*"
+    - "https://charts.example.com"
+    
+    # What destination clusters/namespaces are allowed:
+    destinations:
+    - namespace: "my-app-*"
+      server: https://kubernetes.default.svc
+    
+    # What K8s resources can be deployed:
+    clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    namespaceResourceWhitelist:
+    - group: "apps"
+      kind: Deployment
+    - group: ""
+      kind: Service
+    
+    # Roles within the project:
+    roles:
+    - name: developer
+      description: "Can sync apps, cannot delete"
+      policies:
+      - p, proj:my-team:developer, applications, sync, my-team/*, allow
+      - p, proj:my-team:developer, applications, get, my-team/*, allow
+      groups:
+      - my-github-org:developers
+
+================================================================================
+7. ARGOCD SYNC POLICIES AND RESOURCE HEALTH
+================================================================================
+
+Sync Policies:
+  Manual: Engineer clicks "Sync" in UI or runs argocd app sync
+  Automated: ArgoCD automatically syncs when Git changes detected (poll every 3min
+  or webhook from Git)
+  
+  automated.prune:     Delete K8s resources removed from Git
+  automated.selfHeal:  Revert manual changes to cluster (drift correction)
+
+Resource Health Status:
+  Healthy:     Resource running correctly
+  Progressing: Resource is being created/updated
+  Degraded:    Resource has an error
+  Missing:     Resource does not exist in cluster
+  Suspended:   Resource intentionally paused
+  Unknown:     Health check not yet implemented
+
+Custom Health Checks (Lua):
+  resource.customizations.health.my.io/MyResource: |
+    hs = {}
+    if obj.status ~= nil then
+      if obj.status.ready then
+        hs.status = "Healthy"
+        hs.message = "Ready"
+      else
+        hs.status = "Progressing"
+        hs.message = "Not ready yet"
+      end
+    end
+    return hs
+
+CLI Commands:
+  argocd app list                     # List all applications
+  argocd app get my-app-prod         # Show app details
+  argocd app sync my-app-prod        # Trigger sync
+  argocd app sync my-app-prod --prune  # Sync and prune
+  argocd app rollback my-app-prod 1  # Roll back to revision 1
+  argocd app history my-app-prod     # Show sync history
+  argocd app diff my-app-prod        # Show diff between Git and cluster
+  argocd app delete my-app-prod      # Delete application (and resources if finalizer)
+
+================================================================================
+8. ARGOCD SYNC HOOKS
+================================================================================
+
+Hooks run at specific phases of a sync operation.
+  Defined as K8s Jobs/Pods/Workflows with annotations.
+  
+  # Database migration hook (runs before sync):
+  apiVersion: batch/v1
+  kind: Job
+  metadata:
+    name: run-migrations
+    annotations:
+      argocd.argoproj.io/hook: PreSync           # When to run
+      argocd.argoproj.io/hook-delete-policy: BeforeHookCreation  # Cleanup
+  spec:
+    template:
+      spec:
+        restartPolicy: Never
+        containers:
+        - name: migrate
+          image: my-app:v2.0.0
+          command: ["python", "manage.py", "migrate"]
+
+Hook Types:
+  PreSync     → Before applying manifests
+  Sync        → During sync (with regular resources)
+  PostSync    → After all resources Healthy
+  SyncFail    → If sync fails (cleanup/alerting)
+  PostDelete  → After app deletion (cleanup)
+
+Hook Delete Policies:
+  HookSucceeded       → Delete hook resource after it completes (default)
+  HookFailed          → Delete hook resource after it fails
+  BeforeHookCreation  → Delete previous hook before running new one (prevents buildup)
+
+================================================================================
+9. ARGOCD APP-OF-APPS PATTERN
+================================================================================
+
+The app-of-apps pattern uses one root Application that manages other Applications.
+  Enables bootstrapping an entire cluster from a single git commit.
+  
+  Git Repository Structure:
+  
+  gitops-repo/
+  ├── apps/
+  │   ├── root-app.yaml          # Root Application (points to applications/)
+  │   └── applications/
+  │       ├── prometheus.yaml    # Application for Prometheus
+  │       ├── cert-manager.yaml  # Application for cert-manager
+  │       └── my-app.yaml        # Application for my-app
+  └── manifests/
+      ├── prometheus/            # Actual Prometheus manifests
+      ├── cert-manager/
+      └── my-app/
+  
+  # Root application (bootstrap):
+  apiVersion: argoproj.io/v1alpha1
+  kind: Application
+  metadata:
+    name: root
+    namespace: argocd
+  spec:
+    source:
+      repoURL: https://github.com/my-org/gitops-repo
+      targetRevision: HEAD
+      path: apps/applications          # Points to directory of Application YAMLs
+    destination:
+      server: https://kubernetes.default.svc
+      namespace: argocd              # Applications are deployed into argocd namespace
+    syncPolicy:
+      automated:
+        prune: true
+        selfHeal: true
+  
+  # Child application:
+  apiVersion: argoproj.io/v1alpha1
+  kind: Application
+  metadata:
+    name: prometheus
+    namespace: argocd
+  spec:
+    source:
+      repoURL: https://github.com/my-org/gitops-repo
+      path: manifests/prometheus
+    destination:
+      server: https://kubernetes.default.svc
+      namespace: monitoring
+
+================================================================================
+10. FLUXCD ARCHITECTURE
+================================================================================
+
+FluxCD Overview:
+  GitOps toolkit — set of composable controllers.
+  
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                     Kubernetes Cluster                           │
+  │                                                                   │
+  │  ┌───────────────────┐   ┌────────────────────────────────────┐  │
+  │  │  Source Controller│   │ Kustomize Controller               │  │
+  │  │                   │   │ Applies Kustomize/raw manifests    │  │
+  │  │  GitRepository    │   └────────────────────────────────────┘  │
+  │  │  HelmRepository   │                                            │
+  │  │  OCIRepository    │   ┌────────────────────────────────────┐  │
+  │  │  Bucket           │   │ Helm Controller                    │  │
+  │  └─────────┬─────────┘   │ Manages HelmReleases               │  │
+  │            │             └────────────────────────────────────┘  │
+  │            │ artifact                                             │
+  │  ┌─────────▼─────────────────────────────────────────────────┐   │
+  │  │  Notification Controller                                   │   │
+  │  │  Alerts to Slack/PagerDuty/GitHub when reconciliation done │   │
+  │  └────────────────────────────────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────────────────┘
+
+Flux CLI Bootstrap:
+  # Install Flux on cluster and create GitOps repo:
+  flux bootstrap github \
+    --owner=my-org \
+    --repository=gitops-repo \
+    --branch=main \
+    --path=clusters/prod \
+    --personal
+
+================================================================================
+11. FLUXCD CRDs
+================================================================================
+
+GitRepository (Source):
+  
+  # Defines what to sync from Git:
+  apiVersion: source.toolkit.fluxcd.io/v1
+  kind: GitRepository
+  metadata:
+    name: my-app
+    namespace: flux-system
+  spec:
+    interval: 5m                # Poll every 5 minutes
+    url: https://github.com/my-org/my-app
+    ref:
+      branch: main
+    secretRef:
+      name: github-token        # Secret with Git credentials
+
+HelmRepository (Source):
+  
+  apiVersion: source.toolkit.fluxcd.io/v1beta2
+  kind: HelmRepository
+  metadata:
+    name: prometheus
+    namespace: flux-system
+  spec:
+    interval: 30m
+    url: https://prometheus-community.github.io/helm-charts
+
+Kustomization (Deploy):
+  
+  # Applies kustomize/raw manifests from a source:
+  apiVersion: kustomize.toolkit.fluxcd.io/v1
+  kind: Kustomization
+  metadata:
+    name: my-app
+    namespace: flux-system
+  spec:
+    interval: 10m
+    path: ./k8s/overlays/prod
+    sourceRef:
+      kind: GitRepository
+      name: my-app
+    prune: true                # Delete removed resources
+    wait: true                 # Wait for all resources to be ready
+    timeout: 5m
+    healthChecks:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: my-app
+      namespace: my-app
+
+HelmRelease (Deploy):
+  
+  apiVersion: helm.toolkit.fluxcd.io/v2
+  kind: HelmRelease
+  metadata:
+    name: prometheus-stack
+    namespace: monitoring
+  spec:
+    interval: 30m
+    chart:
+      spec:
+        chart: kube-prometheus-stack
+        version: "55.*"
+        sourceRef:
+          kind: HelmRepository
+          name: prometheus
+          namespace: flux-system
+    values:
+      prometheus:
+        prometheusSpec:
+          retention: 30d
+    valuesFrom:
+    - kind: ConfigMap
+      name: prometheus-values
+      valuesKey: values.yaml
+
+Notification (Flux Alerts):
+  
+  # Alert provider (Slack):
+  apiVersion: notification.toolkit.fluxcd.io/v1beta3
+  kind: Provider
+  metadata:
+    name: slack
+    namespace: flux-system
+  spec:
+    type: slack
+    channel: "#deployments"
+    secretRef:
+      name: slack-webhook
+  ---
+  apiVersion: notification.toolkit.fluxcd.io/v1beta3
+  kind: Alert
+  metadata:
+    name: my-app-alert
+    namespace: flux-system
+  spec:
+    providerRef:
+      name: slack
+    eventSeverity: info
+    eventSources:
+    - kind: Kustomization
+      name: my-app
+
+================================================================================
+12. ARGOCD VS FLUXCD COMPARISON
+================================================================================
+
+┌─────────────────────┬──────────────────────────┬───────────────────────────┐
+│ Feature             │ ArgoCD                   │ FluxCD                    │
+├─────────────────────┼──────────────────────────┼───────────────────────────┤
+│ Architecture        │ Monolithic app with       │ Composable controllers    │
+│                     │ multiple components       │ (one per function)        │
+├─────────────────────┼──────────────────────────┼───────────────────────────┤
+│ UI                  │ Rich built-in Web UI      │ No native UI              │
+│                     │ (great for visibility)    │ (use Weave GitOps GUI)    │
+├─────────────────────┼──────────────────────────┼───────────────────────────┤
+│ Multi-cluster       │ Hub-spoke: ArgoCD hub     │ Individual Flux per       │
+│                     │ manages all clusters      │ cluster (more isolated)   │
+├─────────────────────┼──────────────────────────┼───────────────────────────┤
+│ Multi-tenancy       │ Projects + RBAC           │ Kustomization with        │
+│                     │ (mature, built-in)        │ ServiceAccount impersonation│
+├─────────────────────┼──────────────────────────┼───────────────────────────┤
+│ Sync customization  │ Sync hooks, waves         │ Dependency via            │
+│                     │ (order control)           │ kustomize-controller wait │
+├─────────────────────┼──────────────────────────┼───────────────────────────┤
+│ Drift correction    │ selfHeal option           │ Always-on reconciliation  │
+├─────────────────────┼──────────────────────────┼───────────────────────────┤
+│ Helm support        │ Native Helm               │ HelmRelease CRD           │
+├─────────────────────┼──────────────────────────┼───────────────────────────┤
+│ Kustomize           │ Yes (native)              │ Yes (Kustomize controller)│
+├─────────────────────┼──────────────────────────┼───────────────────────────┤
+│ Bootstrap           │ Bootstrap via app-of-apps │ flux bootstrap CLI        │
+├─────────────────────┼──────────────────────────┼───────────────────────────┤
+│ Learning curve      │ Medium (UI helps)         │ Steeper (all declarative) │
+├─────────────────────┼──────────────────────────┼───────────────────────────┤
+│ Community/adoption  │ Larger (CNCF Graduated)   │ Smaller (CNCF Graduated)  │
+├─────────────────────┼──────────────────────────┼───────────────────────────┤
+│ Best for            │ Teams wanting visibility, │ Teams wanting K8s-native  │
+│                     │ multi-cluster hub, UI     │ composable GitOps         │
+└─────────────────────┴──────────────────────────┴───────────────────────────┘
+
+================================================================================
+13. SECRETS IN GITOPS
+================================================================================
+
+Problem: You cannot store plain secrets in Git.
+Solution Options:
+
+Option 1: Sealed Secrets (Bitnami):
+  Controller in cluster holds the private key.
+  kubeseal CLI encrypts secrets with public key.
+  Encrypted SealedSecret objects are SAFE to commit to Git.
+  
+  # Install controller:
+  helm install sealed-secrets bitnami/sealed-secrets -n kube-system
+  
+  # Create sealed secret:
+  kubectl create secret generic my-secret \
+    --from-literal=password=my-password \
+    --dry-run=client -o yaml | \
+    kubeseal --controller-name=sealed-secrets \
+             --format=yaml > sealed-secret.yaml
+  
+  # Commit sealed-secret.yaml to Git (safe!)
+  # Controller decrypts into regular Secret in cluster
+
+Option 2: External Secrets Operator (ESO):
+  Controller fetches secrets from external stores (AWS Secrets Manager,
+  HashiCorp Vault, GCP Secret Manager, Azure Key Vault).
+  Store secret path in Git (not secret value).
+  
+  # ExternalSecret CRD:
+  apiVersion: external-secrets.io/v1beta1
+  kind: ExternalSecret
+  metadata:
+    name: my-app-secret
+    namespace: my-app
+  spec:
+    refreshInterval: 1h
+    secretStoreRef:
+      name: aws-secrets-manager
+      kind: ClusterSecretStore
+    target:
+      name: my-app-secret        # Name of K8s Secret to create
+      creationPolicy: Owner
+    data:
+    - secretKey: db_password     # Key in K8s Secret
+      remoteRef:
+        key: prod/my-app         # Path in AWS Secrets Manager
+        property: db_password    # Key within the secret
+
+Option 3: SOPS (Mozilla SOPS):
+  Encrypt secret VALUES (not entire file) using AWS KMS, GCP KMS, or PGP.
+  The structure of the file remains readable in Git; only values are encrypted.
+  
+  # .sops.yaml:
+  creation_rules:
+  - path_regex: secrets/.*\.yaml$
+    kms: arn:aws:kms:us-east-1:123456789:key/abc123
+  
+  # Encrypt:
+  sops --encrypt secrets/db.yaml > secrets/db.enc.yaml
+  
+  # Decrypt (automated by Flux's SOPS integration):
+  sops --decrypt secrets/db.enc.yaml
+  
+  # Flux integration:
+  # flux create secret kustomization my-app-sops \
+  #   --namespace=flux-system \
+  #   --name=sops-aws \
+  #   ...
+
+Comparison:
+  Sealed Secrets: Simple, self-contained, team manages keys
+  ESO:            Best when team already uses Secrets Manager / Vault
+  SOPS:           Flexible, supports multiple key backends, file-level encryption
+
+================================================================================
+14. MULTI-CLUSTER GITOPS
+================================================================================
+
+ArgoCD Hub-Spoke:
+  One ArgoCD instance in the hub cluster manages all spoke clusters.
+  
+  # Register a spoke cluster:
+  argocd cluster add prod-cluster-context
+  
+  # Application targeting spoke cluster:
+  destination:
+    server: https://prod-cluster.example.com  # Not default.svc
+    namespace: my-app
+  
+  Benefits: Central visibility and control
+  Risk: Hub is a single point of failure (protect it)
+
+FluxCD Per-Cluster:
+  Each cluster runs its own Flux installation.
+  More isolated — one cluster's Flux can't affect others.
+  
+  Shared repo pattern:
+  clusters/
+  ├── dev/        ← dev cluster's Flux watches this
+  ├── staging/    ← staging cluster's Flux watches this
+  └── prod/       ← prod cluster's Flux watches this
+
+ArgoCD ApplicationSet with Cluster Generator:
+  Dynamically create Applications for each registered cluster.
+  
+  generators:
+  - clusters:
+      selector:
+        matchLabels:
+          environment: production     # Only prod clusters
+  
+  template:
+    destination:
+      server: "{{server}}"          # From cluster list
+      namespace: my-app
+
+================================================================================
+15. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: What is GitOps and how is it different from traditional CI/CD?
+A: GitOps is an operational framework where Git is the SINGLE SOURCE OF TRUTH
+   for the desired state of infrastructure and applications.
+   
+   Traditional CI/CD (Push model):
+   - CI pipeline builds and tests code
+   - CD pipeline PUSHES deployments: kubectl apply, helm upgrade, etc.
+   - CI/CD system needs cluster credentials (security risk)
+   - No continuous reconciliation — manual kubectl changes persist
+   - Hard to know what's actually in the cluster vs. what was deployed
+   
+   GitOps (Pull model):
+   - Desired state lives in Git (YAML, Helm values, Kustomize overlays)
+   - GitOps controller (ArgoCD/Flux) runs IN the cluster
+   - Controller continuously PULLS and reconciles with Git
+   - Manual changes detected and reverted (selfHeal / always-on reconciliation)
+   - Complete audit log: every change = git commit with author/timestamp
+   - Recovery: new cluster syncs from Git in minutes
+   
+   GitOps principles: Declarative, Versioned, Pulled automatically,
+   Continuously reconciled (OpenGitOps standard).
+
+Q2: What is ArgoCD and how does it work?
+A: ArgoCD is a declarative GitOps continuous delivery tool for Kubernetes.
+   
+   How it works:
+   1. Engineer defines Application CRD in ArgoCD (source = Git repo/path,
+      destination = K8s cluster/namespace)
+   2. ArgoCD's Repo Server clones the Git repository and renders manifests
+      (Helm chart, Kustomize overlays, raw YAML)
+   3. Application Controller compares rendered manifests (desired) with
+      actual cluster state (current)
+   4. If diff exists: Application is "OutOfSync"
+   5. With automated sync: ArgoCD automatically applies the difference
+      With manual sync: Engineer reviews diff and clicks sync
+   
+   Key CRD: Application (maps Git source → K8s destination)
+   Project: Boundary/RBAC (which repos, which clusters, which namespaces)
+   ApplicationSet: Template for creating multiple Applications
+   
+   Self-healing: With selfHeal: true, manual kubectl changes get reverted
+   Drift detection: ArgoCD continuously monitors and shows sync status
+
+Q3: When would you use ArgoCD vs FluxCD?
+A: Both are CNCF Graduated GitOps tools. Choose based on team needs.
+   
+   Choose ArgoCD when:
+   - You want a Web UI for visibility (ArgoCD has excellent built-in UI)
+   - Multi-cluster hub-spoke management (one ArgoCD manages all clusters)
+   - You need rich RBAC and multi-tenancy via Projects
+   - Sync hooks and ordering are important (database migrations before deploy)
+   - Your team includes non-platform engineers who benefit from UI
+   
+   Choose FluxCD when:
+   - You prefer composable, controller-per-function architecture
+   - Each cluster should be independently managed (more blast radius isolation)
+   - You want pure Kubernetes-native resources (no extra CRDs for concepts)
+   - Tight integration with Helm Controller for HelmRelease CRD
+   - You prefer everything in Git, no UI needed
+   
+   Either: Both support Helm, Kustomize, raw YAML, SOPS/Sealed Secrets/ESO.
+   Both are production-grade, widely used.
+   
+   In practice: ArgoCD has larger adoption, richer UI. FluxCD used more in
+   enterprise platform teams wanting full declarative control.
+
+Q4: How do you handle secrets in GitOps given you cannot store them in Git?
+A: This is a fundamental GitOps challenge. Three main approaches:
+   
+   1. Sealed Secrets (Bitnami):
+      - Cluster has a controller with a private decryption key
+      - kubeseal CLI encrypts secret with cluster's PUBLIC key
+      - Encrypted SealedSecret YAML is committed to Git (safe)
+      - Controller decrypts into regular Kubernetes Secret
+      Best for: Self-managed clusters, simple setup, team wants Git-only workflow
+      
+   2. External Secrets Operator (ESO):
+      - Secrets live in AWS Secrets Manager / HashiCorp Vault / Azure Key Vault
+      - Git contains ExternalSecret CRD pointing to the secret path (not value)
+      - ESO controller fetches from external store, creates K8s Secret
+      Best for: Enterprise with existing secrets management infrastructure
+      
+   3. SOPS (Mozilla):
+      - Encrypts SECRET VALUES (not structure) using KMS keys
+      - Encrypted file committed to Git (structure readable, values encrypted)
+      - Flux has native SOPS support (decrypts during reconciliation)
+      - Works with AWS KMS, GCP KMS, age keys, PGP
+      Best for: Teams wanting Git-stored encrypted secrets with KMS key rotation
+   
+   What NOT to do:
+   - Never commit plaintext secrets
+   - Never base64-encode secrets and claim they're "encrypted" (they're not)
+
+Q5: Explain the ArgoCD app-of-apps pattern and when you would use it.
+A: App-of-apps is a pattern where one ArgoCD Application manages other Applications.
+   
+   How it works:
+   1. "Root" Application points to a Git directory containing Application YAMLs
+   2. ArgoCD syncs the root app
+   3. Root app creates child Applications from those YAMLs
+   4. Each child Application manages its own set of manifests
+   
+   Use cases:
+   1. Cluster bootstrapping:
+      New cluster → apply ONE root application → all 20 services deploy automatically
+   2. Environment management:
+      One root per environment → changing an env = editing one directory in Git
+   3. Platform components:
+      Root "platform" app manages: cert-manager, external-dns, prometheus, ingress-nginx
+   
+   Alternative: ApplicationSet with Git directory generator (cleaner, less nesting)
+   ApplicationSet creates Applications from a directory automatically — same result
+   but without the parent Application managing child Applications.
+   
+   Important: With finalizers (resources-finalizer.argocd.argoproj.io),
+   deleting the root app cascades and deletes all child apps and their resources.
+   This is powerful for cleanup but requires care.
+
+================================================================================
+16. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+GITOPS PRINCIPLES:
+  Declarative      Desired state expressed as config
+  Versioned        Git is source of truth
+  Pull-based       Controller pulls changes (not CI pushing)
+  Reconciled       Agent continuously corrects drift
+
+ARGOCD KEY OBJECTS:
+  Application      Maps Git source → K8s destination
+  AppProject       Boundary: allowed repos, clusters, namespaces
+  ApplicationSet   Template for multiple Applications
+
+ARGOCD SYNC POLICIES:
+  automated.prune     Delete resources removed from Git
+  automated.selfHeal  Revert manual kubectl changes
+  syncOptions: CreateNamespace=true
+
+ARGOCD HOOK TYPES:
+  PreSync, Sync, PostSync, SyncFail, PostDelete
+
+ARGOCD CLI:
+  argocd app list
+  argocd app sync <name> [--prune]
+  argocd app rollback <name> <revision>
+  argocd app diff <name>
+  argocd app history <name>
+  argocd cluster add <context>
+
+FLUXCD CRDs:
+  GitRepository        Source from Git
+  HelmRepository       Source from Helm repo
+  Kustomization        Deploy with Kustomize
+  HelmRelease          Deploy with Helm
+  Alert/Provider       Notifications
+
+FLUX CLI:
+  flux bootstrap github ...
+  flux get kustomizations
+  flux get helmreleases
+  flux reconcile source git my-app
+  flux reconcile kustomization my-app
+
+SECRETS IN GITOPS:
+  Sealed Secrets       Bitnami — cluster key encrypts, safe to store in Git
+  ESO                  External Secrets Operator — fetch from Secrets Manager
+  SOPS                 Encrypt values with KMS, store encrypted file in Git
+
+================================================================================
+END OF FILE
+================================================================================

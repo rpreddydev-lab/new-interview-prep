@@ -1,0 +1,285 @@
+================================================================
+  SPRING + AWS SQS INTEGRATION (Spring Cloud AWS)
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. AWS SQS OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SQS (Simple Queue Service) is a fully managed AWS message queue.
+
+Queue Types:
+  Standard Queue → at-least-once, nearly unlimited throughput, best-effort ordering
+  FIFO Queue     → exactly-once, 300 TPS (3000 with batching), strict ordering
+
+Key SQS concepts:
+  Visibility Timeout  → time a consumer has to process before message reappears
+  Message Retention   → how long SQS retains undelivered messages (1min–14days)
+  Dead Letter Queue   → receives messages after maxReceiveCount failures
+  Long Polling        → consumer waits up to 20s for messages (reduces API cost)
+  Message Group ID    → FIFO only — messages with same group processed in order
+  Deduplication ID    → FIFO only — prevents duplicate messages within 5 min window
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. DEPENDENCY (Spring Cloud AWS 3.x)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>io.awspring.cloud</groupId>
+            <artifactId>spring-cloud-aws-dependencies</artifactId>
+            <version>3.1.0</version>
+            <type>pom</type>
+            <scope>import</scope>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
+
+<dependency>
+    <groupId>io.awspring.cloud</groupId>
+    <artifactId>spring-cloud-aws-starter-sqs</artifactId>
+</dependency>
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# application.yml
+spring:
+  cloud:
+    aws:
+      region:
+        static: us-east-1
+      credentials:
+        access-key: ${AWS_ACCESS_KEY_ID}
+        secret-key: ${AWS_SECRET_ACCESS_KEY}
+      # Or use instance profile / environment variables on EC2/ECS/Lambda
+
+# For local dev with LocalStack:
+spring:
+  cloud:
+    aws:
+      sqs:
+        endpoint: http://localhost:4566
+      region:
+        static: us-east-1
+      credentials:
+        access-key: test
+        secret-key: test
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. PRODUCER — SqsTemplate
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Service
+public class OrderSqsProducer {
+
+    private final SqsTemplate sqsTemplate;
+
+    public OrderSqsProducer(SqsTemplate sqsTemplate) {
+        this.sqsTemplate = sqsTemplate;
+    }
+
+    // Send POJO (auto-serialized to JSON)
+    public void sendOrder(OrderEvent event) {
+        sqsTemplate.send("orders-queue", event);
+    }
+
+    // Send with message attributes (metadata)
+    public void sendOrderWithAttributes(OrderEvent event) {
+        sqsTemplate.send(to -> to
+            .queue("orders-queue")
+            .payload(event)
+            .header("event-type", "ORDER_CREATED")
+            .header("source-service", "checkout")
+            .delaySeconds(5)              // standard queue only
+        );
+    }
+
+    // FIFO queue — requires MessageGroupId + MessageDeduplicationId
+    public void sendFifoOrder(OrderEvent event) {
+        sqsTemplate.send(to -> to
+            .queue("orders-queue.fifo")
+            .payload(event)
+            .header(SqsHeaders.SQS_GROUP_ID_HEADER, event.getCustomerId())
+            .header(SqsHeaders.SQS_DEDUPLICATION_ID_HEADER, event.getOrderId())
+        );
+    }
+
+    // Batch send (up to 10 messages)
+    public void sendBatch(List<OrderEvent> events) {
+        List<SendResult<OrderEvent>> results = sqsTemplate.sendMany(
+            "orders-queue",
+            events
+        );
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. CONSUMER — @SqsListener
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Component
+public class OrderSqsConsumer {
+
+    // Basic listener — auto deserializes JSON
+    @SqsListener("orders-queue")
+    public void handleOrder(OrderEvent event) {
+        log.info("Received: {}", event);
+    }
+
+    // Access full SQS Message
+    @SqsListener("orders-queue")
+    public void handleWithMessage(Message<OrderEvent> message) {
+        OrderEvent event = message.getPayload();
+        String receiptHandle = (String) message.getHeaders()
+            .get(SqsHeaders.SQS_RECEIPT_HANDLE_HEADER);
+        String messageId = (String) message.getHeaders()
+            .get(SqsHeaders.SQS_MESSAGE_ID_HEADER);
+        log.info("messageId={}, receiptHandle={}", messageId, receiptHandle);
+    }
+
+    // Access message attributes
+    @SqsListener("orders-queue")
+    public void handleWithHeaders(
+        @Payload OrderEvent event,
+        @Header("event-type") String eventType,
+        @Header(SqsHeaders.SQS_APPROXIMATE_RECEIVE_COUNT) Integer receiveCount) {
+
+        log.info("eventType={}, receiveCount={}", eventType, receiveCount);
+        if (receiveCount > 3) {
+            log.warn("High retry count — possible poison pill message");
+        }
+    }
+
+    // Batch listener (up to 10 messages per poll)
+    @SqsListener(value = "orders-queue",
+                 maxMessagesPerPoll = "10")
+    public void handleBatch(List<Message<OrderEvent>> messages) {
+        messages.forEach(msg -> processOrder(msg.getPayload()));
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. ACKNOWLEDGMENT — MANUAL ACK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+By default, SqsListener ACKs on successful return, NACKs on exception.
+For manual control:
+
+@SqsListener(value = "orders-queue",
+             acknowledgementMode = SqsListenerAcknowledgementMode.MANUAL)
+public void handleManual(OrderEvent event,
+                          Acknowledgement acknowledgement) {
+    try {
+        processOrder(event);
+        acknowledgement.acknowledge();    // delete from SQS
+    } catch (RecoverableException ex) {
+        // don't ack — message becomes visible again after visibility timeout
+    } catch (FatalException ex) {
+        // ack to prevent infinite loop — handle separately (DLQ)
+        acknowledgement.acknowledge();
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. LISTENER CONTAINER FACTORY — CUSTOM CONFIG
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Configuration
+public class SqsConfig {
+
+    @Bean
+    public SqsMessageListenerContainerFactory<Object> defaultSqsListenerContainerFactory(
+            SqsAsyncClient sqsAsyncClient) {
+
+        return SqsMessageListenerContainerFactory.builder()
+            .configure(options -> options
+                .maxConcurrentMessages(10)     // max parallel processing
+                .pollTimeout(Duration.ofSeconds(20))  // long polling
+                .maxMessagesPerPoll(10)         // batch size
+                .acknowledgementMode(SqsListenerAcknowledgementMode.ON_SUCCESS)
+                .acknowledgementThreshold(5)   // batch-ack after 5 messages
+                .acknowledgementInterval(Duration.ofSeconds(1))
+            )
+            .sqsAsyncClient(sqsAsyncClient)
+            .build();
+    }
+
+    @Bean
+    public SqsAsyncClient sqsAsyncClient() {
+        return SqsAsyncClient.builder()
+            .region(Region.US_EAST_1)
+            .credentialsProvider(DefaultCredentialsProvider.create())
+            .build();
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. SNS → SQS FAN-OUT PATTERN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Architecture:
+  Producer → SNS Topic → [SQS Queue A, SQS Queue B, SQS Queue C]
+
+Use case: one event published to SNS triggers multiple microservices,
+each subscribed via their own SQS queue.
+
+SNS sends to SQS in wrapped format — enable raw message delivery
+to avoid parsing SNS envelope in consumer:
+
+  AWS Console: SNS → Subscriptions → enable "Raw message delivery"
+  Or via Terraform/CloudFormation: raw_message_delivery = true
+
+With raw delivery, @SqsListener receives the original JSON payload directly.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  9. DEAD LETTER QUEUE (DLQ) SETUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Configure via AWS Console / IaC:
+  - Create a DLQ: orders-dlq
+  - On main queue redrive policy: maxReceiveCount=3, deadLetterTargetArn=<dlq arn>
+
+In Spring — consume DLQ for alerting / manual review:
+  @SqsListener("orders-dlq")
+  public void handleDlq(Message<OrderEvent> message) {
+      String receiveCount = (String) message.getHeaders()
+          .get(SqsHeaders.SQS_APPROXIMATE_RECEIVE_COUNT);
+      alertService.sendAlert("DLQ message", message.getPayload(), receiveCount);
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  10. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the difference between Standard and FIFO SQS queues?
+A: Standard queues offer nearly unlimited throughput and at-least-once
+   delivery with best-effort ordering (messages may arrive out of order
+   or duplicated). FIFO queues guarantee exactly-once processing and
+   strict ordering within a message group, but are limited to 300 TPS
+   (3000 with batching).
+
+Q: How does SQS visibility timeout work?
+A: When a consumer receives a message, SQS hides it from other consumers
+   for the visibility timeout period. If the consumer ACKs (deletes) before
+   timeout, all good. If not, the message reappears and can be picked up
+   again. This enables at-least-once delivery.
+
+Q: How do you prevent a "poison pill" message from blocking a queue?
+A: Configure a DLQ with maxReceiveCount (e.g., 3). After 3 failed delivery
+   attempts, the message moves to the DLQ. Monitor the DLQ and alert the
+   team. In code, catch fatal exceptions and ACK the message to avoid
+   infinite retries.
+
+Q: What is long polling and why should you use it?
+A: Short polling returns immediately even with no messages (wastes API
+   calls, costs money). Long polling waits up to 20 seconds for a message.
+   Always use long polling (WaitTimeSeconds=20) — reduces costs and
+   decreases empty receive counts.
+
+Q: How do you test SQS integration locally?
+A: Use LocalStack (Docker) which emulates AWS services locally.
+   Configure the endpoint to http://localhost:4566 and use test credentials.
+   Spring Cloud AWS 3.x supports LocalStack out of the box.

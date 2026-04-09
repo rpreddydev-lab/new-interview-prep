@@ -1,0 +1,179 @@
+================================================================
+Fetch Join and @EntityGraph — Controlled Eager Loading
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Both JOIN FETCH and @EntityGraph allow you to EAGERLY load specific
+associations for a particular query, while keeping the entity annotation
+as LAZY. This is the "fetch what you need, when you need it" pattern.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. JOIN FETCH (JPQL)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Basic JOIN FETCH:
+  @Query("SELECT u FROM User u JOIN FETCH u.orders WHERE u.id = :id")
+  Optional<User> findByIdWithOrders(@Param("id") Long id);
+  // SQL: SELECT u.*, o.* FROM users u INNER JOIN orders o ON o.user_id = u.id WHERE u.id = ?
+
+LEFT JOIN FETCH (include users with no orders):
+  @Query("SELECT u FROM User u LEFT JOIN FETCH u.orders")
+  List<User> findAllWithOrders();
+  // SQL: SELECT u.*, o.* FROM users u LEFT JOIN orders o ON o.user_id = u.id
+
+DISTINCT to remove duplicated users from join result:
+  @Query("SELECT DISTINCT u FROM User u LEFT JOIN FETCH u.orders")
+  List<User> findAllWithOrders();
+
+  Nested association fetch:
+  @Query("SELECT DISTINCT o FROM Order o " +
+         "JOIN FETCH o.user " +
+         "JOIN FETCH o.items i " +
+         "LEFT JOIN FETCH i.product")
+  List<Order> findAllWithDetails();
+
+JPQL JOIN vs JOIN FETCH:
+  JOIN: filters rows but does NOT load the association
+  JOIN FETCH: filters AND loads the association into the persistence context
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. @ENTITYGRAPH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@EntityGraph avoids writing JPQL — define fetch paths declaratively.
+
+Inline @EntityGraph on repository method:
+  @EntityGraph(attributePaths = {"orders"})
+  List<User> findAll();
+
+  @EntityGraph(attributePaths = {"orders", "orders.items"})
+  Optional<User> findById(Long id);
+  // Fetches user, all orders, and all items in each order in one LEFT JOIN chain
+
+Named @EntityGraph on entity class:
+  @Entity
+  @NamedEntityGraph(
+      name = "User.withOrdersAndProfile",
+      attributeNodes = {
+          @NamedAttributeNode("orders"),
+          @NamedAttributeNode("profile")
+      }
+  )
+  public class User { ... }
+
+  // Repository:
+  @EntityGraph(value = "User.withOrdersAndProfile",
+               type = EntityGraph.EntityGraphType.FETCH)
+  Optional<User> findById(Long id);
+
+EntityGraphType.FETCH vs EntityGraphType.LOAD:
+  FETCH: attributes in graph = EAGER, all others = LAZY (overrides defaults)
+  LOAD:  attributes in graph = EAGER, all others = use annotation default
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. MULTIPLE COLLECTION FETCH PROBLEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Fetching two collections in one JPQL query creates a Cartesian product:
+  // BAD: User has List<Order> and List<Role>
+  @Query("SELECT DISTINCT u FROM User u JOIN FETCH u.orders JOIN FETCH u.roles")
+  // Hibernate 5: MultipleBagFetchException
+  // Even with Set: 10 users × 5 orders × 3 roles = 150 rows from DB
+
+Solutions:
+
+Solution A: Use Set instead of List (avoids MultipleBagFetchException):
+  private Set<Order> orders = new HashSet<>();
+  private Set<Role> roles = new HashSet<>();
+  // With Set + DISTINCT: the Cartesian product is deduplicated correctly
+
+Solution B: Load one collection per query:
+  @EntityGraph(attributePaths = {"orders"})
+  Optional<User> findByIdWithOrders(Long id);
+
+  @EntityGraph(attributePaths = {"roles"})
+  Optional<User> findByIdWithRoles(Long id);
+  // Two separate DB queries; entities merged in 1LC if same session
+
+Solution C: @BatchSize (N/batch queries instead of 1):
+  @OneToMany(mappedBy = "user")
+  @BatchSize(size = 25)
+  private List<Order> orders;
+  // Use Pageable for main entity, let @BatchSize handle collections
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. JOIN FETCH + PAGINATION (THE CLASSIC TRAP)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Combining JOIN FETCH on a collection with Pageable breaks SQL-level pagination:
+  @Query("SELECT DISTINCT u FROM User u LEFT JOIN FETCH u.orders")
+  Page<User> findAllWithOrders(Pageable pageable);  // WARNING!
+  // Hibernate loads ALL rows into memory and paginates in Java!
+  // HHH90003004 warning in logs.
+
+Correct approach — paginate the root entity, then batch-load collections:
+  // Step 1: paginate users without fetch
+  @Query(
+    value = "SELECT u FROM User u",
+    countQuery = "SELECT COUNT(u) FROM User u"
+  )
+  Page<User> findAll(Pageable pageable);
+
+  // Step 2: batch-load orders after getting user IDs:
+  @Query("SELECT DISTINCT u FROM User u LEFT JOIN FETCH u.orders WHERE u IN :users")
+  List<User> loadWithOrders(@Param("users") List<User> users);
+
+  // Service combining both:
+  Page<User> page = userRepo.findAll(pageable);
+  userRepo.loadWithOrders(page.getContent());  // populates 1LC, reuses same entities
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. COMPARISON: JOIN FETCH vs @ENTITYGRAPH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Aspect              | JOIN FETCH                | @EntityGraph
+────────────────────|───────────────────────────|──────────────────────────────
+Definition          | In JPQL string            | Annotation on method or entity
+Reusability         | Per @Query only           | @NamedEntityGraph reusable
+With derived queries| NO — needs @Query         | YES — works with derived queries
+FETCH type control  | INNER vs LEFT JOIN FETCH  | EntityGraphType.FETCH or LOAD
+Nested subgraphs    | Via chained JOIN FETCH    | @NamedSubgraph in @NamedEntityGraph
+Clarity             | Clear SQL intent          | Higher-level abstraction
+Pagination safety   | Same trap                 | Same trap with collections
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. INTERVIEW QUICK HITS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the difference between JOIN and JOIN FETCH in JPQL?
+A: JOIN only filters the query (like SQL JOIN) but does NOT initialize the
+   association in Java. JOIN FETCH both performs the SQL JOIN and loads the
+   associated data into the persistence context, preventing N+1 queries.
+
+Q: What is @EntityGraph and how does it work?
+A: @EntityGraph is a JPA annotation that tells Hibernate which associations
+   to eagerly load for a specific query, overriding the lazy default.
+   It generates a LEFT JOIN in SQL for each attribute in the graph.
+   Works with Spring Data derived queries (no @Query needed).
+
+Q: Why can't you use JOIN FETCH with Pageable?
+A: JOIN FETCH on a collection multiplies result rows (Cartesian join).
+   Hibernate cannot apply LIMIT/OFFSET at the SQL level correctly because
+   the row count no longer matches entity count. Hibernate falls back to
+   loading everything in memory and paginating — causing OOM with large data.
+   Solution: paginate the root entity separately, then load collections
+   via a second query or @BatchSize.
+
+Q: What happens when you fetch two collections with JOIN FETCH?
+A: Hibernate throws MultipleBagFetchException (for List) or creates a
+   Cartesian product (rows = N × M × P). Fix: use Set<> for all collections,
+   or split into separate queries, or use @BatchSize.
+
+Q: When would you choose @EntityGraph over JOIN FETCH?
+A: @EntityGraph is cleaner for Spring Data repositories where you're using
+   derived query methods (findByStatus, findAll, etc.) and can't write JPQL.
+   JOIN FETCH is preferred when you're writing complex @Query methods and
+   want explicit control over INNER vs LEFT JOIN semantics.

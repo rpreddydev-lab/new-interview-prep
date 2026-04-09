@@ -1,0 +1,270 @@
+================================================================================
+CONNECTION POOLING — IN DEPTH
+================================================================================
+
+WHAT IS CONNECTION POOLING?
+-----------------------------
+Connection pooling is the practice of reusing database (or HTTP) connections
+rather than creating a new one for every request. Creating a connection is
+expensive (network round trips, authentication, resource allocation) — pooling
+amortizes this cost.
+
+Without pooling:
+  Request arrives → open connection → execute query → close connection
+  Each connection: TCP 3-way handshake + TLS + DB authentication = ~50-100ms
+
+With pooling:
+  App startup → create N connections → Request arrives → borrow connection
+  → execute query → return to pool (connection stays open)
+  Per request: ~0ms connection overhead
+
+================================================================================
+1. DATABASE CONNECTION POOLING (HikariCP)
+================================================================================
+
+HikariCP is the default and fastest connection pool in Spring Boot.
+Properties configured via spring.datasource.hikari.*
+
+COMPLETE CONFIGURATION:
+  spring:
+    datasource:
+      url: jdbc:postgresql://localhost:5432/mydb
+      username: app_user
+      password: ${DB_PASSWORD}
+      driver-class-name: org.postgresql.Driver
+      hikari:
+        # Pool sizing
+        minimum-idle: 5             # Minimum connections kept alive
+        maximum-pool-size: 20       # Maximum connections in pool
+        
+        # Timeouts
+        connection-timeout: 30000   # Max wait to acquire connection (ms)
+        idle-timeout: 600000        # Remove idle connections after (ms); 10 min
+        max-lifetime: 1800000       # Max connection lifetime (ms); 30 min
+        keepalive-time: 30000       # Send keepalive ping every 30s
+        
+        # Validation
+        connection-test-query: SELECT 1   # (PostgreSQL uses isValid() by default)
+        validation-timeout: 5000         # Max time for validation
+        
+        # Performance
+        auto-commit: true
+        
+        # Naming (helps in monitoring/profiling)
+        pool-name: MyAppPool
+        
+        # Leak detection (log if connection held longer than threshold)
+        leak-detection-threshold: 60000  # warn after 60s
+
+POOL SIZING RULE (Little's Law):
+  pool_size = Tp × (Tq / Ts)
+  Tp = throughput (requests per second)
+  Tq = time in queue (acceptable latency)
+  Ts = service time (time to complete a DB operation)
+  
+  Practical formula from PostgreSQL wiki:
+  pool_size = (core_count × 2) + effective_spindle_count
+  
+  For a 4-core server with SSDs:
+  pool_size = (4 × 2) + 1 = 9
+  
+  Rule of thumb: start with 10-20; monitor and adjust.
+
+TOO SMALL POOL:
+  Requests queue up waiting for connections → high latency, timeouts
+
+TOO LARGE POOL:
+  DB server overwhelmed with connections → context switching overhead
+  PostgreSQL: each connection = OS process → 500 connections = 500 processes
+
+================================================================================
+2. CONNECTION POOL LIFECYCLE
+================================================================================
+
+HikariCP states:
+  IDLE     : Connection in pool, available
+  IN-USE   : Connection borrowed by a thread
+  EVICTED  : Connection closed (exceeded max-lifetime or validation failed)
+
+Connection borrowing:
+  1. Thread calls DataSource.getConnection()
+  2. HikariCP checks idle pool; returns immediately if available
+  3. If pool exhausted: thread waits up to connectionTimeout
+  4. If still no connection: HikariConnectionTimeoutException
+
+Connection validation:
+  Before lending: HikariCP validates connection (SELECT 1 or isValid())
+  If validation fails: connection is evicted and a new one is created
+
+Max lifetime:
+  Connections have a max age (maxLifetime, default 30 min).
+  Before expiry, connection is evicted and replaced.
+  Prevents "stale connection" issues (firewall drops long-idle connections).
+
+================================================================================
+3. COMMON ISSUES AND SOLUTIONS
+================================================================================
+
+CONNECTION LEAK:
+  A connection is borrowed but never returned (not closed).
+  Symptoms: pool exhaustion; ConnectionTimeoutException
+  Detection: leakDetectionThreshold setting — HikariCP logs "Apparent connection
+             leak detected" if connection held > threshold ms.
+  Fix: Use try-with-resources for Connection objects; Spring @Transactional
+       returns connection automatically.
+
+  // WRONG: connection never returned if exception thrown
+  Connection conn = dataSource.getConnection();
+  // ... if exception here, conn is never closed
+  conn.close();
+
+  // RIGHT: try-with-resources
+  try (Connection conn = dataSource.getConnection()) {
+      // conn.close() called automatically
+  }
+
+TOO MANY CONNECTIONS ERROR:
+  Database server rejects new connections (max_connections limit).
+  Fix: reduce maximum-pool-size; use PgBouncer connection pooler at DB level;
+       reduce the number of app instances; or increase DB max_connections.
+
+DEADLOCK ON TRANSACTION:
+  Thread 1: holds Connection A, waiting for Connection B
+  Thread 2: holds Connection B, waiting for Connection A
+  Fix: ensure transaction methods don't call other @Transactional methods that
+       need a new connection; review N+1 query patterns.
+
+STALE CONNECTIONS:
+  Connection was silently dropped by firewall after being idle.
+  Next use: "Connection closed" exception.
+  Fix: maxLifetime < firewall idle timeout; keepaliveTime pings to keep alive.
+
+================================================================================
+4. HTTP CONNECTION POOLING (WebClient/RestClient)
+================================================================================
+
+For HTTP calls to other services, reuse TCP/TLS connections:
+
+SPRING WEBCLIENT WITH REACTOR NETTY POOL:
+  @Bean
+  public WebClient webClient() {
+      ConnectionProvider provider = ConnectionProvider.builder("myPool")
+          .maxConnections(200)                    // max total connections
+          .maxIdleTime(Duration.ofSeconds(30))    // remove idle connections
+          .maxLifeTime(Duration.ofMinutes(5))     // max connection age
+          .pendingAcquireTimeout(Duration.ofMillis(500)) // wait for conn
+          .evictInBackground(Duration.ofSeconds(30))     // cleanup interval
+          .build();
+      
+      HttpClient httpClient = HttpClient.create(provider)
+          .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000)
+          .responseTimeout(Duration.ofSeconds(30))
+          .doOnConnected(conn ->
+              conn.addHandlerLast(new ReadTimeoutHandler(30))
+                  .addHandlerLast(new WriteTimeoutHandler(30)));
+      
+      return WebClient.builder()
+          .clientConnector(new ReactorClientHttpConnector(httpClient))
+          .build();
+  }
+
+HTTP/1.1 KEEP-ALIVE:
+  Connection: keep-alive header reuses TCP connection for multiple requests.
+  Connection: close closes connection after response.
+  HTTP/1.1 keep-alive is default; HTTP/2 multiplexes on single connection.
+
+HTTP/2 MULTIPLEXING:
+  One TCP connection handles many streams concurrently.
+  Connection pooling less critical with HTTP/2 (one connection per host suffices).
+
+================================================================================
+5. PGBOUNCER — EXTERNAL CONNECTION POOLER
+================================================================================
+
+For high-traffic apps, put PgBouncer in front of PostgreSQL:
+  App ──→ PgBouncer (pool) ──→ PostgreSQL
+
+PgBouncer pooling modes:
+  Session: one DB connection per client session (same as app-level pooling)
+  Transaction: DB connection assigned per transaction (return on COMMIT/ROLLBACK)
+  Statement: DB connection per statement (most aggressive; limited functionality)
+
+Transaction mode is most common:
+  1000 app connections → PgBouncer → 20 actual PostgreSQL connections
+  App connections are lightweight (no actual PostgreSQL process)
+
+  # pgbouncer.ini
+  [databases]
+  mydb = host=localhost port=5432 dbname=mydb
+  
+  [pgbouncer]
+  pool_mode = transaction
+  max_client_conn = 1000
+  default_pool_size = 20
+
+================================================================================
+6. MONITORING CONNECTION POOLS
+================================================================================
+
+HikariCP metrics via Spring Boot Actuator + Micrometer:
+  hikaricp.connections.active     → connections currently in use
+  hikaricp.connections.idle       → available connections
+  hikaricp.connections.pending    → threads waiting for connection
+  hikaricp.connections.timeout    → acquisition timeouts
+  hikaricp.connections.acquire    → time to acquire connection (histogram)
+
+Grafana alerts:
+  ALERT if hikaricp.connections.pending > 0 for > 5s (pool exhaustion warning)
+  ALERT if hikaricp.connections.acquire 99th percentile > 1000ms
+
+================================================================================
+7. INTERVIEW QUESTIONS — CONNECTION POOLING
+================================================================================
+
+Q1: Why is connection pooling critical for a web application?
+    Creating a database connection is expensive: it involves TCP handshake,
+    TLS negotiation (if SSL), database authentication, and session setup —
+    typically 50-150ms. Without pooling, a high-traffic API making one DB call
+    per request would spend most of its time creating connections. With pooling,
+    connections are reused — borrowing a connection takes <1ms. Pooling also
+    limits the number of simultaneous DB connections, protecting the DB server
+    from being overwhelmed.
+
+Q2: What happens when the HikariCP pool is exhausted?
+    New threads calling getConnection() are queued and wait up to
+    connectionTimeout (default 30s). If a connection becomes available within
+    that timeout, the thread proceeds. If not, HikariConnectionTimeoutException
+    is thrown. You can detect pool exhaustion before it gets to exceptions by
+    monitoring hikaricp.connections.pending metric — alert if it stays non-zero.
+    Root cause: pool too small, slow queries holding connections too long,
+    or connection leaks.
+
+Q3: How do you choose the right pool size?
+    Use the formula: pool_size ≈ (cores × 2) + effective_spindle_count
+    (effective_spindle_count is typically 1 for SSDs). Start with 10 and
+    increase based on monitoring. More connections isn't always better — too
+    many connections increases DB context switching and memory. Monitor
+    hikaricp.connections.active vs pool size. If always at max, increase size.
+    If pool is mostly idle, reduce it. PgBouncer can help if you have many
+    app instances each needing a pool.
+
+Q4: What is a connection leak and how do you detect it?
+    A connection leak occurs when a connection is borrowed from the pool but
+    never returned (not closed). This gradually exhausts the pool.
+    HikariCP's leakDetectionThreshold setting logs a warning if a connection
+    is held longer than the threshold. Always use try-with-resources for
+    manual connection handling. In Spring, @Transactional manages connection
+    lifecycle automatically. Test for leaks by enabling leak detection in dev
+    and running load tests.
+
+Q5: What is the difference between HikariCP and PgBouncer?
+    HikariCP is an application-side JDBC connection pool — manages connections
+    within the JVM. PgBouncer is a PostgreSQL-specific proxy that pools
+    connections at the infrastructure level. Use PgBouncer when: multiple
+    application instances each with their own pool would create too many DB
+    connections (N instances × pool_size = too many). PgBouncer consolidates
+    them. Also useful for serverless functions (AWS Lambda) that can't maintain
+    persistent pools — use PgBouncer's transaction mode to share a small DB
+    connection pool among thousands of ephemeral Lambda instances.
+
+================================================================================

@@ -1,0 +1,217 @@
+================================================================================
+DISTRIBUTED TRACING
+================================================================================
+
+WHAT IS DISTRIBUTED TRACING?
+------------------------------
+A technique to track the flow of a single request as it travels through multiple
+services in a distributed system. Shows EXACTLY where time was spent and where
+failures occurred.
+
+Without distributed tracing:
+  User: "My checkout is slow"
+  Developer: Which of the 15 services is slow? 🤷
+
+With distributed tracing:
+  User: "My checkout is slow"
+  Developer: Jaeger shows: Order Service 50ms → Inventory 600ms (HERE!) → Payment 100ms
+
+────────────────────────────────────────────────────────────────────────────────
+
+TRACING CONCEPTS
+=================
+
+TRACE: The complete end-to-end journey of ONE request
+  - Identified by a unique Trace ID (e.g., a8f0d5e2f3c1b7a9)
+  - Contains multiple spans
+
+SPAN: A single unit of work within a trace
+  - Has a Span ID, start time, duration, status
+  - Belongs to a trace
+  - Can have a parent span (forming a tree)
+  - Contains tags (metadata) and logs (events within the span)
+
+TRACE CONTEXT: Propagated between services via HTTP headers (W3C TraceContext standard):
+  traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+               ^  ^trace-id                          ^span-id         ^flags
+
+Span Tree Example:
+  Trace: Place Order (total 750ms)
+  ├── [API Gateway] validate JWT (10ms)
+  ├── [Order Service] createOrder (730ms)
+  │   ├── [DB write] INSERT orders (20ms)
+  │   ├── [Inventory Service] reserveItems (600ms) ← SLOW!
+  │   │   └── [DB query] UPDATE inventory (580ms) ← ROOT CAUSE
+  │   └── [Payment Service] processPayment (100ms)
+  │       └── [External API] Stripe charge (95ms)
+  └── [Notification Service] sendEmail (5ms)
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING BOOT + OPENTELEMETRY SETUP
+=====================================
+
+pom.xml:
+  <!-- OpenTelemetry Spring Boot starter (auto-instruments Spring, DB, etc.) -->
+  <dependency>
+    <groupId>io.opentelemetry.instrumentation</groupId>
+    <artifactId>opentelemetry-spring-boot-starter</artifactId>
+    <version>2.8.0</version>
+  </dependency>
+
+  <!-- Or use Micrometer Tracing (simpler for Spring Boot 3) -->
+  <dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-tracing-bridge-otel</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>io.opentelemetry.exporter</groupId>
+    <artifactId>opentelemetry-exporter-otlp</artifactId>
+  </dependency>
+
+application.yml:
+  spring:
+    application:
+      name: order-service
+
+  management:
+    tracing:
+      sampling:
+        probability: 1.0   # 100% sampling (reduce in high-traffic production)
+      enabled: true
+
+  # Send traces to Jaeger / Tempo via OTLP
+  otel:
+    exporter:
+      otlp:
+        endpoint: http://jaeger-collector:4317  # gRPC OTLP endpoint
+        protocol: grpc
+
+Logging with trace context (MDC):
+  # application.yml
+  logging:
+    pattern:
+      console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level [%X{traceId:-},%X{spanId:-}] %logger{36} - %msg%n"
+
+  # This automatically adds traceId and spanId to every log line:
+  2024-01-15 10:23:45 [http-nio-8080] INFO [4bf92f3577b34da6,00f067aa0ba902b7] o.e.OrderService - Order created: 123
+
+Custom Spans:
+  @Service
+  public class OrderService {
+
+    @Autowired private Tracer tracer;
+
+    public Order processOrder(CreateOrderRequest request) {
+      Span span = tracer.nextSpan()
+        .name("processOrder")
+        .tag("orderId", "123")
+        .tag("userId", request.getUserId().toString())
+        .start();
+
+      try (Tracer.SpanInScope scope = tracer.withSpan(span)) {
+        // Business logic here — all child spans will be children of this span
+        Order order = createOrderInDb(request);
+        span.tag("order.total", order.getTotal().toString());
+        return order;
+      } catch (Exception e) {
+        span.error(e);
+        throw e;
+      } finally {
+        span.end();
+      }
+    }
+  }
+
+  // Annotation-based (simpler):
+  @Observed(name = "inventory.reserve", 
+            contextualName = "inventory-reservation",
+            lowCardinalityKeyValues = {"service", "inventory"})
+  public InventoryReservation reserveItems(Long orderId, List<Long> productIds) {
+    // Automatically creates a span
+    return inventoryRepository.reserve(orderId, productIds);
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+TRACE CONTEXT PROPAGATION
+===========================
+
+HTTP headers (W3C TraceContext — standard):
+  traceparent: 00-{traceId}-{spanId}-{flags}
+  tracestate: vendor-specific state (optional)
+
+B3 headers (Zipkin format — older, still common):
+  X-B3-TraceId: 4bf92f3577b34da6a3ce929d0e0e4736
+  X-B3-SpanId: 00f067aa0ba902b7
+  X-B3-Sampled: 1
+
+OpenTelemetry with Spring Cloud Gateway automatically propagates:
+  # application.yml (Spring Cloud Gateway)
+  management:
+    tracing:
+      enabled: true  # Gateway propagates traceId to downstream services
+
+For Kafka:
+  // Producer: inject trace headers into Kafka record
+  // OTel automatically does this with the Kafka instrumentation
+
+  // Consumer: extract trace headers and create child span
+  // OTel automatically restores context from Kafka headers
+
+────────────────────────────────────────────────────────────────────────────────
+
+JAEGER ARCHITECTURE
+====================
+
+  Services → [OTel SDK] → [Jaeger Collector] → [Elasticsearch/Cassandra]
+                               ↑                          ↓
+              [Jaeger Agent]  (local agent on same host)  [Jaeger Query]
+                                                               ↓
+                                                         [Jaeger UI / Grafana]
+
+Sampling strategies:
+  1. Constant (always/never): 100% or 0%
+  2. Probabilistic: 10% of traces sampled
+  3. Rate-limiting: max N traces per second
+  4. Remote controlled: Jaeger UI controls sampling rate dynamically
+
+Production sampling:
+  - 100% for errors (always trace errors!)
+  - 1-10% for normal traffic (storage cost)
+  - Head-based vs tail-based sampling
+
+Head-based sampling: Decision made at request START (all or nothing)
+Tail-based sampling: Decision made at request END (can always trace errors)
+  → Preferred: collect all spans, drop normal traces, keep error traces
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is distributed tracing and what problem does it solve?
+A: Distributed tracing tracks a single request's journey through multiple
+   services. It solves the "where is the latency?" problem in microservices —
+   a single trace shows every service, DB call, and external API call with
+   timing, making it trivial to identify bottlenecks and failures.
+
+Q: What is a Trace and a Span?
+A: A Trace is the complete end-to-end journey of one request, identified by a
+   Trace ID. A Span is one unit of work within that trace (one service call,
+   one DB query), forming a parent-child tree. Spans record start time,
+   duration, tags, and status.
+
+Q: How is trace context propagated between services?
+A: Via HTTP headers. W3C TraceContext standard uses the `traceparent` header
+   containing trace ID and span ID. Services extract the parent context,
+   create a child span, and inject the updated context into outgoing calls.
+   OpenTelemetry handles this automatically with Spring Boot.
+
+Q: What is sampling in distributed tracing?
+A: Because tracing every request generates huge volumes of data, sampling
+   selects a subset to store. Head-based sampling decides upfront (probabilistic
+   10%). Tail-based sampling collects everything but only persists interesting
+   traces (errors, slow requests). Tail-based is preferred in production.
+
+================================================================================

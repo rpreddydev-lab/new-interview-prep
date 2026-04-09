@@ -1,0 +1,252 @@
+================================================================================
+CACHE-ASIDE (LAZY LOADING) — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. WHAT IS CACHE-ASIDE?
+────────────────────────
+Cache-Aside (also called Lazy Loading) is the most commonly used caching pattern.
+The application is responsible for managing the cache. Redis is a side cache —
+it does NOT automatically populate or update itself.
+
+Flow:
+  1. Application needs data
+  2. Check Redis cache first (CACHE READ)
+  3. Cache HIT → return data from cache (fast path, no DB)
+  4. Cache MISS → query the database (slow path)
+  5. Store DB result in Redis with a TTL (populate cache)
+  6. Return data to caller
+
+
+2. DIAGRAM
+───────────
+  ┌──────────────┐   1. GET key   ┌──────────────┐
+  │              │ ─────────────→ │              │
+  │ Application  │   2. nil       │    Redis     │
+  │              │ ←───────────── │    Cache     │
+  │              │                └──────────────┘
+  │              │   3. SELECT…   ┌──────────────┐
+  │              │ ─────────────→ │              │
+  │              │   4. row       │   Database   │
+  │              │ ←───────────── │  (Postgres)  │
+  │              │   5. SET key   └──────────────┘
+  │              │ ─────────────→ ┌──────────────┐
+  │              │                │    Redis     │
+  └──────────────┘                └──────────────┘
+
+
+3. IMPLEMENTATION (PSEUDOCODE)
+───────────────────────────────
+  def get_product(product_id):
+      cache_key = f"product:{product_id}"
+
+      # Step 1: Try cache
+      cached = redis.get(cache_key)
+      if cached:
+          return deserialize(cached)   # Cache HIT
+
+      # Step 2: Cache MISS — query DB
+      product = db.query("SELECT * FROM products WHERE id = ?", product_id)
+      if product is None:
+          # Negative caching (optional, prevents cache stampede on missing data)
+          redis.setex(cache_key, 60, "NULL")   # cache null for 60s
+          return None
+
+      # Step 3: Store in cache
+      redis.setex(cache_key, 3600, serialize(product))  # TTL = 1 hour
+      return product
+
+  Java/Spring example:
+  @Service
+  public class ProductService {
+      @Autowired private RedisTemplate<String, String> redis;
+      @Autowired private ProductRepository repo;
+
+      public Product getProduct(long id) {
+          String key = "product:" + id;
+          String cached = redis.opsForValue().get(key);
+          if (cached != null) {
+              return objectMapper.readValue(cached, Product.class);
+          }
+          Product p = repo.findById(id).orElse(null);
+          if (p != null) {
+              redis.opsForValue().set(key, objectMapper.writeValueAsString(p),
+                                      Duration.ofHours(1));
+          }
+          return p;
+      }
+  }
+
+
+4. CACHE INVALIDATION WITH CACHE-ASIDE
+────────────────────────────────────────
+When data in the DB changes, the cache must be invalidated.
+
+Strategy A — Delete on write (recommended):
+  def update_product(product_id, new_data):
+      db.update("UPDATE products SET ... WHERE id = ?", product_id, new_data)
+      redis.delete(f"product:{product_id}")  # invalidate cache
+      # Next read will be a cache miss → repopulates from DB
+
+  Pro: Simple. Cache is always consistent with DB after read.
+  Con: First read after update is always a DB miss.
+
+Strategy B — Update on write (write-through cache-aside hybrid):
+  def update_product(product_id, new_data):
+      updated_product = db.update(...)
+      redis.setex(f"product:{product_id}", 3600, serialize(updated_product))
+
+  Pro: No cache miss after update.
+  Con: Two writes must succeed atomically (DB + cache). If cache write fails,
+       stale data remains. More complex error handling.
+
+Strategy C — TTL-only (accept eventual consistency):
+  No explicit invalidation. Stale data lives in cache until TTL expires.
+  Appropriate when:
+    - Staleness < TTL window is acceptable
+    - Data changes are infrequent and minor
+    - Simplicity is paramount
+
+
+5. ADVANTAGES
+──────────────
+  ✓ Simple to implement: just wrap your data access with get-from-cache logic
+  ✓ Lazy population: only caches data that's actually requested
+  ✓ Cache failures are non-fatal: on Redis outage, fall back to DB
+  ✓ Works with any backend database
+  ✓ Cache schema can differ from DB schema (e.g., cached objects can be
+    pre-joined/pre-computed)
+  ✓ No cache pollution: unused data never enters cache
+
+
+6. DISADVANTAGES
+─────────────────
+  ✗ Cache miss penalty: first request is slow (DB query + cache write)
+  ✗ Stale data: TTL-based or write-invalidation needed
+  ✗ Cache stampede (thundering herd): many requests miss simultaneously
+  ✗ Application complexity: cache logic mixed with business logic
+  ✗ Inconsistency window: after DB update, before TTL expiry = stale data
+
+
+7. NEGATIVE CACHING
+────────────────────
+Problem: Attacker or buggy code queries non-existent keys in a loop.
+Each miss hits the DB. DB gets hammered.
+
+Solution: Cache the "null" result for a short TTL:
+  if product is None:
+      redis.setex(cache_key, 60, "__NULL__")   # cache miss result
+      return None
+
+  On read:
+  if cached == "__NULL__":
+      return None   # cache hit for non-existent data
+
+  TTL should be SHORT (60 seconds) for negative caches, so eventually
+  real data can be cached if item is created.
+
+
+8. CACHE KEY DESIGN
+────────────────────
+  Good key patterns:
+    product:42                 → single product
+    product:42:reviews         → product reviews list
+    user:99:profile            → user profile
+    search:q=redis&page=1      → search results (careful with cardinality)
+    config:feature-flags       → system config
+
+  Bad patterns:
+    "42"                       → ambiguous, what is 42?
+    "product42reviews"         → hard to scan/invalidate
+    search:{entire_query_json} → unbounded key length and cardinality
+
+  Namespacing with RedisOM or Spring Cache:
+    Spring @Cacheable uses: {cacheNames}::{key}
+    E.g., "products::42"
+
+
+9. SPRING @CACHEABLE (Cache-Aside via Annotation)
+───────────────────────────────────────────────────
+  @Configuration
+  @EnableCaching
+  public class CacheConfig {
+      @Bean
+      public RedisCacheManager cacheManager(RedisConnectionFactory factory) {
+          RedisCacheConfiguration config = RedisCacheConfiguration.defaultCacheConfig()
+              .entryTtl(Duration.ofHours(1))
+              .serializeValuesWith(RedisSerializationContext.SerializationPair
+                  .fromSerializer(new GenericJackson2JsonRedisSerializer()));
+          return RedisCacheManager.builder(factory)
+              .cacheDefaults(config)
+              .build();
+      }
+  }
+
+  @Service
+  public class ProductService {
+      @Cacheable(value = "products", key = "#id")
+      public Product getProduct(Long id) {
+          // Only called on cache MISS; result cached automatically
+          return productRepo.findById(id).orElseThrow();
+      }
+
+      @CacheEvict(value = "products", key = "#product.id")
+      public void updateProduct(Product product) {
+          productRepo.save(product);  // cache evicted automatically on update
+      }
+
+      @CachePut(value = "products", key = "#product.id")
+      public Product saveProduct(Product product) {
+          return productRepo.save(product);  // cache UPDATED (not evicted)
+      }
+  }
+
+
+10. HANDLING CACHE FAILURES (RESILIENCE)
+──────────────────────────────────────────
+  Cache should degrade gracefully — never cause application failure.
+
+  try:
+      cached = redis.get(key)
+      if cached:
+          return deserialize(cached)
+  except RedisException as e:
+      log.warn("Cache read failed, falling back to DB: " + str(e))
+
+  # Always fall through to DB on cache failure
+  result = db.query(...)
+  try:
+      redis.setex(key, 3600, serialize(result))
+  except RedisException as e:
+      log.warn("Cache write failed: " + str(e))   # non-fatal
+
+  # Use Circuit Breaker (Resilience4j) around Redis calls in production
+
+
+11. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: What is Cache-Aside and why is it the most popular caching pattern?
+  A: Cache-Aside (Lazy Loading) is a pattern where the application manages the
+     cache explicitly. On a read: check cache → hit: return it; miss: query DB,
+     store in cache, return. It's popular because: it's simple, only caches
+     data that's actually requested (no wasted memory), cache failures are
+     non-fatal (fall back to DB), and it works with any database.
+
+  Q: What are the drawbacks of Cache-Aside?
+  A: 1) Cache miss penalty (first request always slow), 2) Potential stale data
+     between DB update and TTL expiry, 3) Cache stampede on popular keys after
+     expiry (thundering herd), 4) Application code must handle cache logic.
+
+  Q: How do you handle cache invalidation in Cache-Aside?
+  A: Two main approaches: (1) Delete on write — after a DB update, DELETE the
+     cache key. Next read repopulates it from DB. Simple and correct.
+     (2) Update on write — after DB update, SET the new value in cache.
+     Avoids a subsequent miss but requires both DB and cache writes to succeed.
+     For most cases, delete on write is simpler and safer.
+
+  Q: What is negative caching and when is it needed?
+  A: Negative caching stores a sentinel value (like "NULL") in the cache when
+     a DB lookup returns no result. This prevents cache-stampede-style attacks
+     where non-existent keys cause repeated DB lookups on every request. The
+     sentinel TTL should be short so the cache eventually reflects real data.
+
+================================================================================

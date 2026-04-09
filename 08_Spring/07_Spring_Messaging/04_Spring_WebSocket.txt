@@ -1,0 +1,307 @@
+================================================================
+  SPRING WEBSOCKET
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. WHAT IS WEBSOCKET?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WebSocket is a full-duplex, persistent TCP connection over a single
+HTTP/1.1 upgrade handshake. Both client and server can push messages
+at any time without polling.
+
+HTTP vs WebSocket:
+  HTTP Request-Response  → client asks, server answers, connection closes
+  WebSocket              → connection stays open, both sides send freely
+
+Use cases:
+  - Live chat / messaging
+  - Real-time dashboards / stock prices
+  - Collaborative editing (Google Docs style)
+  - Live game state / notifications
+  - Real-time progress updates (long running jobs)
+
+WebSocket URL scheme: ws:// (insecure) or wss:// (TLS — production)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. STOMP PROTOCOL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WebSocket is just a transport — it has no message routing semantics.
+STOMP (Simple Text Oriented Messaging Protocol) adds messaging on top.
+
+STOMP frames: CONNECT, SUBSCRIBE, SEND, MESSAGE, UNSUBSCRIBE, DISCONNECT
+
+Spring uses STOMP over WebSocket with an in-memory message broker
+(or a full broker like RabbitMQ/ActiveMQ for multi-instance deployments).
+
+Destinations:
+  /app/**    → client sends to a controller (@MessageMapping)
+  /topic/**  → broadcast (pub-sub via topic message broker)
+  /queue/**  → point-to-point (user-specific)
+  /user/**   → routed to a specific user session
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. DEPENDENCY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-websocket</artifactId>
+</dependency>
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. WEBSOCKET + STOMP CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Configuration
+@EnableWebSocketMessageBroker
+public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry config) {
+        // Enable simple in-memory broker for /topic and /queue
+        config.enableSimpleBroker("/topic", "/queue");
+
+        // Application destination prefix: clients send to /app/...
+        config.setApplicationDestinationPrefixes("/app");
+
+        // User-specific prefix: /user/{username}/...
+        config.setUserDestinationPrefix("/user");
+    }
+
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        // WebSocket endpoint
+        registry.addEndpoint("/ws")
+            .setAllowedOriginPatterns("*")
+            .withSockJS();  // SockJS fallback for browsers without WebSocket support
+    }
+}
+
+// To use a full external broker (RabbitMQ with STOMP plugin):
+@Override
+public void configureMessageBroker(MessageBrokerRegistry config) {
+    config.enableStompBrokerRelay("/topic", "/queue")
+        .setRelayHost("localhost")
+        .setRelayPort(61613)
+        .setClientLogin("guest")
+        .setClientPasscode("guest");
+    config.setApplicationDestinationPrefixes("/app");
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. WEBSOCKET CONTROLLER — @MessageMapping
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Controller
+public class ChatController {
+
+    private final SimpMessagingTemplate messagingTemplate;
+
+    public ChatController(SimpMessagingTemplate messagingTemplate) {
+        this.messagingTemplate = messagingTemplate;
+    }
+
+    // Receive from client, broadcast to /topic/messages
+    @MessageMapping("/chat.send")    // client sends to /app/chat.send
+    @SendTo("/topic/messages")       // server broadcasts to all subscribers
+    public ChatMessage handleMessage(ChatMessage message) {
+        message.setTimestamp(Instant.now());
+        return message;
+    }
+
+    // Direct reply to sender (no broadcast)
+    @MessageMapping("/chat.private")
+    @SendToUser("/queue/reply")      // sends to /user/{sessionId}/queue/reply
+    public ChatMessage privateReply(ChatMessage message) {
+        return new ChatMessage("SERVER", "Message received: " + message.getContent());
+    }
+
+    // Send to a specific user programmatically
+    @MessageMapping("/chat.notify")
+    public void notifyUser(ChatMessage message) {
+        messagingTemplate.convertAndSendToUser(
+            message.getTargetUser(),
+            "/queue/notifications",   // destination under /user/{targetUser}/
+            new Notification("New message from " + message.getSender())
+        );
+    }
+
+    // Subscribe event — called when client subscribes to a topic
+    @EventListener
+    public void handleSubscribeEvent(SessionSubscribeEvent event) {
+        StompHeaderAccessor headerAccessor = StompHeaderAccessor.wrap(event.getMessage());
+        log.info("Client subscribed to: {}", headerAccessor.getDestination());
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. SERVER-TO-CLIENT PUSH (SimpMessagingTemplate)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Use SimpMessagingTemplate to push messages from anywhere (not just
+from a @MessageMapping handler — e.g., from a @Service triggered by Kafka).
+
+@Service
+public class OrderStatusService {
+
+    private final SimpMessagingTemplate messagingTemplate;
+
+    public OrderStatusService(SimpMessagingTemplate messagingTemplate) {
+        this.messagingTemplate = messagingTemplate;
+    }
+
+    // Broadcast to all subscribers
+    public void broadcastOrderUpdate(OrderEvent event) {
+        messagingTemplate.convertAndSend("/topic/orders", event);
+    }
+
+    // Push to a specific user
+    public void notifyUser(String username, OrderEvent event) {
+        messagingTemplate.convertAndSendToUser(
+            username,
+            "/queue/order-updates",
+            event
+        );
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. WEBSOCKET SECURITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Configuration
+public class WebSocketSecurityConfig
+        extends AbstractSecurityWebSocketMessageBrokerConfigurer {
+
+    @Override
+    protected void configureInbound(MessageSecurityMetadataSourceRegistry messages) {
+        messages
+            .nullDestMatcher().authenticated()        // CONNECT frame
+            .simpSubscribeDestMatchers("/user/**").authenticated()
+            .simpDestMatchers("/app/**").authenticated()
+            .simpDestMatchers("/topic/public").permitAll()
+            .anyMessage().denyAll();
+    }
+
+    @Override
+    protected boolean sameOriginDisabled() {
+        return true;  // disable CSRF for WebSocket (use token auth instead)
+    }
+}
+
+// JWT Auth for WebSocket:
+// Pass JWT as STOMP CONNECT header or as query param on the HTTP upgrade request.
+// Intercept with ChannelInterceptor:
+
+@Component
+public class JwtChannelInterceptor implements ChannelInterceptor {
+
+    @Override
+    public Message<?> preSend(Message<?> message, MessageChannel channel) {
+        StompHeaderAccessor accessor = MessageHeaderAccessor
+            .getAccessor(message, StompHeaderAccessor.class);
+
+        if (StompCommand.CONNECT.equals(accessor.getCommand())) {
+            String token = accessor.getFirstNativeHeader("Authorization");
+            if (token != null && token.startsWith("Bearer ")) {
+                // validate JWT and set authentication
+                Authentication auth = jwtAuthenticationProvider.authenticate(token);
+                accessor.setUser(auth);
+            }
+        }
+        return message;
+    }
+}
+
+@Override
+public void configureClientInboundChannel(ChannelRegistration registration) {
+    registration.interceptors(jwtChannelInterceptor);
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. CLIENT (JAVASCRIPT — STOMP.JS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// npm install @stomp/stompjs sockjs-client
+import { Client } from '@stomp/stompjs';
+import SockJS from 'sockjs-client';
+
+const client = new Client({
+    webSocketFactory: () => new SockJS('http://localhost:8080/ws'),
+    connectHeaders: { Authorization: 'Bearer ' + token },
+
+    onConnect: (frame) => {
+        // Subscribe to topic
+        client.subscribe('/topic/messages', (message) => {
+            console.log('Received:', JSON.parse(message.body));
+        });
+
+        // Subscribe to user-specific queue
+        client.subscribe('/user/queue/notifications', (message) => {
+            console.log('Notification:', JSON.parse(message.body));
+        });
+
+        // Send a message
+        client.publish({
+            destination: '/app/chat.send',
+            body: JSON.stringify({ sender: 'alice', content: 'Hello!' })
+        });
+    }
+});
+
+client.activate();
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  9. SCALING WEBSOCKET (MULTI-INSTANCE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Problem: In-memory broker is per-instance. If the user is connected
+to Instance A and the message is produced on Instance B, the user
+won't receive it.
+
+Solution: External broker relay (RabbitMQ with STOMP plugin, or Redis):
+
+  config.enableStompBrokerRelay("/topic", "/queue")
+      .setRelayHost("rabbitmq-host")
+      .setRelayPort(61613);
+
+All instances connect to RabbitMQ as the shared broker.
+RabbitMQ fans out to all subscriber sessions regardless of which
+instance they are connected to.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  10. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is STOMP and why do we use it over raw WebSocket?
+A: Raw WebSocket is just a byte-stream protocol — no concept of
+   destinations, subscriptions, or message routing. STOMP is a simple
+   messaging protocol on top of WebSocket that adds these semantics,
+   making it possible for the server to route messages to specific topics
+   or users.
+
+Q: What is SockJS and when is it needed?
+A: SockJS is a JavaScript library that provides a WebSocket-like API but
+   falls back to HTTP-based transport (XHR streaming, long polling) when
+   WebSocket is not available (corporate firewalls, old browsers). It's
+   only needed on older environments; modern browsers support WebSocket.
+
+Q: How do you send a message to a specific user over WebSocket?
+A: Use SimpMessagingTemplate.convertAndSendToUser(username, destination, payload).
+   Spring maps this to /user/{username}/destination. The user's session
+   is resolved by UserDestinationMessageHandler using the principal set
+   during the CONNECT phase.
+
+Q: How does WebSocket authentication work?
+A: HTTP session cookies work if using session-based auth. For JWT, send
+   the token as a STOMP CONNECT header and intercept it with a
+   ChannelInterceptor — validate the JWT and set the Authentication as
+   the STOMP user principal.
+
+Q: What happens to WebSocket connections in a multi-instance environment?
+A: With an in-memory broker, only the instance the client is connected to
+   can deliver messages. For multi-instance, use a broker relay (RabbitMQ
+   STOMP or Redis). All instances relay pub/sub through the shared broker,
+   so any instance can deliver to any connected client.

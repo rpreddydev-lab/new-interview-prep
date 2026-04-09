@@ -1,0 +1,207 @@
+================================================================
+  CACHE CONFIGURATION AND TTL
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. CACHE NAMING CONVENTIONS AND KEY DESIGN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Best practices:
+  - Use domain-specific names: "products", "categories", "userProfiles"
+  - Prefix with service name in multi-service systems: "catalog:products"
+  - Cache key must uniquely identify the data: "product::{id}"
+  - Consider tenant isolation in multi-tenant systems: "{tenantId}::product::{id}"
+
+Redis key format:
+  Spring generates: cacheName::keyValue
+  E.g.: @Cacheable("products") with id=42 → key "products::42" in Redis
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. TTL STRATEGIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Choose TTL based on how quickly data becomes stale and the cost of a cache miss.
+
+Cache Name          | TTL         | Rationale
+--------------------|-------------|---------------------------------------------------
+Exchange rates      | 30 seconds  | Volatile — prices change constantly
+User sessions       | 15 minutes  | Security-sensitive, expire for inactivity
+Product catalog     | 1 hour      | Updates a few times a day (admin edits)
+Category tree       | 6 hours     | Rarely changes
+Static content      | 24 hours    | Almost never changes
+Feature flags       | 5 minutes   | Need to propagate quickly but tolerate brief lag
+Auth tokens         | Token TTL   | Match token expiry (JWT exp claim)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. MULTI-LEVEL CACHE (L1 LOCAL + L2 REDIS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Combine in-process Caffeine (L1) with Redis (L2) for best of both worlds.
+Spring Cache doesn't natively support multi-level, but you can compose them:
+
+@Configuration
+@EnableCaching
+public class MultiLevelCacheConfig {
+
+    @Bean
+    @Primary
+    public CacheManager cacheManager(RedisConnectionFactory factory) {
+        // L1: Caffeine (fast, local)
+        CaffeineCache caffeineProducts = new CaffeineCache("products",
+            Caffeine.newBuilder()
+                .maximumSize(200)
+                .expireAfterWrite(Duration.ofMinutes(5))   // shorter than Redis TTL
+                .build());
+
+        // L2: Redis (shared, longer TTL)
+        RedisCacheConfiguration redisCfg = RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofHours(1))
+            .serializeValuesWith(RedisSerializationContext.SerializationPair
+                .fromSerializer(new GenericJackson2JsonRedisSerializer()));
+
+        // Use SimpleCacheManager to combine both
+        SimpleCacheManager simpleCacheManager = new SimpleCacheManager();
+        simpleCacheManager.setCaches(List.of(caffeineProducts));
+        simpleCacheManager.afterPropertiesSet();
+        return simpleCacheManager;
+    }
+}
+
+// For true L1+L2 chaining, use a library like Spring Data Redis
+// with a custom CompositeCacheManager or cache-spring-boot-starter from JHipster.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. CACHE EVICTION STRATEGIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Time-based eviction:
+  expireAfterWrite(d)   — expires d after entry is created/updated
+  expireAfterAccess(d)  — expires d after last read (sliding window)
+  Both: entry is removed when next access occurs after expiry, or by background thread
+
+Size-based eviction (Caffeine only):
+  maximumSize(N)        — evicts using W-TinyLFU algorithm when N entries exceeded
+
+Redis eviction policies (maxmemory-policy in redis.conf):
+  noeviction        — no eviction; returns error when max memory hit
+  allkeys-lru       — evict any key using LRU
+  volatile-lru      — evict only keys with TTL using LRU
+  allkeys-lfu       — evict any key using LFU
+  allkeys-random    — random eviction
+  volatile-ttl      — evict key with shortest remaining TTL
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. CACHE WARMING (PRE-LOADING)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Cache warming loads data into cache at startup to avoid cold-start latency.
+
+@Component
+public class CacheWarmupRunner implements ApplicationRunner {
+
+    private final ProductService productService;
+    private final CategoryService categoryService;
+
+    @Override
+    public void run(ApplicationArguments args) throws Exception {
+        log.info("Warming up caches...");
+
+        // These calls trigger @Cacheable and populate the cache
+        categoryService.findAll();                          // warm categories
+
+        productService.findTopSellers(20).forEach(p ->
+            productService.findById(p.getId()));           // warm individual products
+
+        log.info("Cache warmup complete.");
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. PROGRAMMATIC CACHE ACCESS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When annotation-driven caching isn't sufficient (e.g., conditional logic,
+bulk operations), use CacheManager directly:
+
+@Service
+public class ProductCacheService {
+
+    private final CacheManager cacheManager;
+
+    public Product getOrLoad(Long id, Supplier<Product> loader) {
+        Cache cache = cacheManager.getCache("products");
+        if (cache == null) return loader.get();
+
+        Cache.ValueWrapper wrapper = cache.get(id);
+        if (wrapper != null) {
+            return (Product) wrapper.get();
+        }
+
+        Product product = loader.get();
+        cache.put(id, product);
+        return product;
+    }
+
+    public void evictProduct(Long id) {
+        Cache cache = cacheManager.getCache("products");
+        if (cache != null) {
+            cache.evict(id);
+        }
+    }
+
+    public void clearProductCache() {
+        Cache cache = cacheManager.getCache("products");
+        if (cache != null) {
+            cache.clear();
+        }
+    }
+
+    // Get without loading
+    public Optional<Product> getCachedProduct(Long id) {
+        Cache cache = cacheManager.getCache("products");
+        if (cache == null) return Optional.empty();
+        Cache.ValueWrapper wrapper = cache.get(id);
+        return Optional.ofNullable(wrapper != null ? (Product) wrapper.get() : null);
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: How do you handle cache invalidation across multiple service instances?
+A: Use Redis as a distributed cache — all pods share the same Redis instance.
+   When one pod calls @CacheEvict, it removes the key from Redis, which all
+   other pods will miss on next access and re-fetch from DB. For local (Caffeine)
+   caches across instances, you need a pub/sub mechanism: use Redis pub/sub or
+   a message broker (Kafka/RabbitMQ) to broadcast eviction events to all pods.
+
+Q: How do you choose TTL values?
+A: Consider: (1) How frequently data changes (high change rate → short TTL).
+   (2) Tolerance for stale data (financial data → very short; product descriptions
+   → longer). (3) Cost of a cache miss (expensive DB query → longer TTL to keep
+   cache warm). (4) Security sensitivity (user permissions → short TTL to pick
+   up revocations quickly). Start with conservative TTLs and tune based on
+   cache hit rate metrics.
+
+Q: What is expireAfterWrite vs expireAfterAccess in Caffeine?
+A: expireAfterWrite: entry expires a fixed time after it was last written/updated —
+   guarantees that data is never more than N minutes old regardless of usage.
+   expireAfterAccess: entry expires after N minutes of inactivity — popular
+   entries stay in cache longer. expireAfterAccess can be used for session data;
+   expireAfterWrite is better for data that must not be stale beyond a fixed interval.
+
+Q: How do you warm a cache at application startup?
+A: Implement ApplicationRunner or CommandLineRunner and call the @Cacheable methods
+   with the most frequently-accessed data. The first call on each key is a cache
+   miss (loads from DB and populates cache). Subsequent calls hit the warm cache.
+   Be careful not to overload the DB by warming too many keys simultaneously —
+   batch the warmup with delays if needed.
+
+Q: What is cache key collision and how do you prevent it?
+A: Cache key collision occurs when two different logical entities produce the same
+   cache key. E.g., @Cacheable("items") on findById(Long) and findByCode(String)
+   both with a single param — if id=1 and code="1" produce the same key "1", they
+   overwrite each other. Prevent by: (1) Using different cache names per method.
+   (2) Including method name in the key: key="#root.methodName + ':' + #id".
+   (3) Explicit unique keys: key="'byId:' + #id" vs key="'byCode:' + #code".

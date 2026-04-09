@@ -1,0 +1,460 @@
+========================================================
+MUTUAL TLS (mTLS)
+========================================================
+
+Mutual TLS (mTLS) is a two-way authentication protocol where BOTH the client
+and server present X.509 certificates to verify each other's identity.
+
+Standard TLS:  Only SERVER presents a certificate (one-way auth)
+Mutual TLS:    BOTH client and server present certificates (two-way auth)
+
+mTLS provides the strongest form of service-to-service authentication
+because identity is cryptographically bound to a certificate, not a shared secret.
+
+========================================================
+1. HOW mTLS WORKS
+========================================================
+
+Standard TLS Handshake (one-way):
+  Client                              Server
+     |──── ClientHello ───────────────→|
+     |←─── ServerHello ───────────────|
+     |←─── ServerCertificate ─────────|  ← Server proves identity
+     |←─── ServerHelloDone ───────────|
+     |──── ClientKeyExchange ─────────→|
+     |──── [ChangeCipherSpec] ─────────→|
+     |──── Finished ──────────────────→|
+     |←─── [ChangeCipherSpec] ─────────|
+     |←─── Finished ──────────────────|
+     |══════════ Encrypted Data ════════|
+
+Mutual TLS Handshake (two-way):
+  Client                              Server
+     |──── ClientHello ───────────────→|
+     |←─── ServerHello ───────────────|
+     |←─── ServerCertificate ─────────|  ← Server proves identity
+     |←─── CertificateRequest ─────────|  ← SERVER requests client cert
+     |←─── ServerHelloDone ───────────|
+     |──── ClientCertificate ──────────→|  ← Client proves identity
+     |──── ClientKeyExchange ─────────→|
+     |──── CertificateVerify ──────────→|  ← Client proves it owns the cert
+     |──── [ChangeCipherSpec] ─────────→|
+     |──── Finished ──────────────────→|
+     |←─── [ChangeCipherSpec] ─────────|
+     |←─── Finished ──────────────────|
+     |══════════ Encrypted Data ════════|
+
+KEY POINT: After handshake, server knows the client is the legitimate holder of
+the certificate. No passwords, API keys, or Bearer tokens needed!
+
+========================================================
+2. CERTIFICATES IN mTLS
+========================================================
+
+Certificate Hierarchy:
+  Root CA (trust anchor)
+      │
+      ├── Intermediate CA
+      │       │
+      │       ├── Service Certificate (order-service.example.com)
+      │       ├── Service Certificate (inventory-service.example.com)
+      │       └── Service Certificate (payment-service.example.com)
+
+Certificate contains:
+  - Subject: CN=order-service, O=Example Corp, C=US
+  - Subject Alternative Names (SANs): order-service.example.com, order-service.svc.cluster.local
+  - Public key
+  - Valid from / Not after (expiry)
+  - Issuer (CA that signed it)
+  - Digital signature from CA
+
+When server sees client certificate:
+  1. Verify cert is signed by a trusted CA (trust chain)
+  2. Verify cert is not expired
+  3. Verify cert is not revoked (CRL or OCSP)
+  4. Extract Subject/SAN to identify the client service
+
+========================================================
+3. SPRING BOOT mTLS CONFIGURATION
+========================================================
+
+3.1 Server Side (requiring client certificates)
+
+application.yml:
+server:
+  ssl:
+    enabled: true
+    key-store: classpath:server-keystore.p12       # Server's cert + private key
+    key-store-password: ${SERVER_KEYSTORE_PASSWORD}
+    key-store-type: PKCS12
+    trust-store: classpath:truststore.p12          # CAs that signed client certs
+    trust-store-password: ${TRUSTSTORE_PASSWORD}
+    trust-store-type: PKCS12
+    client-auth: NEED          # NEED = require, WANT = optional, NONE = disabled
+
+  # client-auth values:
+  # NEED: Client MUST present a certificate (strict mTLS)
+  # WANT: Certificate optional; request proceeds even without cert
+  # NONE: Standard TLS, no client cert (default)
+
+3.2 Extracting Client Certificate in Spring
+
+@RestController
+public class SecureApiController {
+
+    @GetMapping("/api/secure")
+    public ResponseEntity<String> secureEndpoint(
+            HttpServletRequest request) {
+
+        X509Certificate[] certs = (X509Certificate[])
+            request.getAttribute("javax.servlet.request.X509Certificate");
+
+        if (certs == null || certs.length == 0) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+
+        X509Certificate clientCert = certs[0];
+        String subjectDN = clientCert.getSubjectX500Principal().getName();
+        // e.g., "CN=order-service, OU=microservices, O=Example Corp"
+
+        return ResponseEntity.ok("Authenticated as: " + subjectDN);
+    }
+}
+
+3.3 Spring Security X.509 Authentication
+
+Spring Security can automatically extract and authenticate from client certs:
+
+@Configuration
+@EnableWebSecurity
+public class MtlsSecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .x509(x509 -> x509
+                // Extract username from certificate subject
+                .subjectPrincipalRegex("CN=(.*?)(?:,|$)")  // Extract CN
+                .userDetailsService(mtlsUserDetailsService())
+            )
+            .authorizeHttpRequests(auth -> auth
+                .anyRequest().authenticated()
+            )
+            .csrf(csrf -> csrf.disable())
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS));
+
+        return http.build();
+    }
+
+    @Bean
+    public UserDetailsService mtlsUserDetailsService() {
+        // Map certificate CN to application user/authorities
+        return username -> {
+            // username = extracted CN (e.g., "order-service")
+            return User.withUsername(username)
+                .password("")  // No password needed for certificate auth
+                .authorities("ROLE_SERVICE", "ROLE_" + username.toUpperCase())
+                .build();
+        };
+    }
+}
+
+// Controller using extracted identity:
+@GetMapping("/api/orders")
+@PreAuthorize("hasAuthority('ROLE_payment-service')")
+public List<Order> getOrdersForPaymentService(
+        @AuthenticationPrincipal UserDetails userDetails) {
+    String callerService = userDetails.getUsername();  // "payment-service"
+    log.info("Request from service: {}", callerService);
+    return orderService.findAll();
+}
+
+3.4 Programmatic Certificate Validation
+
+@Component
+public class MtlsCertificateValidator {
+
+    @Value("${mtls.allowed-cns}")
+    private List<String> allowedCns;
+
+    public ServiceIdentity validateClientCert(HttpServletRequest request)
+            throws CertificateException {
+
+        X509Certificate[] certs = (X509Certificate[])
+            request.getAttribute("javax.servlet.request.X509Certificate");
+
+        if (certs == null || certs.length == 0) {
+            throw new CertificateException("No client certificate provided");
+        }
+
+        X509Certificate cert = certs[0];
+
+        // 1. Check expiry
+        try {
+            cert.checkValidity();
+        } catch (CertificateExpiredException | CertificateNotYetValidException e) {
+            throw new CertificateException("Certificate is not valid: " + e.getMessage());
+        }
+
+        // 2. Extract CN
+        String dn = cert.getSubjectX500Principal().getName();
+        String cn = extractCN(dn);
+
+        // 3. Check against allowed services
+        if (!allowedCns.contains(cn)) {
+            throw new CertificateException("Service not authorized: " + cn);
+        }
+
+        // 4. Extract SAN for additional info
+        List<String> sans = extractSANs(cert);
+
+        return new ServiceIdentity(cn, sans, cert.getSerialNumber());
+    }
+
+    private String extractCN(String dn) {
+        // Parse "CN=order-service, O=Example, C=US" → "order-service"
+        for (String part : dn.split(",")) {
+            String trimmed = part.trim();
+            if (trimmed.startsWith("CN=")) {
+                return trimmed.substring(3);
+            }
+        }
+        throw new IllegalArgumentException("No CN in certificate DN: " + dn);
+    }
+}
+
+========================================================
+4. GENERATING CERTIFICATES (Development)
+========================================================
+
+Using OpenSSL to create a test PKI:
+
+# 1. Create Root CA
+openssl genrsa -out ca-key.pem 4096
+openssl req -new -x509 -days 3650 -key ca-key.pem -out ca-cert.pem \
+    -subj "/CN=My Root CA/O=Example Corp/C=US"
+
+# 2. Create Server Certificate
+openssl genrsa -out server-key.pem 2048
+openssl req -new -key server-key.pem -out server-csr.pem \
+    -subj "/CN=api.example.com/O=Example Corp/C=US"
+openssl x509 -req -days 365 -in server-csr.pem \
+    -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial \
+    -out server-cert.pem
+
+# 3. Create Client Certificate (for order-service)
+openssl genrsa -out order-service-key.pem 2048
+openssl req -new -key order-service-key.pem -out order-service-csr.pem \
+    -subj "/CN=order-service/O=Example Corp/C=US"
+openssl x509 -req -days 365 -in order-service-csr.pem \
+    -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial \
+    -out order-service-cert.pem
+
+# 4. Create PKCS12 keystores for Java
+# Server keystore (contains server cert + key)
+openssl pkcs12 -export -in server-cert.pem -inkey server-key.pem \
+    -out server-keystore.p12 -name server -password pass:changeit
+
+# Client keystore (for order-service)
+openssl pkcs12 -export -in order-service-cert.pem -inkey order-service-key.pem \
+    -out order-service-keystore.p12 -name order-service -password pass:changeit
+
+# Trust store (contains Root CA for verifying peer certs)
+keytool -importcert -file ca-cert.pem -alias root-ca \
+    -keystore truststore.p12 -storetype PKCS12 -storepass changeit -noprompt
+
+========================================================
+5. mTLS WITH SPRING WEBCLIENT (CLIENT SIDE)
+========================================================
+
+Configuring WebClient to present a client certificate:
+
+@Configuration
+public class MtlsWebClientConfig {
+
+    @Bean
+    public WebClient mtlsWebClient(
+            @Value("${mtls.keystore.path}") String keystorePath,
+            @Value("${mtls.keystore.password}") String keystorePassword,
+            @Value("${mtls.truststore.path}") String truststorePath,
+            @Value("${mtls.truststore.password}") String truststorePassword)
+            throws Exception {
+
+        // Load client keystore (our cert + private key)
+        KeyStore keyStore = KeyStore.getInstance("PKCS12");
+        try (InputStream ks = new FileInputStream(keystorePath)) {
+            keyStore.load(ks, keystorePassword.toCharArray());
+        }
+
+        // Load trust store (CA certs to trust servers)
+        KeyStore trustStore = KeyStore.getInstance("PKCS12");
+        try (InputStream ts = new FileInputStream(truststorePath)) {
+            trustStore.load(ts, truststorePassword.toCharArray());
+        }
+
+        // Build SSL context
+        SSLContext sslContext = SSLContextBuilder.create()
+            .loadKeyMaterial(keyStore, keystorePassword.toCharArray())
+            .loadTrustMaterial(trustStore, null)
+            .build();
+
+        SslContext nettySslContext = SslContextBuilder.forClient()
+            .keyManager(/* KeyManagerFactory from keyStore */)
+            .trustManager(/* TrustManagerFactory from trustStore */)
+            .build();
+
+        HttpClient httpClient = HttpClient.create()
+            .secure(ssl -> ssl.sslContext(nettySslContext));
+
+        return WebClient.builder()
+            .clientConnector(new ReactorClientHttpConnector(httpClient))
+            .build();
+    }
+}
+
+// RestTemplate mTLS setup (alternative):
+@Bean
+public RestTemplate mtlsRestTemplate() throws Exception {
+    SSLContext sslContext = SSLContextBuilder.create()
+        .loadKeyMaterial(keyStore, keystorePassword.toCharArray())
+        .loadTrustMaterial(trustStore, null)
+        .build();
+
+    SSLConnectionSocketFactory socketFactory = new SSLConnectionSocketFactory(sslContext);
+    CloseableHttpClient httpClient = HttpClients.custom()
+        .setSSLSocketFactory(socketFactory)
+        .build();
+
+    HttpComponentsClientHttpRequestFactory factory =
+        new HttpComponentsClientHttpRequestFactory(httpClient);
+    return new RestTemplate(factory);
+}
+
+========================================================
+6. mTLS IN KUBERNETES WITH ISTIO SERVICE MESH
+========================================================
+
+Istio (and Linkerd) can enforce mTLS automatically for ALL service-to-service
+communication in a Kubernetes cluster via a service mesh sidecar proxy.
+
+Automatic mTLS with Istio:
+  - Each pod gets an Envoy sidecar proxy
+  - Istio CA (Citadel) issues SPIFFE SVIDs to each service
+  - All inter-service communication is automatically mTLS
+  - No application code changes needed!
+
+Enforce mTLS (deny non-mTLS traffic):
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: production
+spec:
+  mtls:
+    mode: STRICT    # All traffic must be mTLS
+    # PERMISSIVE: Accept both mTLS and plain text (migration mode)
+    # STRICT: Only mTLS allowed
+    # DISABLE: No mTLS
+
+Authorization based on service identity:
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: order-service-policy
+spec:
+  selector:
+    matchLabels:
+      app: order-service
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/production/sa/payment-service"]
+      to:
+        - operation:
+            methods: ["GET"]
+            paths: ["/api/orders/*"]
+
+SPIFFE/SPIRE (cross-cluster identity):
+  - SPIFFE: Secure Production Identity Framework For Everyone
+  - Provides cryptographic identity to workloads
+  - Format: spiffe://trust-domain/path
+  - E.g.: spiffe://example.com/ns/production/sa/order-service
+
+========================================================
+7. CERTIFICATE MANAGEMENT IN PRODUCTION
+========================================================
+
+Certificate Lifecycle:
+  Issue → Deploy → Monitor → Rotate → Revoke
+
+Tools:
+  - cert-manager (Kubernetes): Automates cert issuance and renewal from CA
+  - HashiCorp Vault PKI: Issues short-lived certificates
+  - AWS ACM (Amazon Certificate Manager): Managed TLS certs
+  - Let's Encrypt: Free TLS certs for public endpoints
+
+Short-lived certificates (best practice):
+  - Issue certs with 24h or 1-week TTL
+  - Automated renewal via cert-manager or Vault Agent
+  - Short TTL minimizes exposure if cert is compromised
+
+cert-manager example (Kubernetes):
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: order-service-cert
+spec:
+  secretName: order-service-tls
+  duration: 24h          # Certificate valid for 24 hours
+  renewBefore: 1h        # Renew 1 hour before expiry
+  subject:
+    organizations: ["Example Corp"]
+  commonName: order-service
+  dnsNames:
+    - order-service.production.svc.cluster.local
+  issuerRef:
+    name: vault-issuer
+    kind: ClusterIssuer
+
+========================================================
+8. COMMON INTERVIEW QUESTIONS
+========================================================
+
+Q: What is mTLS and how does it differ from TLS?
+A: Standard TLS is one-way: only the server presents a certificate (client verifies
+   server identity). mTLS is two-way: both server and client present certificates,
+   so each party cryptographically verifies the other's identity. mTLS eliminates
+   the need for passwords or API keys for service-to-service communication.
+
+Q: What are the advantages of mTLS over API keys for service-to-service auth?
+A: 1) Cryptographic identity (not guessable/stolen strings)
+   2) Certificate expiry is enforced (API keys are often indefinite)
+   3) Revocation via CRL/OCSP
+   4) No shared secrets to rotate manually
+   5) Certificate CN/SAN identifies the service, enabling service-level authz
+   Disadvantage: More complex infrastructure (PKI, cert management).
+
+Q: How does Istio implement mTLS automatically?
+A: Istio injects an Envoy sidecar proxy into each pod. Istio's CA (Citadel) issues
+   SPIFFE-formatted X.509 certificates to each service. All traffic between pods
+   is intercepted by Envoy sidecars and encrypted/authenticated via mTLS without
+   application code changes. PeerAuthentication policy enforces STRICT mode.
+
+Q: What is SPIFFE and why is it used with mTLS?
+A: SPIFFE (Secure Production Identity Framework For Everyone) defines a standard
+   for workload identity using X.509 certificates. SVIDs (SPIFFE Verifiable Identity
+   Documents) use URIs like spiffe://trust-domain/service-name. This creates
+   platform-agnostic, cryptographic service identity for zero-trust environments.
+
+Q: How do you configure Spring Boot to require client certificates?
+A: Set server.ssl.client-auth=NEED in application.yml, along with key-store
+   (server cert), trust-store (CA that signed client certs), and corresponding
+   passwords. Optionally use Spring Security's .x509() to extract CN from the
+   certificate and map to application users/authorities.
+
+Q: What is the difference between client-auth: NEED, WANT, and NONE in Spring Boot?
+A: NEED: Client MUST present a valid certificate. Request rejected without cert.
+   WANT: Client may present a certificate but it's optional. Both mTLS and
+   regular TLS clients are accepted.
+   NONE: Standard TLS only. No client certificate requested.

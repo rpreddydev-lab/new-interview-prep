@@ -1,0 +1,342 @@
+================================================================================
+STOMP PROTOCOL — IN DEPTH
+================================================================================
+
+WHAT IS STOMP?
+---------------
+STOMP (Simple/Streaming Text Oriented Messaging Protocol) is a text-based
+messaging protocol that provides interoperable messaging semantics on top of
+a transport layer (originally TCP, now commonly WebSocket).
+
+STOMP adds:
+  - Message framing with headers and body
+  - Subscription model (pub/sub)
+  - Point-to-point messaging
+  - Message acknowledgment
+  - Transaction support
+  - Works over WebSocket, TCP, or any bidirectional channel
+
+Unlike raw WebSocket (which just sends bytes), STOMP adds a semantic layer
+equivalent to a lightweight messaging protocol like AMQP.
+
+Versions: STOMP 1.0, 1.1 (added heartbeats), 1.2 (improved ACKs)
+Standard Port: 61613 (TCP STOMP)
+
+================================================================================
+1. STOMP FRAME FORMAT
+================================================================================
+
+Every STOMP message is a "frame":
+
+  COMMAND\n
+  header1:value1\n
+  header2:value2\n
+  \n
+  BODY^@
+
+^@ = null byte (frame terminator)
+
+COMMANDS:
+  Client → Server: CONNECT, STOMP, SEND, SUBSCRIBE, UNSUBSCRIBE, ACK, NACK,
+                   BEGIN, COMMIT, ABORT, DISCONNECT
+  Server → Client: CONNECTED, MESSAGE, RECEIPT, ERROR
+
+================================================================================
+2. STOMP HANDSHAKE
+================================================================================
+
+CLIENT sends CONNECT (or STOMP in 1.2):
+  CONNECT
+  accept-version:1.1,1.2
+  host:api.example.com
+  login:guest
+  passcode:guest
+  heart-beat:10000,10000
+  ^@
+
+SERVER responds CONNECTED:
+  CONNECTED
+  version:1.2
+  heart-beat:0,10000
+  session:session-xyz123
+  server:RabbitMQ/3.12.0
+  ^@
+
+heart-beat: cx,cy
+  cx = minimum milliseconds between client heartbeats (0 = cannot send)
+  cy = desired milliseconds between server heartbeats (0 = doesn't want them)
+  Negotiated: max(cx_client, cy_server) for each direction
+
+================================================================================
+3. SUBSCRIBE / SEND
+================================================================================
+
+CLIENT SUBSCRIBES to a destination:
+  SUBSCRIBE
+  id:sub-0
+  destination:/topic/chat
+  ack:auto
+  ^@
+
+  destination: a logical address (e.g., /topic/chat, /queue/orders)
+  id        : subscription identifier (for UNSUBSCRIBE and ACK correlation)
+  ack       : auto (no ACK needed) | client (must ACK) | client-individual
+
+CLIENT SENDS a message:
+  SEND
+  destination:/app/chat.send
+  content-type:application/json
+  ^@
+  {"content":"Hello everyone!","sender":"alice"}^@
+
+SERVER delivers a MESSAGE:
+  MESSAGE
+  destination:/topic/chat
+  message-id:msg-001
+  subscription:sub-0
+  content-type:application/json
+  ^@
+  {"content":"Hello everyone!","sender":"alice","timestamp":"2026-04-08T10:00:00Z"}^@
+
+================================================================================
+4. ACKNOWLEDGMENT (ack mode)
+================================================================================
+
+ack:auto  → broker assumes all delivered messages are processed
+ack:client → client must explicitly ACK; broker retains until ACKed
+
+CLIENT ACK:
+  ACK
+  id:msg-001
+  ^@
+
+CLIENT NACK (message not processed, redeliver):
+  NACK
+  id:msg-001
+  ^@
+
+IMPORTANT: RabbitMQ with STOMP + ack:client = durable processing guarantee
+           Messages stay in queue until ACKed; useful for order processing
+
+================================================================================
+5. TRANSACTIONS
+================================================================================
+
+Group multiple SEND operations into an atomic transaction:
+
+  BEGIN
+  transaction:tx-001
+  ^@
+
+  SEND
+  destination:/queue/orders
+  transaction:tx-001
+  ^@
+  {"orderId":"order-123","action":"CREATED"}^@
+
+  SEND
+  destination:/queue/notifications
+  transaction:tx-001
+  ^@
+  {"userId":"user-42","message":"Order created"}^@
+
+  COMMIT
+  transaction:tx-001
+  ^@
+
+If something goes wrong, ABORT:
+  ABORT
+  transaction:tx-001
+  ^@
+
+All messages in transaction are either committed together or rolled back.
+
+================================================================================
+6. DISCONNECT
+================================================================================
+
+  DISCONNECT
+  receipt:disconnect-001
+  ^@
+
+Server responds:
+  RECEIPT
+  receipt-id:disconnect-001
+  ^@
+
+Graceful shutdown: wait for RECEIPT before closing TCP connection.
+
+================================================================================
+7. ERROR FRAME
+================================================================================
+
+Server sends ERROR when something goes wrong:
+  ERROR
+  message:Invalid destination
+  receipt-id:msg-invalid
+  ^@
+  The destination '/app/unknown' does not exist.^@
+
+After sending ERROR, server MUST close the connection.
+
+================================================================================
+8. STOMP DESTINATIONS CONVENTION
+================================================================================
+
+Spring STOMP follows this destination convention:
+
+/app/{path}         → Routed to @MessageMapping("/{path}")
+/topic/{name}       → Pub/Sub: broadcast to all subscribers
+/queue/{name}       → Point-to-point: one subscriber receives each message
+/user/{userId}/queue/{name} → User-specific (private) messages
+
+EXAMPLES:
+  /app/chat.send         → ChatController.handleMessage()
+  /topic/chat            → All subscribers of the chat room receive messages
+  /queue/orders          → Order processing queue (one consumer)
+  /user/alice/queue/dm   → Only alice's client subscribes here
+
+================================================================================
+9. SPRING STOMP — COMPLETE EXAMPLE
+================================================================================
+
+CONFIGURATION:
+  @Configuration
+  @EnableWebSocketMessageBroker
+  public class StompConfig implements WebSocketMessageBrokerConfigurer {
+
+      @Override
+      public void configureMessageBroker(MessageBrokerRegistry registry) {
+          registry.enableSimpleBroker("/topic", "/queue")
+              .setHeartbeatValue(new long[]{10000, 10000})
+              .setTaskScheduler(heartbeatScheduler());
+          registry.setApplicationDestinationPrefixes("/app");
+          registry.setUserDestinationPrefix("/user");
+      }
+
+      @Override
+      public void registerStompEndpoints(StompEndpointRegistry registry) {
+          registry.addEndpoint("/ws")
+              .setAllowedOriginPatterns("*")
+              .withSockJS();
+      }
+  }
+
+CONTROLLER:
+  @Controller
+  public class StompChatController {
+
+      private final SimpUserRegistry userRegistry;
+      private final SimpMessagingTemplate template;
+
+      @MessageMapping("/chat.join")
+      @SendTo("/topic/chat.presence")
+      public PresenceMessage joinRoom(JoinMessage join, Principal principal,
+                                      SimpMessageHeaderAccessor accessor) {
+          accessor.getSessionAttributes().put("username", principal.getName());
+          return new PresenceMessage("JOIN", principal.getName(), Instant.now());
+      }
+
+      @MessageMapping("/chat.send")
+      @SendTo("/topic/chat")
+      public ChatMessage sendMessage(@Payload @Valid ChatMessage message,
+                                     Principal principal) {
+          return message.withSender(principal.getName()).withTimestamp(Instant.now());
+      }
+
+      @MessageMapping("/chat.direct")
+      public void directMessage(@Payload DirectMessage dm, Principal principal) {
+          template.convertAndSendToUser(
+              dm.getRecipient(),
+              "/queue/messages",
+              dm.withSender(principal.getName())
+          );
+      }
+
+      @SubscribeMapping("/chat.history")   // replies directly to subscriber
+      public List<ChatMessage> getChatHistory() {
+          return chatHistoryService.getLast50Messages();
+      }
+
+      // Triggered when any user disconnects
+      @EventListener
+      public void onDisconnect(SessionDisconnectEvent event) {
+          StompHeaderAccessor accessor = StompHeaderAccessor.wrap(event.getMessage());
+          String username = (String) accessor.getSessionAttributes().get("username");
+          if (username != null) {
+              template.convertAndSend("/topic/chat.presence",
+                  new PresenceMessage("LEAVE", username, Instant.now()));
+          }
+      }
+  }
+
+SESSION EVENTS:
+  @EventListener SessionConnectEvent    → CONNECT frame received
+  @EventListener SessionConnectedEvent  → CONNECTED frame sent (handshake complete)
+  @EventListener SessionDisconnectEvent → Client disconnected
+  @EventListener SessionSubscribeEvent  → Client subscribed to destination
+  @EventListener SessionUnsubscribeEvent→ Client unsubscribed
+
+================================================================================
+10. STOMP vs MQTT vs AMQP
+================================================================================
+
+Protocol | Transport         | Main Use Case            | QoS Levels
+---------|-------------------|--------------------------|------------------
+STOMP    | TCP, WebSocket    | Web messaging, chat      | auto, client, client-individual
+MQTT     | TCP, WebSocket    | IoT, mobile, constrained | 0 (at-most-once), 1 (at-least-once), 2 (exactly-once)
+AMQP     | TCP               | Enterprise messaging     | Transactions, headers exchange
+Kafka    | TCP (custom)      | Event streaming, log     | At-least-once by default
+
+STOMP strengths:
+  - Simple, text-based, easy to debug
+  - Works over WebSocket natively
+  - Well-supported by RabbitMQ, ActiveMQ
+  - Spring excellent integration
+
+STOMP limitations:
+  - Not great for IoT (MQTT better for constrained devices)
+  - Binary framing less efficient than AMQP
+  - No built-in message routing as powerful as AMQP exchanges
+
+================================================================================
+11. INTERVIEW QUESTIONS — STOMP
+================================================================================
+
+Q1: What does STOMP add on top of WebSocket?
+    WebSocket just provides a bidirectional byte channel — no structure, no
+    routing, no subscriptions. STOMP adds: message framing (commands + headers
+    + body), subscription management (SUBSCRIBE/UNSUBSCRIBE), routing destinations
+    (/topic/*, /queue/*), acknowledgment modes, transaction support, and heartbeat
+    negotiation. This allows message broker integration and pub/sub semantics.
+
+Q2: What is the difference between /topic and /queue in STOMP?
+    /topic (pub/sub): messages sent here are delivered to ALL current subscribers.
+    Subscribers don't compete — every subscriber gets a copy.
+    /queue (point-to-point): messages are delivered to ONE subscriber.
+    Multiple consumers compete; each message is processed once. Used for
+    work queues where you want load balancing across consumers.
+
+Q3: How does heartbeat work in STOMP?
+    Both sides negotiate heartbeat parameters during CONNECT/CONNECTED.
+    The header heart-beat:cx,cy means:
+    cx = smallest interval the sender can guarantee between heartbeats (0 = cannot send)
+    cy = desired interval of incoming heartbeats (0 = doesn't want them)
+    Negotiated rate = max(cx_sender, cy_receiver).
+    Heartbeats are newline characters sent on idle connections to detect disconnects
+    and keep TCP connections alive through NAT/proxies.
+
+Q4: How do you use STOMP transactions?
+    Send a BEGIN frame with a transaction ID. All subsequent SEND frames that
+    include the same transaction ID are held until COMMIT (sent together) or
+    ABORT (discarded together). Useful for sending multiple related messages
+    atomically — e.g., updating a state and emitting a notification together.
+
+Q5: What happens when you use ack:client in a STOMP subscription?
+    The broker retains messages until the client explicitly sends an ACK frame
+    with the message ID. If the client disconnects without ACKing, the broker
+    redelivers the unacknowledged messages to the next subscriber. This provides
+    at-least-once delivery guarantee. Use NACK to signal the broker that processing
+    failed and the message should be redelivered or dead-lettered.
+
+================================================================================

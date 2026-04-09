@@ -1,0 +1,512 @@
+================================================================
+ADVANCED gRPC INTERVIEW QUESTIONS
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q1: How does gRPC load balancing work in Kubernetes?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Problem with L4 (kube-proxy) load balancing:
+  - HTTP/2 opens ONE long-lived TCP connection between client and server
+  - kube-proxy (iptables-based) load-balances at TCP connection level
+  - After connection is established, ALL gRPC calls go to ONE pod
+  - Even if 10 pods exist, only 1 gets traffic
+
+                  ┌─────────────────────────────────┐
+  Client          │         kube-proxy               │
+    │             │ iptables rule: pick pod at random │
+    │ TCP conn ───┼──────────────────────────────────┼──> Pod A (100% of calls)
+                  │                                   │    Pod B (0%)
+                  │                                   │    Pod C (0%)
+                  └─────────────────────────────────┘
+
+Solutions:
+
+1. Headless Service + Client-Side gRPC LB:
+   Create K8s Service with clusterIP: None (headless).
+   DNS returns A records for every pod IP.
+   gRPC client resolves DNS and connects to ALL pods with round_robin.
+   
+   // application.yml
+   grpc:
+     client:
+       order-service:
+         address: dns:///order-service.namespace.svc.cluster.local:9090
+         negotiation-type: plaintext
+         default-load-balancing-policy: round_robin
+
+2. Service Mesh (Istio / Linkerd):
+   Sidecar proxy (Envoy) intercepts all traffic at L7.
+   Envoy understands HTTP/2 frames → load-balances individual RPCs.
+   Works without any code changes.
+   
+   // Istio DestinationRule
+   spec:
+     trafficPolicy:
+       loadBalancer:
+         simple: ROUND_ROBIN
+
+3. Dedicated L7 Proxy (Envoy / NGINX):
+   Deploy Envoy as a proxy that speaks HTTP/2.
+   gRPC clients connect to Envoy, Envoy distributes to backend pods.
+
+Recommendation: Service mesh for existing K8s deployments.
+  Headless + client-side LB for simple setups without a mesh.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q2: What is the difference between gRPC retry policies and hedging?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RETRY:
+  - Sequential: attempt fails → wait → attempt again
+  - Used for transient errors (UNAVAILABLE, RESOURCE_EXHAUSTED)
+  - Only retries on failure (status code must match retryableStatusCodes)
+  - maxAttempts, initialBackoff, maxBackoff, backoffMultiplier
+  - Requires the RPC to be idempotent
+
+HEDGING:
+  - Parallel: send same request to multiple servers SIMULTANEOUSLY
+  - Hedging fires after hedgingDelay without waiting for failure
+  - First response to arrive wins; others are cancelled
+  - Trades off server cost (multiple identical requests) for lower latency
+  - Useful when: tail latency is high, RPC is idempotent, you have spare capacity
+
+  Without hedging:     P99 = 500ms (occasional slow server)
+  With hedging (2x):   P99 ≈ P95 of single (cut 50ms tail)
+
+Retry vs Hedging Summary:
+  Feature           | Retry                  | Hedging
+  ─────────────────────────────────────────────────────
+  Trigger           | On failure             | After delay (pre-emptive)
+  Execution         | Sequential             | Parallel
+  Requests sent     | 1..N (on failure)      | 1..N (on slow response)
+  Idempotency req   | YES                    | YES (even more important)
+  Latency impact    | Increases on failure   | Decreases P99
+  Server load       | Moderate               | Higher
+
+Service config JSON (set in channel):
+  {
+    "methodConfig": [{
+      "name": [{"service": "com.example.OrderService"}],
+      "retryPolicy": {
+        "maxAttempts": 3,
+        "initialBackoff": "0.1s",
+        "maxBackoff": "1s",
+        "backoffMultiplier": 2,
+        "retryableStatusCodes": ["UNAVAILABLE", "RESOURCE_EXHAUSTED"]
+      }
+    }]
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q3: How do gRPC server interceptors work? What is the execution order?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ServerInterceptor wraps a ServerCall with an outer ServerCall,
+forming a decorator chain. The innermost call reaches the actual service.
+
+Anatomy:
+  ServerInterceptor {
+    ServerCall.Listener interceptCall(
+        ServerCall<ReqT, RespT> call,
+        Metadata headers,
+        ServerCallHandler<ReqT, RespT> next
+    )
+  }
+
+The interceptor can:
+  1. Inspect/modify headers before calling next.startCall()
+  2. Wrap the ServerCall to intercept sendHeaders, sendMessage, close
+  3. Wrap the Listener to intercept onMessage, onHalfClose, onCancel
+
+Execution order (onion model):
+  Incoming request → Interceptor A → Interceptor B → Service
+  Outgoing response ← Interceptor A ← Interceptor B ← Service
+
+With Spring Boot @Order:
+  @GrpcGlobalServerInterceptor
+  @Order(10)
+  class AuthInterceptor implements ServerInterceptor { ... }
+  
+  @GrpcGlobalServerInterceptor
+  @Order(20)
+  class LoggingInterceptor implements ServerInterceptor { ... }
+  
+  Order(10) = OUTERMOST → runs first on request, last on response
+  Order(20) = INNER     → runs after auth on request, before auth on response
+
+Full interceptor example (auth check before service runs):
+  @Override
+  public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+      ServerCall<ReqT, RespT> call, Metadata headers,
+      ServerCallHandler<ReqT, RespT> next) {
+    
+    String token = headers.get(AUTH_HEADER_KEY);
+    if (!isValid(token)) {
+      call.close(Status.UNAUTHENTICATED.withDescription("Invalid token"), new Metadata());
+      return new ServerCall.Listener<>() {};  // no-op listener
+    }
+    // Put claims into context for the service to access
+    Context ctx = Context.current().withValue(USER_ID_KEY, extractUserId(token));
+    return Contexts.interceptCall(ctx, call, headers, next);
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q4: How do you propagate deadlines across microservice calls?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+gRPC propagates deadlines as absolute timestamps (not timeouts)
+via the grpc-timeout header in milliseconds from epoch.
+
+Why absolute timestamp?
+  Timeout = "3 seconds from now" → changes meaning at each hop
+  Deadline = "Unix epoch 1720000000000" → same absolute point everywhere
+  Network latency is already consumed; each service sees remaining time.
+
+Server A receives a request with deadline T.
+Server A must call Server B with the SAME deadline T.
+Server B will also automatically propagate to Server C.
+
+In Java, this is AUTOMATIC when using the same gRPC context:
+  // Server A handling an incoming call:
+  @Override
+  public GetOrderResponse getOrder(GetOrderRequest req, ...) {
+    // Context.current() already has the incoming deadline
+    // withDeadline() subtracts for internal budget
+    
+    // Get user info from User Service
+    GetUserResponse user = userServiceStub
+        .withDeadline(getReducedDeadline(200))  // subtract 200ms buffer
+        .getUser(GetUserRequest.newBuilder().setUserId(req.getUserId()).build());
+    ...
+  }
+  
+  private Deadline getReducedDeadline(long bufferMs) {
+    return Context.current().getDeadline()
+        .offset(-bufferMs, TimeUnit.MILLISECONDS);
+  }
+
+What happens if you DON'T propagate the deadline?
+  Original deadline: 1000ms
+  Service A takes 800ms
+  Service A calls B with a NEW 1000ms deadline
+  Service B returns in 900ms
+  Client already got a DEADLINE_EXCEEDED after 1000ms
+  Service B did unnecessary work for 900ms
+
+What if deadline is already expired when you make the call?
+  gRPC will immediately throw DEADLINE_EXCEEDED without sending the request.
+  Always check remaining time before starting a long operation.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q5: Explain the gRPC health checking protocol (grpc.health.v1)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The health check protocol is a standardized gRPC service defined in:
+  grpc/health/v1/health.proto
+
+Service definition:
+  service Health {
+    rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+    rpc Watch(HealthCheckRequest) returns (stream HealthCheckResponse);
+  }
+  
+  message HealthCheckRequest { string service = 1; }
+  message HealthCheckResponse {
+    enum ServingStatus {
+      UNKNOWN = 0;
+      SERVING = 1;
+      NOT_SERVING = 2;
+      SERVICE_UNKNOWN = 3;
+    }
+    ServingStatus status = 1;
+  }
+
+Usage:
+  - service = "" → overall server health
+  - service = "com.example.OrderService" → specific service health
+  
+  HealthCheckRequest req = HealthCheckRequest.newBuilder()
+      .setService("com.example.OrderService").build();
+  HealthCheckResponse resp = healthStub.check(req);
+  // resp.getStatus() == SERVING
+
+Spring Boot setup:
+  grpc:
+    server:
+      health-service-enabled: true  // auto-registers HealthService
+  
+  // Programmatic registration:
+  @Autowired HealthStatusManager healthStatusManager;
+  
+  healthStatusManager.setStatus(
+      "com.example.OrderService",
+      HealthCheckResponse.ServingStatus.SERVING
+  );
+
+Used by:
+  - Kubernetes readiness probes (grpc probe or grpc-health-probe CLI tool)
+  - Load balancers (Envoy / Istio liveness checks)
+  - Service discovery systems
+  - Client-side channel management (check before sending traffic)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q6: How would you design a production-grade gRPC service?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Production checklist by category:
+
+1. PROTO DESIGN
+   □ Use dedicated request/response messages per RPC (no primitives)
+   □ Apply google.api.field_behavior (REQUIRED, OUTPUT_ONLY) for clarity
+   □ Version the package (com.example.v1.OrderService)
+   □ Use google.protobuf.FieldMask for partial updates
+   □ Run buf lint and buf breaking in CI/CD
+
+2. SECURITY
+   □ TLS/mTLS between all services
+   □ JWT authentication via server interceptor
+   □ Rate limiting interceptor (Resilience4j or custom token bucket)
+   □ Authorization with per-method policies
+   □ Never log request/response payloads without redaction
+
+3. RELIABILITY
+   □ Always set deadlines on outgoing calls
+   □ Configure retry policies in service config (idempotent methods)
+   □ Implement server-side idempotency keys for non-idempotent ops
+   □ Cancel outgoing calls when incoming call is cancelled
+   □ Check Context.current().isCancelled() in streaming loops
+
+4. OBSERVABILITY
+   □ Distributed tracing (OpenTelemetry gRPC interceptor)
+   □ Metrics: request count, latency histograms, error rate per status code
+   □ Structured logging with correlation ID (from metadata or trace context)
+   □ gRPC access log (method, status, latency, bytes)
+   □ Expose /metrics endpoint for Prometheus scraping
+
+5. LOAD BALANCING & DISCOVERY
+   □ Register health service (grpc.health.v1.Health)
+   □ Use headless K8s service or service mesh for L7 LB
+   □ Configure channel keep-alive (grpc.keepalive.time_ms, grpc.keepalive.timeout_ms)
+   □ Handle connection reset gracefully (exponential backoff reconnect)
+
+6. BUILD & DEPLOYMENT
+   □ buf generate for consistent code generation across teams
+   □ Publish .proto files and generated stubs as library artifacts
+   □ Schema registry or buf.build for schema governance
+   □ Separate proto module from business logic module
+
+7. TESTING
+   □ Unit tests with InProcessServer
+   □ Integration tests with test containers
+   □ Load tests with ghz (gRPC benchmarking tool)
+   □ Contract tests using proto definitions
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q7: What happens during graceful shutdown of a gRPC server?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Graceful shutdown process:
+  1. Server stops accepting new connections and RPCs
+  2. Existing RPCs are allowed to complete up to a timeout
+  3. After timeout, remaining RPCs are forcibly cancelled
+  4. All resources (threads, channels, executors) are released
+
+In gRPC-Java:
+  server.shutdown();          // signal: stop accepting new RPCs
+  server.awaitTermination(30, TimeUnit.SECONDS);  // wait 30s
+  if (!server.isTerminated()) {
+    server.shutdownNow();     // force cancel remaining RPCs
+  }
+
+With Spring Boot:
+  grpc:
+    server:
+      shutdown-grace-period: 30s  // configures graceful period automatically
+
+What happens to in-flight streaming RPCs?
+  - Server streaming: client receives GOAWAY frame, then UNAVAILABLE
+    for new RPCs. Existing stream can continue until natural completion.
+  - Client streaming: server can still receive messages and complete.
+  - HTTP/2 GOAWAY frame tells client: "last processed stream ID = X,
+    any higher stream IDs were not processed, retry them."
+
+In Kubernetes, when a pod receives SIGTERM:
+  1. K8s removes the pod from the Service endpoints (new traffic stops)
+  2. Pod has terminationGracePeriodSeconds (default 30s) to clean up
+  3. Server must call shutdown() in a JVM shutdown hook:
+     Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+         server.shutdown();
+         server.awaitTermination(25, TimeUnit.SECONDS); // 25 < 30
+     }));
+
+Why graceful shutdown matters:
+  Hard kill (SIGKILL) → in-flight RPCs get RST_STREAM
+  → Client gets INTERNAL or UNAVAILABLE with no data
+  Graceful shutdown → Client gets complete responses
+  → Better user experience, no data corruption
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q8: How do you handle non-idempotent retries safely in gRPC?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Problem: POST/Create operations must not be retried blindly.
+  Retry of CreateOrder might create 2 orders and charge the user twice.
+
+Solution: Idempotency Keys
+
+Client generates a UUID for each logical operation:
+  // Client generates once per user intent
+  String idempotencyKey = UUID.randomUUID().toString();
+  
+  // Attach to metadata on EVERY attempt
+  Metadata headers = new Metadata();
+  headers.put(IDEMPOTENCY_KEY, idempotencyKey);
+  
+  CreateOrderResponse response = stub
+      .withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers))
+      .withDeadlineAfter(5, TimeUnit.SECONDS)
+      .createOrder(request);
+
+Server deduplicates using a short-lived cache:
+  // Idempotency store (Redis in production, in-memory for example)
+  Cache<String, CreateOrderResponse> idempotencyCache = 
+      CacheBuilder.newBuilder().expireAfterWrite(24, HOURS).build();
+  
+  @Override
+  public void createOrder(CreateOrderRequest req, StreamObserver<CreateOrderResponse> ro) {
+    String key = IDEMPOTENCY_KEY.get();  // from Context (set by interceptor)
+    if (key != null) {
+      CreateOrderResponse cached = idempotencyCache.getIfPresent(key);
+      if (cached != null) {
+        ro.onNext(cached);
+        ro.onCompleted();
+        return;
+      }
+    }
+    
+    CreateOrderResponse response = processNewOrder(req);
+    
+    if (key != null) {
+      idempotencyCache.put(key, response);
+    }
+    ro.onNext(response);
+    ro.onCompleted();
+  }
+
+Idempotency in gRPC retry config:
+  Do NOT set retryableStatusCodes for non-idempotent methods.
+  Only add methods to retry config when you have server-side dedup.
+
+Stripe / Braintree pattern:
+  - Idempotency key lives for 24 hours
+  - Same key → same response
+  - Key scoped to customer + operation (not global)
+  - Return 409 ALREADY_EXISTS if a different request has same key
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q9: What is gRPC Server Reflection and when is it useful?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Server Reflection is a gRPC service (grpc.reflection.v1alpha.ServerReflection)
+that allows clients to query the server's service descriptors at runtime
+WITHOUT having the .proto files.
+
+Enabled in Spring Boot:
+  grpc:
+    server:
+      reflection: true  // auto-enables ProtoReflectionService
+
+Use cases:
+  1. grpcurl (like curl for gRPC):
+     grpcurl -plaintext localhost:9090 list
+     grpcurl -plaintext localhost:9090 describe com.example.OrderService
+     grpcurl -plaintext -d '{"order_id":"123"}' localhost:9090 com.example.OrderService/GetOrder
+  
+  2. gRPC UI tools (Bloom RPC, Evans, Postman gRPC):
+     Connect to server → auto-discover all services → interactive testing
+  
+  3. Dynamic client generation (rare):
+     Build clients at runtime that adapt to server API changes.
+  
+  4. API gateways:
+     Envoy's gRPC-JSON transcoder uses reflection to know how to
+     map JSON fields to proto messages.
+
+Security note:
+  DISABLE reflection in production if your API is not public.
+  Reflection exposes your entire API surface including field names and types.
+  It's fine for internal services but be deliberate for external-facing services.
+
+How it works:
+  Reflection service returns FileDescriptorProto objects (binary proto format).
+  Client can reconstruct the .proto file from these descriptors.
+  grpcurl uses this to validate request JSON and display response data.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Q10: How does distributed tracing work with gRPC?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Distributed tracing correlates spans across multiple microservices
+to form a complete picture of a request's journey.
+
+Standards: OpenTelemetry (OTel) — industry standard
+  TraceId: global identifier for the entire request chain
+  SpanId: identifier for one hop (one gRPC call)
+  Propagation: via metadata headers
+
+OTel auto-instrumentation with grpc-opentelemetry:
+  // pom.xml
+  <dependency>
+    <groupId>io.opentelemetry.instrumentation</groupId>
+    <artifactId>opentelemetry-grpc-1.6</artifactId>
+    <version>2.0.0</version>
+  </dependency>
+  
+  // Server interceptor (auto-registered by OTel agent):
+  // Reads trace context from metadata: traceparent header
+  // Creates a new server span for each incoming RPC
+  
+  // Client interceptor:
+  // Injects trace context into metadata: traceparent header
+  // Creates a new client span for each outgoing RPC
+
+Trace propagation via metadata:
+  Client A calls Service B with:
+    Metadata: traceparent: 00-{traceId}-{spanIdA}-01
+  
+  Service B creates a new span (child of spanIdA):
+    Metadata sent to C: traceparent: 00-{traceId}-{spanIdB}-01
+  
+  Same traceId throughout → Jaeger/Zipkin links all spans together
+
+What you see in Jaeger:
+  ┌─────────────────────────────────────────────────────────────┐
+  │ TraceId: abc123                          Total: 450ms        │
+  │ ─────────────────────────────────────────────────────────── │
+  │ [OrderService.CreateOrder         ]    0ms─────────────450ms│
+  │   [UserService.GetUser      ]          5ms──────45ms        │
+  │   [InventoryService.Reserve ]          50ms─────────200ms   │
+  │   [PaymentService.Charge    ]          210ms──────────430ms │
+  └─────────────────────────────────────────────────────────────┘
+
+Add custom span attributes:
+  Span span = tracer.spanBuilder("processOrder").startSpan();
+  try (Scope scope = span.makeCurrent()) {
+    span.setAttribute("order.id", orderId);
+    span.setAttribute("order.amount", amount);
+    // ... process
+  } finally {
+    span.end();
+  }
+
+Baggage propagation (sending values down the chain):
+  Baggage.current().toBuilder()
+      .put("userId", userId)
+      .build()
+      .makeCurrent();
+  // userId is available in all downstream services' spans
+
+================================================================
+END OF FILE
+================================================================

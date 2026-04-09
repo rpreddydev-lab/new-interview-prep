@@ -1,0 +1,508 @@
+================================================================================
+                   CI INTEGRATION FOR E2E TESTS
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Why CI Matters for E2E Tests
+2. General CI Strategy for E2E
+3. GitHub Actions — Playwright
+4. GitHub Actions — Cypress
+5. Running the Dev Server in CI
+6. Parallelization
+7. Handling Flaky Tests in CI
+8. Artifacts: Screenshots, Videos, Reports
+9. Environment Variables in CI
+10. Docker-Based E2E Testing
+11. CI Best Practices Summary
+
+
+================================================================================
+1. WHY CI MATTERS FOR E2E TESTS
+================================================================================
+
+E2E tests verify the full stack — they should run against every PR and merge.
+
+WITHOUT CI E2E TESTS:
+  - Bugs caught only after deploy to production
+  - Manual QA becomes the bottleneck
+  - Regressions slip through when teams move fast
+
+WITH CI E2E TESTS:
+  ✅ Every PR gets validated before merging
+  ✅ Regressions caught before they reach users
+  ✅ Confidence to deploy frequently (CI/CD)
+  ✅ Parallelization makes tests manageable (~5-10 min for 100 tests)
+
+CHALLENGES IN CI:
+  - E2E tests are slower than unit/integration tests
+  - CI machines differ from local machines (headless, different OS)
+  - Network may be slower in CI
+  - Tests may be flaky (timing issues, race conditions)
+
+
+================================================================================
+2. GENERAL CI STRATEGY FOR E2E
+================================================================================
+
+RECOMMENDED CI PIPELINE STAGES:
+  Stage 1: Unit + Integration tests (Jest/Vitest) — FAST (<2min)
+  Stage 2: Build the application
+  Stage 3: E2E tests — slower but run after build succeeds
+
+  This way, fast tests fail first and E2E only runs if build passes.
+
+WHEN TO RUN E2E TESTS:
+  Option A: On every PR — maximum safety, slower CI
+  Option B: Only on main/staging deploy — faster PRs, but regressions reach main
+  Option C: On every PR but only smoke tests; full suite on merge — balanced ✅
+
+ENVIRONMENTS:
+  Local dev:    Against localhost:3000 (full dev server)
+  CI:           Against localhost:3000 (built or started in CI)
+  Staging:      Against staging URL (for release validation)
+  Production:   Smoke tests only (post-deploy validation)
+
+
+================================================================================
+3. GITHUB ACTIONS — PLAYWRIGHT
+================================================================================
+
+FILE: .github/workflows/playwright.yml
+
+  name: Playwright E2E Tests
+
+  on:
+    push:
+      branches: [main, develop]
+    pull_request:
+      branches: [main]
+
+  jobs:
+    e2e:
+      name: E2E Tests
+      timeout-minutes: 30
+      runs-on: ubuntu-latest
+
+      steps:
+        - name: Checkout code
+          uses: actions/checkout@v4
+
+        - name: Set up Node.js
+          uses: actions/setup-node@v4
+          with:
+            node-version: '20'
+            cache: 'npm'
+
+        - name: Install dependencies
+          run: npm ci
+
+        - name: Install Playwright browsers
+          run: npx playwright install --with-deps
+          # --with-deps also installs OS-level dependencies (libnss3, etc.)
+
+        - name: Build application
+          run: npm run build
+
+        - name: Start server and run E2E tests
+          run: npx playwright test
+          env:
+            CI: true
+            BASE_URL: http://localhost:3000
+
+        - name: Upload Playwright HTML Report
+          uses: actions/upload-artifact@v4
+          if: always()  # Always upload, even on failure
+          with:
+            name: playwright-report
+            path: playwright-report/
+            retention-days: 30
+
+        - name: Upload test traces on failure
+          uses: actions/upload-artifact@v4
+          if: failure()
+          with:
+            name: playwright-traces
+            path: test-results/
+
+PLAYWRIGHT WITH SHARDING (PARALLEL ACROSS CI JOBS):
+  jobs:
+    test:
+      strategy:
+        matrix:
+          shard: [1, 2, 3, 4]  # Run 4 shards in parallel
+      steps:
+        - run: npx playwright test --shard=${{ matrix.shard }}/4
+
+
+================================================================================
+4. GITHUB ACTIONS — CYPRESS
+================================================================================
+
+USING OFFICIAL CYPRESS GITHUB ACTION:
+  name: Cypress E2E Tests
+
+  on: [push, pull_request]
+
+  jobs:
+    cypress:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+
+        - name: Cypress run
+          uses: cypress-io/github-action@v6
+          with:
+            build: npm run build
+            start: npm run preview
+            wait-on: 'http://localhost:4173'
+            wait-on-timeout: 120
+            browser: chrome
+            record: true         # Record to Cypress Cloud Dashboard
+          env:
+            CYPRESS_RECORD_KEY: ${{ secrets.CYPRESS_RECORD_KEY }}
+
+        - name: Upload screenshots on failure
+          uses: actions/upload-artifact@v4
+          if: failure()
+          with:
+            name: cypress-screenshots
+            path: cypress/screenshots
+
+        - name: Upload videos
+          uses: actions/upload-artifact@v4
+          if: always()
+          with:
+            name: cypress-videos
+            path: cypress/videos
+
+PARALLEL CYPRESS WITH CYPRESS CLOUD:
+  jobs:
+    cypress:
+      strategy:
+        matrix:
+          containers: [1, 2, 3]
+      steps:
+        - uses: cypress-io/github-action@v6
+          with:
+            record: true
+            parallel: true
+            group: 'E2E Parallel'
+          env:
+            CYPRESS_RECORD_KEY: ${{ secrets.CYPRESS_RECORD_KEY }}
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+MATRIX FOR MULTIPLE BROWSERS:
+  strategy:
+    matrix:
+      browser: [chrome, firefox, edge]
+  steps:
+    - uses: cypress-io/github-action@v6
+      with:
+        browser: ${{ matrix.browser }}
+
+
+================================================================================
+5. RUNNING THE DEV SERVER IN CI
+================================================================================
+
+OPTION A: start-server-and-test (works for both Cypress and Playwright)
+  npm install --save-dev start-server-and-test
+
+  // package.json:
+  "test:e2e:ci": "start-server-and-test start http://localhost:3000 cy:run"
+  "start": "node server.js"  // or "next start" etc.
+
+  // In CI:
+  run: npm run test:e2e:ci
+
+OPTION B: Playwright's built-in webServer config
+  // playwright.config.ts:
+  webServer: {
+    command: 'npm run build && npm run start', // Build + start
+    url: 'http://localhost:3000',
+    reuseExistingServer: !process.env.CI,       // Don't restart locally
+    timeout: 120 * 1000,                        // 2 minutes max
+  },
+
+  // In CI:
+  run: npx playwright test
+  # webServer automatically starts and stops the server
+
+OPTION C: Start server as a background job in GitHub Actions
+  - name: Build and start app
+    run: npm run build && npm run start &
+    # & runs in background
+
+  - name: Wait for server to be ready
+    run: npx wait-on http://localhost:3000 --timeout 60000
+
+  - name: Run E2E tests
+    run: npx playwright test
+
+OPTION D: Test against staging URL (no server needed in CI)
+  run: npx playwright test
+  env:
+    BASE_URL: https://staging.myapp.com
+
+
+================================================================================
+6. PARALLELIZATION
+================================================================================
+
+E2E tests are slow — parallelization is essential for fast CI.
+
+PLAYWRIGHT SHARDING (built-in):
+  // playwright.config.ts:
+  workers: process.env.CI ? 4 : undefined, // 4 parallel workers
+
+  // Or shard across CI jobs:
+  npx playwright test --shard=1/4  # Job 1 of 4
+  npx playwright test --shard=2/4  # Job 2 of 4
+  npx playwright test --shard=3/4  # Job 3 of 4
+  npx playwright test --shard=4/4  # Job 4 of 4
+
+  // Merge reports from all shards:
+  npx playwright merge-reports --reporter html ./all-blob-reports
+
+CYPRESS PARALLELIZATION — Two options:
+
+  1. Cypress Cloud (paid, recommended):
+     - Cypress loads balances spec files across machines
+     - Requires CYPRESS_RECORD_KEY from Cloud dashboard
+
+  2. Manual GitHub Actions matrix:
+     strategy:
+       matrix:
+         containers: [1, 2, 3, 4]
+     # Distribute spec files manually or use a bash script
+
+SPLITTING TEST FILES MANUALLY:
+  # scripts/split-tests.sh
+  # Group spec files into buckets and assign to containers:
+  FILES=(cypress/e2e/**/*.cy.ts)
+  BUCKET_SIZE=$((${#FILES[@]} / 4))
+  START=$(( (CONTAINER - 1) * BUCKET_SIZE ))
+  SPECS="${FILES[@]:$START:$BUCKET_SIZE}"
+  npx cypress run --spec "$SPECS"
+
+
+================================================================================
+7. HANDLING FLAKY TESTS IN CI
+================================================================================
+
+FLAKINESS: A test that sometimes passes and sometimes fails without code changes.
+
+COMMON CAUSES:
+  - Race conditions (async operations completing in different order)
+  - Hard-coded timeouts (cy.wait(3000))
+  - Shared state between tests (one test affects the next)
+  - Network timing (slow CI machine vs fast local)
+  - Animations not finished before assertion
+
+PREVENTION:
+  ✅ Use smart waits (cy.wait('@request'), expect().toBeVisible())
+  ✅ Isolate test data (each test creates its own data)
+  ✅ Increase default timeout for CI: defaultCommandTimeout: 8000
+  ✅ Use before/beforeEach to reset state
+
+CI-LEVEL MITIGATION — RETRIES:
+  // Playwright:
+  retries: process.env.CI ? 2 : 0 // Retry flaky tests 2x on CI
+
+  // playwright.config.ts:
+  retries: 2
+
+  // Cypress:
+  // cypress.config.ts:
+  retries: { runMode: 2, openMode: 0 }
+
+  // GitHub Actions:
+  continue-on-error: true  // Don't fail the job on one test
+
+QUARANTINE FLAKY TESTS:
+  Create a separate CI job for known flaky tests:
+  - Main suite runs with 0 retries (hard fail on any failure)
+  - Flaky suite runs with retries (soft fail)
+  - Fix the flaky tests before they're moved back to main suite
+
+DETECTING FLAKINESS:
+  // Playwright — run test 5 times to check:
+  npx playwright test --repeat-each=5
+
+  // Cypress — run test in a loop manually
+  for i in {1..10}; do npx cypress run --spec cypress/e2e/flaky.cy.ts; done
+
+
+================================================================================
+8. ARTIFACTS: SCREENSHOTS, VIDEOS, REPORTS
+================================================================================
+
+PLAYWRIGHT — TRACE VIEWER:
+  Playwright captures traces (screenshots, network, console logs per step).
+  Useful for diagnosing CI failures WITHOUT re-running locally.
+
+  // playwright.config.ts:
+  use: {
+    trace: 'on-first-retry',       // Capture trace on retry
+    screenshot: 'only-on-failure', // Screenshot on failure
+    video: 'on-first-retry',       // Video on retry
+  }
+
+  // View trace:
+  npx playwright show-trace test-results/my-test/trace.zip
+
+  // Upload in CI:
+  - uses: actions/upload-artifact@v4
+    if: always()
+    with:
+      name: playwright-traces
+      path: test-results/
+
+PLAYWRIGHT HTML REPORT:
+  Saved to playwright-report/ by default.
+  View with: npx playwright show-report
+
+  // Auto-open after test run (local):
+  // playwright.config.ts:
+  reporter: [['html', { open: 'on-failure' }]]
+
+CYPRESS ARTIFACTS:
+  Screenshots: cypress/screenshots/**/*.png (on failure)
+  Videos:      cypress/videos/**/*.mp4 (all tests)
+  Reports:     Use mochawesome or allure for HTML reports
+
+  // Install mochawesome:
+  npm install --save-dev cypress-mochawesome-reporter
+
+  // cypress.config.ts:
+  reporter: 'cypress-mochawesome-reporter',
+  reporterOptions: {
+    charts: true,
+    embeddedScreenshots: true,
+    inlineAssets: true,
+  }
+
+
+================================================================================
+9. ENVIRONMENT VARIABLES IN CI
+================================================================================
+
+PLAYWRIGHT:
+  // playwright.config.ts:
+  use: {
+    baseURL: process.env.BASE_URL || 'http://localhost:3000',
+  }
+
+  // In CI:
+  env:
+    BASE_URL: https://staging.example.com
+    API_URL: https://api.staging.example.com
+
+CYPRESS:
+  // cypress.config.ts:
+  env: {
+    apiUrl: process.env.CYPRESS_API_URL,
+  }
+
+  // In test:
+  cy.request(Cypress.env('apiUrl') + '/users');
+
+  // From CI:
+  CYPRESS_API_URL=https://api.staging.example.com npx cypress run
+
+SECRETS IN GITHUB ACTIONS:
+  env:
+    DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
+    API_KEY: ${{ secrets.TEST_API_KEY }}
+
+  # Never log secrets:
+  - name: Verify secret is set
+    run: echo "API_KEY is set? $([[ -n "$API_KEY" ]] && echo yes || echo no)"
+
+
+================================================================================
+10. DOCKER-BASED E2E TESTING
+================================================================================
+
+Running E2E tests in Docker ensures consistent environments (no "works on my machine").
+
+DOCKERFILE FOR E2E (Playwright):
+  FROM mcr.microsoft.com/playwright:v1.45.0-jammy
+
+  WORKDIR /app
+  COPY package*.json ./
+  RUN npm ci
+
+  COPY . .
+  RUN npm run build
+
+  CMD ["npx", "playwright", "test"]
+
+DOCKER COMPOSE WITH APP + E2E:
+  version: '3.8'
+  services:
+    app:
+      build: .
+      ports:
+        - "3000:3000"
+      environment:
+        - NODE_ENV=test
+        - DATABASE_URL=postgresql://test:test@db:5432/testdb
+
+    db:
+      image: postgres:15
+      environment:
+        POSTGRES_USER: test
+        POSTGRES_PASSWORD: test
+        POSTGRES_DB: testdb
+
+    e2e:
+      image: mcr.microsoft.com/playwright:v1.45.0-jammy
+      depends_on:
+        - app
+      working_dir: /app
+      volumes:
+        - .:/app
+        - /app/node_modules
+      command: npx playwright test
+      environment:
+        - BASE_URL=http://app:3000
+
+  // Run:
+  docker compose up --exit-code-from e2e
+
+
+================================================================================
+11. CI BEST PRACTICES SUMMARY
+================================================================================
+
+SPEED:
+  ✅ Run unit tests first (fail fast)
+  ✅ Parallelize E2E tests (sharding / matrix strategy)
+  ✅ Cache node_modules (actions/cache or cache: 'npm' in setup-node)
+  ✅ Use built artifacts instead of building per shard
+  ✅ Playwright: workers: 4+ in CI
+
+RELIABILITY:
+  ✅ Set CI: true in env so code behaves correctly
+  ✅ Use retries: 2 for CI only (not locally)
+  ✅ Increase timeouts for CI machines
+  ✅ Use wait-on or webServer to ensure server is ready
+  ✅ Isolate test data — no shared state
+
+DEBUGGING:
+  ✅ Always upload test artifacts (screenshots, traces, videos)
+  ✅ Use descriptive test names
+  ✅ Use Playwright trace viewer or Cypress Cloud dashboard
+
+MAINTENANCE:
+  ✅ Review and fix flaky tests promptly
+  ✅ Don't add to E2E suite unless it's a critical journey
+  ✅ Keep test count manageable — quality over quantity
+  ✅ Review E2E timing each month (should stay under 10 min)
+
+
+================================================================================
+END OF FILE
+================================================================================

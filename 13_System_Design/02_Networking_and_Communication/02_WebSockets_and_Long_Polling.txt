@@ -1,0 +1,243 @@
+================================================================
+WEBSOCKETS AND LONG POLLING
+================================================================
+
+THE PROBLEM: HTTP IS REQUEST-RESPONSE ONLY
+--------------------------------------------
+Standard HTTP is a pull-based protocol: client asks, server answers.
+For real-time applications (chat, live scores, collaborative editing),
+the server needs to push updates to the client without waiting for a poll.
+
+Solutions (in order of evolution):
+  1. Short Polling — simplest, least efficient
+  2. Long Polling  — better, still HTTP
+  3. Server-Sent Events (SSE) — server push, one-directional
+  4. WebSockets    — bidirectional, real-time
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SHORT POLLING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Client sends periodic requests to check for new data.
+  setInterval(() => {
+    fetch('/api/messages').then(render)
+  }, 5000)  // every 5 seconds
+
+Problems:
+  - Most requests return "nothing new" (wasted traffic)
+  - Latency = up to 5 seconds behind real-time
+  - Server handles 10s of thousands of idle requests per minute
+
+Use when:
+  - Updates are infrequent (every few minutes)
+  - Simple to implement, no server-side changes needed
+  - Data freshness of 5–30 seconds is acceptable (dashboards)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LONG POLLING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Client sends request; server HOLDS the response until:
+  a) New data is available — sends it immediately
+  b) Timeout (e.g., 30 seconds) — sends empty response
+Client immediately sends another long-poll request.
+
+Flow:
+  Client → GET /api/messages?timeout=30
+  Server holds connection...
+  [8 seconds later: new message arrives]
+  Server → 200 OK { messages: [...] }
+  Client immediately → GET /api/messages?timeout=30  [repeat]
+
+Advantages:
+  ✓ Near-real-time (latency ≈ server processing time)
+  ✓ Works through firewalls and proxies (it's just HTTP)
+  ✓ No special client support needed
+  ✓ Fallback for environments where WebSockets are blocked
+
+Disadvantages:
+  ✗ Each message requires a new HTTP request/response cycle
+  ✗ Connection overhead: TCP handshake + HTTP headers each time
+  ✗ Server must hold many open connections (can overwhelm thread-per-connection servers)
+  ✗ Not suitable for very high frequency updates
+
+Used by: Facebook chat (originally), many legacy systems
+
+Server-Side Implementation Pattern:
+  GET /messages/poll
+    1. Check DB for messages newer than last received
+    2. If found: return immediately
+    3. If not: subscribe to Redis pub/sub for user channel
+    4. If event arrives in 30s: return it
+    5. If timeout: return empty with 204
+    6. Client re-polls immediately
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SERVER-SENT EVENTS (SSE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SSE is a one-directional persistent connection from server to client.
+Uses standard HTTP with Content-Type: text/event-stream.
+Built into browsers natively (EventSource API).
+
+Client:
+  const es = new EventSource('/api/stream')
+  es.onmessage = (event) => console.log(event.data)
+  es.addEventListener('tweet', (event) => renderTweet(event.data))
+
+Server sends:
+  HTTP/1.1 200 OK
+  Content-Type: text/event-stream
+  Cache-Control: no-cache
+  
+  data: {"message": "Hello"}
+  
+  event: tweet
+  data: {"tweet_id": 123, "text": "..."}
+  id: 456
+  
+  : this is a comment (heartbeat)
+
+SSE Features:
+  - Automatic reconnection with Last-Event-ID header
+  - Named events (event: tweet)
+  - Heartbeats via comment lines (`: heartbeat`)
+  - Works over HTTP/2 (many SSE streams on one connection)
+
+Advantages:
+  ✓ Server push with HTTP — simple to implement
+  ✓ Auto-reconnect built-in
+  ✓ Works through most proxies
+  ✓ Native browser support (EventSource)
+  ✓ No custom protocol needed
+
+Disadvantages:
+  ✗ One-directional only (server → client)
+  ✗ HTTP overhead (headers per connection)
+  ✗ Not supported in old IE
+
+Use for: Twitter live feed, live scores, progress bars, notifications,
+         stock tickers, logs streaming
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WEBSOCKETS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WebSocket is a full-duplex (bidirectional) persistent connection over
+a single TCP connection.
+Protocol: ws:// (insecure) or wss:// (TLS-encrypted, use always)
+
+HOW IT WORKS:
+  1. Client initiates HTTP upgrade handshake:
+     GET /chat HTTP/1.1
+     Upgrade: websocket
+     Connection: Upgrade
+     Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+
+  2. Server accepts:
+     HTTP/1.1 101 Switching Protocols
+     Upgrade: websocket
+     Connection: Upgrade
+     Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+
+  3. Connection upgrades from HTTP to WebSocket protocol.
+     Now both sides can send frames at any time.
+
+  4. Messages are sent as frames (text or binary).
+     No headers per message — very low overhead.
+
+  5. Connection closes with a close handshake or abruptly on error.
+
+FRAME FORMAT:
+  Small overhead per message (2-14 bytes header vs hundreds for HTTP).
+  Text frames: UTF-8 encoded strings (JSON messages typically)
+  Binary frames: raw bytes (images, audio, protocol buffers)
+  Ping/Pong frames: heartbeat (keep connection alive through NAT/proxies)
+
+CLIENT (JavaScript):
+  const ws = new WebSocket('wss://chat.example.com/ws')
+  
+  ws.onopen    = () => ws.send(JSON.stringify({type: 'join', room: 'general'}))
+  ws.onmessage = (event) => handleMessage(JSON.parse(event.data))
+  ws.onclose   = (event) => reconnect()
+  ws.onerror   = (error) => handleError(error)
+
+SERVER (Node.js with ws library):
+  const wss = new WebSocketServer({ port: 8080 })
+  wss.on('connection', (ws) => {
+    ws.on('message', (data) => handleMessage(ws, JSON.parse(data)))
+    ws.on('close', () => cleanup(ws))
+    // Send to client: ws.send(JSON.stringify(payload))
+  })
+
+ADVANTAGES:
+  ✓ True bidirectional communication (client ↔ server)
+  ✓ Very low latency (persistent connection, no handshake per message)
+  ✓ Low per-message overhead (no HTTP headers)
+  ✓ Supports binary and text
+  ✓ Real-time: server can push at any time
+
+DISADVANTAGES:
+  ✗ More complex than HTTP (connection management, reconnection logic)
+  ✗ Stateful — connections are tied to a specific server
+  ✗ Load balancing is harder (sticky sessions needed or shared state)
+  ✗ Some proxies/firewalls block WebSockets
+  ✗ No native caching (unlike HTTP)
+  ✗ Each open connection consumes server resources (file descriptors)
+
+SCALING WEBSOCKETS:
+  Problem: User A connects to Server 1; User B connects to Server 2.
+           When A sends message to B, Server 1 must forward to Server 2.
+  
+  Solution: Use a pub/sub broker (Redis Pub/Sub, Kafka) as a message bus.
+    Server 1 receives message from A → publish to Redis channel B's user ID
+    Server 2 subscribes to B's channel → pushes to B's WebSocket connection
+  
+  ┌────────────┐         ┌─────────────┐        ┌────────────┐
+  │  Server 1  │─publish→│    Redis    │←subscr.│  Server 2  │
+  │  User A    │         │  Pub/Sub    │         │  User B    │
+  └────────────┘         └─────────────┘        └────────────┘
+
+WEBSOCKET SERVER CAPACITY:
+  Each open TCP connection uses ~1 file descriptor + ~65KB kernel memory
+  A modern server (8 GB RAM) can hold ~100K concurrent connections
+  WhatsApp: 2B users → need thousands of servers just for WebSocket connections
+
+  C10K problem (10,000 concurrent connections):
+    Old threaded model: 1 thread per connection → too expensive
+    Solution: Event loop (Node.js, Nginx, Netty)
+              Single thread handles thousands of connections via select/epoll
+
+HEARTBEATS:
+  NAT routers and firewalls close idle TCP connections (typically after 30-120s).
+  Solution: Send ping frames every 30 seconds.
+  If no pong received: connection is dead → cleanup and reconnect client.
+
+RECONNECTION STRATEGY (Client):
+  On disconnect, exponential backoff with jitter:
+  delay = min(cap, base × 2^attempt) + random(0, 1) × delay
+  Example: 1s, 2s, 4s, 8s, 16s, 32s (max 30s)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMPARISON TABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────┬────────────┬─────────────┬─────────┬────────────┐
+│ Feature         │Short Poll  │Long Poll    │ SSE     │ WebSocket  │
+├─────────────────┼────────────┼─────────────┼─────────┼────────────┤
+│ Direction       │Client→Svr  │Client→Svr   │Svr→Clt  │ Both       │
+│ Latency         │High (poll) │Medium       │Low      │ Very low   │
+│ Overhead        │High        │Medium       │Low      │ Very low   │
+│ Server state    │Stateless   │Semi-stateful│Stateful │ Stateful   │
+│ Browser support │All         │All          │Modern   │ Modern     │
+│ Firewall-safe   │Yes         │Yes          │Usually  │ Usually    │
+│ HTTP/2          │Yes         │Yes          │Yes      │ No (TCP)   │
+│ Best for        │Dashboards  │Notifications│Feeds,   │Chat, games,│
+│                 │            │             │progress │ collab apps│
+└─────────────────┴────────────┴─────────────┴─────────┴────────────┘
+
+DECISION GUIDE:
+  Server push only (notifications, feeds) → SSE
+  Bidirectional real-time (chat, games, live collaboration) → WebSocket
+  Infrequent updates (dashboards, polling-friendly) → Short/Long poll
+  Legacy compatibility → Long polling fallback

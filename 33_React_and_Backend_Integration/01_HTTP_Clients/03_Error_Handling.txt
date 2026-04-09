@@ -1,0 +1,385 @@
+================================================================
+ERROR HANDLING IN REACT-BACKEND INTEGRATION
+================================================================
+
+Error handling is a multi-layer concern. Errors can occur at the:
+1. Network level (no connection, timeout, DNS failure)
+2. HTTP level (4xx client errors, 5xx server errors)
+3. Application level (validation failures, business rule violations)
+4. React rendering level (exceptions during render)
+
+================================================================
+1. TYPES OF ERRORS
+================================================================
+
+A) NETWORK ERROR
+   - No internet connection
+   - DNS resolution failure
+   - Connection refused (server down)
+   - Request timeout
+   - Axios: error.response is UNDEFINED, error.request is set
+
+B) HTTP ERROR (4xx / 5xx)
+   - 400 Bad Request: invalid data sent
+   - 401 Unauthorized: not authenticated
+   - 403 Forbidden: authenticated but not authorized
+   - 404 Not Found: resource doesn't exist
+   - 409 Conflict: duplicate resource
+   - 422 Unprocessable Entity: validation error (most REST APIs use this)
+   - 429 Too Many Requests: rate limited
+   - 500 Internal Server Error: generic server error
+   - 503 Service Unavailable: server overloaded or down
+   - Axios: error.response IS set with status and data
+
+C) AXIOS REQUEST SETUP ERROR
+   - Error before the request was even sent
+   - Axios: error.response is undefined, error.request is undefined
+   - e.g., invalid URL, config error
+
+D) CANCELLATION
+   - Request was cancelled via AbortController
+   - Axios: axios.isCancel(error) === true
+   - Should NOT be treated as an error in most cases
+
+================================================================
+2. AXIOS ERROR STRUCTURE
+================================================================
+
+  try {
+    await apiClient.get('/api/users/999');
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+
+      if (error.response) {
+        // Server responded with a non-2xx status
+        console.log('Status:', error.response.status);      // 404
+        console.log('Data:', error.response.data);          // { message: 'Not found' }
+        console.log('Headers:', error.response.headers);
+
+      } else if (error.request) {
+        // Request was sent but no response received (network error, timeout)
+        console.log('No response received:', error.request);
+
+      } else {
+        // Error during request setup
+        console.log('Request setup error:', error.message);
+      }
+
+      console.log('Config:', error.config);  // the Axios config used
+
+    } else if (axios.isCancel(error)) {
+      console.log('Request cancelled:', error.message);
+
+    } else {
+      // Non-Axios error (programming error, etc.)
+      console.error('Unexpected error:', error);
+    }
+  }
+
+================================================================
+3. CENTRALIZED ERROR HANDLER
+================================================================
+
+Create a utility function to extract a human-readable error message:
+
+  // src/utils/errorHandler.js
+  import axios from 'axios';
+
+  export const extractErrorMessage = (error) => {
+    if (axios.isCancel(error)) return null; // cancelled, not an error
+
+    if (axios.isAxiosError(error)) {
+      // Network error
+      if (!error.response) {
+        return 'Network error. Please check your internet connection.';
+      }
+
+      const { status, data } = error.response;
+
+      // Spring Boot validation error format: { errors: [{ field, message }] }
+      if (data?.errors && Array.isArray(data.errors)) {
+        return data.errors.map(e => `${e.field}: ${e.message}`).join(', ');
+      }
+
+      // Common API error format: { message: 'some message' }
+      if (data?.message) return data.message;
+
+      // Fall back to status code messages
+      const statusMessages = {
+        400: 'Invalid request. Please check your input.',
+        401: 'Session expired. Please log in again.',
+        403: 'You do not have permission to perform this action.',
+        404: 'The requested resource was not found.',
+        409: 'A conflict occurred. The resource may already exist.',
+        422: 'Validation error. Please check your input.',
+        429: 'Too many requests. Please slow down.',
+        500: 'Server error. Please try again later.',
+        503: 'Service temporarily unavailable.',
+      };
+
+      return statusMessages[status] || `Unexpected error: HTTP ${status}`;
+    }
+
+    if (error instanceof Error) return error.message;
+    return 'An unexpected error occurred.';
+  };
+
+================================================================
+4. ERROR HANDLING IN COMPONENTS
+================================================================
+
+A) MANUAL LOADING/ERROR STATE
+  function UserList() {
+    const [users, setUsers] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+
+    useEffect(() => {
+      const controller = new AbortController();
+      setLoading(true);
+      setError(null);
+
+      apiClient.get('/users', { signal: controller.signal })
+        .then(res => setUsers(res.data))
+        .catch(err => {
+          if (!axios.isCancel(err)) {
+            setError(extractErrorMessage(err));
+          }
+        })
+        .finally(() => setLoading(false));
+
+      return () => controller.abort();
+    }, []);
+
+    if (loading) return <Spinner />;
+    if (error) return <Alert variant="error">{error}</Alert>;
+    return <ul>{users.map(u => <li key={u.id}>{u.name}</li>)}</ul>;
+  }
+
+B) REACT QUERY ERROR HANDLING
+  function UserList() {
+    const { data: users, isLoading, isError, error } = useQuery({
+      queryKey: ['users'],
+      queryFn: () => apiClient.get('/users').then(r => r.data),
+      retry: 2,              // retry twice before marking as error
+      retryDelay: 1000,      // wait 1 second between retries
+    });
+
+    if (isLoading) return <Spinner />;
+    if (isError) return <Alert>{extractErrorMessage(error)}</Alert>;
+    return <ul>{users.map(u => <li key={u.id}>{u.name}</li>)}</ul>;
+  }
+
+C) MUTATION ERROR HANDLING
+  const mutation = useMutation({
+    mutationFn: (data) => apiClient.post('/users', data),
+    onError: (error) => {
+      const message = extractErrorMessage(error);
+      toast.error(message);
+    },
+    onSuccess: () => {
+      toast.success('User created!');
+      queryClient.invalidateQueries({ queryKey: ['users'] });
+    },
+  });
+
+================================================================
+5. GLOBAL ERROR INTERCEPTOR (Centralized)
+================================================================
+
+  // src/api/axiosConfig.js
+  import toast from 'react-hot-toast';
+
+  apiClient.interceptors.response.use(
+    (response) => response,
+    (error) => {
+      if (axios.isCancel(error)) return Promise.reject(error);
+
+      const message = extractErrorMessage(error);
+      if (message) {
+        toast.error(message);
+      }
+
+      // Re-throw so individual callers can also handle if needed
+      return Promise.reject(error);
+    }
+  );
+
+  IMPORTANT: Don't show toasts for 401 errors if you have a refresh
+  interceptor — the refresh interceptor handles 401, not the error toast.
+
+================================================================
+6. FORM VALIDATION ERROR MAPPING
+================================================================
+
+Spring Boot often returns validation errors in this format:
+  {
+    "timestamp": "...",
+    "status": 400,
+    "errors": [
+      { "field": "email", "message": "must be a valid email" },
+      { "field": "name", "message": "must not be blank" }
+    ]
+  }
+
+Map these to React Hook Form field errors:
+
+  const { handleSubmit, setError, formState: { errors } } = useForm();
+
+  const onSubmit = async (data) => {
+    try {
+      await createUser(data);
+    } catch (err) {
+      if (axios.isAxiosError(err) && err.response?.status === 400) {
+        const apiErrors = err.response.data.errors;
+        apiErrors?.forEach(({ field, message }) => {
+          setError(field, { type: 'server', message });
+        });
+      }
+    }
+  };
+
+  // In JSX:
+  {errors.email && <p className="error">{errors.email.message}</p>}
+
+================================================================
+7. REACT ERROR BOUNDARY (Rendering Errors)
+================================================================
+
+Error Boundaries catch errors during rendering, lifecycle methods,
+and constructors. They do NOT catch:
+  - Async errors (fetch, setTimeout)
+  - Event handlers (use try/catch manually)
+  - Server-side rendering errors
+
+  class ErrorBoundary extends React.Component {
+    state = { hasError: false, error: null };
+
+    static getDerivedStateFromError(error) {
+      return { hasError: true, error };
+    }
+
+    componentDidCatch(error, info) {
+      // Log to error tracking (Sentry, etc.)
+      Sentry.captureException(error, { extra: info });
+    }
+
+    render() {
+      if (this.state.hasError) {
+        return (
+          <div>
+            <h2>Something went wrong.</h2>
+            <button onClick={() => this.setState({ hasError: false })}>
+              Try again
+            </button>
+          </div>
+        );
+      }
+      return this.props.children;
+    }
+  }
+
+  // Usage: Wrap sections of the UI
+  <ErrorBoundary>
+    <UserDashboard />
+  </ErrorBoundary>
+
+================================================================
+8. NETWORK STATUS DETECTION
+================================================================
+
+  // Detect online/offline status
+  function useNetworkStatus() {
+    const [isOnline, setIsOnline] = useState(navigator.onLine);
+
+    useEffect(() => {
+      const handleOnline = () => setIsOnline(true);
+      const handleOffline = () => setIsOnline(false);
+
+      window.addEventListener('online', handleOnline);
+      window.addEventListener('offline', handleOffline);
+
+      return () => {
+        window.removeEventListener('online', handleOnline);
+        window.removeEventListener('offline', handleOffline);
+      };
+    }, []);
+
+    return isOnline;
+  }
+
+  // In component or interceptor:
+  const isOnline = useNetworkStatus();
+  if (!isOnline) return <OfflineBanner />;
+
+================================================================
+9. ERROR REPORTING TO SENTRY
+================================================================
+
+  import * as Sentry from '@sentry/react';
+
+  // Initialize in main.jsx
+  Sentry.init({
+    dsn: import.meta.env.VITE_SENTRY_DSN,
+    integrations: [Sentry.browserTracingIntegration()],
+    tracesSampleRate: 0.1,
+  });
+
+  // Capture in error interceptor
+  apiClient.interceptors.response.use(
+    (response) => response,
+    (error) => {
+      if (error.response?.status >= 500) {
+        Sentry.captureException(error, {
+          extra: {
+            url: error.config?.url,
+            status: error.response?.status,
+            data: error.response?.data,
+          },
+        });
+      }
+      return Promise.reject(error);
+    }
+  );
+
+  // Wrap app with ErrorBoundary
+  root.render(
+    <Sentry.ErrorBoundary fallback={<ErrorPage />}>
+      <App />
+    </Sentry.ErrorBoundary>
+  );
+
+================================================================
+10. INTERVIEW QUESTIONS
+================================================================
+
+Q: What are the different types of errors in React API integration?
+A: Network errors (no response), HTTP errors (4xx/5xx), cancellation,
+   and rendering errors. Each requires different handling: network
+   errors show connectivity messages, 401 triggers refresh, 403 shows
+   permission denied, 422 shows validation errors on form fields,
+   5xx shows "try again" messages.
+
+Q: How do you distinguish between a network error and a 404 in Axios?
+A: In a network error, error.response is undefined and error.request
+   is set. For a 404, error.response is set with status 404.
+   axios.isAxiosError() can be used to confirm it's an Axios error.
+
+Q: How do you map Spring Boot validation errors to React Hook Form?
+A: Spring Boot returns 400 with an errors array containing field
+   and message. After catching the error, iterate the errors array
+   and call setError(field, { type: 'server', message }) for each.
+   RHF then makes the error available via formState.errors.fieldName.
+
+Q: What is an Error Boundary and what doesn't it catch?
+A: Error Boundary is a React class component with getDerivedStateFromError
+   and componentDidCatch. It catches rendering errors in the component tree.
+   It does NOT catch async errors, event handler errors, or errors thrown
+   inside useEffect async callbacks — those need try/catch.
+
+Q: Should you show toast notifications for all HTTP errors?
+A: No. 401 is handled by the token refresh interceptor — showing a toast
+   would be confusing since the request will be retried. 404 may be
+   expected behavior (e.g., checking if a resource exists). 422
+   validation errors are best shown on form fields, not toasts.
+   Use judgment: 500s always warrant a toast, 400 depends on context.

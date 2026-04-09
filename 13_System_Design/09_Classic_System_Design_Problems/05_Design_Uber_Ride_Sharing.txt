@@ -1,0 +1,271 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DESIGN: UBER / RIDE-SHARING PLATFORM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FUNCTIONAL:
+  - Rider requests ride from location A to B
+  - System matches rider with nearby available driver
+  - Driver accepts/rejects ride
+  - Real-time location tracking for rider (where's my driver?)
+  - Trip tracking (live GPS route)
+  - Fare calculation (distance, time, surge pricing)
+  - Payment processing (card, cash, wallet)
+  - Rating system (rider rates driver, driver rates rider)
+  - Ride history
+
+NON-FUNCTIONAL:
+  - 100M DAU riders, 5M active drivers at peak
+  - 15M trips/day ≈ 175 trips/second
+  - Driver location updates every 4 seconds → 5M × (60/4) = 75M updates/minute
+  - Match latency: < 5 seconds from request to driver assignment
+  - Location update write throughput: ~1.25M writes/second (driver GPS)
+  - Availability: 99.99% (critical safety infrastructure)
+  - Consistency for trip state: Strong (ACID)
+
+SCALE:
+  5M drivers × 1 location update/4 sec = 1.25M location updates/second
+  These must be stored in a geospatial index for nearby driver lookup
+
+
+2. ESTIMATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+LOCATION UPDATES:
+  5M active drivers × (1 update / 4 seconds) = 1.25M writes/second
+  Each update: ~50 bytes → 62.5 MB/second write throughput
+
+TRIP MATCHING:
+  175 trip requests/second
+  Each requires geo-search: find drivers within 5km radius
+  Must respond in < 5 seconds
+
+STORAGE (trips):
+  15M trips/day × 1KB/trip = 15GB/day
+  5-year retention: 15GB × 1,825 = 27TB
+
+LOCATION STORAGE:
+  Only need CURRENT location (not history)
+  5M drivers × 50 bytes = 250MB — fits entirely in Redis!
+
+
+3. API DESIGN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RIDER SIDE:
+  POST /api/v1/trips
+    Body: { "pickupLat": 37.7749, "pickupLng": -122.4194,
+            "dropoffLat": 37.7849, "dropoffLng": -122.4094,
+            "rideType": "uberx" }
+    Response: { "tripId": "trip-123", "status": "searching",
+                "estimatedWait": 3, "estimatedFare": 12.50 }
+  
+  GET /api/v1/trips/{tripId}  ← poll for status updates
+  WebSocket ws://api.uber.com/trips/{tripId}/track ← real-time updates
+
+DRIVER SIDE:
+  PUT /api/v1/drivers/location
+    Body: { "lat": 37.7749, "lng": -122.4194, "heading": 180,
+            "speed": 35, "timestamp": 1700000000 }
+  
+  GET /api/v1/drivers/trip-request ← poll for new trip requests
+  POST /api/v1/drivers/trips/{tripId}/accept
+  POST /api/v1/drivers/trips/{tripId}/reject
+
+
+4. HIGH-LEVEL ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CORE SERVICES:
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                        API Gateway                               │
+  └───┬─────────────────────────────────────────┬───────────────────┘
+      │                                         │
+  ┌───▼──────────────────┐           ┌──────────▼──────────────────┐
+  │ Trip Service         │           │ Driver Location Service      │
+  │ - Create/manage trips│           │ - Receive GPS updates        │
+  │ - Rider ↔ Driver     │           │ - Update geospatial index    │
+  │   state machine      │           │ - Store in Redis Geo         │
+  └───┬──────────────────┘           └──────────┬──────────────────┘
+      │                                         │
+  ┌───▼──────────────────┐           ┌──────────▼──────────────────┐
+  │ Matching Service     │           │ Driver Location Store        │
+  │ - Find nearby drivers│←──────────│ Redis GEOSEARCH              │
+  │ - Send trip offers   │           │ All 5M drivers: 250MB        │
+  │ - Handle accept/     │           └─────────────────────────────┘
+  │   reject/timeout     │
+  └───┬──────────────────┘
+      │
+  ┌───▼──────────────────┐  ┌──────────────────────────────────────┐
+  │ Trip DB              │  │ Pricing / Surge Service               │
+  │ (PostgreSQL per      │  │ - Dynamic pricing based on            │
+  │  region, sharded)    │  │   supply/demand ratio                 │
+  └──────────────────────┘  └──────────────────────────────────────┘
+
+
+5. GEOSPATIAL DRIVER LOCATION — DEEP DIVE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+KEY REQUIREMENT: Given a lat/lng point, find all available drivers within radius R
+
+OPTION 1: SQL + PostGIS (GeoDB query):
+  SELECT driver_id, distance FROM drivers
+  WHERE ST_DWithin(location, ST_Point(-122.42, 37.77), 5000)
+  AND status = 'available'
+  ORDER BY distance LIMIT 10;
+  
+  Index: CREATE INDEX ON drivers USING GIST(location);
+  
+  Limitation: 1.25M updates/second → too many writes for PostgreSQL
+  Use for: Historical trip data, not real-time driver positions
+
+OPTION 2: REDIS GEOSEARCH (Recommended for real-time)
+  Redis Geo: Each driver is stored with lat/lng as a geohash
+  
+  // Update driver location (every 4 seconds)
+  GEOADD drivers -122.4194 37.7749 "driver-123"
+  
+  // Find drivers within 5km of pickup point
+  GEOSEARCH drivers FROMLONLAT -122.4100 37.7850
+                    BYRADIUS 5 km
+                    ASC LIMIT 10
+  
+  Pros:
+    - Very fast updates (O(log N) insert)
+    - Fast radius query (O(N+log M) where M is result count)
+    - 5M drivers at 50 bytes = 250MB — trivially fits in Redis
+    - Redis handles 1M+ operations/second
+  
+  Redis Geo internals:
+    - Encodes lat/lng as 52-bit geohash
+    - Stored in a sorted set (member = driver_id, score = geohash)
+    - Radius search: convert to geohash range + lookup
+
+OPTION 3: GEOHASH GRID (alternative distributed approach):
+  Divide world into cells (geohash precision 5 = 5km × 5km cells)
+  Each driver registers in their current cell
+  Geohash for (-122.41, 37.77) = "9q8yy" (precision 5)
+  
+  To find nearby drivers: query current cell + 8 adjacent cells
+  
+  Cell management in Redis:
+    SADD geo:9q8yy driver-123  // driver joins cell
+    SREM geo:9q8yy driver-123  // driver leaves cell (moves)
+  
+  Pros: Easily sharded (different Redis instances per region)
+  Cons: More complex cell boundary handling
+
+
+6. TRIP MATCHING — STATE MACHINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TRIP STATES:
+  REQUESTED → SEARCHING → DRIVER_ASSIGNED → DRIVER_EN_ROUTE
+  → DRIVER_ARRIVED → IN_PROGRESS → COMPLETED
+  Alternative: REQUESTED → CANCELLED (rider cancels)
+               DRIVER_ASSIGNED → DRIVER_CANCELLED (driver cancels before pickup)
+
+MATCHING ALGORITHM:
+  When rider requests trip:
+    1. Calculate fare estimate (call Pricing Service)
+    2. Create trip in DB (status: SEARCHING)
+    3. Query Redis Geo: find available drivers within 5km, sorted by distance
+    4. Offer trip to closest driver (push notification + WebSocket)
+    5. 15-second timeout per driver
+    6. Driver accepts → assign trip, notify rider
+    7. Driver rejects / timeout → offer to next driver
+    8. No drivers in 5km radius → expand to 8km, repeat
+    9. After 60 seconds: "No drivers available" → cancel
+
+DRIVER AVAILABILITY STATE:
+  Redis: SET driver:{driver_id}:status "available" EX 60  (TTL refreshed on heartbeat)
+  If driver app dies: status expires → driver considered offline (no false offers)
+
+TRIP OFFER DELIVERY:
+  Driver is on a persistent WebSocket connection to Driver Connection Service
+  Trip offer pushed via WebSocket (immediate delivery)
+  Fallback: Firebase push notification if WebSocket disconnected
+
+DRIVER STATE MACHINE:
+  OFFLINE → AVAILABLE (driver goes online, starts accepting rides)
+  AVAILABLE → EN_ROUTE (accepted a trip, heading to pickup)
+  EN_ROUTE → ON_TRIP (picked up rider, in progress)
+  ON_TRIP → AVAILABLE (trip completed, ready for next trip)
+
+
+7. SURGE PRICING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DEFINITION: Dynamic fare multiplier when demand exceeds supply
+
+CALCULATION:
+  Surge Multiplier = f(demand / supply) per geographic zone
+  
+  Zone: geohash cell (5km × 5km)
+  Every 1-2 minutes:
+    demand = trip requests in zone in last 5 minutes
+    supply = available drivers in zone
+    surge = demand / supply (smoothed, capped at 8×)
+    
+    if demand/supply > 2: surge = 1.5×
+    if demand/supply > 4: surge = 2.0×
+    if demand/supply > 8: surge = 3.0×
+
+IMPLEMENTATION:
+  Kafka topic "trip-requests" + "driver-location-updates"
+  Flink streaming job: compute supply/demand ratio per zone every 60 seconds
+  Publish surge multiplier to Redis: SET surge:{geohash} 1.5 EX 120
+
+UBER HEAT MAP:
+  Client app fetches surge zones: GET /api/v1/surge-map?lat=...&lng=...
+  Returns: list of geohash zones + multipliers
+  Client renders the heat map visualization
+
+
+8. REAL-TIME LOCATION TRACKING (RIDER'S VIEW)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+After driver assignment:
+  1. Driver app sends GPS update every 4 seconds to Driver Location Service
+  2. Location Service publishes to Kafka topic "driver-locations"
+  3. Trip Service consumes driver location for assigned trips
+  4. Trip Service pushes update to Rider via WebSocket
+  
+  Rider sees: Driver's car icon moving on the map in real time
+
+REDUCING BATTERY USAGE (Mobile optimization):
+  Before driver is close (> 2km): Update every 10 seconds
+  Driver nearby (< 2km): Update every 4 seconds
+  Driver arrived: Update every 1 second
+  Server-side: calculate distance, tell driver app the update frequency
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWER — "Walk through Uber's ride matching"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"The hardest problem is efficiently finding nearby available drivers.
+5M drivers sending GPS updates every 4 seconds = 1.25M writes/second.
+
+I store all current driver locations in Redis using the GEOADD command.
+Redis Geo encodes lat/lng as a 52-bit geohash in a sorted set.
+GEOSEARCH finds all drivers within 5km in O(log N) — and all 5M drivers
+fit in just 250MB of Redis RAM.
+
+When a rider requests a trip:
+1. Redis Geo query finds nearby available drivers, sorted by distance
+2. We offer the trip to the closest driver via WebSocket push
+3. 15-second accept timeout, then offer to the next driver
+4. On accept: update trip status, notify rider, lock driver as busy
+
+Trip state is managed in PostgreSQL (ACID required — concurrent accepts
+could double-assign a driver without proper locking).
+
+For real-time tracking after assignment: driver GPS flows through Kafka,
+consumed by the Trip Service which pushes location updates to the rider
+via WebSocket every 4 seconds.
+
+Surge pricing: a Flink streaming job computes demand/supply ratio per
+geohash cell every 60 seconds, publishing multipliers to Redis for fast
+lookup during fare calculation."

@@ -1,0 +1,417 @@
+================================================================
+AXIOS INTERCEPTORS — IN-DEPTH GUIDE
+================================================================
+
+Interceptors are middleware for HTTP requests and responses.
+They run for every request/response that passes through an Axios instance,
+making them the perfect place for cross-cutting concerns.
+
+================================================================
+1. INTERCEPTOR BASICS
+================================================================
+
+  // REQUEST interceptor runs BEFORE the request is sent
+  apiClient.interceptors.request.use(
+    (config) => {
+      // Modify config here (add headers, log, etc.)
+      return config;          // MUST return config
+    },
+    (error) => {
+      // Handles errors in the request SETUP phase
+      return Promise.reject(error);
+    }
+  );
+
+  // RESPONSE interceptor runs AFTER a response is received
+  apiClient.interceptors.response.use(
+    (response) => {
+      // Handles 2xx responses
+      return response;         // MUST return response
+    },
+    (error) => {
+      // Handles errors (4xx, 5xx, network errors)
+      return Promise.reject(error);  // propagate error
+    }
+  );
+
+EXECUTION ORDER:
+  Request Interceptors: LIFO (last added = first executed)
+  Response Interceptors: FIFO (first added = first executed)
+
+================================================================
+2. REQUEST INTERCEPTOR — ADD AUTH TOKEN
+================================================================
+
+The most common use case: attach the JWT to every outgoing request.
+
+  import { getAccessToken } from '../services/authService';
+
+  apiClient.interceptors.request.use(
+    (config) => {
+      const token = getAccessToken(); // read from memory/localStorage
+      if (token) {
+        config.headers.Authorization = `Bearer ${token}`;
+      }
+      return config;
+    },
+    (error) => Promise.reject(error)
+  );
+
+Where is the token stored?
+  - Memory (most secure): store in a module-level variable or Zustand store
+  - localStorage (less secure, XSS risk): localStorage.getItem('token')
+  - httpOnly Cookie: token IS NOT accessible from JS — backend sets it;
+    use withCredentials: true instead of a header
+
+================================================================
+3. REQUEST INTERCEPTOR — LOGGING
+================================================================
+
+  apiClient.interceptors.request.use(
+    (config) => {
+      if (import.meta.env.DEV) {
+        console.group(`🔵 Request: ${config.method?.toUpperCase()} ${config.url}`);
+        console.log('Headers:', config.headers);
+        console.log('Params:', config.params);
+        console.log('Data:', config.data);
+        console.groupEnd();
+      }
+      return config;
+    }
+  );
+
+================================================================
+4. REQUEST INTERCEPTOR — ADD REQUEST ID (TRACING)
+================================================================
+
+  import { v4 as uuidv4 } from 'uuid';
+
+  apiClient.interceptors.request.use((config) => {
+    config.headers['X-Request-ID'] = uuidv4();
+    config.headers['X-Client-Version'] = '2.1.0';
+    config.metadata = { startTime: Date.now() };
+    return config;
+  });
+
+  // Match with response interceptor for latency logging
+  apiClient.interceptors.response.use((response) => {
+    const duration = Date.now() - response.config.metadata?.startTime;
+    console.log(`Request took ${duration}ms`);
+    return response;
+  });
+
+================================================================
+5. RESPONSE INTERCEPTOR — TOKEN REFRESH (FULL IMPLEMENTATION)
+================================================================
+
+This is the most complex and important interceptor. It handles
+the case where an access token expires mid-session:
+  1. Request returns 401 Unauthorized
+  2. Interceptor catches the 401
+  3. Calls the refresh endpoint with the refresh token
+  4. Gets a new access token
+  5. Retries the original request with the new token
+  6. If refresh also fails → log out
+
+CHALLENGE: Multiple simultaneous requests may all return 401.
+The fix: a "request queue" that holds failed requests while
+refreshing, then replays them all.
+
+  // src/api/axiosConfig.js
+  import axios from 'axios';
+  import {
+    getAccessToken,
+    getRefreshToken,
+    setTokens,
+    clearTokens,
+  } from '../services/tokenService';
+
+  const apiClient = axios.create({
+    baseURL: import.meta.env.VITE_API_BASE_URL,
+    timeout: 10_000,
+  });
+
+  // State for handling concurrent 401s
+  let isRefreshing = false;
+  let failedQueue = []; // holds { resolve, reject } for each queued request
+
+  const processQueue = (error, token = null) => {
+    failedQueue.forEach((promise) => {
+      if (error) {
+        promise.reject(error);
+      } else {
+        promise.resolve(token);
+      }
+    });
+    failedQueue = [];
+  };
+
+  // REQUEST interceptor — attach token
+  apiClient.interceptors.request.use((config) => {
+    const token = getAccessToken();
+    if (token) config.headers.Authorization = `Bearer ${token}`;
+    return config;
+  });
+
+  // RESPONSE interceptor — handle 401 with refresh
+  apiClient.interceptors.response.use(
+    (response) => response, // pass through successes
+    async (error) => {
+      const originalRequest = error.config;
+
+      // Only handle 401, and avoid infinite loop with _retry flag
+      if (error.response?.status !== 401 || originalRequest._retry) {
+        return Promise.reject(error);
+      }
+
+      // If already refreshing, queue this request
+      if (isRefreshing) {
+        return new Promise((resolve, reject) => {
+          failedQueue.push({ resolve, reject });
+        }).then((newToken) => {
+          originalRequest.headers.Authorization = `Bearer ${newToken}`;
+          return apiClient(originalRequest);
+        }).catch((err) => Promise.reject(err));
+      }
+
+      originalRequest._retry = true;
+      isRefreshing = true;
+
+      try {
+        const refreshToken = getRefreshToken();
+        const response = await axios.post(
+          `${import.meta.env.VITE_API_BASE_URL}/auth/refresh`,
+          { refreshToken }
+        );
+
+        const { accessToken, refreshToken: newRefreshToken } = response.data;
+        setTokens(accessToken, newRefreshToken);
+
+        // Retry all queued requests with new token
+        processQueue(null, accessToken);
+
+        // Retry the original request
+        originalRequest.headers.Authorization = `Bearer ${accessToken}`;
+        return apiClient(originalRequest);
+
+      } catch (refreshError) {
+        processQueue(refreshError, null);
+        clearTokens();
+        window.location.href = '/login'; // force logout
+        return Promise.reject(refreshError);
+      } finally {
+        isRefreshing = false;
+      }
+    }
+  );
+
+  export default apiClient;
+
+TOKEN SERVICE: src/services/tokenService.js
+  // Store tokens in memory for security (not localStorage)
+  let accessToken = null;
+  let refreshToken = null;
+
+  export const getAccessToken = () => accessToken;
+  export const getRefreshToken = () => refreshToken;
+  export const setTokens = (at, rt) => {
+    accessToken = at;
+    refreshToken = rt;
+  };
+  export const clearTokens = () => {
+    accessToken = null;
+    refreshToken = null;
+  };
+
+================================================================
+6. RESPONSE INTERCEPTOR — GLOBAL ERROR HANDLING
+================================================================
+
+  import toast from 'react-hot-toast';
+
+  apiClient.interceptors.response.use(
+    (response) => response,
+    (error) => {
+      if (!error.response) {
+        // Network error (no internet, server down)
+        toast.error('Network error. Please check your connection.');
+        return Promise.reject(error);
+      }
+
+      const { status, data } = error.response;
+
+      switch (status) {
+        case 400:
+          toast.error(data?.message || 'Invalid request. Please check your input.');
+          break;
+        case 401:
+          // Handled by token refresh interceptor (if present)
+          // Otherwise:
+          toast.error('Session expired. Please log in again.');
+          break;
+        case 403:
+          toast.error('You do not have permission to perform this action.');
+          break;
+        case 404:
+          toast.error('The requested resource was not found.');
+          break;
+        case 422:
+          // Validation errors from backend
+          const messages = data?.errors?.join(', ') || data?.message;
+          toast.error(`Validation error: ${messages}`);
+          break;
+        case 429:
+          toast.error('Too many requests. Please slow down.');
+          break;
+        case 500:
+          toast.error('Server error. Please try again later.');
+          break;
+        case 503:
+          toast.error('Service unavailable. Please try again.');
+          break;
+        default:
+          toast.error(`Unexpected error: ${status}`);
+      }
+
+      return Promise.reject(error);
+    }
+  );
+
+================================================================
+7. RESPONSE INTERCEPTOR — DATA TRANSFORMATION
+================================================================
+
+Automatically transform snake_case responses to camelCase:
+
+  import humps from 'humps'; // npm install humps
+
+  apiClient.interceptors.response.use((response) => {
+    if (
+      response.data &&
+      response.headers['content-type']?.includes('application/json')
+    ) {
+      response.data = humps.camelizeKeys(response.data);
+    }
+    return response;
+  });
+
+  apiClient.interceptors.request.use((config) => {
+    if (config.data) {
+      config.data = humps.decamelizeKeys(config.data);
+    }
+    return config;
+  });
+
+================================================================
+8. REMOVING AN INTERCEPTOR
+================================================================
+
+  const requestInterceptorId = apiClient.interceptors.request.use(
+    (config) => { ... }
+  );
+
+  // Later, remove it:
+  apiClient.interceptors.request.eject(requestInterceptorId);
+
+Useful in tests where you want to clear interceptors between tests.
+
+================================================================
+9. MULTIPLE INTERCEPTORS (ORDER MATTERS)
+================================================================
+
+  // Added first
+  apiClient.interceptors.request.use((config) => {
+    console.log('Interceptor 1');
+    return config;
+  });
+
+  // Added second
+  apiClient.interceptors.request.use((config) => {
+    console.log('Interceptor 2');
+    return config;
+  });
+
+  // Request execution order: Interceptor 2 → Interceptor 1 → Request
+  // (LIFO for request interceptors)
+
+  // Response interceptor 1 (first added)
+  apiClient.interceptors.response.use((res) => {
+    console.log('Response interceptor 1');
+    return res;
+  });
+
+  // Response interceptor 2 (second added)
+  apiClient.interceptors.response.use((res) => {
+    console.log('Response interceptor 2');
+    return res;
+  });
+
+  // Response execution order: interceptor 1 → interceptor 2
+  // (FIFO for response interceptors)
+
+================================================================
+10. TESTING INTERCEPTORS
+================================================================
+
+Use axios-mock-adapter to unit test interceptors:
+
+  import axios from 'axios';
+  import MockAdapter from 'axios-mock-adapter';
+  import apiClient from '../api/axiosConfig';
+
+  const mock = new MockAdapter(apiClient);
+
+  describe('auth interceptor', () => {
+    it('adds Authorization header', async () => {
+      mock.onGet('/test').reply(config => {
+        expect(config.headers.Authorization).toBe('Bearer test-token');
+        return [200, { data: 'ok' }];
+      });
+
+      setTokens('test-token', null);
+      await apiClient.get('/test');
+    });
+
+    it('refreshes token on 401', async () => {
+      mock.onGet('/protected').replyOnce(401);
+      mock.onPost('/auth/refresh').reply(200, { accessToken: 'new-token' });
+      mock.onGet('/protected').reply(200, { data: 'success' });
+
+      const result = await apiClient.get('/protected');
+      expect(result.data).toEqual({ data: 'success' });
+    });
+  });
+
+================================================================
+11. INTERVIEW QUESTIONS
+================================================================
+
+Q: What are Axios interceptors and what are they used for?
+A: Interceptors are middleware that run for every request or response
+   through an Axios instance. Request interceptors typically add auth
+   headers, log requests, or add tracing IDs. Response interceptors
+   handle global error responses (401→refresh, toast notifications),
+   transform data, and log latency.
+
+Q: How do you implement silent token refresh in Axios?
+A: Add a response interceptor that checks for 401. On first 401, set
+   a flag (isRefreshing=true), call the refresh endpoint, then replay
+   the original request with the new token. Queue any concurrent
+   401s using a promise array (failedQueue), process all after refresh.
+
+Q: What's the difference between adding a header in the request
+   interceptor vs in axios.defaults?
+A: axios.defaults applies globally to all Axios instances.
+   An interceptor on a specific instance applies only to that instance's
+   requests. The interceptor approach is preferred because it reads
+   the token dynamically at request time (so it gets the latest token
+   after refresh), whereas a default is set once at initialization.
+
+Q: How do you remove an interceptor?
+A: interceptors.request.use() returns an ID. Pass that ID to
+   interceptors.request.eject(id) to remove it.
+
+Q: Can you have multiple response interceptors?
+A: Yes. Multiple interceptors can be added and run in FIFO order.
+   Each must return the response or a promise. If one throws,
+   the error handler of the next interceptor in chain runs.

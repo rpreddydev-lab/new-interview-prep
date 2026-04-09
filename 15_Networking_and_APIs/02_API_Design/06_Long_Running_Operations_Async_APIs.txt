@@ -1,0 +1,467 @@
+================================================================================
+LONG-RUNNING OPERATIONS & ASYNC APIs — IN DEPTH
+================================================================================
+
+THE PROBLEM WITH SYNCHRONOUS HTTP
+-----------------------------------
+HTTP is synchronous by default: client sends request, waits, gets response.
+This breaks down for operations that take > 30 seconds (gateway timeouts),
+unpredictable duration (AI model inference, report generation), or that need
+to fan out to multiple services and aggregate results.
+
+Solutions:
+  1. 202 Accepted + polling
+  2. Callbacks / Webhooks
+  3. Server-Sent Events (SSE)
+  4. WebSockets (bidirectional)
+  5. Message queues (Kafka, SQS, RabbitMQ)
+  6. Event-driven async APIs (AsyncAPI spec)
+
+================================================================================
+1. 202 ACCEPTED + POLLING PATTERN
+================================================================================
+
+FLOW:
+  Client → POST /reports             → 202 Accepted + job ID + status URL
+  Client → GET  /jobs/{id}/status    → 200 (status: PROCESSING, progress: 45%)
+  Client → GET  /jobs/{id}/status    → 200 (status: COMPLETED, resultUrl: ...)
+  Client → GET  /jobs/{id}/result    → 200 + actual result
+
+INITIAL RESPONSE (202):
+  HTTP/1.1 202 Accepted
+  Content-Type: application/json
+  Location: /jobs/job-abc123
+  Retry-After: 5            ← hint: poll after 5 seconds
+
+  {
+    "jobId": "job-abc123",
+    "status": "PENDING",
+    "statusUrl": "https://api.example.com/jobs/job-abc123",
+    "estimatedDurationSeconds": 30
+  }
+
+STATUS RESPONSE (while processing):
+  {
+    "jobId": "job-abc123",
+    "status": "PROCESSING",
+    "progress": 45,
+    "createdAt": "2026-04-08T10:00:00Z",
+    "updatedAt": "2026-04-08T10:00:15Z",
+    "estimatedCompletionAt": "2026-04-08T10:01:00Z"
+  }
+
+COMPLETED RESPONSE:
+  {
+    "jobId": "job-abc123",
+    "status": "COMPLETED",
+    "progress": 100,
+    "result": {
+      "downloadUrl": "https://cdn.example.com/reports/report-abc123.pdf",
+      "expiresAt": "2026-04-09T10:00:00Z"
+    },
+    "completedAt": "2026-04-08T10:01:05Z"
+  }
+
+FAILED RESPONSE:
+  {
+    "jobId": "job-abc123",
+    "status": "FAILED",
+    "error": {
+      "code": "REPORT_GENERATION_FAILED",
+      "message": "Insufficient data for the selected date range"
+    }
+  }
+
+JOB STATUS ENUM:
+  PENDING   → Queued, not started
+  PROCESSING → Being executed
+  COMPLETED → Success, result available
+  FAILED    → Error, check error field
+  CANCELLED → Cancelled by user or system
+
+================================================================================
+2. SPRING BOOT — 202 PATTERN WITH @ASYNC
+================================================================================
+
+// Job entity
+@Entity
+public class Job {
+    @Id private String id;
+    @Enumerated(EnumType.STRING)
+    private JobStatus status;
+    private int progress;
+    private String resultUrl;
+    private String errorMessage;
+    private LocalDateTime createdAt;
+    private LocalDateTime completedAt;
+    
+    public enum JobStatus { PENDING, PROCESSING, COMPLETED, FAILED, CANCELLED }
+}
+
+// Job service
+@Service
+@Transactional
+public class ReportService {
+
+    private final JobRepository jobRepository;
+    private final S3Service s3Service;
+
+    public String submitReportJob(ReportRequest request) {
+        String jobId = UUID.randomUUID().toString();
+        Job job = new Job(jobId, JobStatus.PENDING, LocalDateTime.now());
+        jobRepository.save(job);
+        
+        // Fire and forget — @Async runs on a thread pool
+        generateReportAsync(jobId, request);
+        
+        return jobId;
+    }
+
+    @Async("reportTaskExecutor")    // named executor
+    public void generateReportAsync(String jobId, ReportRequest request) {
+        jobRepository.updateStatus(jobId, JobStatus.PROCESSING);
+        try {
+            // Long-running work...
+            byte[] reportBytes = heavyReportGenerator.generate(request);
+            
+            // Update progress periodically
+            jobRepository.updateProgress(jobId, 80);
+            
+            String url = s3Service.upload(jobId, reportBytes);
+            jobRepository.markCompleted(jobId, url);
+        } catch (Exception e) {
+            jobRepository.markFailed(jobId, e.getMessage());
+        }
+    }
+}
+
+// Controller
+@RestController
+@RequestMapping("/v1/reports")
+public class ReportController {
+
+    private final ReportService reportService;
+    private final JobRepository jobRepository;
+
+    @PostMapping
+    public ResponseEntity<JobSubmittedResponse> submitReport(
+            @Valid @RequestBody ReportRequest request) {
+        String jobId = reportService.submitReportJob(request);
+        URI statusUri = URI.create("/v1/jobs/" + jobId);
+        return ResponseEntity
+            .accepted()                         // 202
+            .location(statusUri)
+            .header("Retry-After", "5")
+            .body(new JobSubmittedResponse(jobId, statusUri.toString()));
+    }
+}
+
+@RestController
+@RequestMapping("/v1/jobs")
+public class JobController {
+
+    @GetMapping("/{jobId}")
+    public ResponseEntity<JobStatusResponse> getJobStatus(@PathVariable String jobId) {
+        Job job = jobRepository.findById(jobId)
+            .orElseThrow(() -> new NotFoundException("Job not found: " + jobId));
+        return ResponseEntity.ok(JobStatusResponse.from(job));
+    }
+
+    @DeleteMapping("/{jobId}")
+    public ResponseEntity<Void> cancelJob(@PathVariable String jobId) {
+        jobService.cancel(jobId);
+        return ResponseEntity.noContent().build();
+    }
+}
+
+// Thread pool configuration
+@Configuration
+@EnableAsync
+public class AsyncConfig {
+
+    @Bean("reportTaskExecutor")
+    public Executor reportTaskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(5);
+        executor.setMaxPoolSize(20);
+        executor.setQueueCapacity(100);
+        executor.setThreadNamePrefix("report-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.initialize();
+        return executor;
+    }
+}
+
+================================================================================
+3. WEBHOOKS
+================================================================================
+
+CONCEPT:
+  Instead of the client polling, the server calls the client when done.
+  Client registers a callback URL; server POSTs a notification to that URL.
+
+FLOW:
+  Client → POST /subscriptions  { callbackUrl: "https://client.app/webhooks" }
+  Server → (async work happens)
+  Server → POST https://client.app/webhooks  { event: "report.completed", ... }
+  Client → returns 200 OK to acknowledge
+
+WEBHOOK PAYLOAD DESIGN:
+  {
+    "eventId": "evt-xyz789",          // idempotency key
+    "eventType": "report.completed",  // dot-notation event type
+    "apiVersion": "2026-04-08",       // spec version for payload shape
+    "timestamp": "2026-04-08T10:05:00Z",
+    "data": {
+      "reportId": "report-abc123",
+      "downloadUrl": "https://cdn.example.com/reports/report-abc123.pdf",
+      "expiresAt": "2026-04-09T10:05:00Z"
+    }
+  }
+
+WEBHOOK SECURITY:
+  Sign payloads with HMAC-SHA256 using a shared secret:
+  
+  // Sender signs:
+  String payload = objectMapper.writeValueAsString(webhookEvent);
+  String signature = "sha256=" + hmacSha256(payload, webhookSecret);
+  httpClient.post(callbackUrl)
+      .header("X-Webhook-Signature", signature)
+      .body(payload)
+      .execute();
+
+  // Receiver verifies:
+  @PostMapping("/webhooks")
+  public ResponseEntity<Void> handleWebhook(
+          @RequestHeader("X-Webhook-Signature") String signature,
+          @RequestBody String rawBody) {
+      String expected = "sha256=" + hmacSha256(rawBody, webhookSecret);
+      if (!MessageDigest.isEqual(
+              expected.getBytes(), signature.getBytes())) {
+          return ResponseEntity.status(401).build();
+      }
+      // Process event (idempotently — check eventId)
+      webhookProcessor.process(objectMapper.readValue(rawBody, WebhookEvent.class));
+      return ResponseEntity.ok().build();
+  }
+
+  // ALWAYS: check eventId to handle duplicate deliveries (at-least-once delivery)
+
+WEBHOOK RETRY LOGIC (producer side):
+  - Retry on non-2xx with exponential backoff
+  - Retry on timeout (set short timeout: 5-10s)
+  - After N failures: mark subscription as disabled; alert user
+  
+  Typical strategy: retry immediately, then 1min, 5min, 30min, 2h, 24h
+  Store delivery attempts and status
+
+================================================================================
+4. SERVER-SENT EVENTS FOR ASYNC STATUS UPDATES
+================================================================================
+
+Instead of polling, client subscribes to a stream of status events:
+
+  // Client (EventSource API in browser or HttpClient in Java)
+  EventSource es = new EventSource("https://api.example.com/v1/jobs/job-abc123/stream");
+  es.onmessage = (event) => console.log(JSON.parse(event.data));
+
+  // Spring Boot SSE endpoint
+  @GetMapping(value = "/v1/jobs/{jobId}/stream",
+              produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+  public SseEmitter streamJobStatus(@PathVariable String jobId) {
+      SseEmitter emitter = new SseEmitter(60_000L); // 60s timeout
+      
+      Executors.newSingleThreadExecutor().submit(() -> {
+          try {
+              while (true) {
+                  Job job = jobRepository.findById(jobId).orElseThrow();
+                  emitter.send(SseEmitter.event()
+                      .id(String.valueOf(System.currentTimeMillis()))
+                      .name("status")
+                      .data(JobStatusResponse.from(job)));
+                  
+                  if (job.isTerminal()) {  // COMPLETED or FAILED
+                      emitter.complete();
+                      break;
+                  }
+                  Thread.sleep(2000);     // poll DB every 2s
+              }
+          } catch (Exception e) {
+              emitter.completeWithError(e);
+          }
+      });
+      
+      return emitter;
+  }
+
+SSE is better than polling for:
+  - Real-time progress updates
+  - Multiple simultaneous job statuses
+  - Reducing load from many polling clients
+
+================================================================================
+5. SPRING WEBFLUX — REACTIVE ASYNC APIS
+================================================================================
+
+For truly non-blocking async processing:
+
+  @RestController
+  @RequestMapping("/v1/reports")
+  public class ReactiveReportController {
+
+      private final ReactiveReportService reportService;
+
+      @PostMapping
+      public Mono<ResponseEntity<JobSubmittedResponse>> submitReport(
+              @RequestBody Mono<ReportRequest> requestMono) {
+          return requestMono
+              .flatMap(reportService::submitJob)
+              .map(jobId -> ResponseEntity
+                  .accepted()
+                  .location(URI.create("/v1/jobs/" + jobId))
+                  .body(new JobSubmittedResponse(jobId)));
+      }
+
+      // Stream results as Flux (SSE)
+      @GetMapping(value = "/{jobId}/stream",
+                  produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+      public Flux<ServerSentEvent<JobStatusResponse>> streamStatus(
+              @PathVariable String jobId) {
+          return Flux.interval(Duration.ofSeconds(2))
+              .flatMap(tick -> reportService.getStatus(jobId))
+              .map(status -> ServerSentEvent.<JobStatusResponse>builder()
+                  .id(String.valueOf(System.currentTimeMillis()))
+                  .event("status")
+                  .data(status)
+                  .build())
+              .takeUntil(sse -> sse.data() != null && sse.data().isTerminal());
+      }
+  }
+
+================================================================================
+6. ASYNC APIs WITH MESSAGE QUEUES
+================================================================================
+
+KAFKA-BASED ASYNC WORKFLOW:
+  
+  Client → POST /v1/reports  → 202 Accepted + jobId
+  Controller → produce message to Kafka topic: report-requests
+  ReportWorker consumes from Kafka → processes → publishes to report-results
+  ResultConsumer stores result in DB → notifies via webhook or SSE
+
+  // Producer (REST controller)
+  @PostMapping
+  public ResponseEntity<JobSubmittedResponse> submitReport(
+          @RequestBody ReportRequest request) {
+      String jobId = UUID.randomUUID().toString();
+      kafkaTemplate.send("report-requests", jobId,
+          new ReportJobMessage(jobId, request));
+      jobRepository.save(new Job(jobId, JobStatus.PENDING));
+      return ResponseEntity.accepted()
+          .location(URI.create("/v1/jobs/" + jobId))
+          .body(new JobSubmittedResponse(jobId));
+  }
+
+  // Consumer (background worker service)
+  @KafkaListener(topics = "report-requests", groupId = "report-workers")
+  public void processReport(ReportJobMessage message) {
+      String jobId = message.getJobId();
+      jobRepository.updateStatus(jobId, JobStatus.PROCESSING);
+      try {
+          byte[] result = heavyGenerator.generate(message.getRequest());
+          String url = s3Service.upload(jobId, result);
+          jobRepository.markCompleted(jobId, url);
+          // Trigger webhook notification
+          webhookService.notifyAll(jobId, "report.completed");
+      } catch (Exception e) {
+          jobRepository.markFailed(jobId, e.getMessage());
+      }
+  }
+
+================================================================================
+7. ASYNCAPI SPECIFICATION
+================================================================================
+
+AsyncAPI is the equivalent of OpenAPI but for event-driven/async APIs.
+Describes Kafka topics, WebSocket channels, AMQP queues etc.
+
+asyncapi: "2.6.0"
+info:
+  title: "Report Events API"
+  version: "1.0.0"
+
+channels:
+  report-requests:
+    description: "Channel for incoming report generation requests"
+    publish:
+      operationId: "submitReportJob"
+      message:
+        $ref: "#/components/messages/ReportRequest"
+  
+  report-results:
+    description: "Channel for completed report notifications"
+    subscribe:
+      operationId: "receiveReportResult"
+      message:
+        $ref: "#/components/messages/ReportResult"
+
+================================================================================
+8. PATTERNS COMPARISON
+================================================================================
+
+Pattern         | Best For                      | Pros                   | Cons
+----------------|-------------------------------|------------------------|---------------------------
+Polling         | Simple, stateless             | Easy; works everywhere | Wasteful network calls
+202 + Location  | Multi-step job tracking       | RESTful; standard      | Client must manage polling
+Webhooks        | Event notifications           | No polling; efficient  | Client needs public URL
+SSE             | Real-time updates; streaming  | Simple; HTTP-native    | One-way; no binary
+WebSockets      | Bidirectional real-time       | Full duplex            | Complex; stateful
+Message Queue   | Decoupled, at-scale async     | Durable; scalable      | Infrastructure overhead
+
+================================================================================
+9. INTERVIEW QUESTIONS — ASYNC APIs
+================================================================================
+
+Q1: What HTTP status code should you return for a long-running operation?
+    202 Accepted — indicates the request was received and will be processed
+    asynchronously. The response body should include a job ID and a URL
+    (also in Location header) for polling the status. Include Retry-After
+    to hint how long to wait before polling.
+
+Q2: What is the difference between webhooks and polling?
+    Polling: client repeatedly calls server on an interval to check status.
+    Simple but wastes network resources and introduces latency proportional
+    to interval. Webhooks: server calls client when event occurs.
+    More efficient, real-time, but requires the client to have a public
+    endpoint, handle retries, and verify webhook signatures for security.
+
+Q3: How do you handle duplicate webhook deliveries?
+    Use an idempotency key — the eventId field in the payload. On receipt,
+    check if this eventId has been processed before (using a DB or Redis set).
+    If yes, return 200 but skip processing. This handles at-least-once delivery
+    semantics. ALWAYS make webhook handlers idempotent.
+
+Q4: How do you secure webhook endpoints?
+    1. HMAC-SHA256 signature verification: sender signs payload with shared
+       secret; receiver recomputes and compares. Use constant-time comparison
+       to prevent timing attacks. 2. Validate Content-Type. 3. Use short
+       timeout and return 200 quickly, then process async. 4. IP allowlisting
+       if the sending service has fixed IPs. 5. TLS always.
+
+Q5: When would you choose SSE over webhooks?
+    SSE when: the client is a browser (native EventSource support), you need
+    real-time streaming updates to a connected client (live dashboard, progress
+    bar), and the client can maintain an open HTTP connection. Webhooks when:
+    the client is a server that needs push notifications asynchronously without
+    maintaining an open connection, or when the event should trigger background
+    processing on the client side.
+
+Q6: What is the difference between @Async in Spring and reactive (WebFlux) async?
+    @Async uses thread-per-request on a thread pool — the calling thread is freed
+    but a worker thread is blocked. Good for simple fire-and-forget. WebFlux
+    (Reactor) uses an event loop with non-blocking I/O — no threads are blocked
+    waiting; work propagates through reactive operators. WebFlux handles more
+    concurrent requests with fewer threads (better for high-throughput, I/O-heavy
+    workloads) but has steeper learning curve and requires reactive drivers.
+
+================================================================================

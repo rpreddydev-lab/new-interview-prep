@@ -1,0 +1,1074 @@
+================================================================================
+BLUE-GREEN vs CANARY vs ROLLING — DEEP DIVE INTERVIEW GUIDE
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Overview and Context
+2. Blue-Green Deployment — Technical Deep Dive
+3. Canary Deployment — Technical Deep Dive
+4. Rolling Deployment — Technical Deep Dive
+5. Progressive Delivery (Beyond Basic Canary)
+6. Implementation on AWS
+7. Implementation on Kubernetes with Argo Rollouts
+8. Implementation with Istio Service Mesh
+9. Real-World Examples: Amazon, Netflix, Etsy
+10. Choosing the Right Strategy
+11. Common Interview Questions & Answers
+12. Quick Reference Cheat Sheet
+
+================================================================================
+1. OVERVIEW AND CONTEXT
+================================================================================
+
+Why These Three Strategies Are the "Big Three":
+  These are the three primary strategies used for production deployments
+  in modern cloud-native applications:
+  
+  ROLLING UPDATE:   Default for most platforms. Simple, zero-downtime.
+  BLUE-GREEN:       Maximum safety and fastest rollback. Costs more.
+  CANARY:           Maximum risk reduction. Gradual validation.
+
+The Goal Spectrum:
+  
+  SIMPLICITY ←──────────────────────────────────────────→ SAFETY
+  
+  Recreate → Rolling → Blue-Green → Canary → Progressive Delivery
+
+When Each Is Used in Practice:
+  Most companies use a combination:
+  - Small services: Rolling (simple enough, fast rollback)
+  - Critical services: Blue-Green (instant rollback) or Canary (risk reduction)
+  - Feature releases: Canary with automated analysis
+  - Large migrations: Blue-Green for clean cutover
+  
+  Reality: Many teams start with Rolling, add Blue-Green as they scale,
+  and implement Canary as they build monitoring maturity.
+
+================================================================================
+2. BLUE-GREEN DEPLOYMENT — TECHNICAL DEEP DIVE
+================================================================================
+
+Core Concept:
+  Two identical production environments.
+  Only one is live at any time.
+  Deploy to idle environment → validate → switch traffic.
+
+Full Lifecycle:
+  
+  INITIAL STATE: Blue is live (v1), Green is idle or running old version.
+  
+  STEP 1 — DEPLOY TO GREEN:
+    - Deploy v2 to Green environment
+    - Run automated smoke tests on Green
+    - Green is NOT receiving production traffic
+    - All users still on Blue (v1)
+  
+  STEP 2 — VALIDATE GREEN:
+    - Run functional tests against Green
+    - Performance tests against Green (zero real load)
+    - Security scan of running v2 on Green
+    - QA team accesses Green via internal URL
+  
+  STEP 3 — SWITCH TRAFFIC:
+    - Change load balancer to route traffic to Green
+    - Keep Blue running (for rollback)
+    - Monitor Green for 10-30 minutes (bake time)
+  
+  STEP 4 — CONFIRM OR ROLLBACK:
+    - If Green healthy: SUCCESS. Scale down Blue after bake time.
+    - If Green has issues: Switch LB back to Blue (instant rollback).
+  
+  STEP 5 — CLEANUP:
+    - After confidence in Green, Blue becomes the next "idle" environment
+    - Next deployment goes to Blue (now playing Green's role)
+    - Blue/Green swap roles with each deployment
+
+Traffic Switching Mechanisms:
+
+  1. DNS-LEVEL SWITCH:
+     Change DNS record to point to Green load balancer.
+     Fastest to configure but has DNS TTL propagation delay.
+     
+     Use low TTL (60 seconds) before the switch for faster propagation.
+     
+     Route53 Example:
+     # Before switch (pointing to Blue LB)
+     api.example.com → A Record → blue-lb.us-east-1.elb.amazonaws.com
+     
+     # After switch (pointing to Green LB)
+     api.example.com → A Record → green-lb.us-east-1.elb.amazonaws.com
+  
+  2. LOAD BALANCER TARGET GROUP SWITCH (fastest for AWS ALB):
+     One ALB, two target groups. Change which target group receives traffic.
+     Instant (no DNS propagation), atomic switch.
+     
+     aws elbv2 modify-listener \
+       --listener-arn $LISTENER_ARN \
+       --default-actions Type=forward,TargetGroupArn=$GREEN_TG_ARN
+  
+  3. KUBERNETES SERVICE SELECTOR SWITCH:
+     Service selects pods by label. Change label selector.
+     
+     # Before: Service points to blue pods
+     selector:
+       app: myapp
+       version: blue
+     
+     # After: Change selector to green
+     kubectl patch svc myapp \
+       -p '{"spec":{"selector":{"app":"myapp","version":"green"}}}'
+  
+  4. WEIGHTED TRAFFIC (GRADUAL BLUE-GREEN):
+     Some teams do 80/20 for a few minutes, then 100% Green.
+     Less "atomic" but allows monitoring during transition.
+     
+     # AWS ALB weighted target group
+     aws elbv2 modify-listener --default-actions \
+       '[{
+         "Type": "forward",
+         "ForwardConfig": {
+           "TargetGroups": [
+             {"TargetGroupArn": "'$BLUE_TG_ARN'", "Weight": 80},
+             {"TargetGroupArn": "'$GREEN_TG_ARN'", "Weight": 20}
+           ],
+           "TargetGroupStickinessConfig": {"Enabled": true, "DurationSeconds": 300}
+         }
+       }]'
+
+Blue-Green Database Pattern:
+  
+  The challenge: Both Blue and Green share the same database.
+  If Green made schema changes, rolling back to Blue may be inconsistent.
+  
+  OPTION 1: SHARED DATABASE WITH EXPAND-CONTRACT (most common):
+  - Both Blue and Green use same DB
+  - Schema changes must be backward-compatible (expand-contract)
+  - Rollback is safe as long as we're in expand phase
+  
+  OPTION 2: SEPARATE DATABASE (expensive, complex):
+  - Blue and Green have separate DB instances
+  - Data is replicated (Green gets live data from Blue during test)
+  - After switch: Data written to Green doesn't go back to Blue
+  - Rollback to Blue means data loss of what was written to Green
+  - Used for: Major architecture migrations, not routine releases
+  
+  OPTION 3: READ REPLICA SWITCH:
+  - Read replica can be promoted to primary
+  - Blue writes to primary; Green is tested against promoted replica
+  - Switch: Green's DB replica becomes new primary
+  - Complex, expensive, rarely used in practice
+
+The "V-Switch" Anti-Pattern:
+  Don't switch Blue to Green for ONE deployment, then immediately
+  switch Green back to Blue for the NEXT deployment without a Blue-phase.
+  
+  Correct:
+  Deploy 1: Blue→Green switch → Green is now "live"
+  Deploy 2: Deploy to Blue → Blue-Green switch → Blue is now "live"
+  Deploy 3: Deploy to Green → Green-Blue switch → Green is now "live"
+
+Cost Considerations:
+  - 2× compute costs during deployment (both environments running)
+  - Idle environment can be scaled down to minimal capacity between deploys
+  - Auto-scaling on Cloud: Scale up idle env before deploy, scale down after confirm
+  - For large environments: Cost difference between on-demand and reserved instances
+
+Use Blue-Green When:
+  ✓ Zero-downtime is critical and you need instant rollback capability
+  ✓ You want to validate new version before any user traffic reaches it
+  ✓ Regulatory requirement for validated deployment with documented rollback
+  ✓ Database changes are backward-compatible (or using separate DBs)
+  ✓ Budget for 2× infrastructure (even temporarily)
+  ✓ Switching between monolithic components or stateful services
+
+================================================================================
+3. CANARY DEPLOYMENT — TECHNICAL DEEP DIVE
+================================================================================
+
+Core Concept:
+  Gradually shift a percentage of traffic to the new version.
+  Monitor for errors at each step.
+  Promote (increase %) or rollback (decrease to 0%) based on metrics.
+  
+  Origin of name: Coal miners used to bring canaries into mines.
+  If the canary died, it signaled dangerous gas — miners had time to escape.
+  Similarly, canary users signal a bad deployment before all users are affected.
+
+Traffic Splitting Mechanisms:
+
+  1. REPLICA-BASED (simplest in Kubernetes):
+     Run N canary pods alongside M stable pods.
+     Traffic distributes proportionally by pod count.
+     
+     # 1 canary pod out of 10 = ~10% canary traffic
+     deployment/myapp-stable: 9 replicas (v1)
+     deployment/myapp-canary: 1 replica (v2)
+     # Both deployments use same Service label
+     
+     Problem: Not precise. Traffic is proportional to pod count.
+               If pods have different load, split is uneven.
+  
+  2. NGINX INGRESS CANARY ANNOTATIONS (traffic-percentage based):
+     Configure NGINX ingress to split traffic by exact percentage.
+     
+     # Production ingress (stable)
+     apiVersion: networking.k8s.io/v1
+     kind: Ingress
+     metadata:
+       name: myapp-stable
+     spec:
+       rules:
+       - host: api.example.com
+         http:
+           paths:
+           - path: /
+             backend:
+               service:
+                 name: myapp-stable
+                 port: {number: 80}
+     
+     ---
+     # Canary ingress
+     apiVersion: networking.k8s.io/v1
+     kind: Ingress
+     metadata:
+       name: myapp-canary
+       annotations:
+         nginx.ingress.kubernetes.io/canary: "true"
+         nginx.ingress.kubernetes.io/canary-weight: "10"  # 10% to canary
+     spec:
+       rules:
+       - host: api.example.com
+         http:
+           paths:
+           - path: /
+             backend:
+               service:
+                 name: myapp-canary
+                 port: {number: 80}
+     
+     # Increase canary:
+     kubectl annotate ingress myapp-canary \
+       nginx.ingress.kubernetes.io/canary-weight="25" --overwrite
+  
+  3. ISTIO VIRTUAL SERVICE (most precise, feature-rich):
+     Fine-grained traffic control via service mesh.
+     
+     apiVersion: networking.istio.io/v1alpha3
+     kind: VirtualService
+     metadata:
+       name: myapp
+     spec:
+       hosts:
+       - myapp
+       http:
+       - match:
+         - headers:
+             x-canary: {exact: "true"}  # Header-based canary for testing
+         route:
+         - destination:
+             host: myapp
+             subset: v2
+       - route:                            # Default: 90/10 split
+         - destination:
+             host: myapp
+             subset: v1
+           weight: 90
+         - destination:
+             host: myapp
+             subset: v2
+           weight: 10
+  
+  4. AWS ALB WEIGHTED TARGET GROUPS (covered in blue-green section, applies here too)
+
+Canary Analysis — The Decision Engine:
+
+  Three outcomes at each canary step:
+  ✓ PROMOTE: Metrics healthy → Increase canary weight
+  ✗ ABORT: Metrics fail threshold → Rollback to 0%
+  ⏸ INCONCLUSIVE: Not enough data → Wait longer
+
+  Metrics to analyze:
+  
+  TECHNICAL METRICS (compare canary vs stable):
+  - HTTP success rate: Canary 5xx rate vs stable 5xx rate
+  - Latency P99: Canary must not be significantly slower
+  - Error rate: Application-level errors (from logs)
+  
+  BUSINESS METRICS (requires longer observation):
+  - Conversion rate: Are canary users completing purchases?
+  - Page load time: Real user monitoring
+  - Feature engagement: Are users using the new feature?
+
+Statistical Approach (Automated Canary Analysis):
+  
+  SIMPLE THRESHOLD:
+  If canary_error_rate > 0.05 (5%), ABORT.
+  Risk: Noisy at small percentages (1 error out of 20 requests = 5%)
+  
+  COMPARISON-BASED:
+  If canary_error_rate > stable_error_rate + tolerance, ABORT.
+  More robust: Accounts for baseline error rate.
+  
+  STATISTICAL SIGNIFICANCE (advanced):
+  Uses Mann-Whitney U test or t-test to determine if the difference
+  between canary and baseline is statistically significant.
+  Tools: Kayenta (Google's canary analysis service, used in Spinnaker)
+
+Argo Rollouts Canary Configuration (Full Example):
+
+  apiVersion: argoproj.io/v1alpha1
+  kind: Rollout
+  metadata:
+    name: myapp
+    namespace: production
+  spec:
+    replicas: 10
+    selector:
+      matchLabels:
+        app: myapp
+    template:
+      metadata:
+        labels:
+          app: myapp
+      spec:
+        containers:
+        - name: myapp
+          image: myapp:v2
+          ports:
+          - containerPort: 8080
+    
+    strategy:
+      canary:
+        # Traffic splitting via Istio
+        trafficRouting:
+          istio:
+            virtualService:
+              name: myapp-vsvc
+            destinationRule:
+              name: myapp-destrule
+              canarySubsetName: canary
+              stableSubsetName: stable
+        
+        # Canary steps
+        steps:
+        - setWeight: 5              # 5% to canary
+        - pause: {duration: 5m}     # Wait 5 minutes
+        - analysis:                 # Run automated analysis
+            templates:
+            - templateName: http-error-rate
+            args:
+            - name: service-name
+              value: myapp-canary
+        - setWeight: 20             # 20% to canary
+        - pause: {duration: 10m}
+        - analysis:
+            templates:
+            - templateName: http-error-rate
+            args:
+            - name: service-name
+              value: myapp-canary
+        - setWeight: 50             # 50% to canary
+        - pause: {}                 # Manual approval pause
+        - setWeight: 100            # Full promotion
+        
+        # Track old version pods during rollout
+        canaryMetadata:
+          labels:
+            deployment: canary
+        stableMetadata:
+          labels:
+            deployment: stable
+
+Canary with Header-Based Routing (Internal Testing Before %):
+  Before exposing canary to random users, allow internal team to test.
+  
+  Route to canary if request has specific header:
+  x-canary: true
+  
+  Internal users (QA, developers) add this header.
+  Production users are not affected until percentage rollout begins.
+  
+  Istio header-based routing example already shown above.
+
+Use Canary When:
+  ✓ You want to validate with real production traffic before full rollout
+  ✓ You have good monitoring and can compare canary vs stable metrics
+  ✓ Risk reduction is more important than rollback speed
+  ✓ You're making significant changes to user-facing features
+  ✓ You have automated canary analysis (Argo Rollouts, Flagger, Spinnaker)
+
+================================================================================
+4. ROLLING DEPLOYMENT — TECHNICAL DEEP DIVE
+================================================================================
+
+Core Concept:
+  Replace instances of old version with new version one-at-a-time (or in batches).
+  At any point during rollout, both old and new versions are running.
+  Load balancer continues to route traffic to healthy pods of either version.
+
+Kubernetes Rolling Update Internals:
+  
+  1. kubectl apply triggers Deployment spec change (new image)
+  2. Deployment controller creates new ReplicaSet for v2
+  3. New ReplicaSet scales up (adding v2 pods)
+  4. Old ReplicaSet scales down (removing v1 pods)
+  5. Rate controlled by maxSurge and maxUnavailable
+  6. Kubernetes waits for readinessProbe before routing traffic to new pod
+  7. Kubernetes does NOT remove old pod until readinessProbe of new pod passes
+  
+  With maxUnavailable=0 and maxSurge=1:
+  - Always maintain full capacity
+  - Only add 1 extra pod at a time
+  - Remove old pod only after new pod is healthy
+
+Detailed Rolling Update Timeline (4 replicas, maxSurge=1, maxUnavailable=0):
+  
+  INITIAL:     [v1][v1][v1][v1] = 4 pods, all v1
+  
+  STEP 1:      [v1][v1][v1][v1][v2*] = 5 pods (v2 starting, readiness pending)
+               (*v2 not yet receiving traffic — readinessProbe not yet passing)
+  
+  STEP 2:      [v1][v1][v1][   ][v2] = 4 pods (v1 removed after v2 ready)
+               (v2 is now passing readinessProbe, receiving traffic)
+  
+  STEP 3:      [v1][v1][v1][v2][v2*] = 5 pods (next v2 starting)
+  
+  STEP 4:      [v1][v1][  ][v2][v2] = 4 pods (another v1 removed)
+  
+  ... (continues until all v1 replaced by v2)
+  
+  FINAL:       [v2][v2][v2][v2] = 4 pods, all v2
+
+Rolling Rollback:
+  kubectl rollout undo deployment/myapp
+  
+  This triggers a REVERSE rolling update:
+  v2 pods are replaced by v1 pods, using the same maxSurge/maxUnavailable settings.
+  
+  This is SLOWER than blue-green rollback (which is instant).
+  During rollback, some v2 pods are still running and receiving traffic.
+
+Problems with Rolling Deployments:
+  
+  1. MIXED VERSION TRAFFIC:
+     During rollout, both v1 and v2 receive traffic.
+     API changes MUST be backward-compatible.
+     New v2 schema must work with both v1 code and v2 code.
+  
+  2. SLOWER ROLLBACK:
+     Rollback requires re-rolling all pods, which takes the same time as deployment.
+     Cannot instantly revert like blue-green.
+  
+  3. HARD TO VALIDATE BEFORE ROLLOUT:
+     Unlike canary, you can't easily observe v2 behavior before it gets traffic.
+     Rolling update starts sending traffic to v2 immediately.
+     
+     Workaround: Combine rolling update with monitoring, and have automated
+     rollback triggers that run during the rollout.
+  
+  4. READINESS PROBE DEPENDENCY:
+     If readinessProbe is poorly configured, a bad pod might pass and receive
+     traffic before the issue is apparent.
+
+Best Practices for Rolling Updates:
+  - Configure readinessProbe and livenessProbe carefully
+  - Set maxUnavailable=0 for zero-downtime guarantee
+  - Use maxSurge=1 to control rollout rate (avoid overwhelming infrastructure)
+  - Set deploymentProgressDeadline: Fail if rollout doesn't complete in N seconds
+  - Ensure new version is backward-compatible with old version's API/DB schema
+
+Rolling Update Configuration Examples:
+  
+  # Zero-downtime, slow rollout:
+  rollingUpdate:
+    maxSurge: 1          # Only 1 extra pod at a time
+    maxUnavailable: 0    # Never drop below desired replicas
+  
+  # Fast rollout, allow some unavailability:
+  rollingUpdate:
+    maxSurge: 3
+    maxUnavailable: 2    # Can have 2 pods down during rollout
+  
+  # 25% batches (default):
+  rollingUpdate:
+    maxSurge: 25%
+    maxUnavailable: 25%
+
+Use Rolling When:
+  ✓ Default choice for most stateless services
+  ✓ Simple changes where both v1 and v2 can coexist
+  ✓ Infrastructure cost is a concern (no double environment needed)
+  ✓ Kubernetes default (easiest to get started)
+  ✓ When you have good readiness probes configured
+
+================================================================================
+5. PROGRESSIVE DELIVERY (BEYOND BASIC CANARY)
+================================================================================
+
+Progressive Delivery Definition:
+  An evolution of canary that adds:
+  - Automated metrics-based promotion/rollback decisions
+  - Sophisticated traffic management (header-based, segment-based)
+  - A/B testing as part of the delivery pipeline
+  - Experimentation linked to deployment
+
+The term "Progressive Delivery" was coined by James Governor of RedMonk (2018):
+  "Continuous Delivery with fine-grained control over who gets
+  the new version, built-in safety mechanisms, and automated rollback."
+
+Tools:
+  ARGO ROLLOUTS (CNCF):
+    - CRD: Rollout, AnalysisTemplate, AnalysisRun
+    - Strategies: Canary, Blue-Green, Experiment
+    - Traffic: NGINX, Istio, ALB, SMI
+    - Analysis: Prometheus, Datadog, CloudWatch, NewRelic, Wavefront
+  
+  FLAGGER (WEAVEWORKS):
+    - Works with existing Deployments (no CRD change)
+    - Traffic: Istio, Linkerd, App Mesh, NGINX, Gloo
+    - Analyzes Prometheus, Datadog, CloudWatch metrics
+    - Webhooks for custom tests and notifications
+  
+  SPINNAKER (NETFLIX):
+    - Full CD platform with multi-cloud deployment
+    - Kayenta: Google's automated canary analysis module
+    - Supports all major cloud providers
+    - Heavy-weight, designed for enterprise
+
+================================================================================
+6. IMPLEMENTATION ON AWS
+================================================================================
+
+AWS CodeDeploy — All Three Strategies:
+
+  # appspec.yml for Blue-Green
+  version: 0.0
+  Resources:
+    - TargetService:
+        Type: AWS::ECS::Service
+        Properties:
+          TaskDefinition: "arn:aws:ecs:..."
+          LoadBalancerInfo:
+            ContainerName: "myapp"
+            ContainerPort: 8080
+  
+  Hooks:
+    BeforeAllowTraffic:
+      - location: scripts/smoke-tests.sh
+    AfterAllowTraffic:
+      - location: scripts/validate.sh
+  
+  # Deployment config options:
+  # CodeDeployDefault.ECSAllAtOnce         = recreate
+  # CodeDeployDefault.ECSLinear10PercentEvery1Minutes = rolling (10% per min)
+  # CodeDeployDefault.ECSCanary10Percent5Minutes = canary (10% first, rest after 5min)
+  # Blue/Green is configured at deployment group level
+
+AWS ECS Blue-Green with CodeDeploy:
+  
+  1. Two target groups: myapp-blue-tg, myapp-green-tg
+  2. ALB listener → Production rule → myapp-blue-tg (live)
+  3. ALB listener → Test traffic rule → myapp-green-tg (test access)
+  4. CodeDeploy deployment:
+     a. Deploy new task definition to Green service
+     b. Test traffic goes to Green via test listener port (8443)
+     c. Run test hooks against test port
+     d. Shift traffic: ALB production rule → myapp-green-tg
+     e. Wait "bake time" (configurable)
+     f. Either: Complete (terminate Blue) or Rollback (shift back to Blue)
+
+AWS Lambda Blue-Green (Weighted Aliases):
+  
+  # Lambda uses aliases for traffic routing
+  
+  # Create new version
+  aws lambda publish-version --function-name my-function
+  # Returns version: e.g., "42"
+  
+  # Update alias to split traffic: 90% to v41 (stable), 10% to v42 (canary)
+  aws lambda update-alias \
+    --function-name my-function \
+    --name production \
+    --routing-config '{"AdditionalVersionWeights": {"42": 0.1}}'
+  
+  # After validation, update alias to 100% v42
+  aws lambda update-alias \
+    --function-name my-function \
+    --name production \
+    --function-version 42
+  
+  # Rollback: update alias back to v41
+  aws lambda update-alias \
+    --function-name my-function \
+    --name production \
+    --function-version 41
+
+================================================================================
+7. KUBERNETES WITH ARGO ROLLOUTS
+================================================================================
+
+Installation:
+  kubectl create namespace argo-rollouts
+  kubectl apply -n argo-rollouts \
+    -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
+  
+  # Install kubectl plugin
+  brew install argoproj/tap/kubectl-argo-rollouts
+
+Blue-Green Rollout:
+
+  apiVersion: argoproj.io/v1alpha1
+  kind: Rollout
+  metadata:
+    name: myapp-blue-green
+  spec:
+    replicas: 5
+    selector:
+      matchLabels:
+        app: myapp
+    template:
+      metadata:
+        labels:
+          app: myapp
+      spec:
+        containers:
+        - name: myapp
+          image: myapp:v2
+    
+    strategy:
+      blueGreen:
+        activeService: myapp-active      # Points to current live version
+        previewService: myapp-preview    # Points to new version (for testing)
+        autoPromotionEnabled: false      # Require manual promotion
+        scaleDownDelaySeconds: 30        # Keep old version for 30s after switch
+        prePromotionAnalysis:           # Analysis before promotion
+          templates:
+          - templateName: smoke-tests
+        postPromotionAnalysis:          # Analysis after promotion
+          templates:
+          - templateName: error-rate-check
+
+Canary Rollout (already shown in section 3):
+  See section 3 for full Argo Rollouts canary configuration.
+
+Useful Commands:
+  # Watch rollout status
+  kubectl argo rollouts get rollout myapp --watch
+  
+  # Promote canary (move to next step)
+  kubectl argo rollouts promote myapp
+  
+  # Abort rollout (rollback)
+  kubectl argo rollouts abort myapp
+  
+  # Retry a failed rollout
+  kubectl argo rollouts retry rollout myapp
+  
+  # Open Argo Rollouts dashboard UI
+  kubectl argo rollouts dashboard
+
+================================================================================
+8. IMPLEMENTATION WITH ISTIO SERVICE MESH
+================================================================================
+
+Istio provides powerful traffic management without changing application code.
+
+Core Objects:
+  VirtualService: Defines routing rules for traffic entering the mesh
+  DestinationRule: Defines subsets (labels) of a service for routing
+  Gateway: Entry point for external traffic
+
+Canary Deployment with Istio:
+  
+  # Step 1: Label your pods
+  # v1 pods have label: version=v1
+  # v2 pods have label: version=v2
+  
+  # Step 2: DestinationRule - define subsets
+  apiVersion: networking.istio.io/v1alpha3
+  kind: DestinationRule
+  metadata:
+    name: myapp
+  spec:
+    host: myapp
+    subsets:
+    - name: v1
+      labels:
+        version: v1
+    - name: v2
+      labels:
+        version: v2
+  
+  # Step 3: VirtualService - 90/10 split initially
+  apiVersion: networking.istio.io/v1alpha3
+  kind: VirtualService
+  metadata:
+    name: myapp
+  spec:
+    hosts:
+    - myapp
+    http:
+    - route:
+      - destination:
+          host: myapp
+          subset: v1
+        weight: 90
+      - destination:
+          host: myapp
+          subset: v2
+        weight: 10
+  
+  # Increase canary to 50%:
+  kubectl patch vs myapp --type=json -p='[
+    {"op": "replace", "path": "/spec/http/0/route/0/weight", "value": 50},
+    {"op": "replace", "path": "/spec/http/0/route/1/weight", "value": 50}
+  ]'
+
+Advanced Istio: User Segment Based Canary:
+  
+  # Internal employees always get v2 (for testing)
+  apiVersion: networking.istio.io/v1alpha3
+  kind: VirtualService
+  metadata:
+    name: myapp
+  spec:
+    hosts:
+    - myapp
+    http:
+    - match:                             # If request has internal-user header
+      - headers:
+          x-user-type: {exact: "internal"}
+      route:
+      - destination:
+          host: myapp
+          subset: v2
+        weight: 100
+    - route:                             # External: 95% v1, 5% v2
+      - destination:
+          host: myapp
+          subset: v1
+        weight: 95
+      - destination:
+          host: myapp
+          subset: v2
+        weight: 5
+
+================================================================================
+9. REAL-WORLD EXAMPLES
+================================================================================
+
+AMAZON:
+  Strategy: Canary + Blue-Green (varies by service type)
+  
+  Canary approach: "One Box" deployment
+  - Fleet: 1000 servers
+  - Deploy to 1 server (the "one box")
+  - Run bake time, monitor metrics
+  - Deploy to 10% of fleet (canary)
+  - Monitor for 30 minutes
+  - Deploy to remaining 90%
+  
+  Tools: Apollo (internal), CodeDeploy (external-facing AWS service)
+  
+  Key insight: Amazon deploys per-service team.
+  AWS itself has thousands of independent services, each with their own deployment.
+  Not a single "Amazon deployment" — per-service autonomy.
+
+NETFLIX:
+  Strategy: Red-Black (their term for Blue-Green) + Canary
+  
+  Their terminology:
+  - "Red-Black" = Blue-Green
+  - "Canary Analysis" = Automated Canary Analysis (ACA)
+  
+  Tool: Spinnaker (open-sourced by Netflix)
+  
+  Automated Canary Analysis (ACA):
+  - Deploy canary to 1 server in the cluster
+  - Compare canary metrics to baseline (same version, different sample) for fairness
+  - Kayenta (their analysis system): Compares hundreds of metrics
+  - If canary passes: Promote to full cluster
+  - If fails: Auto-rollback
+  
+  Chaos Monkey (part of Simian Army):
+  - Randomly terminates production instances
+  - Forces resilience: Any service that can't survive random failure is a risk
+  - Validates that rolling updates handle instance termination gracefully
+
+ETSY:
+  Strategy: Feature flags + Gradual rollout
+  
+  Context: E-commerce, pioneered DevOps
+  
+  Deployinator: Internal tool allowing anyone to deploy
+  - Each service has a deploy button
+  - Deployment announced in IRC/Slack channel
+  - All engineers see deployments happening in real-time
+  - "Deploy to engineer first" culture
+  
+  Key insight: "If you're scared to deploy, you haven't deployed enough."
+  Etsy normalized deployment with feature flags, making it a routine event.
+
+GOOGLE:
+  Strategy: Internal canary called "0-1% Dogfood → wider %"
+  
+  Dogfood: Internal Google employees see new versions first ("eating your own dogfood")
+  Trusted Testers: Selected external users
+  1% → 10% → 50% → 100% (called "global rollout" or "stable channel")
+  
+  Used for: Chrome browser releases
+  6-week release cycle with multiple channels:
+  - Canary (daily builds)
+  - Dev (weekly)
+  - Beta (6-week release candidate)
+  - Stable (final release)
+
+FACEBOOK (Meta):
+  Strategy: Staged rollout with internal tooling
+  
+  Gatekeeper: Feature flag system (similar to LaunchDarkly)
+  - Internal employees first
+  - 1% → 10% → 50% → 100% of users
+  - Automatic rollback if error rate spikes
+  
+  "Dark launch": Deploy code, run in background, discard results.
+  New feature might be "dark launched" for weeks before becoming user-facing.
+
+================================================================================
+10. CHOOSING THE RIGHT STRATEGY
+================================================================================
+
+Decision Tree:
+
+  START: What is your primary concern?
+  
+  ZERO DOWNTIME required?
+  ├─ NO → Use Recreate (simplest)
+  └─ YES → Continue
+  
+  Do you need instant rollback?
+  ├─ YES → Blue-Green
+  └─ NO → Continue
+  
+  Do you have monitoring and metrics in place?
+  ├─ NO → Use Rolling Update (monitor manually)
+  └─ YES → Canary (automated analysis)
+  
+  Is infrastructure cost a major constraint?
+  ├─ YES → Rolling Update (minimal extra cost)
+  └─ NO → Consider Blue-Green or Canary
+
+Comparison Matrix:
+
+  DIMENSION          ROLLING    BLUE-GREEN   CANARY
+  ─────────────────────────────────────────────────────────
+  Zero downtime      YES        YES          YES
+  Rollback speed     MEDIUM     INSTANT      FAST
+  Rollback risk      Medium     Low          Low
+  Infra cost         Low +25%   HIGH (2×)    Medium +20%
+  Complexity         LOW        MEDIUM       HIGH
+  Mixed versions     YES        NO           YES
+  DB requirement     Compat     Compat       Compat
+  Validation point   Post-dep   Pre-traffic  During rollout
+  Best for           Default    Critical svc Risk reduction
+
+When to Combine Strategies:
+  BLUE-GREEN + CANARY:
+  - Use Blue-Green for major version upgrades or infrastructure changes
+  - Use Canary within Blue-Green for user-facing feature changes
+  
+  ROLLING + FEATURE FLAGS:
+  - Rolling update to get new code deployed
+  - Feature flag to control which users see new functionality
+  - Most common combination in practice
+  
+  BLUE-GREEN + FEATURE FLAGS:
+  - Blue-Green for zero-downtime deployment with instant rollback
+  - Feature flags for gradual user rollout after deployment
+
+================================================================================
+11. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: Explain Blue-Green deployment and when you would use it.
+A: Blue-Green deployment maintains two identical environments. Blue is live
+   and serving production traffic. Green is idle. When deploying:
+   
+   1. Deploy new version to Green
+   2. Run smoke tests and validation on Green (without real user traffic)
+   3. Switch all traffic from Blue to Green at the load balancer
+   4. Monitor Green for bake time (10-30 minutes)
+   5. If healthy: scale down Blue (rollback window expired)
+      If issues: switch traffic back to Blue (instant rollback)
+   
+   Use cases:
+   - When you need INSTANT rollback capability (one LB command)
+   - When you want to fully validate new version before ANY user traffic
+   - For regulated industries requiring a tested rollback procedure
+   
+   Trade-offs:
+   - Double infrastructure cost (temporarily)
+   - Database changes must be backward-compatible (both environments share DB)
+   - DNS TTL propagation if using DNS-level switching (use LB target groups instead)
+
+Q2: What is a canary deployment and how does automated canary analysis work?
+A: A canary deployment gradually shifts traffic from the current version to
+   a new version, starting with a small percentage (e.g., 5%) and increasing
+   based on metric validation.
+   
+   Named after "canary in a coal mine" — a small sample of users acts as the
+   early warning system for a bad deployment before all users are affected.
+   
+   Automated canary analysis (using tools like Argo Rollouts with Prometheus):
+   1. Deploy canary (5% of traffic)
+   2. Collect metrics for both canary and stable versions
+   3. Compare: Is canary error rate significantly higher than stable?
+   4. If healthy (error rate < threshold): Promote to 25%
+   5. Repeat validation at each traffic level
+   6. If metrics degrade at any point: Auto-rollback (shift to 0%)
+   7. If all steps pass: Promote to 100%
+   
+   The key advantage: Problems affect only 5% of users before you catch them.
+   With Blue-Green, you validate before any real traffic. With Canary, you
+   validate with real production traffic patterns, catching issues that staging
+   might miss.
+
+Q3: What are the main differences between Blue-Green and Canary?
+A: They solve slightly different problems:
+   
+   BLUE-GREEN:
+   - Test new version in isolation (no real user traffic during validation)
+   - Switch is all-or-nothing (atomic)
+   - Instant rollback (switch LB back)
+   - Higher infra cost (double environment)
+   - Best for: When you can't afford to expose any users to a bad deployment,
+     or when you need to validate infrastructure/configuration changes
+   
+   CANARY:
+   - Test with real production traffic (catches issues staging can't simulate)
+   - Gradual exposure (5% → 25% → 50% → 100%)
+   - Rollback is fast but not instant (shift traffic)
+   - Moderate infra cost (small canary fleet)
+   - Best for: Risk reduction with real user validation, catching subtle bugs
+     that only appear with production data or traffic patterns
+   
+   Hybrid: Some teams use Blue-Green to deploy (test without user traffic),
+   then use canary (traffic weighting) after the Blue-Green switch for the
+   gradual rollout phase.
+
+Q4: How do you ensure the new version is backward compatible with the old version
+    during a Rolling Update?
+A: Rolling updates require both old and new versions to run simultaneously,
+   sharing the same database and infrastructure. To ensure compatibility:
+   
+   DATABASE:
+   - Use Expand-Contract pattern for schema changes
+   - Never remove or rename columns referenced by old code
+   - Add new columns as nullable (old code ignores them)
+   
+   API VERSIONING:
+   - Maintain backward-compatible API responses
+   - Add new fields to responses (old clients ignore unknown fields)
+   - Don't remove fields that old clients depend on
+   - For breaking changes: Use API versioning (/v1/ → /v2/)
+   
+   CONSUMER-DRIVEN CONTRACT TESTS:
+   - Test that v2 still satisfies v1 consumers' expectations
+   - Pact framework: Consumers define what they expect; provider validates
+   
+   FEATURE FLAGS:
+   - New behavior behind flags that old code doesn't trigger
+   - Old code receives same responses as before
+   
+   The general principle: "The new version should be a superset of the old
+   version's capabilities, not a replacement during the rollout."
+
+Q5: How would you implement a gradual rollout for a new feature using
+    Kubernetes and Argo Rollouts?
+A: Here's a production-ready implementation:
+   
+   1. Replace Kubernetes Deployment with Argo Rollouts Rollout object
+   
+   2. Define canary steps with analysis:
+      - 5% traffic → 5 min pause → Prometheus error rate check
+      - 25% traffic → 10 min pause → Prometheus error rate + latency check
+      - 50% traffic → Manual approval pause (human review)
+      - 100% traffic (full promotion)
+   
+   3. Define AnalysisTemplate referencing Prometheus queries:
+      Success: error rate < 1%
+      Failure: error rate > 5%
+   
+   4. Configure traffic routing with NGINX Ingress or Istio VirtualService
+   
+   5. Deploy: kubectl apply -f rollout.yaml
+      Argo automatically manages the canary steps.
+   
+   6. Monitor: kubectl argo rollouts get rollout myapp --watch
+   
+   7. If Prometheus detects error rate > 5% at any step, Argo Rollouts
+      automatically shifts traffic back to stable and marks the rollout as failed.
+   
+   This gives you: Automated progressive delivery with metrics-based promotion
+   and automatic rollback — no human judgment needed for standard metrics checks.
+
+================================================================================
+12. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+STRATEGY SUMMARY:
+
+  ROLLING:
+    Replace pods one-by-one. Both versions live simultaneously.
+    K8s config: rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+    Rollback: kubectl rollout undo deployment/myapp
+    Best for: Default choice, stateless services, low complexity
+
+  BLUE-GREEN:
+    Two environments. Switch traffic atomically.
+    Rollback: kubectl patch svc → change selector back to blue
+    or: aws elbv2 modify-listener → point to blue target group
+    Best for: Instant rollback, pre-traffic validation, critical services
+
+  CANARY:
+    Gradual traffic shift. Metrics-based promotion.
+    Tools: Argo Rollouts, Flagger, NGINX Ingress annotations, Istio VS weights
+    Rollback: kubectl argo rollouts abort myapp
+    Best for: Risk reduction with real traffic validation
+
+Key Kubernetes Commands:
+  # Rolling rollback
+  kubectl rollout undo deployment/myapp
+  kubectl rollout undo deployment/myapp --to-revision=2
+  kubectl rollout history deployment/myapp
+  
+  # Argo Rollouts
+  kubectl argo rollouts promote myapp
+  kubectl argo rollouts abort myapp
+  kubectl argo rollouts get rollout myapp --watch
+  
+  # Helm rollback
+  helm rollback myapp-release [revision]
+  helm history myapp-release
+
+Traffic Splitting Tools:
+  NGINX Ingress: annotations: nginx.ingress.kubernetes.io/canary-weight: "10"
+  Istio: VirtualService http[].route[].weight
+  Argo Rollouts: canary.steps[].setWeight
+  AWS ALB: ForwardConfig.TargetGroups[].Weight
+
+Progressive Delivery Pipeline:
+  Code → CI → Docker Image → Staging Tests → Canary 5% → Analysis →
+  Canary 25% → Analysis → Manual Approval → 100% → Monitor
+
+Real-World Companies:
+  Amazon:  One-box canary → 10% fleet → 100%
+  Netflix: Red-Black (blue-green) + Automated Canary Analysis
+  Etsy:    Feature flags + gradual rollout via Deployinator
+  Google:  Dogfood → Trusted Testers → 1% → progressive
+
+================================================================================
+END OF FILE
+================================================================================

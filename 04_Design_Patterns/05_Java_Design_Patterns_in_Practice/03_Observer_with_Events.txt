@@ -1,0 +1,323 @@
+================================================================
+  OBSERVER PATTERN WITH JAVA EVENTS IN PRACTICE
+================================================================
+
+  Observer is the foundation of event-driven architecture.
+  This file shows all practical Java implementations from low-level
+  to Spring's enterprise event system.
+
+----------------------------------------------------------------
+LEVEL 1: MANUAL OBSERVER (BASELINE)
+----------------------------------------------------------------
+
+  // Generic Observer interface
+  @FunctionalInterface
+  public interface EventListener<T> {
+      void onEvent(T event);
+  }
+
+  // Subject (event publisher)
+  public class EventBus<T> {
+      private final List<EventListener<T>> listeners = new CopyOnWriteArrayList<>();
+
+      public void subscribe(EventListener<T> listener) {
+          listeners.add(listener);
+      }
+
+      public void unsubscribe(EventListener<T> listener) {
+          listeners.remove(listener);
+      }
+
+      public void publish(T event) {
+          listeners.forEach(l -> l.onEvent(event));
+      }
+  }
+
+  // Domain event
+  public record OrderCreatedEvent(String orderId, String customerId, double total) {}
+
+  // Usage with lambdas (Observer = lambda)
+  EventBus<OrderCreatedEvent> bus = new EventBus<>();
+
+  bus.subscribe(event -> emailService.sendConfirmation(event.customerId()));
+  bus.subscribe(event -> inventoryService.reserve(event.orderId()));
+  bus.subscribe(event -> auditLog.record(event));
+
+  bus.publish(new OrderCreatedEvent("ORD-001", "CUST-42", 99.99));
+
+----------------------------------------------------------------
+LEVEL 2: JAVA BEANS PropertyChangeSupport
+----------------------------------------------------------------
+
+  Standard Java (no framework):
+
+  public class StockPrice {
+      private final PropertyChangeSupport pcs = new PropertyChangeSupport(this);
+      private double price;
+
+      public void addPropertyChangeListener(PropertyChangeListener l) {
+          pcs.addPropertyChangeListener(l);
+      }
+
+      public void removePropertyChangeListener(PropertyChangeListener l) {
+          pcs.removePropertyChangeListener(l);
+      }
+
+      public void setPrice(double newPrice) {
+          double oldPrice = this.price;
+          this.price = newPrice;
+          pcs.firePropertyChange("price", oldPrice, newPrice);
+      }
+  }
+
+  // Subscribe
+  StockPrice apple = new StockPrice();
+  apple.addPropertyChangeListener(evt ->
+      System.out.printf("Price changed: %s -> %s%n", evt.getOldValue(), evt.getNewValue())
+  );
+
+  apple.setPrice(150.0);  // fires event
+
+  PropertyChangeEvent provides: propertyName, oldValue, newValue, source.
+  Used in: JavaBeans, Swing, older frameworks.
+
+----------------------------------------------------------------
+LEVEL 3: SPRING APPLICATION EVENTS (RECOMMENDED)
+----------------------------------------------------------------
+
+  // 1. Domain Event — extend ApplicationEvent or use POJO (Spring 4.2+)
+  public record OrderShippedEvent(String orderId, String trackingNumber, Instant shippedAt) {
+      // POJO event — no need to extend ApplicationEvent in Spring 4.2+
+  }
+
+  // 2. Publisher (Subject) — inject ApplicationEventPublisher
+  @Service
+  @RequiredArgsConstructor
+  public class ShipmentService {
+      private final ApplicationEventPublisher eventPublisher;
+      private final ShipmentRepository shipmentRepository;
+
+      @Transactional
+      public void shipOrder(String orderId, String trackingNumber) {
+          // Business logic
+          shipmentRepository.markShipped(orderId, trackingNumber);
+
+          // Publish event — all listeners notified
+          eventPublisher.publishEvent(
+              new OrderShippedEvent(orderId, trackingNumber, Instant.now())
+          );
+      }
+  }
+
+  // 3. Listeners (Observers) — @EventListener on any @Component method
+  @Component
+  @RequiredArgsConstructor
+  public class EmailNotificationListener {
+      private final EmailService emailService;
+
+      @EventListener
+      public void onOrderShipped(OrderShippedEvent event) {
+          emailService.sendShippingNotification(event.orderId(), event.trackingNumber());
+      }
+  }
+
+  @Component
+  public class AnalyticsListener {
+      @EventListener
+      public void trackShipment(OrderShippedEvent event) {
+          analytics.track("order.shipped", Map.of("orderId", event.orderId()));
+      }
+  }
+
+  @Component
+  public class AuditListener {
+      @EventListener
+      @Async  // runs in separate thread pool — non-blocking
+      public void auditShipment(OrderShippedEvent event) {
+          auditLog.write("ORDER_SHIPPED", event.orderId());
+      }
+  }
+
+  // Adding a new listener doesn't change ShipmentService — pure OCP.
+
+----------------------------------------------------------------
+TRANSACTIONAL EVENT LISTENERS
+----------------------------------------------------------------
+
+  Problem: event published DURING a transaction.
+  Listener runs and commits BEFORE the outer transaction commits.
+  If outer transaction rolls back, listener already acted (sent email, etc.).
+
+  Solution: @TransactionalEventListener — runs AFTER transaction commits.
+
+  @Component
+  public class PostCommitListener {
+      @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+      public void onOrderCreated(OrderCreatedEvent event) {
+          // Only runs if the transaction commits successfully
+          emailService.sendConfirmation(event.orderId());
+      }
+
+      @TransactionalEventListener(phase = TransactionPhase.AFTER_ROLLBACK)
+      public void onOrderFailed(OrderCreatedEvent event) {
+          // Cleanup on failure
+          cleanupReservedStock(event.orderId());
+      }
+  }
+
+  Phases:
+    AFTER_COMMIT   -- fires only on successful commit (most common)
+    AFTER_ROLLBACK -- fires only on rollback
+    AFTER_COMPLETION -- fires always (after commit or rollback)
+    BEFORE_COMMIT  -- fires before commit; runs in original transaction
+
+----------------------------------------------------------------
+ASYNC EVENT LISTENER
+----------------------------------------------------------------
+
+  @Component
+  public class AsyncListener {
+      private static final Logger log = LoggerFactory.getLogger(AsyncListener.class);
+
+      @EventListener
+      @Async("emailTaskExecutor")  // run in specific executor
+      public CompletableFuture<Void> sendEmail(OrderShippedEvent event) {
+          try {
+              emailService.send(event.orderId());
+              return CompletableFuture.completedFuture(null);
+          } catch (Exception e) {
+              log.error("Failed to send email for order: " + event.orderId(), e);
+              return CompletableFuture.failedFuture(e);
+          }
+      }
+  }
+
+  // Configure the executor
+  @Bean("emailTaskExecutor")
+  public Executor emailTaskExecutor() {
+      ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+      executor.setCorePoolSize(2);
+      executor.setMaxPoolSize(5);
+      executor.setQueueCapacity(100);
+      executor.setThreadNamePrefix("email-async-");
+      executor.initialize();
+      return executor;
+  }
+
+----------------------------------------------------------------
+CONDITIONAL EVENT LISTENERS
+----------------------------------------------------------------
+
+  // Only handle events meeting certain conditions
+  @EventListener(condition = "#event.total > 100.0")
+  public void onHighValueOrder(OrderCreatedEvent event) {
+      vipService.escalate(event.orderId());
+  }
+
+  // Listen to multiple event types
+  @EventListener({OrderCreatedEvent.class, OrderUpdatedEvent.class})
+  public void onOrderChange(Object event) {
+      audit.record(event);
+  }
+
+  // @EventListener method return value = re-publish event
+  @EventListener
+  public PaymentRequestedEvent onOrderCreated(OrderCreatedEvent event) {
+      return new PaymentRequestedEvent(event.orderId(), event.total());
+  }
+
+----------------------------------------------------------------
+GUAVA EVENTBUS (ALTERNATIVE)
+----------------------------------------------------------------
+
+  // Simple pub/sub within a single JVM
+  EventBus eventBus = new EventBus();  // or AsyncEventBus for async
+
+  // Subscriber
+  public class OrderSubscriber {
+      @Subscribe
+      public void handleOrder(OrderCreatedEvent event) {
+          System.out.println("Handling: " + event.orderId());
+      }
+  }
+
+  eventBus.register(new OrderSubscriber());
+  eventBus.post(new OrderCreatedEvent("ORD-001", "CUST-1", 50.0));
+
+  DeadEvent: If no subscriber handles an event, Guava calls @Subscribe on
+             DeadEvent wrappers — useful for debugging missed events.
+
+  AsyncEventBus: uses Executor; all subscribers called on separate threads.
+
+  Guava vs Spring Events:
+    Guava: simpler, no framework needed, good for in-process event bus.
+    Spring: integrated with transactions, AOP, async, conditions.
+
+----------------------------------------------------------------
+MEMORY LEAK PREVENTION
+----------------------------------------------------------------
+
+  Manual observers:
+    ALWAYS unsubscribe when observer is done.
+    Use WeakReference<Observer> in the list for auto-GC cleanup:
+
+    List<WeakReference<EventListener<T>>> listeners = new ArrayList<>();
+
+    public void publish(T event) {
+        listeners.removeIf(ref -> ref.get() == null);  // clean up GC'd listeners
+        listeners.stream()
+            .map(WeakReference::get)
+            .filter(Objects::nonNull)
+            .forEach(l -> l.onEvent(event));
+    }
+
+  Spring Events:
+    @Component beans are Spring-managed — auto-unregistered when context closes.
+    No manual cleanup needed for @EventListener beans.
+
+  Guava EventBus:
+    Call eventBus.unregister(subscriber) when done.
+    Forgetting causes memory leak.
+
+----------------------------------------------------------------
+INTERVIEW Q&A
+----------------------------------------------------------------
+
+  Q: How does Observer differ from pub/sub?
+  A: Observer (GoF): Subject knows its observers. Direct coupling through interface.
+     Pub/Sub: Publisher and subscriber don't know each other; message broker in between.
+     Spring Events: hybrid — loose coupling (observers register via @EventListener),
+     but same JVM (no broker). Kafka/RabbitMQ: true pub/sub with external broker.
+
+  Q: What is @TransactionalEventListener? When to use it?
+  A: Fires event listener AFTER the publishing transaction commits.
+     Use when listener side effects (emails, external calls) should NOT run
+     if the transaction rolls back. Without it, listeners run mid-transaction.
+
+  Q: How do you make Spring event listeners async?
+  A: Add @Async to the @EventListener method. Configure a ThreadPoolTaskExecutor.
+     Add @EnableAsync to a @Configuration class. The listener runs in a separate
+     thread; the publisher returns immediately after publishing.
+
+  Q: What's the memory leak risk with Observer?
+  A: Subject holds references to observers. If observers are not unsubscribed,
+     GC cannot collect them as long as subject lives.
+     Fix: WeakReference, explicit unsubscribe, lifecycle-aware listeners.
+
+  Q: Spring Events vs Kafka for event-driven architecture?
+  A: Spring Events: in-process, synchronous (default), no persistence.
+     Use for: coordinating within one service, post-commit side effects.
+     Kafka: cross-service, persisted, distributed, async.
+     Use for: event sourcing, saga pattern, cross-microservice events.
+
+----------------------------------------------------------------
+INTERVIEW TIPS
+----------------------------------------------------------------
+
+  - Know the full Spring Events flow: POJO event + @EventListener + publisher.
+  - @TransactionalEventListener is a frequent interview topic.
+  - Memory leak risk shows production awareness.
+  - Know when to use Spring Events vs Kafka.
+  - @Async + @EventListener combination for non-blocking side effects.
+
+================================================================

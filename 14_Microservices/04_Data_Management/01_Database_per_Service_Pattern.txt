@@ -1,0 +1,230 @@
+================================================================================
+DATABASE PER SERVICE PATTERN
+================================================================================
+
+DEFINITION
+----------
+Each microservice owns and exclusively manages its own database.
+No other service may directly access another service's database tables.
+Data exchange happens only through APIs or events.
+
+This is not just a recommendation — it's a HARD RULE for true microservices.
+
+────────────────────────────────────────────────────────────────────────────────
+
+WHY DATABASE PER SERVICE?
+===========================
+
+1. LOOSE COUPLING
+   - Schema changes in Service A can't break Service B
+   - Services evolve independently
+   - Team A can change their DB schema without notifying Team B
+
+2. TECHNOLOGY FREEDOM (Polyglot Persistence)
+   - Order service: PostgreSQL (relational, ACID transactions)
+   - User service: MySQL (relational, mature tooling)
+   - Product catalog: MongoDB (flexible schema, full-text search)
+   - Cart service: Redis (in-memory, key-value, TTL)
+   - Analytics: Cassandra (high-throughput writes, time-series)
+   - Search: Elasticsearch (full-text search, aggregations)
+
+3. INDEPENDENT SCALING
+   - Scale Order DB independently from User DB
+   - Add read replicas per service based on need
+   - Database-specific tuning (PostgreSQL config for Order service)
+
+4. FAILURE ISOLATION
+   - Order DB outage doesn't affect User or Payment services
+   - Database upgrades/migrations per service at own pace
+
+────────────────────────────────────────────────────────────────────────────────
+
+IMPLEMENTATION OPTIONS
+=======================
+
+Option 1: PRIVATE TABLES IN SHARED SERVER (Logical separation)
+  - Each service has its own schema/tables in a shared DB server
+  - Service A can only access schema_a, service B can only access schema_b
+  - Enforced via DB user permissions
+  - Cheapest option (single DB server)
+  - Risk: accidental cross-schema query, shared resource contention
+
+  PostgreSQL:
+    CREATE SCHEMA order_schema;
+    CREATE SCHEMA payment_schema;
+    CREATE USER order_service WITH PASSWORD '...';
+    GRANT ALL ON SCHEMA order_schema TO order_service;
+    REVOKE ALL ON SCHEMA payment_schema FROM order_service;
+
+Option 2: SEPARATE DATABASE INSTANCES (Physical separation)
+  - Each service has its own DB server/cluster
+  - True isolation: no shared resources
+  - Higher cost
+  - Recommended for production microservices
+
+  Kubernetes:
+    # Order service PostgreSQL
+    apiVersion: apps/v1
+    kind: StatefulSet
+    metadata:
+      name: order-postgres
+    spec:
+      serviceName: order-postgres
+      replicas: 1
+      template:
+        spec:
+          containers:
+          - name: postgres
+            image: postgres:15
+            env:
+            - name: POSTGRES_DB
+              value: order_db
+            volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+
+Option 3: SEPARATE DATABASE TECHNOLOGIES (Polyglot)
+  - Optimal: choose the best DB type per service's data pattern
+  - Most flexible, highest operational overhead
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING BOOT MULTI-DATASOURCE CONFIGURATION
+===========================================
+(Not for cross-service access — for a single service with multiple data stores)
+
+@Configuration
+public class DataSourceConfig {
+
+  @Bean
+  @Primary
+  @ConfigurationProperties("spring.datasource.orders")
+  public DataSource ordersDataSource() {
+    return DataSourceBuilder.create().build();
+  }
+
+  @Bean
+  @ConfigurationProperties("spring.datasource.analytics")
+  public DataSource analyticsDataSource() {
+    return DataSourceBuilder.create().build();
+  }
+}
+
+# application.yml
+spring:
+  datasource:
+    orders:
+      url: jdbc:postgresql://order-postgres:5432/orders
+      username: order_user
+      password: ${ORDER_DB_PASSWORD}
+      driver-class-name: org.postgresql.Driver
+      hikari:
+        maximum-pool-size: 20
+        minimum-idle: 5
+
+    analytics:
+      url: jdbc:cassandra://cassandra:9042/analytics
+      username: analytics_user
+      password: ${ANALYTICS_DB_PASSWORD}
+
+────────────────────────────────────────────────────────────────────────────────
+
+CHALLENGES WITH DATABASE PER SERVICE
+======================================
+
+1. CROSS-SERVICE QUERIES
+   Problem: "Give me all orders with customer name and product details"
+   Solution options:
+     a) API Composition: call Order, User, Product services in parallel → aggregate
+     b) CQRS: build a denormalized read model via events
+     c) GraphQL federation: each service exposes GraphQL, gateway composes
+
+2. DISTRIBUTED TRANSACTIONS
+   Problem: "Deduct inventory AND create order — must be atomic"
+   Solution: Saga pattern (choreography or orchestration based)
+   NOT a solution: 2-Phase Commit (too fragile for microservices)
+
+3. DATA DUPLICATION
+   Problem: Order service needs customer name, but User service owns user data
+   Solution: Store a COPY of needed data in Order service at time of order creation
+     - Order stores: userId (foreign key for service boundary), customerName (copy)
+     - Accept that customerName in Order may be stale if user changes their name later
+     - For legal/audit purposes, this is often CORRECT (historical state)
+
+4. REFERENTIAL INTEGRITY
+   Problem: What prevents creating an Order referencing a non-existent userId?
+   Solution:
+     - Application-level validation (call User service to verify before creating order)
+     - Compensating transactions if validation fails later
+     - Eventual consistency: Order may temporarily reference a recently deleted user
+
+────────────────────────────────────────────────────────────────────────────────
+
+MIGRATING FROM SHARED DATABASE TO DATABASE PER SERVICE
+=======================================================
+
+Step 1: IDENTIFY SERVICE BOUNDARIES
+  - Map tables to owning services
+  - Find cross-service table dependencies
+
+Step 2: SPLIT LOGICALLY FIRST
+  - Create schemas per service in the same database
+  - Apply strict access controls
+  - Verify no cross-service queries remain
+
+Step 3: INTRODUCE API ACCESS
+  - Replace direct table access with API calls
+  - Add service layer abstractions
+
+Step 4: MIGRATE TO SEPARATE DATABASES
+  - Move data to dedicated database instances
+  - Update connection strings
+
+Step 5: HANDLE JOINS REMOVED
+  - Implement API composition or CQRS read models
+
+This is known as the "Strangler Fig" approach applied to data.
+
+────────────────────────────────────────────────────────────────────────────────
+
+DATA OWNERSHIP MATRIX — EXAMPLE
+==================================
+
+Table                │ Owner Service    │ Other Services Get Data Via
+─────────────────────┼──────────────────┼──────────────────────────────────────
+users                │ User Service     │ User API (/api/v1/users/{id})
+orders               │ Order Service    │ Order API
+order_items          │ Order Service    │ Order API (nested in order response)
+products             │ Catalog Service  │ Catalog API
+inventory            │ Inventory Svc    │ Inventory API
+prices               │ Pricing Service  │ Pricing API
+payments             │ Payment Service  │ Payment API
+notifications        │ Notification Svc │ N/A (write-only domain)
+order_search_index   │ Search Service   │ Search API (populated via events)
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is the Database per Service pattern and why is it essential?
+A: Each service exclusively owns and manages its database — no direct cross-
+   service DB access. Ensures loose coupling, independent deployability, technology
+   freedom (polyglot persistence), and failure isolation. Schema changes in one
+   service can't break another.
+
+Q: How do you handle data that multiple services need?
+A: Each service stores the data it needs, even if it's a copy from another service.
+   At creation time, copy necessary fields (e.g., Order stores customerName from
+   User service). For live queries, use API Composition or CQRS read models.
+
+Q: How do you handle referential integrity across services?
+A: No foreign key constraints across service boundaries. Instead: application-level
+   validation (call the other service to verify existence), eventual consistency
+   acceptance, and compensating transactions if data becomes invalid later.
+
+Q: Can you share a database for multiple services as a starting point?
+A: Yes — logical separation (separate schemas, strict access controls) is an
+   acceptable intermediate step when migrating a monolith. But physical separation
+   (separate DB instances) is the goal for true operational independence.
+
+================================================================================

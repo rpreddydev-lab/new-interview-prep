@@ -1,0 +1,318 @@
+================================================================================
+THROTTLING — IN DEPTH
+================================================================================
+
+WHAT IS THROTTLING?
+--------------------
+Throttling is the practice of controlling the rate of requests to an API,
+typically by slowing down processing rather than hard-rejecting requests.
+
+Rate Limiting vs Throttling:
+  Rate Limiting : Rejects requests once quota is exceeded (HTTP 429)
+  Throttling    : Queues, delays, or degrades service for excess traffic
+                  ("soft" rate limiting — eventually the request completes)
+
+Throttling techniques:
+  1. Request queuing (buffer excess requests)
+  2. Concurrency limiting (max simultaneous in-flight requests)
+  3. Adaptive throttling (dynamic based on service health)
+  4. Client-side throttling (SDKs self-throttle before hitting server)
+
+In practice: the terms are often used interchangeably. For interviews,
+know both concepts and their trade-offs.
+
+================================================================================
+1. CONCURRENCY LIMITING (BULKHEAD PATTERN)
+================================================================================
+
+CONCEPT:
+  Limit the number of simultaneous in-flight requests to a service.
+  Prevents downstream overload regardless of request timing.
+
+  Example: Allow max 50 concurrent requests to payment-service.
+  If 51st arrives and 50 are already being processed → queue or reject.
+
+This is the Bulkhead Pattern (from ship bulkheads that prevent flooding
+one compartment from sinking the whole ship).
+
+SPRING CLOUD CIRCUIT BREAKER — BULKHEAD:
+  Resilience4j has a Bulkhead implementation:
+
+  @Bean
+  public BulkheadRegistry bulkheadRegistry() {
+      BulkheadConfig config = BulkheadConfig.custom()
+          .maxConcurrentCalls(50)
+          .maxWaitDuration(Duration.ofMillis(500)) // wait up to 500ms for a slot
+          .build();
+      return BulkheadRegistry.of(config);
+  }
+
+  @Service
+  public class PaymentService {
+
+      private final Bulkhead bulkhead;
+
+      PaymentService(BulkheadRegistry registry) {
+          this.bulkhead = registry.bulkhead("paymentService");
+      }
+
+      public PaymentResult processPayment(PaymentRequest request) {
+          return Bulkhead.decorateSupplier(bulkhead,
+              () -> paymentClient.process(request)).get();
+      }
+  }
+
+THREAD POOL BULKHEAD (isolate with dedicated thread pool):
+  ThreadPoolBulkheadConfig config = ThreadPoolBulkheadConfig.custom()
+      .maxThreadPoolSize(10)
+      .coreThreadPoolSize(5)
+      .queueCapacity(100)
+      .keepAliveDuration(Duration.ofMillis(20))
+      .build();
+
+Pros: Protects critical services; limits blast radius; enables service isolation
+Cons: Requires tuning pool sizes; underfilled pool = wasted resources
+
+================================================================================
+2. CIRCUIT BREAKER + THROTTLING
+================================================================================
+
+Circuit breaker prevents calls to a failing service, effectively throttling
+requests to zero during an outage:
+
+STATES:
+  CLOSED  : Normal operation; all requests pass through
+  OPEN    : Service failing; all requests fail fast (no downstream call)
+  HALF-OPEN: Probe state; limited requests allowed to test recovery
+
+SPRING CLOUD CIRCUIT BREAKER (Resilience4j):
+
+  application.yml:
+    resilience4j:
+      circuitbreaker:
+        instances:
+          paymentService:
+            slidingWindowType: COUNT_BASED
+            slidingWindowSize: 10
+            failureRateThreshold: 50          # open if > 50% fail
+            slowCallRateThreshold: 80         # open if > 80% are slow
+            slowCallDurationThreshold: 2000ms # slow = > 2s
+            waitDurationInOpenState: 30s      # wait 30s before half-open
+            permittedNumberOfCallsInHalfOpenState: 3
+            minimumNumberOfCalls: 5           # min calls before evaluation
+
+  Java usage:
+    @Service
+    public class OrderService {
+
+        @CircuitBreaker(name = "paymentService", fallbackMethod = "paymentFallback")
+        public PaymentResult processPayment(PaymentRequest req) {
+            return paymentClient.charge(req);
+        }
+
+        public PaymentResult paymentFallback(PaymentRequest req, Exception e) {
+            log.error("Payment service unavailable", e);
+            // Queue for retry, or return async job ID
+            return PaymentResult.queued(req.getOrderId());
+        }
+    }
+
+================================================================================
+3. ADAPTIVE THROTTLING
+================================================================================
+
+CONCEPT:
+  Dynamically adjust request rates based on observed system health.
+  No static limit — system adapts to load in real time.
+
+GOOGLE'S CLIENT-SIDE THROTTLING (Pub/Sub, Spanner):
+  Clients track their own accept rate:
+  
+  acceptRate = accepted_requests / total_requests (over last 2 minutes)
+  
+  Throttle probability = max(0, (requests - K * accepts) / (requests + 1))
+  where K = multiplier (e.g., 1.1 means allow 10% headroom above accept rate)
+  
+  Client randomly rejects requests locally based on this probability.
+  Result: zero wasted server calls; graceful degradation.
+
+ADAPTIVE THROTTLING WITH SPRING ACTUATOR:
+  Monitor system metrics and adjust rate dynamically:
+
+  @Component
+  public class AdaptiveRateLimiter {
+
+      private volatile int currentLimit = 1000; // starts at 1000 req/min
+      
+      @Scheduled(fixedDelay = 5000)
+      public void adjustLimit() {
+          double cpuUsage = getCpuUsage();
+          double errorRate = getErrorRate();
+          
+          if (cpuUsage > 0.85 || errorRate > 0.05) {
+              currentLimit = (int)(currentLimit * 0.9); // reduce by 10%
+              currentLimit = Math.max(100, currentLimit); // floor at 100
+          } else if (cpuUsage < 0.60 && errorRate < 0.01) {
+              currentLimit = (int)(currentLimit * 1.05); // increase by 5%
+              currentLimit = Math.min(10000, currentLimit); // ceiling at 10000
+          }
+      }
+  }
+
+================================================================================
+4. THROTTLING IN API GATEWAY (Spring Cloud Gateway)
+================================================================================
+
+Using the built-in RequestRateLimiter filter with Redis:
+
+spring:
+  cloud:
+    gateway:
+      default-filters:
+        - name: RequestRateLimiter
+          args:
+            redis-rate-limiter.replenishRate: 100    # sustained rate
+            redis-rate-limiter.burstCapacity: 200    # allow brief bursts
+
+TIERS (different limits per plan):
+  @Bean
+  public KeyResolver tieredKeyResolver() {
+      return exchange -> {
+          String apiKey = exchange.getRequest()
+              .getHeaders().getFirst("X-Api-Key");
+          // Store tier in JWT claims or API key metadata
+          String tier = apiKeyService.getTier(apiKey);
+          return Mono.just(apiKey + ":" + tier);
+      };
+  }
+
+  // Dynamic rate limit based on tier
+  @Bean
+  public RateLimiter tieredRateLimiter(ReactiveStringRedisTemplate template) {
+      return new TieredRedisRateLimiter(template,
+          Map.of(
+              "FREE",       new long[]{10, 20},   // replenish=10, burst=20
+              "BASIC",      new long[]{100, 200},
+              "ENTERPRISE", new long[]{1000, 2000}
+          ));
+  }
+
+================================================================================
+5. THROTTLING RESPONSE PATTERNS
+================================================================================
+
+HARD REJECT (Rate Limiting):
+  HTTP 429 Too Many Requests — reject immediately.
+  Client must wait Retry-After seconds.
+
+QUEUING / DELAY (Throttling):
+  HTTP 202 Accepted — request queued; poll for result.
+  Suitable for batch/async operations.
+
+GRACEFUL DEGRADATION:
+  Serve a cached or simplified response instead of real-time data.
+  Example: serve yesterday's stock prices during rate limiting.
+  HTTP 200 with Deprecation header or X-Data-Stale: true
+
+BACKPRESSURE SIGNAL:
+  Return Retry-After or X-RateLimit-Remaining headers.
+  Well-designed clients back off automatically when they see remaining → 0.
+
+================================================================================
+6. CLIENT-SIDE BACKOFF STRATEGIES
+================================================================================
+
+EXPONENTIAL BACKOFF WITH JITTER:
+  The standard approach — prevents thundering herd (all clients retry
+  simultaneously after a server returns 503/429).
+
+  public <T> T withRetry(Supplier<T> call) {
+      int maxAttempts = 5;
+      long baseDelayMs = 100;
+      
+      for (int attempt = 0; attempt <= maxAttempts; attempt++) {
+          try {
+              return call.get();
+          } catch (RateLimitException | ServiceUnavailableException e) {
+              if (attempt == maxAttempts) throw e;
+              
+              // Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms
+              long delay = baseDelayMs * (1L << attempt);
+              
+              // Add jitter (± 25% of delay)
+              long jitter = (long)(delay * 0.25 * (Math.random() * 2 - 1));
+              long sleep = delay + jitter;
+              
+              // Respect server's Retry-After if present
+              if (e instanceof RateLimitException rle && rle.getRetryAfterMs() > 0) {
+                  sleep = rle.getRetryAfterMs();
+              }
+              
+              Thread.sleep(sleep);
+          }
+      }
+      throw new MaxRetriesExceededException();
+  }
+
+RESILIENCE4J RETRY:
+  resilience4j:
+    retry:
+      instances:
+        externalApi:
+          maxAttempts: 4
+          waitDuration: 1s
+          enableExponentialBackoff: true
+          exponentialBackoffMultiplier: 2
+          randomizedWaitFactor: 0.5  # 50% jitter
+          retryExceptions:
+            - org.springframework.web.client.HttpServerErrorException
+          ignoreExceptions:
+            - com.example.NotFoundException
+
+================================================================================
+7. INTERVIEW QUESTIONS — THROTTLING
+================================================================================
+
+Q1: What is the difference between rate limiting and throttling?
+    Rate limiting is a hard gate: once the quota is exceeded, requests are
+    rejected immediately (HTTP 429). Throttling is softer: excess requests
+    are queued, delayed, or degraded rather than immediately rejected. Rate
+    limiting is about admission control; throttling is about flow control.
+    In practice, the terms overlap — APIs often use "throttling" to mean
+    both. The key distinction: 429 = rate limited; delayed 202 = throttled.
+
+Q2: What is exponential backoff with jitter and why is jitter important?
+    Exponential backoff doubles the wait time after each retry (100ms, 200ms,
+    400ms...) so clients automatically reduce pressure on a struggling service.
+    Without jitter, all clients that received a 429 at the same time would
+    retry simultaneously after the same delay — creating a thundering herd.
+    Jitter adds randomness (±25% of delay), spreading retries across time
+    and preventing synchronized stampedes.
+
+Q3: What is the Bulkhead pattern?
+    Named after ship bulkheads that isolate flooding to one compartment.
+    In microservices: isolate a service so that its failure doesn't exhaust
+    resources (threads, connections) needed by other services. Implemented
+    with a dedicated thread pool or concurrency semaphore per external service.
+    Resilience4j Bulkhead limits concurrent calls; ThreadPoolBulkhead uses
+    a bounded thread pool per service. Prevents one slow service from
+    blocking the entire application.
+
+Q4: How does a circuit breaker interact with throttling?
+    Circuit breaker is complementary to throttling: while rate limiting controls
+    how many requests the client sends, a circuit breaker responds to how many
+    are FAILING. When the error rate threshold is exceeded, the circuit breaker
+    opens, effectively throttling all requests to zero (fail-fast) to protect
+    the downstream service. HALF_OPEN state allows probing for recovery.
+    Together: rate limiting prevents overload; circuit breaker prevents
+    cascading failures.
+
+Q5: How would you implement tiered rate limiting for API monetization?
+    Store each API key's tier (FREE/BASIC/ENTERPRISE) in Redis or a database.
+    Use a key resolver in the gateway that extracts the API key and tier.
+    Configure different rate limits per tier (e.g., 10/min, 100/min, 1000/min).
+    Enforce limits in the API gateway via Redis token buckets keyed by
+    apiKey + tier. Return rate limit headers so clients can monitor usage.
+    429 response should include the client's tier and upgrade CTA.
+
+================================================================================

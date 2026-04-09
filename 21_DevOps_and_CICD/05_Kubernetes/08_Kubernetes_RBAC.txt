@@ -1,0 +1,845 @@
+================================================================================
+KUBERNETES RBAC — ROLE-BASED ACCESS CONTROL
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. RBAC Overview and Concepts
+2. RBAC Core Resources
+3. Role vs ClusterRole
+4. RoleBinding vs ClusterRoleBinding
+5. Common RBAC Patterns
+6. ServiceAccounts
+7. Cloud Provider Identity Integration (IRSA, Workload Identity)
+8. OIDC Integration for Human Users
+9. Auditing and Troubleshooting RBAC
+10. RBAC Best Practices
+11. Common Interview Questions & Answers
+12. Quick Reference Cheat Sheet
+
+================================================================================
+1. RBAC OVERVIEW AND CONCEPTS
+================================================================================
+
+What is RBAC?
+  Role-Based Access Control (RBAC) controls WHO can do WHAT to WHICH resources.
+  RBAC is the authorization layer AFTER authentication.
+  
+  Flow: Request → Authentication (who are you?) → Authorization (are you allowed?) → Admission
+
+Three Questions RBAC Answers:
+  1. SUBJECT:  Who is making the request?
+               (User, Group, ServiceAccount)
+  2. VERB:     What action do they want?
+               (get, list, watch, create, update, patch, delete, exec...)
+  3. RESOURCE: On what resource?
+               (pods, services, deployments, secrets, configmaps...)
+
+RBAC vs ABAC vs Node Authorization:
+  RBAC:  Role-based, Kubernetes-native, most common
+  ABAC:  Attribute-based, policy files on disk, deprecated/uncommon
+  Node:  Special auth for kubelet to read its own pods/configmaps
+  Webhook: External service makes authz decisions
+
+Enabling RBAC:
+  RBAC is enabled by default in all modern K8s clusters.
+  kube-apiserver flag: --authorization-mode=Node,RBAC
+  (Node auth is always paired for kubelet access)
+
+RBAC API Group:
+  rbac.authorization.k8s.io
+  Resources: Role, ClusterRole, RoleBinding, ClusterRoleBinding
+
+================================================================================
+2. RBAC CORE RESOURCES
+================================================================================
+
+The Four RBAC Resources:
+  
+  ┌────────────────────────────────────────────────────────────────┐
+  │  Role              Permissions WITHIN a namespace              │
+  │  ClusterRole       Permissions across ALL namespaces or        │
+  │                    for cluster-scoped resources                │
+  │  RoleBinding       Binds Role OR ClusterRole to subject        │
+  │                    WITHIN a namespace                          │
+  │  ClusterRoleBinding Binds ClusterRole to subject               │
+  │                    cluster-wide (all namespaces)               │
+  └────────────────────────────────────────────────────────────────┘
+
+Subjects (who can be bound):
+  1. User:           External user (from cert CN or OIDC claim)
+                     "name: jane@example.com"
+  2. Group:          User group (from cert O field or OIDC group claim)
+                     "name: developers"
+  3. ServiceAccount: In-cluster identity for pods
+                     "name: my-app-sa, namespace: production"
+
+Verbs:
+  get          Read a single resource
+  list         List resources
+  watch        Stream resource changes
+  create       Create a resource
+  update       Full update (PUT)
+  patch        Partial update (PATCH)
+  delete       Delete a resource
+  deletecollection  Delete multiple resources
+  
+  Special:
+  exec         Execute into a pod (pods/exec subresource)
+  portforward  Port forward (pods/portforward)
+  attach       Attach to pod (pods/attach)
+  log          Get pod logs (pods/log)
+
+Resources and Subresources:
+  resources: ["pods"]                # The main resource
+  resources: ["pods/exec"]           # Subresource
+  resources: ["pods", "pods/exec"]   # Both main + subresource
+  
+  resourceNames: ["my-specific-pod"] # Restrict to specific named resources
+
+================================================================================
+3. ROLE vs CLUSTERROLE
+================================================================================
+
+Role (namespace-scoped):
+  Defines permissions within ONE namespace.
+  Can only reference namespaced resources.
+  
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata:
+    name: pod-reader
+    namespace: production     # This Role only works in 'production'
+  rules:
+  - apiGroups: [""]           # "" = core API group (pods, services, configmaps, etc.)
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]       # apps group (deployments, replicasets, daemonsets)
+    resources: ["deployments"]
+    verbs: ["get", "list"]
+
+ClusterRole (cluster-scoped):
+  Can define permissions for:
+  1. Namespaced resources ACROSS ALL namespaces
+  2. Cluster-scoped resources (nodes, persistentvolumes, clusterroles, namespaces)
+  3. Non-resource URLs (/healthz, /metrics)
+  
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRole
+  metadata:
+    name: node-reader      # No namespace — cluster-scoped
+  rules:
+  - apiGroups: [""]
+    resources: ["nodes"]    # Cluster-scoped resource
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]    # Another cluster-scoped resource
+    verbs: ["get", "list"]
+  - nonResourceURLs: ["/healthz", "/healthz/*"]
+    verbs: ["get"]
+
+Built-in ClusterRoles:
+  
+  CLUSTERROLE     DESCRIPTION
+  ─────────────────────────────────────────────────────────────────
+  cluster-admin   Full access to everything. Equivalent to root.
+  admin           Full access to namespace resources. Not to cluster scope.
+  edit            CRUD on most namespace resources. No RBAC.
+  view            Read-only on most namespace resources.
+  system:*        Internal system roles (scheduler, controller-manager, etc.)
+  ─────────────────────────────────────────────────────────────────
+  
+  # Check what a built-in ClusterRole allows:
+  kubectl describe clusterrole edit
+  kubectl describe clusterrole admin
+
+ClusterRole Aggregation:
+  ClusterRoles can be built from smaller ClusterRoles using aggregation rules.
+  
+  # View built-in aggregation roles:
+  kubectl get clusterrole view -o yaml | grep aggregationRule -A 5
+
+================================================================================
+4. ROLEBINDING vs CLUSTERROLEBINDING
+================================================================================
+
+RoleBinding — Namespace-scoped Binding:
+  Binds Role OR ClusterRole to subjects WITHIN a namespace.
+  
+  # Bind Role in same namespace:
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: RoleBinding
+  metadata:
+    name: read-pods
+    namespace: production     # Effective only in 'production'
+  subjects:
+  - kind: User
+    name: jane@example.com
+    apiGroup: rbac.authorization.k8s.io
+  - kind: Group
+    name: developers
+    apiGroup: rbac.authorization.k8s.io
+  - kind: ServiceAccount
+    name: my-app-sa
+    namespace: production     # Must specify namespace for ServiceAccount
+  roleRef:
+    kind: Role          # OR ClusterRole
+    name: pod-reader
+    apiGroup: rbac.authorization.k8s.io
+  
+  # Bind ClusterRole in specific namespace (limit scope to one namespace):
+  # Same as above but:
+  roleRef:
+    kind: ClusterRole    # ClusterRole but scoped to namespace by RoleBinding
+    name: admin
+    apiGroup: rbac.authorization.k8s.io
+
+ClusterRoleBinding — Cluster-wide Binding:
+  Binds ClusterRole to subjects across ALL namespaces.
+  
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    name: cluster-admin-binding
+  subjects:
+  - kind: User
+    name: admin@example.com
+    apiGroup: rbac.authorization.k8s.io
+  roleRef:
+    kind: ClusterRole
+    name: cluster-admin
+    apiGroup: rbac.authorization.k8s.io
+
+Scope Matrix:
+  
+  ┌──────────────────┬────────────────────┬──────────────────────────┐
+  │ Role Type        │ Binding Type       │ Access Scope              │
+  ├──────────────────┼────────────────────┼──────────────────────────┤
+  │ Role             │ RoleBinding        │ Same namespace only       │
+  │ ClusterRole      │ RoleBinding        │ Specific namespace only   │
+  │ ClusterRole      │ ClusterRoleBinding │ All namespaces            │
+  │ Role             │ ClusterRoleBinding │ NOT VALID                 │
+  └──────────────────┴────────────────────┴──────────────────────────┘
+  
+  Key insight:
+  ClusterRole + RoleBinding = Reusable permission set, scoped to namespace.
+  Define permissions once (ClusterRole), use in specific namespaces (RoleBinding).
+  This is how built-in "admin", "edit", "view" ClusterRoles are used per-namespace.
+
+================================================================================
+5. COMMON RBAC PATTERNS
+================================================================================
+
+Read-Only Role (namespace):
+  
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata:
+    name: read-only
+    namespace: production
+  rules:
+  - apiGroups: ["", "apps", "batch", "autoscaling"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  ---
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: RoleBinding
+  metadata:
+    name: read-only-binding
+    namespace: production
+  subjects:
+  - kind: Group
+    name: on-call-team
+    apiGroup: rbac.authorization.k8s.io
+  roleRef:
+    kind: Role
+    name: read-only
+    apiGroup: rbac.authorization.k8s.io
+
+Pod Exec Role (for debugging):
+  
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata:
+    name: pod-exec
+    namespace: production
+  rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]     # Subresource for exec
+    verbs: ["create"]             # "create" verb to open exec session
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+
+Namespace Admin Role:
+  # Grant 'admin' ClusterRole in specific namespace:
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: RoleBinding
+  metadata:
+    name: team-a-admin
+    namespace: team-a
+  subjects:
+  - kind: Group
+    name: team-a-developers
+    apiGroup: rbac.authorization.k8s.io
+  roleRef:
+    kind: ClusterRole    # Built-in admin ClusterRole
+    name: admin
+    apiGroup: rbac.authorization.k8s.io
+
+Deployer Role (CI/CD):
+  
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata:
+    name: deployer
+    namespace: production
+  rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+
+Secret Reader (specific secrets only):
+  
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata:
+    name: specific-secret-reader
+    namespace: production
+  rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["db-password", "api-key"]   # Only THESE specific secrets
+    verbs: ["get"]
+
+================================================================================
+6. SERVICEACCOUNTS
+================================================================================
+
+What is a ServiceAccount?
+  Identity for PODS (not humans).
+  When a pod calls the K8s API (e.g., to watch pods, create jobs),
+  it authenticates using its ServiceAccount token.
+  
+  Every pod gets a ServiceAccount (default: "default" in its namespace).
+
+Create and Use ServiceAccount:
+  
+  # Create ServiceAccount:
+  kubectl create serviceaccount my-app-sa -n production
+  
+  # Or via YAML:
+  apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    name: my-app-sa
+    namespace: production
+    annotations:
+      # For IRSA (AWS EKS):
+      eks.amazonaws.com/role-arn: arn:aws:iam::123456789:role/my-app-role
+  automountServiceAccountToken: false  # Opt out of auto-mount (security)
+  
+  # Use in pod:
+  spec:
+    serviceAccountName: my-app-sa     # Mount this SA's token
+    automountServiceAccountToken: true # Override SA default
+
+Bind ServiceAccount to Role:
+  
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: RoleBinding
+  metadata:
+    name: my-app-sa-binding
+    namespace: production
+  subjects:
+  - kind: ServiceAccount
+    name: my-app-sa
+    namespace: production
+  roleRef:
+    kind: ClusterRole
+    name: view
+    apiGroup: rbac.authorization.k8s.io
+
+Default ServiceAccount:
+  Every namespace has a "default" ServiceAccount.
+  Pods use "default" unless specified otherwise.
+  Best practice: Create dedicated ServiceAccounts. Don't use "default".
+  
+  # Disable auto-mount for all pods in namespace (security):
+  kubectl patch serviceaccount default -p '{"automountServiceAccountToken": false}'
+
+ServiceAccount Token:
+  Projected volume: Token auto-mounted at /var/run/secrets/kubernetes.io/serviceaccount/token
+  The token is a JWT signed by the API server.
+  
+  # Pod can use this token to call K8s API:
+  TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+  curl -H "Authorization: Bearer $TOKEN" \
+    https://kubernetes.default.svc/api/v1/namespaces/production/pods
+
+================================================================================
+7. CLOUD PROVIDER IDENTITY INTEGRATION
+================================================================================
+
+IRSA — IAM Roles for Service Accounts (AWS EKS):
+  Allows pods to assume AWS IAM roles WITHOUT storing credentials.
+  Uses OIDC federation between EKS cluster and AWS IAM.
+  
+  Architecture:
+  Pod SA Token → EKS OIDC provider → AWS STS AssumeRoleWithWebIdentity
+  → Temporary AWS credentials
+  
+  Setup:
+  1. Enable OIDC provider on EKS cluster:
+     eksctl utils associate-iam-oidc-provider \
+       --cluster my-cluster --approve
+  
+  2. Create IAM role with trust policy:
+     {
+       "Principal": {
+         "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/oidc.eks.REGION.amazonaws.com/id/OIDC_ID"
+       },
+       "Action": "sts:AssumeRoleWithWebIdentity",
+       "Condition": {
+         "StringEquals": {
+           "oidc.eks.REGION.amazonaws.com/id/OIDC_ID:sub":
+             "system:serviceaccount:NAMESPACE:SERVICEACCOUNT_NAME"
+         }
+       }
+     }
+  
+  3. Annotate ServiceAccount:
+     kubectl annotate serviceaccount my-app-sa \
+       eks.amazonaws.com/role-arn=arn:aws:iam::123456789:role/my-app-role \
+       -n production
+  
+  4. Pod automatically gets AWS credentials injected.
+     AWS SDK auto-discovers them from environment variables:
+     AWS_ROLE_ARN, AWS_WEB_IDENTITY_TOKEN_FILE
+  
+  # Using eksctl:
+  eksctl create iamserviceaccount \
+    --name my-app-sa \
+    --namespace production \
+    --cluster my-cluster \
+    --attach-policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess \
+    --approve
+
+Workload Identity (GKE):
+  Similar to IRSA but for Google Cloud.
+  
+  1. Enable Workload Identity on cluster/node pool.
+  2. Create Google Service Account (GSA).
+  3. Bind K8s ServiceAccount to GSA:
+     kubectl annotate serviceaccount my-app-sa \
+       iam.gke.io/gcp-service-account=my-app@project.iam.gserviceaccount.com
+     
+     gcloud iam service-accounts add-iam-policy-binding \
+       my-app@project.iam.gserviceaccount.com \
+       --role roles/iam.workloadIdentityUser \
+       --member "serviceAccount:project.svc.id.goog[namespace/my-app-sa]"
+
+Azure Workload Identity:
+  Uses Azure AD federation (OIDC).
+  kubectl annotate serviceaccount my-app-sa \
+    azure.workload.identity/client-id: "$CLIENT_ID"
+
+================================================================================
+8. OIDC INTEGRATION FOR HUMAN USERS
+================================================================================
+
+The Problem with K8s User Auth:
+  Kubernetes doesn't have a user database.
+  Users are authenticated via:
+  1. Client certificates (x509) — the kubeconfig method
+  2. OIDC tokens (recommended for organizations)
+  3. Static token files (not recommended)
+  4. Webhook token authentication
+
+OIDC Integration Flow:
+  
+  User → Login to OIDC Provider (Okta, GitHub, Dex, AWS Cognito)
+      → Gets JWT ID token
+      → kubectl configured with token
+      → API server validates token with OIDC provider's public keys
+      → Username extracted from 'sub' claim (or 'email' from --oidc-username-claim)
+      → Groups extracted from configurable claim
+  
+  kube-apiserver OIDC flags:
+  --oidc-issuer-url=https://accounts.google.com
+  --oidc-client-id=kubernetes
+  --oidc-username-claim=email       # Use email as username
+  --oidc-groups-claim=groups        # JWT claim for groups
+  --oidc-username-prefix="oidc:"    # Prefix to avoid collision
+
+Dex (Self-hosted OIDC Provider):
+  Dex acts as OIDC gateway in front of other providers (LDAP, GitHub, SAML).
+  Deployed in cluster, integrates with API server.
+  Popular with on-premise clusters.
+
+kubectl config for OIDC:
+  # Using kubelogin plugin:
+  kubectl config set-credentials oidc-user \
+    --exec-api-version=client.authentication.k8s.io/v1beta1 \
+    --exec-command=kubectl \
+    --exec-arg=oidc-login \
+    --exec-arg=get-token \
+    --exec-arg=--oidc-issuer-url=https://my-dex.example.com \
+    --exec-arg=--oidc-client-id=kubernetes
+
+Group-Based RBAC (recommended for teams):
+  
+  # ClusterRoleBinding for OIDC group:
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    name: platform-team-cluster-admin
+  subjects:
+  - kind: Group
+    name: platform-team      # OIDC group name
+    apiGroup: rbac.authorization.k8s.io
+  roleRef:
+    kind: ClusterRole
+    name: cluster-admin
+    apiGroup: rbac.authorization.k8s.io
+  
+  # RoleBinding for dev team (namespace-scoped):
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: RoleBinding
+  metadata:
+    name: dev-team-edit
+    namespace: team-a
+  subjects:
+  - kind: Group
+    name: team-a-developers   # OIDC group
+    apiGroup: rbac.authorization.k8s.io
+  roleRef:
+    kind: ClusterRole
+    name: edit
+    apiGroup: rbac.authorization.k8s.io
+
+================================================================================
+9. AUDITING AND TROUBLESHOOTING RBAC
+================================================================================
+
+kubectl auth can-i:
+  # Check if YOU can do something:
+  kubectl auth can-i get pods
+  kubectl auth can-i create deployments -n production
+  kubectl auth can-i "*" "*"                        # Am I cluster-admin?
+  
+  # Check if a specific USER can do something (impersonation):
+  kubectl auth can-i get pods --as jane@example.com
+  kubectl auth can-i create secrets -n production --as jane@example.com
+  
+  # Check as a ServiceAccount:
+  kubectl auth can-i get pods --as system:serviceaccount:production:my-app-sa
+  
+  # List ALL permissions for current user:
+  kubectl auth can-i --list
+  kubectl auth can-i --list -n production
+
+Impersonation:
+  # Act as another user (requires impersonate verb on users resource):
+  kubectl get pods --as jane@example.com
+  kubectl get pods --as-group=developers --as jane@example.com
+
+View RBAC Resources:
+  kubectl get roles -n production
+  kubectl get rolebindings -n production
+  kubectl get clusterroles
+  kubectl get clusterrolebindings
+  
+  # Describe a role (see its rules):
+  kubectl describe role pod-reader -n production
+  kubectl describe clusterrole admin
+
+Find Who Has Access:
+  # kubectl-who-can plugin:
+  kubectl who-can get secrets -n production
+  kubectl who-can exec pods -n production
+  
+  # Manual approach with grep:
+  kubectl get rolebindings,clusterrolebindings -A \
+    -o custom-columns='BINDING:.metadata.name,ROLE:.roleRef.name,SUBJECT:.subjects[*].name'
+
+Audit Logs:
+  Enable audit logging on kube-apiserver:
+  
+  --audit-log-path=/var/log/kubernetes/audit.log
+  --audit-policy-file=/etc/kubernetes/audit-policy.yaml
+  
+  # Audit policy:
+  apiVersion: audit.k8s.io/v1
+  kind: Policy
+  rules:
+  # Log all secret access:
+  - level: RequestResponse
+    resources:
+    - group: ""
+      resources: ["secrets"]
+  # Log auth failures:
+  - level: Metadata
+    omitStages: ["RequestReceived"]
+    namespaces: ["production"]
+  
+  Audit levels:
+  None           Don't log
+  Metadata       Log metadata (user, timestamp, resource) but no body
+  Request        Log metadata + request body
+  RequestResponse Log metadata + request + response body
+
+Common Issues:
+  "Error from server (Forbidden): pods is forbidden: User 'jane' cannot list resource 'pods'..."
+  → Need: RoleBinding/ClusterRoleBinding with list on pods
+  
+  "Unauthorized: cannot list resource 'pods' in API group '' in the namespace 'production'"
+  → User is authenticated but not authorized. Add RoleBinding in 'production' ns.
+  
+  ServiceAccount can't access API:
+  1. Check SA exists: kubectl get sa -n production
+  2. Check RoleBinding: kubectl get rolebinding -n production -o yaml
+  3. Check token mounted: kubectl exec pod -- cat /var/run/secrets/kubernetes.io/serviceaccount/token
+  4. Test: kubectl auth can-i get pods --as system:serviceaccount:production:my-app-sa
+
+================================================================================
+10. RBAC BEST PRACTICES
+================================================================================
+
+Principle of Least Privilege:
+  ✓ Grant minimum permissions needed
+  ✓ Never use cluster-admin for application ServiceAccounts
+  ✓ Prefer namespace-scoped Roles over ClusterRoles when possible
+  ✓ Use resourceNames to restrict to specific secrets if needed
+
+ServiceAccount Hygiene:
+  ✓ Create dedicated ServiceAccounts per application
+  ✓ Set automountServiceAccountToken: false unless needed
+  ✓ Use IRSA/Workload Identity instead of static AWS/GCP credentials
+  ✓ Don't use the "default" ServiceAccount
+
+User Management:
+  ✓ Use OIDC (Okta, Dex, Google) for human authentication
+  ✓ Bind to GROUPS not individual users (easier management)
+  ✓ Use RoleBinding + ClusterRole (not ClusterRoleBinding) for namespace access
+  ✓ Regularly audit bindings: kubectl get rolebindings -A
+  ✓ Remove bindings when people leave teams
+
+Security:
+  ✓ Enable audit logging (especially for secrets access)
+  ✓ Alert on escalation attempts (binding to cluster-admin)
+  ✓ Scan for overly permissive roles (RBAC tools: kube-bench, rbac-lookup)
+  ✓ Don't grant wildcards (*) in production
+  ✓ Use OPA/Gatekeeper policies to enforce RBAC standards
+
+CI/CD:
+  ✓ CI pipelines get dedicated ServiceAccount with minimal permissions
+  ✓ Deployer role: create/update Deployments, Services, ConfigMaps
+  ✓ NOT secrets, RBAC resources, or cluster-scoped resources
+  ✓ Use Helm chart with service account templates
+
+================================================================================
+11. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: Explain the four RBAC resources in Kubernetes and how they relate.
+A: K8s RBAC has four resources:
+   
+   1. Role: Defines permissions WITHIN a namespace.
+      Rules: which API groups, resources, and verbs are allowed.
+      Example: "allow get/list/watch on pods in namespace X"
+   
+   2. ClusterRole: Defines permissions across ALL namespaces OR for
+      cluster-scoped resources (nodes, PVs, namespaces).
+      Also used for non-resource URLs (/healthz).
+   
+   3. RoleBinding: Attaches a Role OR ClusterRole to subjects (User/Group/SA)
+      WITHIN a specific namespace. Even if binding a ClusterRole,
+      access is limited to that namespace.
+   
+   4. ClusterRoleBinding: Attaches a ClusterRole to subjects across
+      ALL namespaces (cluster-wide). Use sparingly.
+   
+   Key pattern: ClusterRole + RoleBinding = Define once, use in many namespaces.
+   The built-in "admin", "edit", "view" ClusterRoles work this way.
+   
+   You bind them to namespace-specific RoleBindings per team:
+   - team-a namespace → RoleBinding → ClusterRole:edit → Group:team-a
+   - team-b namespace → RoleBinding → ClusterRole:edit → Group:team-b
+
+Q2: How would you give a CI/CD pipeline access to deploy to a namespace?
+A: I'd create a dedicated ServiceAccount with minimal permissions:
+   
+   1. Create ServiceAccount:
+      kubectl create serviceaccount cicd-deployer -n production
+   
+   2. Create a Role with just what's needed:
+      - apps: deployments, statefulsets → get, list, watch, create, update, patch
+      - "" (core): services, configmaps → get, create, update, patch
+      - "" (core): pods → get, list, watch (for rollout status)
+      NOT: secrets (use External Secrets), RBAC resources
+   
+   3. Create RoleBinding:
+      Bind the Role to the ServiceAccount in 'production' namespace.
+   
+   4. Configure CI/CD to use the ServiceAccount:
+      In GitHub Actions:
+      - Use kubernetes-actions/kubectl-action with kubeconfig
+      - kubeconfig only has ServiceAccount token credentials
+   
+   5. For cloud platforms (EKS): Use IRSA.
+      Annotate the ServiceAccount with IAM role ARN.
+      The IAM role has K8s API access via aws-auth configmap.
+   
+   Security principle: Deployer role should deploy, not read secrets
+   or modify RBAC. Separate concerns.
+
+Q3: What is IRSA and why is it better than other credential methods?
+A: IRSA = IAM Roles for Service Accounts (EKS-specific).
+   
+   The problem it solves:
+   Apps in pods need AWS credentials to access S3, DynamoDB, SQS, etc.
+   
+   Bad approaches:
+   1. Hardcode credentials in env vars → exposed in kubectl, etcd, logs
+   2. Mount IAM user credentials as K8s Secret → manually rotated, risky
+   3. Use the node's EC2 instance role → ALL pods on the node share it
+      → overly permissive, violates least privilege
+   
+   IRSA approach:
+   1. EKS cluster has an OIDC provider endpoint
+   2. Each pod's ServiceAccount token is OIDC-compatible (audience set)
+   3. The SA token references the IAM Role ARN via annotation
+   4. AWS SDK in the pod calls STS AssumeRoleWithWebIdentity
+   5. STS validates the OIDC token against the EKS OIDC provider
+   6. Returns temporary credentials (15 min - 12 hour TTL)
+   
+   Benefits:
+   ✓ No long-lived credentials stored anywhere
+   ✓ Per-pod granularity (not per-node)
+   ✓ Automatic credential rotation (temp credentials, SDK handles renewal)
+   ✓ Auditable: CloudTrail shows which pod assumed which role
+   ✓ Role Condition restricts to specific SA (not any pod can assume it)
+
+Q4: How do you troubleshoot a "Forbidden" error in Kubernetes?
+A: Systematic approach:
+   
+   1. Identify the requester:
+      The error message says who:
+      "User 'jane@example.com' cannot list resource 'pods'..."
+      "serviceaccount 'production/my-app-sa' cannot..."
+   
+   2. Check what they need:
+      From the error: verb (list), resource (pods), namespace
+   
+   3. Check what they have:
+      # If user:
+      kubectl auth can-i --list --as jane@example.com -n production
+      
+      # If ServiceAccount:
+      kubectl auth can-i --list -n production \
+        --as system:serviceaccount:production:my-app-sa
+   
+   4. Check existing bindings:
+      kubectl get rolebindings,clusterrolebindings -A \
+        | grep jane
+   
+   5. Fix: Create/update Role and RoleBinding.
+   
+   Common gotchas:
+   - Wrong namespace: RoleBinding in 'staging' doesn't help 'production'
+   - ServiceAccount wrong namespace: --as system:serviceaccount:NAMESPACE:SA
+     The namespace must be correct in the subject
+   - ClusterRole bound in namespace (RoleBinding) doesn't grant cluster resources
+   - automountServiceAccountToken: false → pod has no token → can't call API
+
+Q5: What's the difference between a Role and a ClusterRole? Can you use a ClusterRole for namespace-scoped access?
+A: Role vs ClusterRole:
+   
+   Role: Namespace-scoped. Can only grant access to resources WITHIN its namespace.
+   ClusterRole: Cluster-scoped. Can grant access to:
+   1. Resources across ALL namespaces
+   2. Cluster-scoped resources (nodes, PVs, clusterroles, namespaces)
+   3. Non-resource URLs (/healthz, /metrics)
+   
+   Yes, you CAN use ClusterRole for namespace-scoped access:
+   By binding it with a RoleBinding (not ClusterRoleBinding).
+   
+   ClusterRole + RoleBinding = ClusterRole's permissions, but ONLY in the binding's namespace.
+   
+   Why use this pattern?
+   Define the permission set ONCE as ClusterRole.
+   Reuse it in multiple namespaces with namespace-specific RoleBindings.
+   
+   Example: Built-in "edit" ClusterRole.
+   You want "edit" access in multiple namespaces without creating identical Roles:
+   
+   # Namespace A:
+   RoleBinding in namespace-a → ClusterRole:edit → Group:team-a
+   # Namespace B:
+   RoleBinding in namespace-b → ClusterRole:edit → Group:team-b
+   
+   If you used ClusterRoleBinding instead, team-a would have "edit" EVERYWHERE.
+   RoleBinding restricts the scope to the binding's namespace.
+
+================================================================================
+12. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+RBAC RESOURCES:
+  Role            Permissions in namespace
+  ClusterRole     Permissions cluster-wide or cluster-scoped resources
+  RoleBinding     Bind Role/ClusterRole to subject IN namespace
+  ClusterRoleBinding  Bind ClusterRole to subject EVERYWHERE
+
+COMMON VERBS:
+  get, list, watch, create, update, patch, delete
+  exec → pods/exec  (create verb)
+  logs → pods/log   (get verb)
+
+BUILT-IN CLUSTERROLES:
+  cluster-admin   Full control
+  admin           Namespace full control
+  edit            CRUD on namespace resources
+  view            Read-only on namespace resources
+
+KUBECTL COMMANDS:
+  kubectl auth can-i get pods [-n ns] [--as user]
+  kubectl auth can-i --list [--as user] [-n ns]
+  kubectl get rolebindings,clusterrolebindings -A
+  kubectl describe role/clusterrole NAME
+  kubectl create role/clusterrole NAME --verb=get --resource=pods
+  kubectl create rolebinding/clusterrolebinding NAME --clusterrole=NAME --serviceaccount=NS:SA
+
+SCOPE MATRIX:
+  Role + RoleBinding         → Namespace only
+  ClusterRole + RoleBinding  → Namespace only (recommended pattern)
+  ClusterRole + CRB          → All namespaces
+
+IRSA (EKS):
+  1. Create OIDC provider for cluster
+  2. Create IAM Role with trust policy for OIDC + SA
+  3. Annotate SA: eks.amazonaws.com/role-arn: ARN
+  4. AWS SDK auto-discovers credentials
+
+BEST PRACTICES:
+  ✓ Least privilege
+  ✓ Groups not individual users
+  ✓ IRSA/Workload Identity for pods
+  ✓ automountServiceAccountToken: false by default
+  ✓ Audit bindings regularly
+  ✗ Never cluster-admin for apps
+  ✗ No wildcard (*) in production
+
+================================================================================
+END OF FILE
+================================================================================

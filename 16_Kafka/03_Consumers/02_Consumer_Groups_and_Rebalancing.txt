@@ -1,0 +1,280 @@
+================================================================================
+  KAFKA CONSUMER GROUPS AND REBALANCING
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHAT IS A CONSUMER GROUP?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A consumer group is a logical grouping of consumers that jointly consume a
+topic. Kafka guarantees that each partition is assigned to exactly ONE consumer
+within the group at any time.
+
+  Topic: orders  (6 partitions: P0 P1 P2 P3 P4 P5)
+  Consumer Group: order-processors (3 consumers)
+
+  Consumer-1 → P0, P1
+  Consumer-2 → P2, P3
+  Consumer-3 → P4, P5
+
+Rules:
+  - Max parallelism = number of partitions (no benefit from more consumers)
+  - If consumers > partitions → some consumers are IDLE (no partition assigned)
+  - If consumers < partitions → some consumers handle multiple partitions
+  - Multiple groups can consume the same topic independently (fan-out)
+    e.g., group "billing" and group "analytics" both read "orders" independently
+
+Groups scale horizontally: to increase throughput, add consumers up to partition count.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. GROUP COORDINATOR
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Every consumer group has a Group Coordinator — a designated broker responsible
+for managing the group's lifecycle.
+
+Determining the coordinator:
+  partition = abs(hash(group.id)) % offsets.topic.num.partitions (50)
+  The broker that is LEADER of that __consumer_offsets partition = coordinator
+
+The Group Coordinator:
+  - Maintains the list of active consumers (heartbeat tracking)
+  - Triggers rebalances when the group composition changes
+  - Manages offset commits for the group
+  - Coordinates JoinGroup / SyncGroup protocol
+
+Consumer → Coordinator discovery:
+  1. Consumer sends FindCoordinator request to any broker
+  2. Broker responds with coordinator address
+  3. Consumer connects directly to coordinator
+  4. Coordinator is also written to consumer metadata
+
+If coordinator dies:
+  - Consumers detect via heartbeat failure
+  - Send FindCoordinator again → Kafka elects a new coordinator
+  - Group rebalances automatically
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. JOIN GROUP / SYNC GROUP PROTOCOL (EAGER REBALANCE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When a consumer joins, leaves, or times out, a rebalance occurs via this protocol:
+
+  PHASE 1: JoinGroup
+  ──────────────────
+  1. Coordinator sends REBALANCE notification to ALL consumers in the group
+  2. ALL consumers STOP processing and send JoinGroup request
+     - Consumers include their "subscription" (topic list) and supported
+       partition assignment strategies
+  3. Coordinator waits for all members to join (max.poll.interval.ms window)
+  4. Coordinator elects one consumer as GROUP LEADER (usually the first to join)
+  5. Coordinator responds with: member list, leader ID, generation ID
+
+  PHASE 2: SyncGroup
+  ──────────────────
+  6. GROUP LEADER runs the partition assignment algorithm locally
+     - Considers all subscribed topics and all partitions
+     - Runs the chosen PartitionAssignor
+  7. GROUP LEADER sends SyncGroup request to coordinator WITH the assignment
+  8. Other members also send SyncGroup (with empty assignment map)
+  9. Coordinator distributes the assignment to each member
+  10. Consumers resume polling with new partition assignments
+
+  PHASE 3: Heartbeat
+  ──────────────────
+  - After syncing, consumers send heartbeats every heartbeat.interval.ms (3s default)
+  - If coordinator doesn't receive heartbeat within session.timeout.ms (45s default)
+    → consumer is declared dead → rebalance triggered
+
+Rebalance Triggers:
+  - New consumer joins
+  - Consumer dies (heartbeat timeout / crash)
+  - Consumer voluntarily leaves (consumer.close())
+  - New partition added to subscribed topic
+  - Group subscription changes (new topic matching pattern)
+  - max.poll.interval.ms exceeded (consumer is alive but not polling fast enough)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. PARTITION ASSIGNMENT STRATEGIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Set via: partition.assignment.strategy
+
+─── RangeAssignor (DEFAULT) ───────────────────────────────────────────────────
+  - Assigns contiguous ranges of partitions per topic
+  - Algorithm: sort partitions, sort consumers, divide evenly
+  - Example: Topic with 6 partitions, 3 consumers:
+      C1 → P0, P1   C2 → P2, P3   C3 → P4, P5
+  - Problem with multiple topics:
+      Topic A (6 partitions), Topic B (6 partitions):
+      C1 → A:[P0,P1], B:[P0,P1]   → 4 partitions
+      C2 → A:[P2,P3], B:[P2,P3]   → 4 partitions
+      C3 → A:[P4,P5], B:[P4,P5]   → 4 partitions  ✓ balanced
+      
+      Topic A (7 partitions), Topic B (7 partitions):
+      C1 → A:[P0,P1,P2], B:[P0,P1,P2] → 6 partitions (overloaded!)
+      C2 → A:[P3,P4],    B:[P3,P4]    → 4 partitions
+      C3 → A:[P5,P6],    B:[P5,P6]    → 4 partitions
+
+─── RoundRobinAssignor ────────────────────────────────────────────────────────
+  - Lists ALL partitions across all topics, assigns round-robin
+  - More balanced across multiple topics
+  - Example: T-A-P0, T-A-P1, T-B-P0, T-B-P1 → consumers C1, C2:
+      C1 → T-A-P0, T-B-P0
+      C2 → T-A-P1, T-B-P1
+  - Problem: subscription must be IDENTICAL across all consumers in the group
+    (fails if consumers subscribe to different topic subsets)
+
+─── StickyAssignor ────────────────────────────────────────────────────────────
+  - Maximizes stability: preserves as many partition assignments as possible
+    during rebalance
+  - Also minimizes data movement (unlike Range/RoundRobin which fully reassign)
+  - Before rebalance: C1→P0,P1  C2→P2,P3  C3→P4,P5
+  - C3 leaves, rebalance:
+      StickyAssignor: C1→P0,P1,P4  C2→P2,P3,P5 (P4 and P5 moved minimally)
+      vs RoundRobin: could reassign everything
+  - Still EAGER (stops all consumers during rebalance)
+
+─── CooperativeStickyAssignor (RECOMMENDED) ───────────────────────────────────
+  - Implements INCREMENTAL cooperative rebalancing (Kafka 2.4+)
+  - Only revokes partitions that NEED to move; others continue processing
+  - Two-phase incremental protocol instead of stop-the-world
+  - 2 JoinGroup/SyncGroup rounds to avoid duplicate assignment
+  - BEST CHOICE for production: minimizes consumer pause time
+
+Set strategy:
+  props.put(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG,
+    CooperativeStickyAssignor.class.getName());
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. EAGER VS COOPERATIVE REBALANCING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+EAGER (Range, RoundRobin, Sticky):
+  - ALL consumers drop ALL partitions at the start of rebalance
+  - Nobody processes anything during the full JoinGroup→SyncGroup cycle
+  - "Stop the world" — can pause consumption for several seconds
+  - Safe but expensive
+
+  Timeline:
+  C1 processing...  [STOP]  [JoinGroup] [SyncGroup] [resume with P0,P1]
+  C2 processing...  [STOP]  [JoinGroup] [SyncGroup] [resume with P2,P3]
+  C3 joins                  [JoinGroup] [SyncGroup] [assigned P4,P5 from C2]
+
+COOPERATIVE (CooperativeStickyAssignor):
+  - Only revoked partitions pause; others continue processing uninterrupted
+  - Two JoinGroup/SyncGroup rounds:
+      Round 1: identify which partitions will be revoked
+      Round 2: assign the revoked partitions to new owners
+  - Consumers not involved in a reassignment don't stop at all
+
+  Timeline:
+  C1 processing P0,P1  [round1: keep P0,P1]  [round2: keep P0,P1] → CONTINUOUS
+  C2 processing P2,P3  [round1: keep P2,P3]  [round2: P3 moves]   → brief pause
+  C3 joins             [round1: waiting]     [round2: gets P3,P5]
+
+Impact on production:
+  - Eager: consumer lag spikes during every rebalance (including new deployments)
+  - Cooperative: minimal lag increase, smooth rolling restart support
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. STATIC GROUP MEMBERSHIP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Problem: Rolling restarts in Kubernetes cause repeated rebalances:
+  Pod restarts → consumer leaves → rebalance → pod rejoins → rebalance again
+  If you have 10 pods, a rolling restart causes 20 rebalances!
+
+Solution: Static group membership (Kafka 2.3+)
+
+  props.put(ConsumerConfig.GROUP_INSTANCE_ID_CONFIG, "consumer-pod-0");
+
+How it works:
+  - Consumer is assigned a persistent, unique group.instance.id
+  - When a static consumer LEAVES (closes without a timeout), coordinator does NOT
+    trigger a rebalance immediately
+  - It waits for session.timeout.ms before considering the member dead
+  - If the same group.instance.id REJOINS before timeout → gets its old partitions
+    back without a rebalance
+
+  Consumer pod restarts:
+    Without static: leave → rebalance → rejoin → rebalance (2 rebalances!)
+    With static:    leave → (timeout window) → rejoin → NO rebalance (if rejoins in time)
+
+Configuration:
+  - Set group.instance.id to a unique, stable identifier per consumer process
+    (e.g., pod name, hostname, container ID)
+  - Tune session.timeout.ms to be slightly longer than your typical restart time
+    (e.g., session.timeout.ms=60000 for pods that restart in 30-45s)
+
+Trade-off: If a consumer process truly dies (doesn't come back), the coordinator
+  waits the full session.timeout.ms before reassigning its partitions → higher
+  lag during unplanned failures compared to dynamic membership.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. HEARTBEAT AND SESSION TIMEOUT CONFIGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────────────────────────┬─────────────┬─────────────────────────────────────┐
+  │ Config                       │ Default     │ Description                         │
+  ├──────────────────────────────┼─────────────┼─────────────────────────────────────┤
+  │ heartbeat.interval.ms        │ 3000 (3s)   │ How often consumer sends heartbeat  │
+  │ session.timeout.ms           │ 45000 (45s) │ Time without heartbeat = dead        │
+  │ max.poll.interval.ms         │ 300000 (5m) │ Max time between poll() calls        │
+  │ max.poll.records             │ 500         │ Max records per poll()               │
+  └──────────────────────────────┴─────────────┴─────────────────────────────────────┘
+
+  RULE: heartbeat.interval.ms < session.timeout.ms / 3
+  (ensures at least 3 heartbeats can be missed before timing out)
+
+Two types of consumer liveness checks:
+  1. HEARTBEAT thread: background thread sends heartbeats independently of poll()
+     - Detects: network partitions, crashed processes
+     - Controlled by: session.timeout.ms
+  
+  2. POLL INTERVAL check: coordinator tracks time since last poll()
+     - Detects: consumer alive but processing TOO slowly (blocking in poll loop)
+     - Controlled by: max.poll.interval.ms
+     - If exceeded: consumer leaves the group (group triggered rebalance)
+     - Fix: reduce processing time, increase max.poll.interval.ms, or
+            reduce max.poll.records to process smaller batches faster
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What happens when a new consumer joins an existing consumer group?
+A: A rebalance is triggered. The group coordinator notifies all current members.
+   All members stop processing (in eager mode) and send JoinGroup requests to the
+   coordinator. The elected leader runs the partition assignment algorithm and sends
+   the result via SyncGroup. All consumers then resume with their new assignments.
+
+Q: What is the difference between session.timeout.ms and max.poll.interval.ms?
+A: session.timeout.ms tracks liveness via heartbeats — if the coordinator doesn't
+   receive a heartbeat in this window, the consumer is declared dead. This detects
+   crashed or network-partitioned consumers. max.poll.interval.ms tracks poll()
+   call frequency — if a consumer is alive (sending heartbeats) but not calling
+   poll() fast enough (e.g., processing is too slow), it is kicked out of the group
+   after this timeout. Two different failure modes.
+
+Q: Why is CooperativeStickyAssignor preferred over RangeAssignor?
+A: CooperativeStickyAssignor uses incremental cooperative rebalancing — only the
+   partitions that must move are revoked and reassigned. Consumers that keep their
+   partitions continue processing throughout the rebalance. Range/RoundRobin/Sticky
+   use eager rebalancing: ALL consumers drop ALL partitions during rebalance ("stop
+   the world"). In high-throughput systems, eager rebalances cause lag spikes.
+
+Q: What is static group membership and why is it useful?
+A: Static membership assigns a stable group.instance.id to each consumer. If that
+   consumer restarts within session.timeout.ms, it rejoins without triggering a
+   rebalance — it gets its old partitions back. Without static membership, every
+   consumer restart (e.g., Kubernetes rolling restart) causes two rebalances
+   (on leave and on rejoin). Static membership is essential in containerized
+   environments to avoid rebalance storms during deployments.
+
+Q: Can you have more consumers in a group than there are partitions in a topic?
+A: Yes, but the excess consumers will be idle — they won't be assigned any
+   partitions. Each partition can only be assigned to one consumer within the group.
+   So for a topic with 6 partitions, only 6 consumers can actively consume. Adding
+   a 7th consumer is wasted capacity until the number of partitions increases.

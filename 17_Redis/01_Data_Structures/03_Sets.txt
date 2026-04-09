@@ -1,0 +1,235 @@
+================================================================================
+REDIS SETS — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. OVERVIEW
+────────────
+A Redis Set is an unordered collection of unique strings. Duplicates are
+automatically ignored. Key properties:
+  - Uniqueness guaranteed (unlike Lists)
+  - Unordered (unlike Sorted Sets)
+  - O(1) average for add, remove, membership test
+  - Supports set operations: UNION, INTERSECTION, DIFFERENCE
+  - Max elements: 2^32 - 1 (~4 billion)
+
+
+2. INTERNAL ENCODING
+─────────────────────
+  intset: when ALL members are integers AND count ≤ set-max-intset-entries (512)
+    - Sorted array of integers
+    - Very compact (8 bytes per integer)
+    - Binary search for O(log N) membership (fast in practice)
+    - OBJECT ENCODING key → "intset"
+
+  listpack: when count ≤ set-max-listpack-entries (128) AND elements ≤ 64 bytes
+    - Added in Redis 7.2 as an intermediate encoding
+    - OBJECT ENCODING key → "listpack"
+
+  hashtable: for larger sets
+    - O(1) average for all operations
+    - Higher memory overhead
+    - OBJECT ENCODING key → "hashtable"
+
+  Threshold config:
+    set-max-intset-entries    512   # intset threshold
+    set-max-listpack-entries  128   # listpack threshold
+    set-max-listpack-value     64   # max element size for listpack
+
+
+3. CORE COMMANDS
+─────────────────
+  Add / Remove:
+    SADD key member [member …]       → add members. Returns count of new adds.
+    SREM key member [member …]       → remove members. Returns count removed.
+    SPOP key [count]                  → remove and return random member(s)
+    SMOVE src dst member              → atomically move member between sets
+
+  Query:
+    SMEMBERS key                      → all members (O(N) — use carefully!)
+    SISMEMBER key member              → 1 if member exists, 0 if not. O(1).
+    SMISMEMBER key m1 m2 …            → batch membership check. O(N).
+    SCARD key                         → cardinality (count). O(1).
+    SRANDMEMBER key [count]           → random member(s) without removing
+                                        positive count: distinct members
+                                        negative count: may repeat members
+
+  Scan:
+    SSCAN key cursor [MATCH pat] [COUNT n]  → iterate members (non-blocking)
+
+  Set Operations:
+    SUNION key [key …]               → union of all sets (no duplicates)
+    SINTER key [key …]               → intersection (only common members)
+    SDIFF key [key …]                → difference (in first but not others)
+
+    SUNIONSTORE dst key [key …]      → store union in dst key
+    SINTERSTORE dst key [key …]      → store intersection in dst key
+    SDIFFSTORE dst key [key …]       → store difference in dst key
+    SINTERCARD numkeys key [key …] [LIMIT limit]  → count intersection size
+
+
+4. SET OPERATIONS IN DEPTH
+────────────────────────────
+  SUNION:
+    set1 = {a, b, c}
+    set2 = {b, c, d}
+    SUNION set1 set2 → {a, b, c, d}
+
+  SINTER:
+    SINTER set1 set2 → {b, c}    (common members)
+
+  SDIFF:
+    SDIFF set1 set2  → {a}       (in set1 but NOT in set2)
+    SDIFF set2 set1  → {d}       (in set2 but NOT in set1)
+
+  Complexity: O(N*M) for SINTER where N=smallest set, M=number of sets.
+  Optimization: always list the SMALLEST set first in SINTER — Redis processes
+  from the smallest set and checks membership in others.
+
+  SINTERCARD (Redis 7.0+):
+    SINTERCARD 2 set1 set2 LIMIT 10   → count of intersection, up to 10
+    → Avoids returning all members just to count them
+
+
+5. RANDOM SAMPLING — SRANDMEMBER vs SPOP
+──────────────────────────────────────────
+  SRANDMEMBER key 5    → 5 distinct random members (no removal)
+  SRANDMEMBER key -5   → 5 random members (may repeat, no removal)
+  SPOP key 5           → 5 random members REMOVED from set
+
+  When to use each:
+    SRANDMEMBER: random sampling without modification (e.g., show 5 random
+                 products from a category)
+    SPOP:        lottery/drawing (each item only drawn once), game mechanics
+
+  Randomness quality:
+    Redis uses a pseudo-random algorithm. Not cryptographically secure.
+    For security-sensitive sampling (tokens, prizes), use application-layer
+    secure random + Redis for state tracking.
+
+
+6. PRACTICAL USE CASES
+───────────────────────
+
+6a. Online Users / Active Sessions:
+    SADD online:users user:42
+    SREM online:users user:42       # on disconnect
+    SCARD online:users              # total online count
+    SISMEMBER online:users user:42  # is user online?
+
+6b. Tagging:
+    SADD tags:product:123 "electronics" "sale" "featured"
+    SMEMBERS tags:product:123
+    # Products with BOTH "sale" AND "electronics" tags:
+    SINTERSTORE result tags:electronics tags:sale
+    SMEMBERS result
+
+6c. Friends / Social Graph:
+    SADD friends:alice bob charlie dave
+    SADD friends:bob  alice charlie eve
+
+    # Mutual friends (Alice & Bob's common friends)
+    SINTER friends:alice friends:bob    → {charlie}
+
+    # All of Alice's friends or Bob's friends
+    SUNION friends:alice friends:bob    → {bob, charlie, dave, alice, eve}
+
+    # Bob's friends Alice doesn't have
+    SDIFF friends:bob friends:alice     → {eve}
+
+6d. Unique Visitors (daily):
+    SADD visitors:2024-01-15 user:42 user:99
+    SCARD visitors:2024-01-15       # unique visitor count
+    # Note: use HyperLogLog for very large counts
+
+6e. Lottery Draw:
+    SADD lottery:participants u1 u2 u3 u4 u5
+    SPOP lottery:participants 3     # draw 3 winners (removes them)
+    SMEMBERS lottery:participants   # remaining participants
+
+6f. Blacklist / Whitelist:
+    SADD blacklist:ips "1.2.3.4" "5.6.7.8"
+    SISMEMBER blacklist:ips "1.2.3.4"  → 1 (blocked)
+
+6g. Pub/Sub Channel Membership (track who's subscribed):
+    SADD channel:sports:subscribers user:42 user:99
+    SMEMBERS channel:sports:subscribers  # get all subscribers
+
+6h. Recommendation Engine (collaborative filtering):
+    SADD user:42:liked item:1 item:2 item:3
+    SADD user:99:liked item:2 item:3 item:4
+    # Items liked by both (similarity)
+    SINTER user:42:liked user:99:liked   → {item:2, item:3}
+    # Items user:99 liked that user:42 hasn't seen
+    SDIFF user:99:liked user:42:liked    → {item:4}  → recommend to user:42
+
+
+7. PERFORMANCE SUMMARY
+───────────────────────
+  Command           │ Complexity
+  ──────────────────┼─────────────────────────────────────────
+  SADD              │ O(1) avg per element
+  SREM              │ O(1) avg per element
+  SISMEMBER         │ O(1) avg
+  SMISMEMBER        │ O(N) where N = elements to check
+  SCARD             │ O(1)
+  SMEMBERS          │ O(N) — returns all, use SSCAN for large sets
+  SRANDMEMBER       │ O(N) for multiple distinct elements
+  SPOP              │ O(1) for single, O(N) for multiple
+  SUNION            │ O(N) where N = total elements in all sets
+  SINTER            │ O(N*M) where N = smallest set, M = num sets
+  SDIFF             │ O(N) where N = total elements
+  SUNIONSTORE etc.  │ Same as above + O(N) to write result
+  SSCAN             │ O(1) per call (amortized O(N) total)
+
+
+8. SMEMBERS vs SSCAN FOR LARGE SETS
+──────────────────────────────────────
+  SMEMBERS: returns ALL members at once.
+    - Simple but dangerous for large sets → could return millions of members
+    - Blocks server for large sets
+    - Use ONLY for small, bounded sets
+
+  SSCAN cursor [MATCH pat] [COUNT n]:
+    - Iterates over members in chunks
+    - Non-blocking (cursor-based, like pagination)
+    - cursor=0 to start, cursor=0 returned = complete
+    - COUNT is a hint, not guaranteed (may return more or fewer)
+
+  Example iteration:
+    cursor = 0
+    loop:
+      cursor, members = SSCAN myset cursor COUNT 100
+      process(members)
+      if cursor == 0: break
+
+
+9. INTERVIEW QUESTIONS & ANSWERS
+────────────────────────────────────
+  Q: What is the time complexity of SINTER?
+  A: O(N * M) where N is the size of the smallest set and M is the number of
+     sets. Redis optimizes by iterating the smallest set and checking membership
+     in all others (O(1) hashtable lookup per check). Always put the smallest
+     set first.
+
+  Q: How does Redis ensure uniqueness in a Set?
+  A: Through the underlying hashtable (for large sets) or intset/listpack (for
+     small sets). SADD checks for membership before insertion. If the member
+     already exists, it's not added again and the return count for that member
+     is 0.
+
+  Q: What's the difference between SPOP and SRANDMEMBER?
+  A: SPOP removes the randomly selected member(s) from the set. SRANDMEMBER
+     returns random members without removal. Use SPOP for lottery/drawing
+     mechanics, SRANDMEMBER for sampling.
+
+  Q: How would you implement "mutual friends" feature using Redis?
+  A: Store each user's friends as a Set. Use SINTER to compute the intersection:
+     SINTER friends:user1 friends:user2 returns members in both sets.
+
+  Q: When would Redis Set NOT be appropriate?
+  A: When you need ordered data (use Sorted Set), when members need scores or
+     metadata (use Sorted Set or Hash), when you need very large unique counts
+     (use HyperLogLog — Sets use O(N) memory), or when you need to store
+     duplicate elements (use List).
+
+================================================================================

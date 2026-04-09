@@ -1,0 +1,271 @@
+================================================================
+CSRF PROTECTION IN REACT
+================================================================
+
+CSRF (Cross-Site Request Forgery) is an attack where a malicious
+website tricks a user's browser into making an unwanted request
+to your application.
+
+================================================================
+1. UNDERSTANDING THE ATTACK
+================================================================
+
+SCENARIO:
+  1. Alice logs in to bank.com (session cookie is set)
+  2. Alice visits evil.com while still logged in
+  3. evil.com has hidden HTML:
+     <img src="https://bank.com/transfer?to=attacker&amount=5000">
+     Or: <form action="https://bank.com/transfer" method="POST">
+         <input type="hidden" name="amount" value="5000">
+     </form> → auto-submitted via JS
+  4. Browser automatically includes bank.com cookies with the request
+  5. Bank's server thinks Alice made the request → money transferred
+
+WHY IT WORKS:
+  Browsers automatically include cookies with every request to their origin,
+  regardless of which page initiated the request.
+
+================================================================
+2. WHEN IS CSRF A CONCERN IN REACT APPS?
+================================================================
+
+VULNERABLE: When using COOKIES for authentication.
+  - Session cookies
+  - JWT in a cookie (even httpOnly)
+
+NOT VULNERABLE: When using Authorization header for authentication.
+  - JWT in Authorization: Bearer header
+  - The header must be explicitly set by JavaScript
+  - A CSRF attack cannot set custom headers
+  - Malicious sites cannot read the token (SameOrigin policy)
+
+KEY INSIGHT:
+  If your React app uses JWT in the Authorization header (not cookie),
+  CSRF is NOT an issue. The attacker cannot access or send the JWT header.
+
+  If you use cookies (for security against XSS), you MUST protect against CSRF.
+
+================================================================
+3. CSRF PROTECTION MECHANISMS
+================================================================
+
+A) SYNCHRONIZER TOKEN PATTERN (Classic)
+   - Backend generates a random CSRF token per session
+   - Token is stored on the server + sent to client
+   - Client includes it in every mutating request (POST/PUT/DELETE)
+   - Server validates the token matches
+
+B) DOUBLE SUBMIT COOKIE PATTERN
+   - Server sends CSRF token as a NON-httpOnly cookie
+   - Client reads it via JavaScript (document.cookie)
+   - Client sends it in a custom header or form field
+   - Server compares header value with cookie value
+   - An attacker cannot read the cookie from another origin → attack fails
+
+C) SAMSITE COOKIE ATTRIBUTE (Modern Defense)
+   - SameSite=Strict: Cookie sent ONLY for same-site requests
+   - SameSite=Lax: Cookie sent for same-site + top-level navigation GETs
+   - SameSite=None: Cookie sent cross-site (requires Secure flag)
+
+   SameSite=Strict is the best CSRF defense for modern browsers.
+   Old browsers don't support it → combine with CSRF tokens.
+
+D) ORIGIN / REFERER HEADER VALIDATION
+   - Server checks Origin or Referer header on mutating requests
+   - If origin doesn't match your domain → reject
+   - Easy to implement but can fail if headers are stripped
+
+================================================================
+4. SPRING BOOT CSRF CONFIGURATION
+================================================================
+
+BY DEFAULT: Spring Security enables CSRF protection for all mutating
+            requests. It uses the Synchronizer Token Pattern.
+
+WHEN USING JWT (Authorization header) — Disable CSRF:
+  @Configuration
+  public class SecurityConfig {
+      @Bean
+      public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+          http
+              .csrf(csrf -> csrf.disable())  // JWT auth doesn't need CSRF
+              .sessionManagement(sm -> sm.sessionCreationPolicy(STATELESS))
+              .authorizeHttpRequests(...)
+              .oauth2ResourceServer(...);
+          return http.build();
+      }
+  }
+
+  This is the most common configuration for React + JWT + Spring Boot.
+
+WHEN USING COOKIES — Enable CSRF with Double Submit:
+  @Bean
+  public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+      http
+          .csrf(csrf -> csrf
+              .csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())
+              // ↑ Sends CSRF token as XSRF-TOKEN cookie (readable by JS)
+              .csrfTokenRequestHandler(new CsrfTokenRequestAttributeHandler())
+          )
+          ...
+      return http.build();
+  }
+
+================================================================
+5. REACT + AXIOS CSRF (Double Submit Cookie Pattern)
+================================================================
+
+When Spring Security sends the CSRF token as the XSRF-TOKEN cookie:
+
+AXIOS AUTO-HANDLING:
+  Axios automatically reads the XSRF-TOKEN cookie and sends it as the
+  X-XSRF-TOKEN header for mutating requests. This behavior is built-in.
+
+  const apiClient = axios.create({
+    xsrfCookieName: 'XSRF-TOKEN',   // default value
+    xsrfHeaderName: 'X-XSRF-TOKEN', // default value
+    withCredentials: true,           // needed to send cookies
+  });
+
+  // That's it! Axios handles CSRF automatically.
+
+MANUAL (with fetch):
+  // Read the CSRF token from cookie
+  const getCsrfToken = () => {
+    const cookie = document.cookie
+      .split(';')
+      .find(c => c.trim().startsWith('XSRF-TOKEN='));
+    return cookie ? decodeURIComponent(cookie.split('=')[1]) : null;
+  };
+
+  // Include in requests
+  fetch('/api/users', {
+    method: 'POST',
+    credentials: 'include',  // send cookies
+    headers: {
+      'Content-Type': 'application/json',
+      'X-XSRF-TOKEN': getCsrfToken(),
+    },
+    body: JSON.stringify(data),
+  });
+
+================================================================
+6. SAMESITE COOKIE SETUP IN SPRING BOOT
+================================================================
+
+  @PostMapping("/login")
+  public ResponseEntity<?> login(..., HttpServletResponse response) {
+      // ...
+
+      // Set session/refresh token cookie with SameSite
+      ResponseCookie cookie = ResponseCookie.from("refreshToken", token)
+          .httpOnly(true)
+          .secure(true)
+          .sameSite("Strict")  // or "Lax"
+          .path("/api/auth")
+          .maxAge(Duration.ofDays(30))
+          .build();
+
+      response.addHeader(HttpHeaders.SET_COOKIE, cookie.toString());
+      return ResponseEntity.ok(new LoginResponse(accessToken));
+  }
+
+================================================================
+7. COMPREHENSIVE SECURITY STRATEGY
+================================================================
+
+THE GOLD STANDARD SETUP:
+
+  ACCESS TOKEN:
+    - Store in memory (JavaScript variable)
+    - Send in Authorization: Bearer header
+    - No CSRF risk
+
+  REFRESH TOKEN:
+    - Store in httpOnly Secure SameSite=Strict cookie
+    - Path scoped to /api/auth/refresh only
+    - Cannot be read by JS → XSS resistant
+    - SameSite=Strict → CSRF resistant
+
+  RESULT:
+    - XSS can't steal tokens (in-memory access token, httpOnly refresh token)
+    - CSRF can't use refresh token (SameSite=Strict cookie)
+    - No CSRF token needed (Authorization header for API calls)
+
+================================================================
+8. SECURITY CHECKLIST FOR REACT APPS
+================================================================
+
+  ✅ Use HTTPS everywhere
+  ✅ JWT in Authorization header (not cookie) → no CSRF needed
+  ✅ Refresh token in httpOnly + Secure + SameSite=Strict cookie
+  ✅ Short access token lifetime (5-15 min)
+  ✅ Refresh token rotation (new RT on every refresh)
+  ✅ Validate JWT signature on backend (don't trust client)
+  ✅ Set Content Security Policy (CSP) headers to mitigate XSS
+  ✅ Avoid dangerouslySetInnerHTML with user content
+  ✅ Sanitize user input (DOMPurify for HTML content)
+  ✅ Keep dependencies updated (npm audit)
+  ✅ Don't put secrets in .env files
+  ✅ CORS properly configured (allowedOrigins not *)
+
+================================================================
+9. CONTENT SECURITY POLICY (CSP) — XSS MITIGATION
+================================================================
+
+CSP is an HTTP header that restricts what scripts can run on a page.
+It's the best defense against XSS (which could steal in-memory tokens).
+
+  Content-Security-Policy:
+    default-src 'self';
+    script-src 'self' https://cdn.auth0.com;
+    connect-src 'self' https://api.example.com;
+    style-src 'self' 'unsafe-inline';
+
+Spring Boot:
+  http.headers(headers -> headers
+      .contentSecurityPolicy(csp -> csp
+          .policyDirectives("default-src 'self'; script-src 'self'")
+      )
+  );
+
+================================================================
+10. INTERVIEW QUESTIONS
+================================================================
+
+Q: What is CSRF and when is it a concern for React apps?
+A: CSRF is an attack where a malicious site tricks the user's browser
+   into making requests to your app using the user's cookies. It's only
+   a concern when using cookie-based authentication. If React uses
+   JWT in the Authorization header, CSRF is not applicable because
+   the attacker cannot set custom HTTP headers.
+
+Q: How does Axios handle CSRF protection automatically?
+A: Axios reads the XSRF-TOKEN cookie and automatically includes it
+   as the X-XSRF-TOKEN header on non-GET requests. This works with
+   Spring Security's CookieCsrfTokenRepository. Configure
+   withCredentials: true and set xsrfCookieName/xsrfHeaderName if
+   your cookie names differ from defaults.
+
+Q: What is the SameSite cookie attribute and how does it prevent CSRF?
+A: SameSite=Strict prevents the browser from sending the cookie with
+   cross-site requests. So even if an attacker triggers a request
+   to your API from their site, the browser won't include the cookie.
+   SameSite=Lax allows the cookie on top-level navigation (like clicking
+   a link) but blocks it on form submissions from external sites.
+
+Q: You use httpOnly cookies for refresh tokens. Does that make you
+   immune to both XSS and CSRF? Explain.
+A: httpOnly makes the cookie unreadable by JavaScript → XSS-resistant.
+   But httpOnly alone doesn't prevent CSRF — the browser still sends
+   httpOnly cookies automatically. To prevent CSRF, combine with:
+   SameSite=Strict (blocks cross-site requests at browser level)
+   and scope the cookie to /api/auth/refresh only. This way, even a
+   CSRF attack can't trigger a token refresh from an external page.
+
+Q: What is a double-submit cookie CSRF protection pattern?
+A: The server sends a CSRF token as a non-httpOnly cookie. JavaScript
+   reads it and includes it in a custom header or request body.
+   The server compares the header value with the cookie value.
+   An attacker from another origin can't read the cookie (SameOrigin),
+   so they can't include the correct header value, and the attack fails.

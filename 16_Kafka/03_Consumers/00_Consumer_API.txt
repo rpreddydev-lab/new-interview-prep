@@ -1,0 +1,288 @@
+================================================================================
+  KAFKA CONSUMER API
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. CONSUMER API SETUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Maven dependency:
+  <dependency>
+    <groupId>org.apache.kafka</groupId>
+    <artifactId>kafka-clients</artifactId>
+    <version>3.9.0</version>
+  </dependency>
+
+Minimal consumer:
+  Properties props = new Properties();
+  props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+  props.put(ConsumerConfig.GROUP_ID_CONFIG, "my-consumer-group");
+  props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
+            StringDeserializer.class.getName());
+  props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,
+            StringDeserializer.class.getName());
+
+  KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);
+  consumer.subscribe(Collections.singletonList("orders"));
+
+  try {
+    while (true) {
+      ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+      for (ConsumerRecord<String, String> record : records) {
+        System.out.printf("key=%s value=%s offset=%d partition=%d%n",
+            record.key(), record.value(), record.offset(), record.partition());
+      }
+    }
+  } finally {
+    consumer.close();
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. CONSUMERRECORD FIELDS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ConsumerRecord<K, V> fields:
+  String topic()          → which topic the record came from
+  int partition()         → which partition
+  long offset()           → offset of this record in the partition
+  long timestamp()        → producer timestamp (or log-append time if configured)
+  TimestampType timestampType() → CREATE_TIME or LOG_APPEND_TIME
+  K key()                 → deserialized key (null if no key)
+  V value()               → deserialized value
+  Headers headers()       → message headers (for tracing, routing metadata)
+  int serializedKeySize() → bytes of the serialized key (-1 if null)
+  int serializedValueSize() → bytes of the serialized value (-1 if null)
+  Optional<Integer> leaderEpoch() → leader epoch when record was produced
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. SEEK OPERATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Consumers can manually control their position (useful for replay/recovery):
+
+  // Seek to a specific offset
+  TopicPartition tp = new TopicPartition("orders", 0);
+  consumer.seek(tp, 1000); // start reading from offset 1000
+
+  // Seek to beginning (offset 0)
+  consumer.seekToBeginning(consumer.assignment());
+
+  // Seek to end (skip all existing messages, read only new ones)
+  consumer.seekToEnd(consumer.assignment());
+
+  // Seek to a timestamp (e.g., reprocess last hour of data)
+  long oneHourAgo = System.currentTimeMillis() - 3600_000;
+  Map<TopicPartition, Long> timestamps = new HashMap<>();
+  for (TopicPartition tp : consumer.assignment()) {
+    timestamps.put(tp, oneHourAgo);
+  }
+  Map<TopicPartition, OffsetAndTimestamp> result = consumer.offsetsForTimes(timestamps);
+  for (Map.Entry<TopicPartition, OffsetAndTimestamp> entry : result.entrySet()) {
+    if (entry.getValue() != null) {
+      consumer.seek(entry.getKey(), entry.getValue().offset());
+    }
+  }
+
+Note: seek() only works after partitions are assigned (after subscribe+poll or assign).
+      Use ConsumerRebalanceListener.onPartitionsAssigned() to seek after rebalance.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. CONSUMERREBALANCELISTENER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ConsumerRebalanceListener allows you to act before/after partition assignment changes.
+This is critical for implementing exactly-once or clean shutdown.
+
+  consumer.subscribe(Arrays.asList("orders"), new ConsumerRebalanceListener() {
+    
+    @Override
+    public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
+      // Called BEFORE partitions are taken away from this consumer
+      // Commit current offsets before losing partition
+      log.info("Partitions revoked: {}", partitions);
+      commitCurrentOffsets(partitions);
+    }
+    
+    @Override
+    public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
+      // Called AFTER partitions are assigned to this consumer
+      // Good place to: restore state, seek to custom offset
+      log.info("Partitions assigned: {}", partitions);
+      for (TopicPartition tp : partitions) {
+        consumer.seek(tp, getLastCommittedOffset(tp));
+      }
+    }
+    
+    @Override
+    public void onPartitionsLost(Collection<TopicPartition> partitions) {
+      // Called when partitions are lost without being revoked (e.g., consumer crash)
+      // Kafka 2.4+ CooperativeStickyAssignor calls this on unexpected partition loss
+      log.warn("Partitions lost unexpectedly: {}", partitions);
+    }
+  });
+
+Use cases for ConsumerRebalanceListener:
+  - Save state before losing a partition (graceful handoff)
+  - Seek to last processed position from an external store
+  - Load/clear per-partition resources (caches, DB connections)
+  - Implement "at-most-once" by committing BEFORE processing (in onPartitionsAssigned)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. WAKEUP AND GRACEFUL SHUTDOWN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The consumer poll loop is blocking — you need a way to exit it cleanly.
+
+  KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);
+  
+  // Register shutdown hook
+  Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+    consumer.wakeup(); // thread-safe, causes poll() to throw WakeupException
+  }));
+  
+  consumer.subscribe(Collections.singletonList("orders"));
+  
+  try {
+    while (true) {
+      ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+      process(records);
+      consumer.commitSync();
+    }
+  } catch (WakeupException e) {
+    // Expected on shutdown — ignore
+    log.info("Consumer shutting down...");
+  } finally {
+    consumer.commitSync(); // commit last batch before closing
+    consumer.close();      // triggers rebalance to reassign partitions
+    log.info("Consumer closed.");
+  }
+
+consumer.wakeup():
+  - Thread-safe (can be called from another thread)
+  - Makes the next (or current) poll() throw WakeupException
+  - Does NOT affect other consumer methods
+
+consumer.close():
+  - Commits offsets and triggers a group rebalance to reassign partitions
+  - With Duration: consumer.close(Duration.ofSeconds(10)) — max wait time
+  - Should ALWAYS be called in a finally block
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. PAUSE AND RESUME
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+You can pause fetching from specific partitions without leaving the group:
+
+  consumer.pause(consumer.assignment()); // pause ALL assigned partitions
+  // No records returned on subsequent poll() for paused partitions
+  // Heartbeat still sent (consumer stays in group)
+
+  consumer.resume(consumer.assignment()); // resume fetching
+
+  // Or pause a specific partition:
+  TopicPartition tp = new TopicPartition("orders", 0);
+  consumer.pause(Collections.singleton(tp));
+  consumer.resume(Collections.singleton(tp));
+
+  consumer.paused(); // returns set of currently paused partitions
+
+Use cases:
+  - Back-pressure: downstream is overloaded, slow consumer down
+  - Per-partition processing queue: pause a partition while its queue is full
+  - Drain in-progress messages before a graceful shutdown of that partition
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. COMPLETE PRODUCTION CONSUMER PATTERN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+public class OrderConsumer implements Runnable {
+  private final KafkaConsumer<String, String> consumer;
+  private volatile boolean running = true;
+  
+  public OrderConsumer() {
+    Properties props = new Properties();
+    props.put(BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
+    props.put(GROUP_ID_CONFIG, "order-processor");
+    props.put(KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+    props.put(VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+    props.put(ENABLE_AUTO_COMMIT_CONFIG, "false");         // manual commit
+    props.put(AUTO_OFFSET_RESET_CONFIG, "earliest");       // replay from start if new group
+    props.put(MAX_POLL_RECORDS_CONFIG, "500");             // max per poll
+    props.put(SESSION_TIMEOUT_MS_CONFIG, "45000");         // 45s heartbeat timeout
+    props.put(HEARTBEAT_INTERVAL_MS_CONFIG, "15000");      // 15s heartbeat interval
+    props.put(MAX_POLL_INTERVAL_MS_CONFIG, "300000");      // 5 min processing time max
+    props.put(PARTITION_ASSIGNMENT_STRATEGY_CONFIG,
+        "org.apache.kafka.clients.consumer.CooperativeStickyAssignor");
+    this.consumer = new KafkaConsumer<>(props);
+  }
+  
+  @Override
+  public void run() {
+    Runtime.getRuntime().addShutdownHook(new Thread(consumer::wakeup));
+    consumer.subscribe(Collections.singletonList("orders"));
+    
+    try {
+      while (running) {
+        ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(200));
+        
+        if (!records.isEmpty()) {
+          for (ConsumerRecord<String, String> record : records) {
+            processOrder(record);
+          }
+          consumer.commitSync(); // commit after processing all records in poll()
+        }
+      }
+    } catch (WakeupException e) {
+      if (running) throw e; // unexpected
+    } finally {
+      try { consumer.commitSync(); } catch (Exception e) { /* best effort */ }
+      consumer.close();
+    }
+  }
+  
+  private void processOrder(ConsumerRecord<String, String> record) {
+    log.info("Processing order: key={} partition={} offset={}",
+        record.key(), record.partition(), record.offset());
+    // business logic here
+  }
+  
+  public void stop() { running = false; consumer.wakeup(); }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is consumer.poll() and why must it be called regularly?
+A: poll() fetches records from the broker and also sends heartbeats, handles
+   rebalances, and runs ConsumerRebalanceListener callbacks. If poll() is not
+   called within max.poll.interval.ms (5 min default), the group coordinator
+   assumes the consumer is stuck and triggers a rebalance, removing it from
+   the group. This is why long processing should be done asynchronously.
+
+Q: How do you implement graceful shutdown for a Kafka consumer?
+A: Call consumer.wakeup() from the shutdown hook (thread-safe). This causes
+   poll() to throw WakeupException. Catch WakeupException in the poll loop,
+   then commit the last offsets in the finally block and call consumer.close().
+   consumer.close() triggers a rebalance so partitions are immediately reassigned
+   to other consumers without waiting for session timeout.
+
+Q: What is ConsumerRebalanceListener used for?
+A: It provides hooks for onPartitionsRevoked() (called before losing partitions)
+   and onPartitionsAssigned() (called after gaining partitions). Use it to:
+   commit offsets before losing a partition (ensuring no duplicate processing),
+   seek to a specific offset on assignment (e.g., from an external offset store),
+   or load/clear per-partition state (caches, connections).
+
+Q: What is the difference between consumer.assign() and consumer.subscribe()?
+A: subscribe() joins a consumer group and lets Kafka manage partition assignment
+   automatically (with rebalancing). assign() lets you manually specify exact
+   TopicPartition assignments — no group coordination, no rebalancing. Use assign
+   for exact replay, testing, or custom partition assignment logic.
+
+Q: What does consumer.pause() do and when would you use it?
+A: pause() stops fetching records from specified partitions but keeps the consumer
+   in the group (heartbeats still sent). Use it for back-pressure: if your downstream
+   system is slow, pause the consumer rather than letting records pile up or having
+   poll() time out. Resume with consumer.resume() when ready.

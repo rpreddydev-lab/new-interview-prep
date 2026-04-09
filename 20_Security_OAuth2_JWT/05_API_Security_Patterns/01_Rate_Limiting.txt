@@ -1,0 +1,408 @@
+========================================================
+RATE LIMITING
+========================================================
+
+Rate limiting controls how many requests a client can make to an API
+within a given time window. It protects against:
+  - DoS/DDoS attacks (traffic floods)
+  - Brute force attacks (password/key guessing)
+  - API abuse (excessive scraping, automated misuse)
+  - Infrastructure cost control
+  - Fair resource allocation between clients
+
+========================================================
+1. RATE LIMITING ALGORITHMS
+========================================================
+
+1.1 FIXED WINDOW COUNTER
+-------------------------
+
+Count requests in a fixed time window (e.g., per minute).
+Reset counter at the start of each window.
+
+Window:    |----60s----|----60s----|
+Requests:  [100 allowed] [100 allowed]
+
+Pros: Simple, low memory
+Cons: Burst problem — 100 requests at 59s + 100 at 61s = 200 in 2s
+
+|------Window 1------|------Window 2------|
+0                   60                  120
+           [100 req here] + [100 req here] = 200 req at boundary!
+
+1.2 SLIDING WINDOW LOG
+-----------------------
+
+Store timestamp of every request. Count requests in the last N seconds.
+More accurate than fixed window.
+
+Pros: No burst problem at window boundaries
+Cons: High memory (stores all request timestamps)
+
+1.3 SLIDING WINDOW COUNTER
+---------------------------
+
+Hybrid approach: combine current + previous window with a weight.
+
+Rate = currentCount + previousCount * (1 - percentageOfCurrentWindowElapsed)
+
+Pros: Good accuracy, low memory
+Cons: Approximate (not exact)
+
+1.4 TOKEN BUCKET (MOST COMMON)
+--------------------------------
+
+A bucket holds tokens (capacity = burst size). Each request consumes one token.
+Tokens are added at a fixed rate (refill rate).
+
+  - Bucket capacity: 100 (max burst)
+  - Refill rate: 10 tokens/second
+  - Request: consumes 1 token; if bucket empty → reject
+
+Allows short bursts up to bucket capacity, then enforces sustained rate.
+
+Token Bucket state:
+  capacity     = 100 tokens
+  refill_rate  = 10 tokens/second
+  current      = variable
+
+1.5 LEAKY BUCKET
+-----------------
+
+Requests go into a queue (bucket). They're processed at a fixed rate.
+Queue full → reject incoming requests.
+
+Vs Token Bucket:
+  Leaky: Smooths out bursty traffic (steady output rate)
+  Token: Allows bursts up to bucket capacity
+
+========================================================
+2. RATE LIMIT KEYS (WHAT TO THROTTLE ON)
+========================================================
+
+You can throttle based on different identifiers:
+
+  Identifier          Use Case
+  ------------------- -----------------------------------------
+  IP address          Unauthenticated endpoints, login pages
+  API key             Per-client limits
+  User ID             Per-user limits (authenticated APIs)
+  Client ID           OAuth2 client-level limits
+  IP + endpoint       Fine-grained (limit /login more strictly)
+  Account tier        Free/Basic/Premium different limits
+
+Tiered limits example:
+  Free tier:    100 req/min
+  Basic tier:   1,000 req/min
+  Premium tier: 10,000 req/min
+
+========================================================
+3. BUCKET4J — SPRING BOOT RATE LIMITING
+========================================================
+
+Bucket4j is the most popular Java library for rate limiting.
+Uses Token Bucket algorithm. Integrates with Spring Boot and Redis.
+
+Dependency:
+<dependency>
+    <groupId>com.bucket4j</groupId>
+    <artifactId>bucket4j-core</artifactId>
+    <version>8.x.x</version>
+</dependency>
+<!-- For Redis backend: -->
+<dependency>
+    <groupId>com.bucket4j</groupId>
+    <artifactId>bucket4j-redis</artifactId>
+    <version>8.x.x</version>
+</dependency>
+
+3.1 In-Memory Rate Limiter (Single Node)
+
+@Component
+public class RateLimiterService {
+
+    // Store a bucket per API key in ConcurrentHashMap
+    private final Map<String, Bucket> buckets = new ConcurrentHashMap<>();
+
+    public Bucket resolveBucket(String apiKey) {
+        return buckets.computeIfAbsent(apiKey, this::createBucket);
+    }
+
+    private Bucket createBucket(String key) {
+        // Simple: 100 requests per minute
+        Bandwidth limit = Bandwidth.classic(100, Refill.intervally(100, Duration.ofMinutes(1)));
+        return Bucket.builder().addLimit(limit).build();
+    }
+
+    // Multi-tier bucket based on client subscription
+    private Bucket createTieredBucket(ClientTier tier) {
+        return switch (tier) {
+            case FREE -> Bucket.builder()
+                .addLimit(Bandwidth.classic(100, Refill.intervally(100, Duration.ofMinutes(1))))
+                .build();
+            case BASIC -> Bucket.builder()
+                .addLimit(Bandwidth.classic(1000, Refill.greedy(1000, Duration.ofMinutes(1))))
+                .build();
+            case PREMIUM -> Bucket.builder()
+                .addLimit(Bandwidth.classic(10000, Refill.greedy(10000, Duration.ofMinutes(1))))
+                .build();
+        };
+    }
+}
+
+3.2 Rate Limiting Filter
+
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class RateLimitingFilter extends OncePerRequestFilter {
+
+    private final RateLimiterService rateLimiterService;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                     HttpServletResponse response,
+                                     FilterChain filterChain)
+            throws ServletException, IOException {
+
+        String clientKey = extractClientKey(request);
+        Bucket bucket = rateLimiterService.resolveBucket(clientKey);
+
+        ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+
+        if (probe.isConsumed()) {
+            // Add rate limit headers to response
+            response.addHeader("X-Rate-Limit-Remaining",
+                String.valueOf(probe.getRemainingTokens()));
+            filterChain.doFilter(request, response);
+        } else {
+            // Rate limit exceeded
+            long waitForRefillSeconds = probe.getNanosToWaitForRefill() / 1_000_000_000;
+            response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
+            response.addHeader("X-Rate-Limit-Retry-After-Seconds",
+                String.valueOf(waitForRefillSeconds));
+            response.setContentType("application/json");
+            response.getWriter().write("""
+                {"error": "TOO_MANY_REQUESTS",
+                 "message": "Rate limit exceeded. Try again in %d seconds."}
+                """.formatted(waitForRefillSeconds));
+        }
+    }
+
+    private String extractClientKey(HttpServletRequest request) {
+        // Try API key first
+        String apiKey = request.getHeader("X-API-Key");
+        if (apiKey != null) return "apikey:" + apiKey;
+
+        // Fallback to IP
+        String ip = request.getHeader("X-Forwarded-For");
+        if (ip != null) ip = ip.split(",")[0].trim();
+        else ip = request.getRemoteAddr();
+        return "ip:" + ip;
+    }
+}
+
+3.3 Redis-Backed Distributed Rate Limiting
+
+For multi-instance deployments, rate limit state must be shared in Redis:
+
+@Configuration
+public class RateLimitConfig {
+
+    @Bean
+    public ProxyManager<String> proxyManager(RedissonClient redissonClient) {
+        return Bucket4jRedisson.casBasedBuilder(redissonClient).build();
+    }
+}
+
+@Service
+public class DistributedRateLimiterService {
+
+    private final ProxyManager<String> proxyManager;
+
+    public BucketProxy getOrCreateBucket(String key) {
+        BucketConfiguration config = BucketConfiguration.builder()
+            .addLimit(Bandwidth.classic(100, Refill.intervally(100, Duration.ofMinutes(1))))
+            .build();
+        return proxyManager.builder().build(key, config);
+    }
+}
+
+3.4 Rate Limiting with Spring Boot Starter (bucket4j-spring-boot-starter)
+
+application.yml:
+bucket4j:
+  enabled: true
+  filters:
+    - cache-name: rate-limit-cache
+      url: /api/.*
+      rate-limits:
+        - cache-key: "getHeader('X-API-Key')"
+          execute-condition: "getHeader('X-API-Key') != null"
+          bandwidths:
+            - capacity: 100
+              time: 1
+              unit: minutes
+              refill-speed: intervally
+
+========================================================
+4. RATE LIMIT RESPONSE HEADERS
+========================================================
+
+Standard rate limit headers (follow these conventions):
+
+Header                          Description
+------------------------------  ----------------------------------------
+X-RateLimit-Limit               Max requests per window
+X-RateLimit-Remaining           Remaining requests in current window
+X-RateLimit-Reset               Unix timestamp when window resets
+X-RateLimit-Retry-After         Seconds until request can be retried
+Retry-After                     HTTP standard (seconds to wait)
+
+HTTP status codes:
+  200: Request succeeded
+  429: Too Many Requests (rate limit exceeded)
+
+Example response headers:
+  HTTP/1.1 429 Too Many Requests
+  X-RateLimit-Limit: 100
+  X-RateLimit-Remaining: 0
+  X-RateLimit-Reset: 1718000000
+  Retry-After: 47
+  Content-Type: application/json
+
+  {"error": "rate_limit_exceeded", "message": "100 requests per minute allowed"}
+
+========================================================
+5. RATE LIMITING IN API GATEWAY
+========================================================
+
+For microservices, rate limiting is often implemented at the API Gateway:
+
+Spring Cloud Gateway Rate Limiting (Redis + Token Bucket):
+
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: order-service
+          uri: lb://order-service
+          predicates:
+            - Path=/api/orders/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 100    # tokens/second
+                redis-rate-limiter.burstCapacity: 200    # max burst
+                redis-rate-limiter.requestedTokens: 1    # tokens per request
+                key-resolver: "#{@userKeyResolver}"
+
+Custom key resolver (rate limit per user):
+@Bean
+public KeyResolver userKeyResolver() {
+    return exchange -> exchange.getPrincipal()
+        .map(Principal::getName)
+        .defaultIfEmpty("anonymous");
+}
+
+Other API Gateways:
+  - AWS API Gateway: Built-in throttling per stage/method
+  - Kong: Rate Limiting plugin
+  - NGINX: limit_req_zone directive
+  - Envoy: RateLimitService filter
+
+========================================================
+6. ADVANCED PATTERNS
+========================================================
+
+6.1 Dynamic Rate Limits per Client
+
+Fetch rate limits from DB based on client subscription:
+@Service
+public class DynamicRateLimitService {
+
+    private final ClientRepository clientRepository;
+
+    public BucketConfiguration getConfigForClient(String clientId) {
+        Client client = clientRepository.findById(clientId).orElseThrow();
+        int requestsPerMinute = switch (client.getTier()) {
+            case FREE -> 60;
+            case BASIC -> 600;
+            case ENTERPRISE -> 6000;
+        };
+        return BucketConfiguration.builder()
+            .addLimit(Bandwidth.classic(requestsPerMinute,
+                Refill.intervally(requestsPerMinute, Duration.ofMinutes(1))))
+            .build();
+    }
+}
+
+6.2 Cost-Based Rate Limiting
+
+Not all endpoints are equal. Expensive operations cost more tokens:
+  GET /api/orders → 1 token
+  POST /api/reports/generate → 10 tokens (expensive computation)
+  GET /api/export → 5 tokens (large response)
+
+// Consume multiple tokens for expensive operations
+ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(5);
+
+6.3 Circuit Breaker + Rate Limiting (Resilience4j)
+
+Combine rate limiting with circuit breaker:
+@Service
+public class ProtectedApiClient {
+
+    @RateLimiter(name = "order-api", fallbackMethod = "fallback")
+    @CircuitBreaker(name = "order-api")
+    public List<Order> getOrders() {
+        return orderApi.fetchOrders();
+    }
+
+    private List<Order> fallback(RequestNotPermitted ex) {
+        return cachedOrders;  // Return cached data when rate limited
+    }
+}
+
+resilience4j:
+  ratelimiter:
+    instances:
+      order-api:
+        limitForPeriod: 100
+        limitRefreshPeriod: 1s
+        timeoutDuration: 0ms  # Don't wait, fail fast
+
+========================================================
+7. COMMON INTERVIEW QUESTIONS
+========================================================
+
+Q: What is the difference between Token Bucket and Leaky Bucket algorithms?
+A: Token Bucket allows bursts (up to bucket capacity) while enforcing an average rate.
+   Leaky Bucket smooths out traffic to a constant output rate — no bursts allowed.
+   Token Bucket is more flexible for APIs where occasional bursts are acceptable.
+   Leaky Bucket is better when consistent, smooth throughput is required.
+
+Q: How do you implement distributed rate limiting across multiple service instances?
+A: Use a shared backend like Redis. Libraries like Bucket4j with Redisson or Spring
+   Cloud Gateway's Redis Rate Limiter store token bucket state in Redis. All instances
+   share the same counter via atomic Redis operations (INCR with TTL or Lua scripts
+   for atomic updates).
+
+Q: What HTTP status code is used for rate limit exceeded?
+A: 429 Too Many Requests. Include Retry-After header (seconds until the client
+   can retry) and X-RateLimit-* headers for transparency.
+
+Q: How do you prevent rate limit bypass via IP rotation?
+A: Use multiple identifiers simultaneously (IP + User-Agent fingerprint, API key,
+   user account ID). At the application level, rate limit per authenticated identity
+   rather than IP. IP-based limits are only useful for unauthenticated endpoints.
+
+Q: What is the sliding window algorithm and why is it better than fixed window?
+A: Fixed window resets its counter at fixed intervals, allowing bursts at boundaries
+   (e.g., 100 requests at 59s + 100 at 61s = 200 in 2 seconds). Sliding window
+   counts requests in the LAST N seconds from the current time, eliminating the
+   boundary burst problem. It's more accurate but uses more memory.
+
+Q: Where in the architecture should rate limiting be implemented?
+A: Ideally at the API Gateway level (before requests reach services) so all services
+   benefit uniformly. Service-level rate limiting is a second defense. Both can be
+   combined: gateway enforces global limits, services enforce service-specific limits.

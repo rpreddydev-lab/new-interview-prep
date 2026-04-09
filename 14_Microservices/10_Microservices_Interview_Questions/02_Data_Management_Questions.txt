@@ -1,0 +1,478 @@
+================================================================================
+DATA MANAGEMENT INTERVIEW QUESTIONS
+================================================================================
+
+TOP 15 DATA MANAGEMENT QUESTIONS — covering Saga, CQRS, Event Sourcing, Outbox.
+
+================================================================================
+Q1. What is the database-per-service pattern and why is it important?
+================================================================================
+
+ANSWER:
+Each microservice owns its own database. No other service can access it directly.
+Data sharing only through APIs or events.
+
+WHY critical:
+  ✓ Independent schema evolution — change DB without coordinating with others
+  ✓ Technology choice — Order Service uses PostgreSQL, Product Service uses MongoDB
+  ✓ Fault isolation — one DB down doesn't take down others
+  ✓ Scale independently — high-read Product Service → read replicas
+                         high-write Order Service → partitioned PostgreSQL
+
+The rule: If Service A needs data from Service B's DB, it must:
+  Option 1: Call Service B's API (synchronous)
+  Option 2: Subscribe to Service B's domain events (asynchronous)
+  Option 3: Maintain a denormalized read model from B's events (CQRS)
+
+NEVER: Direct DB access between services.
+
+CHALLENGES:
+  - Cross-service joins (solve with CQRS read models)
+  - Distributed transactions (solve with Saga)
+  - Referential integrity across services (accept eventual consistency)
+
+================================================================================
+Q2. What is the Saga pattern?
+================================================================================
+
+ANSWER:
+Saga is a pattern for managing distributed transactions across microservices.
+
+A Saga is a sequence of local transactions. Each transaction updates ONE service's
+database and publishes an event/message to trigger the next step.
+If a step fails, execute compensating transactions for all previous steps.
+
+Example: Order Processing Saga
+  1. Order Service: Create order (PENDING) → publish OrderCreated
+  2. Payment Service: Charge payment → publish PaymentProcessed / PaymentFailed
+  3. Inventory Service: Reserve items → publish ItemsReserved / InsufficientStock
+  4. Order Service: Confirm order (CONFIRMED) → publish OrderConfirmed
+
+Failure at step 3:
+  3c. Inventory Service publishes InsufficientStock
+  2c. Payment Service compensates: refund payment
+  1c. Order Service compensates: cancel order (CANCELLED)
+
+Two coordination styles:
+  Choreography: Services react to each other's events (no central coordinator)
+  Orchestration: Saga Orchestrator sends commands, tracks state explicitly
+
+  Choreography (+) decoupled, (-) hard to see the full flow
+  Orchestration (+) clear flow, easy to monitor, (-) orchestrator = coupling point
+
+================================================================================
+Q3. What is CQRS?
+================================================================================
+
+ANSWER:
+CQRS = Command Query Responsibility Segregation.
+Separate the write model (commands, state changes) from the read model (queries).
+
+WRITE SIDE: Handles commands. Validates business rules. Updates normalized data.
+  Domain model: Order aggregate with OrderItems.
+  Storage: Normalized relational DB or event store.
+
+READ SIDE: Handles queries. Returns optimized, denormalized views.
+  Read models: OrderSummaryDTO, UserDashboardDTO.
+  Storage: Elasticsearch for full-text, Redis for caching, separate DB.
+
+Benefits:
+  ✓ Each side optimized for its purpose
+  ✓ Read side scales independently from write side
+  ✓ Read models can be queried without impacting write performance
+  ✓ Multiple read models for different use cases (mobile vs web vs reporting)
+
+Tradeoffs:
+  ✗ Eventual consistency between write and read side
+  ✗ More complexity (two models to maintain)
+  ✗ Synchronization logic (event handlers update read models)
+
+Implementation flow:
+  Command → Write Model (DB) → Domain Event → Event Handler → Update Read Model(s)
+
+================================================================================
+Q4. What is Event Sourcing?
+================================================================================
+
+ANSWER:
+Event Sourcing stores ALL state changes as an immutable sequence of events.
+Current state is NOT stored — it is REBUILT by replaying events.
+
+Traditional: Store current state.
+  Order { status: CONFIRMED, total: 150.00 }
+
+Event Sourcing: Store events.
+  OrderCreated { orderId: 1, userId: 42, total: 150.00 }
+  OrderPaymentProcessed { orderId: 1, amount: 150.00 }
+  OrderShipped { orderId: 1, trackingId: "UPS-1234" }
+  OrderConfirmed { orderId: 1 }
+
+Current state = replay all events through aggregate.
+
+Benefits:
+  ✓ Complete audit trail (every change is recorded)
+  ✓ Time travel queries (what was state at time T?)
+  ✓ Event replay (rebuild read models, fix bugs, add new projections)
+  ✓ Natural event publishing for event-driven architecture
+  ✓ Debugging — see exactly what happened
+
+Challenges:
+  ✗ Querying current state requires replay (use snapshots for large streams)
+  ✗ Schema evolution — old events must still be readable
+  ✗ Eventual consistency with projections
+  ✗ Higher storage requirements
+
+Snapshots: Periodically save current state + event position.
+Replay from snapshot + events after snapshot.
+
+================================================================================
+Q5. What is the Outbox Pattern?
+================================================================================
+
+ANSWER:
+Problem: After saving to DB, need to publish Kafka event.
+If app crashes between DB commit and Kafka publish → event lost.
+Solution: Two-phase write solves this but kills availability.
+
+Outbox Pattern:
+  Write DB record AND outbox event in same transaction.
+  Separate process reads outbox and publishes to Kafka.
+  Guarantees: event published if and only if DB committed.
+
+  STEP 1 (atomic):
+    BEGIN TRANSACTION;
+      INSERT INTO orders (id, status, user_id) VALUES (1, 'PENDING', 42);
+      INSERT INTO outbox (id, type, payload, status)
+        VALUES (uuid(), 'OrderCreated', '{"orderId":1}', 'PENDING');
+    COMMIT;
+
+  STEP 2 (CDC or scheduler):
+    SELECT * FROM outbox WHERE status = 'PENDING';
+    kafka.send("order-events", event);
+    UPDATE outbox SET status = 'PROCESSED' WHERE id = event.id;
+
+  CDC (Debezium): More reliable than scheduler. Monitors PostgreSQL WAL.
+  Publishes outbox table INSERTs to Kafka in milliseconds.
+
+Key guarantee: AT-LEAST-ONCE delivery (duplicates possible on retry).
+Consumer MUST be idempotent (use message_id UNIQUE constraint / idempotency key).
+
+================================================================================
+Q6. What is the difference between eventual consistency and strong consistency?
+================================================================================
+
+ANSWER:
+Strong consistency: After a write, all subsequent reads see the new value.
+Works for single-node DB. Hard/expensive for distributed systems.
+
+Eventual consistency: After a write, all replicas will eventually converge.
+During propagation window (ms to seconds), some reads return stale data.
+
+Strong consistency in microservices:
+  - Only within a single service (ACID transactions within one DB)
+  - NOT across services without 2PC (which kills availability)
+
+Eventual consistency patterns:
+  - Saga: chain of eventual state changes with compensation
+  - CQRS: read models eventually consistent with write model
+  - Event-driven: downstream services update when event processed
+
+Handling in UI:
+  "Order placed! Processing..." → poll for status
+  Optimistic UI update → rollback if failed
+  Version/timestamp in response → detect stale reads
+
+The key interview answer: "I accept eventual consistency between services.
+I design operations to be idempotent and compensatable. I use Saga for
+distributed transactions, Outbox for reliable event publishing, and
+CQRS for independent read scaling."
+
+================================================================================
+Q7. What is the difference between Two-Phase Commit and Saga?
+================================================================================
+
+ANSWER:
+                   │ Two-Phase Commit (2PC)      │ Saga
+───────────────────┼─────────────────────────────┼────────────────────────
+Consistency        │ Strong (ACID)               │ Eventual
+───────────────────┼─────────────────────────────┼────────────────────────
+Availability       │ Low (blocking protocol)     │ High
+───────────────────┼─────────────────────────────┼────────────────────────
+Throughput         │ Low (locks held across all  │ High (local transactions)
+                   │ participants during prep)   │
+───────────────────┼─────────────────────────────┼────────────────────────
+Failure handling   │ Rollback all                │ Compensating transactions
+───────────────────┼─────────────────────────────┼────────────────────────
+Coordinator SPOF   │ Yes (coordinator failure    │ Less critical
+                   │ = blocked participants)     │
+───────────────────┼─────────────────────────────┼────────────────────────
+Use in microservices│ NOT recommended            │ Standard approach
+
+2PC details:
+  Phase 1 (Prepare): Coordinator asks all participants to lock resources.
+  Phase 2 (Commit): If all say "ready", commit. Else rollback all.
+  If coordinator crashes in Phase 2 → participants stuck holding locks.
+
+RECOMMENDATION: Never use 2PC in microservices. Use Saga + eventual consistency.
+If you need strong consistency: keep the operation within a single service boundary.
+
+================================================================================
+Q8. How does the Inbox Pattern relate to the Outbox Pattern?
+================================================================================
+
+ANSWER:
+Outbox Pattern: Guarantees event is PUBLISHED at least once.
+  (Producer side idempotency)
+
+Inbox Pattern: Guarantees event is PROCESSED at most once.
+  (Consumer side idempotency)
+
+Together: Exactly-once semantics at the application level.
+  (Kafka guarantees at-least-once delivery; application handles deduplication)
+
+Inbox implementation:
+  CREATE TABLE inbox_events (
+    message_id VARCHAR(255) PRIMARY KEY,  -- UNIQUE constraint
+    topic VARCHAR(255),
+    payload TEXT,
+    processed_at TIMESTAMP
+  );
+
+  @KafkaListener(topics = "order-events")
+  @Transactional
+  public void onOrderEvent(ConsumerRecord<String, String> record) {
+    String messageId = record.partition() + "-" + record.offset();
+    try {
+      inboxRepository.insertInbox(messageId, record.topic(), record.value());
+      processEvent(record.value());  // Business logic
+    } catch (DataIntegrityViolationException e) {
+      // Duplicate — messageId already processed, skip silently
+      log.debug("Duplicate message {} skipped", messageId);
+    }
+  }
+
+"With Outbox on the producer side and Inbox on the consumer side, I get
+effectively exactly-once processing despite Kafka's at-least-once guarantee."
+
+================================================================================
+Q9. What is the CQRS read model and how do you keep it updated?
+================================================================================
+
+ANSWER:
+Read models are denormalized projections of domain data optimized for queries.
+Updated asynchronously via domain events from the write side.
+
+Example: Order Service write model (normalized):
+  orders table: id, user_id, status, created_at
+  order_items table: order_id, product_id, quantity, price
+
+Read model for user dashboard:
+  user_order_summary: user_id, total_orders, total_spent, last_order_date
+  recent_orders view: user_id, order_id, status, item_count, total, created_at
+
+Update flow:
+  1. User places order → Order aggregate saved
+  2. OrderPlaced domain event published (via Outbox → Kafka)
+  3. OrderProjectionHandler consumes event:
+     - Increments user_order_summary.total_orders
+     - Inserts row into recent_orders view
+     - Updates user_order_summary.last_order_date
+
+  @EventHandler
+  public void on(OrderPlacedEvent event) {
+    userOrderSummaryRepository.incrementOrderCount(event.getUserId(), event.getTotal());
+    recentOrdersRepository.addOrder(event.toRecentOrderDTO());
+  }
+
+Rebuilding read models:
+  Read models can be rebuilt from scratch by replaying all historical events.
+  This is a major advantage — add new read model, replay all events, done.
+
+================================================================================
+Q10. What is Change Data Capture (CDC)?
+================================================================================
+
+ANSWER:
+CDC is a pattern for capturing database changes (INSERT/UPDATE/DELETE) and
+streaming them as events.
+
+Debezium is the most popular CDC tool for microservices.
+It reads the database transaction log (PostgreSQL WAL, MySQL binlog)
+and publishes row changes to Kafka.
+
+Use cases:
+  1. Outbox Pattern: Debezium reads outbox table, publishes to Kafka
+  2. Data synchronization: Keep read model updated from primary DB
+  3. Audit log: Every DB change captured as immutable event
+  4. Cache invalidation: Invalidate Redis on DB change
+  5. Search index: Update Elasticsearch when DB record changes
+
+Debezium PostgreSQL config:
+  {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres",
+    "database.dbname": "orders",
+    "table.include.list": "public.outbox_events",
+    "slot.name": "debezium_slot",
+    "publication.autocreate.mode": "filtered"
+  }
+
+"Debezium + Outbox pattern is my preferred reliable event publishing mechanism.
+It guarantees exactly-once event publishing (from DB perspective) without
+2PC, and handles application crashes gracefully."
+
+================================================================================
+Q11. How do you handle schema evolution in event-driven systems?
+================================================================================
+
+ANSWER:
+Events are immutable. Old events must always be deserializable.
+
+Strategies:
+
+1. Additive changes (backward compatible — safe):
+   - Add new optional fields
+   - Consumers ignore unknown fields (Jackson: FAIL_ON_UNKNOWN_PROPERTIES=false)
+
+2. Schema Registry (Confluent / AWS Glue):
+   Stores all schema versions. Enforces compatibility rules.
+   BACKWARD: New schema can read old messages.
+   FORWARD: Old schema can read new messages.
+   FULL: Both directions.
+
+3. Event versioning:
+   Include version in event type: OrderCreatedV1, OrderCreatedV2
+   Route to different handlers based on version.
+   Eventually sunset V1.
+
+4. Upcasting (Event Sourcing):
+   Transform old events to new format on read.
+   EventUpcaster registered in framework (Axon).
+
+RULE: Never remove or rename fields in published events.
+Add new fields as optional. Create V2 event when significant changes needed.
+
+================================================================================
+Q12. What is the Shared Database antipattern?
+================================================================================
+
+ANSWER:
+When multiple microservices access the same database directly.
+
+  [Order Service] ──────┐
+  [Inventory Service] ──┤──→ [Shared DB]
+  [Payment Service] ────┘
+
+Problems:
+  ✗ Coupling: DB schema becomes a shared API. Any change breaks all services.
+  ✗ No independent scaling: DB becomes the bottleneck for all services.
+  ✗ No technology choice: All services must use same DB type.
+  ✗ Failure correlation: DB performance issues affect all services.
+  ✗ No clear ownership: Who is responsible for which tables?
+
+Detection signs:
+  - Services fail together (correlated failures)
+  - Changing a DB table requires coordination across teams
+  - All services in the same DB schema/database
+
+MIGRATION:
+  1. Identify which tables "belong" to which service
+  2. Add API layer: other services call owner service API
+  3. Replicate data to consumer DBs if needed (CDC + local copy)
+  4. Separate physical databases progressively
+
+================================================================================
+Q13. How do you handle cross-service queries?
+================================================================================
+
+ANSWER:
+With DB-per-service, you can't JOIN across service databases. Solutions:
+
+1. API Composition (synchronous):
+   API layer calls multiple services, merges results in memory.
+   
+   // BFF or dedicated query service
+   OrderDTO order = orderService.getOrder(orderId);
+   UserDTO user = userService.getUser(order.getUserId());
+   ProductDTO product = productService.getProduct(order.getProductId());
+   return OrderDetailDTO.of(order, user, product);
+
+   Use Mono.zip() for parallel calls.
+   Problem: n+1 calls, performance, coupling.
+
+2. CQRS Read Model (asynchronous — preferred for complex queries):
+   Build a denormalized read model containing pre-joined data.
+   Updated via events from multiple services.
+   
+   order_details view: order_id, user_name, user_email, product_name, qty, total
+   Updated whenever OrderPlaced, UserUpdated, or ProductUpdated events arrive.
+
+3. Data Replication:
+   Service replicates needed data from other services via CDC/events.
+   Local copy — no network call needed at query time.
+
+RECOMMENDATION: Use API Composition for simple cases. Build CQRS read models
+for complex, high-frequency queries.
+
+================================================================================
+Q14. What is a Snapshot in Event Sourcing?
+================================================================================
+
+ANSWER:
+Problem: As events accumulate, rebuilding aggregate state from event 1 becomes
+expensive. An order with 10,000 events takes 10,000 event applications to rebuild.
+
+Snapshot: Periodically save the aggregate's current state + the event position
+at which the snapshot was taken.
+
+  ORDER-1 snapshot at event position 9,847:
+  { orderId: 1, status: CONFIRMED, total: 150.00, items: [...], version: 9847 }
+
+Loading state:
+  1. Load latest snapshot for aggregate (position 9847)
+  2. Load events AFTER position 9847 (only new events)
+  3. Apply new events to snapshot state
+
+Snapshot triggers:
+  - Every N events (every 100 events)
+  - Time-based (daily snapshot)
+  - Before closing an order (terminal state snapshot)
+
+Snapshot storage: Same event store or separate snapshot store.
+
+"I use snapshots when aggregates have long event histories. I snapshot
+every 50 events for high-traffic aggregates (orders), every 500 for
+low-traffic ones."
+
+================================================================================
+Q15. What is Polyglot Persistence?
+================================================================================
+
+ANSWER:
+Polyglot Persistence: Each service uses the database technology best suited
+for its specific access patterns.
+
+Service                 │ DB Choice           │ Reason
+────────────────────────┼─────────────────────┼───────────────────────────────
+Order Service           │ PostgreSQL          │ ACID, relational, Saga/Outbox
+Product Catalog         │ MongoDB             │ Flexible schema, nested docs
+Search Service          │ Elasticsearch       │ Full-text search, faceting
+Session/Cache           │ Redis               │ Low latency key-value, TTL
+User Activity Feed      │ Cassandra           │ High write throughput, time series
+Recommendation Engine   │ Neo4j               │ Graph queries, relationships
+Analytics               │ ClickHouse/BigQuery │ Column store, OLAP queries
+────────────────────────┴─────────────────────┴───────────────────────────────
+
+"Each service picks the right tool. Product catalog uses MongoDB for its
+flexible document model. Session data uses Redis for sub-millisecond reads.
+This is only possible because each service has its own database."
+
+Challenges:
+  ✗ Operations team must support multiple DB technologies
+  ✗ Different backup/recovery strategies per DB
+  ✗ Different expertise required
+
+Balance: Don't use 10 different DBs for the sake of it. Use the right tool
+when the access pattern genuinely requires it.
+
+================================================================================

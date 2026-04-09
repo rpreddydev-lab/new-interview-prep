@@ -1,0 +1,218 @@
+================================================================================
+REDIS SEARCH AND JSON (RediSearch / RedisJSON) — DEEP DIVE FOR INTERVIEWS
+================================================================================
+
+1. WHAT ARE REDISEARCH AND REDISJSON?
+───────────────────────────────────────
+  Redis modules that extend Redis with full-text search and JSON document storage.
+
+  RedisSearch (now part of Redis Stack):
+    - Full-text search, secondary indexing, aggregation
+    - Search across Redis Hashes and JSON documents
+    - Commands: FT.CREATE, FT.SEARCH, FT.AGGREGATE, FT.INDEX, etc.
+
+  RedisJSON:
+    - Native JSON data type in Redis
+    - Store, query, update JSON documents in place
+    - Commands: JSON.SET, JSON.GET, JSON.MGET, JSON.ARRAPPEND, etc.
+    - JSONPath syntax (RFC 9535) for querying nested fields
+
+  Redis Stack = Redis + RedisSearch + RedisJSON + RedisTimeSeries + RedisBloom
+
+
+2. REDISJSON — JSON DOCUMENT STORAGE
+──────────────────────────────────────
+  JSON.SET key path value    → set JSON at path ($ = root)
+  JSON.GET key [path …]      → get JSON (default: root)
+  JSON.MGET key [key …] path → get path from multiple keys
+  JSON.DEL key path           → delete field/element
+  JSON.TYPE key path          → get type of value at path
+  JSON.STRLEN key path        → length of string at path
+  JSON.NUMINCRBY key path val → increment number at path
+  JSON.ARRAPPEND key path val → append to array at path
+  JSON.ARRINSERT key path idx val → insert into array
+  JSON.ARRTRIM key path start stop → trim array
+  JSON.OBJKEYS key path       → list object keys at path
+
+  JSONPath examples:
+    $           → root
+    $.name      → field "name" at root
+    $.address.city → nested field
+    $.tags[0]   → first element of array
+    $.tags[*]   → all elements of array
+    $..price    → recursive: all "price" fields at any depth
+    $.items[?(@.qty > 10)] → filter: items where qty > 10
+
+  Examples:
+    JSON.SET user:42 $ '{"name":"Alice","age":30,"address":{"city":"NYC"}}'
+    JSON.GET user:42 $                      → full document
+    JSON.GET user:42 $.name                 → ["Alice"]
+    JSON.GET user:42 $.address.city         → ["NYC"]
+    JSON.NUMINCRBY user:42 $.age 1          → [31]
+    JSON.SET user:42 $.phone '"555-1234"'   → add/update field
+    JSON.DEL user:42 $.address.city         → remove field
+
+
+3. REDISEARCH — FULL-TEXT SEARCH AND INDEXING
+──────────────────────────────────────────────
+
+3a. Create an Index:
+  FT.CREATE idx:users
+    ON JSON
+    PREFIX 1 user:
+    SCHEMA
+      $.name AS name TEXT WEIGHT 2.0
+      $.age AS age NUMERIC
+      $.address.city AS city TAG
+      $.email AS email TEXT NOSTEM
+
+  Index types:
+    TEXT   → full-text search, tokenized, stemmed, TF-IDF scoring
+    NUMERIC → numeric range queries
+    TAG    → exact match, comma-separated multi-value
+    GEO    → geospatial (lat,lon for GEODIST queries)
+    VECTOR → vector similarity search (KNN, Redis 7.2+)
+
+3b. Search:
+  FT.SEARCH idx:users "@name:(Alice)" RETURN 2 name age
+  FT.SEARCH idx:users "@city:{NYC}" LIMIT 0 10 SORTBY age ASC
+  FT.SEARCH idx:users "@age:[25 35]" → range query
+  FT.SEARCH idx:users "@name:(java developer)" → multi-word
+  FT.SEARCH idx:users "@name:Al*" → prefix wildcard
+  FT.SEARCH idx:users "*" SORTBY age DESC LIMIT 0 20
+
+  Query syntax:
+    @field:(word)     → full-text search on field
+    @field:{tag}      → exact tag match
+    @field:[min max]  → numeric range
+    -@field:(word)    → NOT
+    @f1:(a) @f2:(b)   → AND (implicit)
+    @f1:(a) | @f2:(b) → OR
+    @field:Al*        → prefix search
+    @field:%wrod%     → fuzzy match (1 Levenshtein distance)
+
+3c. Aggregation:
+  FT.AGGREGATE idx:users "*"
+    GROUPBY 1 @city
+    REDUCE COUNT 0 AS user_count
+    SORTBY 2 @user_count DESC
+    LIMIT 0 10
+
+  Aggregation reducers:
+    COUNT, SUM, AVG, MIN, MAX, STDDEV, TOLIST, COUNT_DISTINCT
+
+
+4. SPRING DATA REDIS WITH REDISEARCH
+──────────────────────────────────────
+  Spring Data Redis (with Redis OM Spring — simpler) or via RedisTemplate directly.
+
+  Option 1: Execute FT commands directly via RedisTemplate:
+    redisTemplate.execute((RedisCallback<Object>) connection -> {
+        // execute FT.SEARCH using StringCommands
+        return null;
+    });
+
+  Option 2: Jedis direct:
+    JedisPooled jedis = new JedisPooled("localhost", 6379);
+    SearchResult result = jedis.ftSearch("idx:users",
+        new Query("@name:(Alice)").returnFields("name", "age"));
+    for (Document doc : result.getDocuments()) {
+        System.out.println(doc.getId() + ": " + doc.getString("name"));
+    }
+
+  Option 3: Redis OM Spring (recommended for full-stack Spring):
+    <dependency>
+      <groupId>com.redis.om</groupId>
+      <artifactId>redis-om-spring</artifactId>
+      <version>0.8.7</version>
+    </dependency>
+
+    @Document                           // → stored as JSON
+    public class User {
+        @Id String id;
+        @Searchable String name;        // TEXT index
+        @Indexed String city;           // TAG index
+        @NumericIndexed int age;        // NUMERIC index
+    }
+
+    public interface UserRepository
+        extends RedisDocumentRepository<User, String> {
+        List<User> findByCity(String city);
+        List<User> findByNameContaining(String keyword);
+        List<User> findByAgeBetween(int min, int max);
+    }
+
+
+5. VECTOR SIMILARITY SEARCH (Redis 7.2+)
+─────────────────────────────────────────
+  Store ML embeddings (float vectors) and search by cosine/L2 similarity.
+
+  Create vector index:
+    FT.CREATE idx:products
+      ON JSON
+      PREFIX 1 product:
+      SCHEMA
+        $.description AS description TEXT
+        $.embedding AS embedding VECTOR FLAT 6
+          TYPE FLOAT32
+          DIM 1536          ← OpenAI ada-002 dimension
+          DISTANCE_METRIC COSINE
+
+  Store document with embedding:
+    JSON.SET product:42 $ '{"description":"Redis book","embedding":[0.1,0.2,...]}'
+
+  KNN Search (top-5 most similar):
+    FT.SEARCH idx:products "*=>[KNN 5 @embedding $query_vector AS score]"
+      PARAMS 2 query_vector <binary_float32_blob>
+      SORTBY score ASC
+      RETURN 3 description score __vector_score
+
+  Use case: semantic search, recommendation engines, image similarity.
+
+
+6. FT COMMANDS REFERENCE
+──────────────────────────
+  FT.CREATE index ON {HASH|JSON} PREFIX N prefix1 … SCHEMA field …
+  FT.SEARCH index query [RETURN n field …] [LIMIT offset count] [SORTBY field ASC|DESC]
+  FT.AGGREGATE index query GROUPBY … REDUCE … SORTBY … LIMIT …
+  FT.EXPLAIN index query   → explain query execution plan
+  FT.INFO index            → index stats, num docs, indexing status
+  FT.DROPINDEX index [DD]  → drop index (DD = also delete documents)
+  FT.ALTER index SCHEMA ADD field type → add field to existing index
+  FT.CURSOR READ index cursor [COUNT n] → paginate aggregate results
+  FT.SPELLCHECK index query → spelling correction suggestions
+  FT.SUGADD key word score  → add to autocomplete suggestion
+  FT.SUGGET key prefix [FUZZY] [MAX n] → get autocomplete suggestions
+
+
+7. INTERVIEW QUESTIONS & ANSWERS
+──────────────────────────────────
+  Q: What is Redis Stack and how is it different from plain Redis?
+  A: Redis Stack is a distribution of Redis bundled with modules:
+     RedisJSON (native JSON storage), RediSearch (full-text search +
+     secondary indexing), RedisTimeSeries (time-series data), and RedisBloom
+     (probabilistic data structures). Plain Redis supports only core data types
+     (strings, lists, sets, etc.) without search or JSON document capabilities.
+
+  Q: How does RediSearch index data in Redis?
+  A: RediSearch scans existing keys with the configured PREFIX pattern and indexes
+     the specified fields. For JSON documents, it uses JSONPath expressions to
+     extract field values. The index is maintained automatically — new/updated
+     keys matching the prefix are re-indexed. Index types include TEXT (full-text,
+     TF-IDF), NUMERIC (range), TAG (exact), GEO, and VECTOR.
+
+  Q: When would you use RedisJSON + RediSearch over a traditional DB?
+  A: RedisJSON + RediSearch makes sense when: you need sub-millisecond query
+     responses, data is already in Redis (avoid DB round-trip), full-text search
+     or secondary indexing on Redis data is needed, or you want vector similarity
+     search for ML use cases. For complex relational queries, ACID transactions,
+     or large persistent datasets, a traditional RDBMS is more appropriate.
+
+  Q: What's the difference between TAG and TEXT index types in RediSearch?
+  A: TEXT: full-text indexed — tokenized, stemmed, supports partial word match,
+     fuzzy search, TF-IDF relevance scoring. Good for descriptions, titles.
+     TAG: exact match only — no stemming, supports comma-separated multi-values.
+     Good for categories, status fields, user IDs. TAG is faster and uses less
+     memory than TEXT for exact-match queries.
+
+================================================================================

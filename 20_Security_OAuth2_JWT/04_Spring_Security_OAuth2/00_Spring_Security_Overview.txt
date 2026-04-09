@@ -1,0 +1,549 @@
+========================================================
+SPRING SECURITY OVERVIEW
+========================================================
+
+Spring Security is the de-facto standard for securing Spring-based applications.
+It provides comprehensive security services for Java applications including:
+  - Authentication (Who are you?)
+  - Authorization (What can you do?)
+  - Protection against common exploits (CSRF, session fixation, clickjacking, etc.)
+
+Spring Security 6 (Spring Boot 3) dropped all deprecated APIs and moved to
+a purely lambda-based configuration style.
+
+========================================================
+1. CORE ARCHITECTURE
+========================================================
+
+Spring Security is implemented as a chain of Servlet Filters sitting between
+the HTTP request and your application logic.
+
+┌────────────────────────────────────────────────────────────────┐
+│                    HTTP Request                                 │
+└──────────────────────────┬─────────────────────────────────────┘
+                           ▼
+┌──────────────────────────────────────────────────────────────┐
+│               DelegatingFilterProxy (Spring Bridge)           │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │              FilterChainProxy                           │  │
+│  │  ┌──────────────────────────────────────────────────┐  │  │
+│  │  │          SecurityFilterChain (your config)        │  │  │
+│  │  │  Filter1 → Filter2 → Filter3 → ... → FilterN     │  │  │
+│  │  └──────────────────────────────────────────────────┘  │  │
+│  └────────────────────────────────────────────────────────┘  │
+└──────────────────────────┬───────────────────────────────────┘
+                           ▼
+                    DispatcherServlet → Controllers
+
+KEY COMPONENTS:
+  - DelegatingFilterProxy: Standard Servlet filter that delegates to a Spring bean
+  - FilterChainProxy: Spring Security's main filter; holds multiple SecurityFilterChains
+  - SecurityFilterChain: Maps URL patterns to a list of Security Filters
+  - SecurityFilter: Each filter handles one concern (auth, authz, CSRF, etc.)
+
+========================================================
+2. SECURITY FILTER CHAIN
+========================================================
+
+Spring Security installs ~15 filters in a specific ORDER. Key ones:
+
+Order   Filter                              Purpose
+------  ----------------------------------  ----------------------------
+100     DisableEncodeUrlFilter              Prevents session IDs in URLs
+200     WebAsyncManagerIntegrationFilter    Async request support
+300     SecurityContextHolderFilter         Loads SecurityContext per request
+400     HeaderWriterFilter                  Adds security headers (HSTS, etc.)
+500     CorsFilter                          Handles CORS preflight
+600     CsrfFilter                          CSRF token validation
+700     LogoutFilter                        Processes /logout requests
+800     UsernamePasswordAuthFilter          Form login processing
+900     BearerTokenAuthFilter               OAuth2 JWT/opaque token processing
+1000    BasicAuthenticationFilter           HTTP Basic auth
+1100    RequestCacheAwareFilter             Remembers original request after redirect
+1200    SecurityContextHolderAwareFilter    Adds servlet security methods
+1300    AnonymousAuthenticationFilter       Sets anonymous auth if none present
+1400    ExceptionTranslationFilter          Converts security exceptions to HTTP responses
+1500    AuthorizationFilter                 Access control decisions (FINAL)
+
+IMPORTANT: AuthorizationFilter runs LAST — all auth happens before authz.
+
+========================================================
+3. SECURITY CONTEXT
+========================================================
+
+The SecurityContext holds the Authentication object for the current user.
+It's stored in a ThreadLocal by default.
+
+┌─────────────────────────────────────────────────┐
+│  SecurityContextHolder (ThreadLocal storage)     │
+│  ┌───────────────────────────────────────────┐  │
+│  │  SecurityContext                           │  │
+│  │  ┌─────────────────────────────────────┐  │  │
+│  │  │  Authentication                      │  │  │
+│  │  │  - Principal (UserDetails/JWT claims)│  │  │
+│  │  │  - Credentials (password/token)      │  │  │
+│  │  │  - Authorities (roles/permissions)   │  │  │
+│  │  │  - isAuthenticated()                 │  │  │
+│  │  └─────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────┘
+
+Accessing SecurityContext in code:
+
+// Get current user
+Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+String username = auth.getName();
+Collection<? extends GrantedAuthority> authorities = auth.getAuthorities();
+
+// Type-safe for JWT
+JwtAuthenticationToken jwtAuth = (JwtAuthenticationToken) auth;
+Jwt jwt = jwtAuth.getToken();
+String subject = jwt.getSubject();
+List<String> roles = jwt.getClaimAsStringList("roles");
+
+// In controller method parameters
+@GetMapping("/me")
+public ResponseEntity<UserDto> getCurrentUser(
+    @AuthenticationPrincipal Jwt jwt) {  // Spring injects current principal
+    return ResponseEntity.ok(new UserDto(jwt.getSubject(), jwt.getClaims()));
+}
+
+SecurityContextHolder Strategies:
+  - MODE_THREADLOCAL (default): Each thread has its own context
+  - MODE_INHERITABLETHREADLOCAL: Child threads inherit parent context
+  - MODE_GLOBAL: Single global context (not recommended for web apps)
+
+For async/reactive apps:
+  - Use ReactiveSecurityContextHolder for WebFlux
+  - Propagate SecurityContext manually in CompletableFuture:
+    DelegatingSecurityContextExecutorService wraps ExecutorService
+
+========================================================
+4. SPRING SECURITY 6 CONFIGURATION
+========================================================
+
+Spring Security 6 uses the SecurityFilterChain bean approach.
+The old WebSecurityConfigurerAdapter is REMOVED.
+
+// Complete Spring Security 6 configuration example
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity(prePostEnabled = true)
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            // Authorization rules
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/public/**", "/actuator/health").permitAll()
+                .requestMatchers("/admin/**").hasRole("ADMIN")
+                .requestMatchers(HttpMethod.GET, "/api/**").hasAnyRole("USER", "ADMIN")
+                .anyRequest().authenticated()
+            )
+            // OAuth2 Resource Server (JWT)
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(jwt -> jwt
+                    .jwtAuthenticationConverter(jwtAuthenticationConverter())
+                )
+            )
+            // Disable CSRF for stateless REST APIs
+            .csrf(csrf -> csrf.disable())
+            // Stateless session (no HttpSession for REST APIs)
+            .sessionManagement(session -> session
+                .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            )
+            // Security headers
+            .headers(headers -> headers
+                .frameOptions(frame -> frame.deny())
+                .httpStrictTransportSecurity(hsts -> hsts
+                    .maxAgeInSeconds(31536000)
+                    .includeSubDomains(true)
+                )
+            )
+            // Exception handling
+            .exceptionHandling(ex -> ex
+                .authenticationEntryPoint(new BearerTokenAuthenticationEntryPoint())
+                .accessDeniedHandler(new BearerTokenAccessDeniedHandler())
+            );
+
+        return http.build();
+    }
+
+    @Bean
+    public JwtAuthenticationConverter jwtAuthenticationConverter() {
+        JwtGrantedAuthoritiesConverter converter = new JwtGrantedAuthoritiesConverter();
+        converter.setAuthoritiesClaimName("roles");
+        converter.setAuthorityPrefix("ROLE_");
+
+        JwtAuthenticationConverter jwtConverter = new JwtAuthenticationConverter();
+        jwtConverter.setJwtGrantedAuthoritiesConverter(converter);
+        return jwtConverter;
+    }
+}
+
+========================================================
+5. AUTHENTICATION ARCHITECTURE
+========================================================
+
+Spring Security's authentication flow:
+
+1. Filter intercepts request (e.g., UsernamePasswordAuthenticationFilter)
+2. Creates an Authentication token (unauthenticated)
+3. Delegates to AuthenticationManager
+4. AuthenticationManager iterates through AuthenticationProviders
+5. Matching AuthenticationProvider loads UserDetails, validates credentials
+6. Returns authenticated Authentication token
+7. Stored in SecurityContextHolder
+
+Key classes:
+
+AuthenticationManager:
+  - Interface with single method: authenticate(Authentication)
+  - Default impl: ProviderManager (delegates to list of AuthenticationProvider)
+
+AuthenticationProvider:
+  - Handles specific Authentication type
+  - DaoAuthenticationProvider: username/password against UserDetailsService
+  - JwtAuthenticationProvider: validates JWT tokens
+
+UserDetails Interface:
+public interface UserDetails extends Serializable {
+    Collection<? extends GrantedAuthority> getAuthorities();
+    String getPassword();
+    String getUsername();
+    boolean isAccountNonExpired();
+    boolean isAccountNonLocked();
+    boolean isCredentialsNonExpired();
+    boolean isEnabled();
+}
+
+UserDetailsService:
+  - Single method: loadUserByUsername(String username)
+  - Your custom implementation connects to DB/LDAP/etc.
+
+Example Custom UserDetailsService:
+
+@Service
+public class CustomUserDetailsService implements UserDetailsService {
+
+    private final UserRepository userRepository;
+
+    @Override
+    public UserDetails loadUserByUsername(String username)
+            throws UsernameNotFoundException {
+        User user = userRepository.findByUsername(username)
+            .orElseThrow(() -> new UsernameNotFoundException(
+                "User not found: " + username));
+
+        return org.springframework.security.core.userdetails.User.builder()
+            .username(user.getUsername())
+            .password(user.getPassword())  // must be BCrypt encoded
+            .roles(user.getRoles().toArray(new String[0]))
+            .accountLocked(user.isLocked())
+            .disabled(!user.isEnabled())
+            .build();
+    }
+}
+
+PasswordEncoder (BCrypt):
+
+@Bean
+public PasswordEncoder passwordEncoder() {
+    return new BCryptPasswordEncoder(12);  // strength 12 = ~1 second hashing
+}
+
+// Encoding:
+String encoded = passwordEncoder.encode(rawPassword);
+
+// Verification (never decode; compare hashes):
+boolean matches = passwordEncoder.matches(rawPassword, encodedPassword);
+
+========================================================
+6. AUTHORIZATION ARCHITECTURE
+========================================================
+
+Spring Security evaluates authorization at two levels:
+
+1. HTTP Level: via authorizeHttpRequests() in SecurityFilterChain
+2. Method Level: via @PreAuthorize, @PostAuthorize, @Secured
+
+HTTP Authorization Matchers (evaluated in ORDER — first match wins):
+
+.authorizeHttpRequests(auth -> auth
+    .requestMatchers("/public/**").permitAll()           // No auth required
+    .requestMatchers("/admin/**").hasRole("ADMIN")       // Must have ROLE_ADMIN
+    .requestMatchers("/api/**").hasAuthority("scope:read") // Exact authority
+    .requestMatchers(HttpMethod.POST, "/api/**")
+        .hasAnyRole("USER", "ADMIN")                     // OR condition
+    .anyRequest().authenticated()                        // Everything else: must be logged in
+)
+
+RequestMatcher types:
+  - "/path/**" → AntPathRequestMatcher
+  - new RegexRequestMatcher("/api/v[0-9]+/.*", "GET") → Regex matcher
+  - HttpMethod.GET → HTTP method matching
+
+GrantedAuthority:
+  - Simple string authority (e.g., "ROLE_ADMIN", "scope:read")
+  - hasRole("ADMIN") automatically prefixes with "ROLE_"
+  - hasAuthority("ROLE_ADMIN") checks exact string match
+
+========================================================
+7. GRANTED AUTHORITIES AND ROLES
+========================================================
+
+In Spring Security, a "role" is just an authority with the "ROLE_" prefix.
+
+// These are equivalent:
+.hasRole("ADMIN")          →  checks for authority "ROLE_ADMIN"
+.hasAuthority("ROLE_ADMIN") →  exact string match
+
+Best practice: Use roles for coarse-grained access, authorities/scopes for fine-grained:
+
+// For JWT with custom claims:
+"ROLE_USER" → coarse role
+"order:read" → fine-grained permission/scope
+"SCOPE_openid" → OAuth2 scope (Spring Security adds SCOPE_ prefix)
+
+Custom GrantedAuthority mapping:
+
+@Bean
+public JwtAuthenticationConverter jwtAuthenticationConverter() {
+    return new JwtAuthenticationConverter() {{
+        setJwtGrantedAuthoritiesConverter(jwt -> {
+            List<GrantedAuthority> authorities = new ArrayList<>();
+
+            // Extract roles from custom claim
+            List<String> roles = jwt.getClaimAsStringList("roles");
+            if (roles != null) {
+                roles.stream()
+                    .map(role -> new SimpleGrantedAuthority("ROLE_" + role))
+                    .forEach(authorities::add);
+            }
+
+            // Extract scopes
+            List<String> scopes = jwt.getClaimAsStringList("scope");
+            if (scopes != null) {
+                scopes.stream()
+                    .map(scope -> new SimpleGrantedAuthority("SCOPE_" + scope))
+                    .forEach(authorities::add);
+            }
+
+            return authorities;
+        });
+    }};
+}
+
+========================================================
+8. SPRING SECURITY AUTO-CONFIGURATION
+========================================================
+
+When you add spring-boot-starter-security:
+  - All endpoints require authentication by default
+  - Form login is enabled with auto-generated login page
+  - HTTP Basic is enabled
+  - CSRF protection is enabled
+  - A default user "user" with random password is created
+
+To see the auto-generated password:
+  → Look for: "Using generated security password: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+Overriding defaults:
+  1. Define SecurityFilterChain bean → replaces auto-config
+  2. Set spring.security.user.name and spring.security.user.password in application.properties
+  3. Exclude SecurityAutoConfiguration if needed (rare)
+
+Spring Boot Security Starters:
+  spring-boot-starter-security       → Core security
+  spring-boot-starter-oauth2-client  → OAuth2/OIDC client
+  spring-boot-starter-oauth2-resource-server  → JWT/opaque token resource server
+  spring-security-test               → Testing utilities
+
+========================================================
+9. SECURITY EXCEPTION HANDLING
+========================================================
+
+Two key exceptions in Spring Security:
+
+AuthenticationException (401 Unauthorized):
+  - Thrown when user is not authenticated
+  - Handled by AuthenticationEntryPoint
+
+AccessDeniedException (403 Forbidden):
+  - Thrown when user is authenticated but lacks permission
+  - Handled by AccessDeniedHandler
+
+Custom error responses:
+
+@Component
+public class CustomAuthenticationEntryPoint implements AuthenticationEntryPoint {
+    @Override
+    public void commence(HttpServletRequest request,
+                         HttpServletResponse response,
+                         AuthenticationException authException)
+            throws IOException {
+        response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+        response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+        response.getWriter().write("""
+            {"error": "unauthorized", "message": "Authentication required"}
+            """);
+    }
+}
+
+@Component
+public class CustomAccessDeniedHandler implements AccessDeniedHandler {
+    @Override
+    public void handle(HttpServletRequest request,
+                       HttpServletResponse response,
+                       AccessDeniedException accessDeniedException)
+            throws IOException {
+        response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+        response.setStatus(HttpServletResponse.SC_FORBIDDEN);
+        response.getWriter().write("""
+            {"error": "forbidden", "message": "Access denied"}
+            """);
+    }
+}
+
+// Wire into SecurityFilterChain:
+.exceptionHandling(ex -> ex
+    .authenticationEntryPoint(customAuthenticationEntryPoint)
+    .accessDeniedHandler(customAccessDeniedHandler)
+)
+
+========================================================
+10. MULTIPLE SECURITY FILTER CHAINS
+========================================================
+
+You can define multiple SecurityFilterChain beans for different URL patterns:
+
+// Chain 1: API endpoints with JWT
+@Bean
+@Order(1)
+public SecurityFilterChain apiSecurityFilterChain(HttpSecurity http) throws Exception {
+    http
+        .securityMatcher("/api/**")  // Only applies to /api/**
+        .authorizeHttpRequests(auth -> auth.anyRequest().authenticated())
+        .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()))
+        .csrf(csrf -> csrf.disable())
+        .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS));
+    return http.build();
+}
+
+// Chain 2: Admin console with form login
+@Bean
+@Order(2)
+public SecurityFilterChain adminSecurityFilterChain(HttpSecurity http) throws Exception {
+    http
+        .securityMatcher("/admin/**")  // Only applies to /admin/**
+        .authorizeHttpRequests(auth -> auth.anyRequest().hasRole("ADMIN"))
+        .formLogin(Customizer.withDefaults())
+        .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.IF_REQUIRED));
+    return http.build();
+}
+
+// Chain 3: Actuator with HTTP Basic
+@Bean
+@Order(3)
+public SecurityFilterChain actuatorSecurityFilterChain(HttpSecurity http) throws Exception {
+    http
+        .securityMatcher("/actuator/**")
+        .authorizeHttpRequests(auth -> auth
+            .requestMatchers("/actuator/health").permitAll()
+            .anyRequest().hasRole("ACTUATOR")
+        )
+        .httpBasic(Customizer.withDefaults());
+    return http.build();
+}
+
+========================================================
+11. SPRING SECURITY INTERNALS — FLOW DIAGRAM
+========================================================
+
+HTTP Request → Filter Chain:
+
+DisableEncodeUrlFilter
+        ↓
+SecurityContextHolderFilter (loads SecurityContext from repository)
+        ↓
+HeaderWriterFilter (adds X-Frame-Options, HSTS, etc.)
+        ↓
+CsrfFilter (validates CSRF token for state-changing requests)
+        ↓
+LogoutFilter (checks if request matches /logout)
+        ↓
+BearerTokenAuthenticationFilter (reads Authorization: Bearer header)
+        │
+        ├── Extracts token from Authorization header
+        ├── Creates BearerTokenAuthenticationToken
+        ├── Calls AuthenticationManager.authenticate()
+        │   └── JwtAuthenticationProvider validates JWT
+        │       ├── JwtDecoder verifies signature, expiry
+        │       └── JwtAuthenticationConverter maps claims to authorities
+        └── Stores Authentication in SecurityContextHolder
+        ↓
+ExceptionTranslationFilter (catches AccessDeniedException)
+        ↓
+AuthorizationFilter
+        ├── SecurityMetadataSource reads access rules
+        ├── Calls AccessDecisionManager (or AuthorizationManager in 6.x)
+        │   └── Checks Authentication authorities against required rules
+        ├── If allowed → continue to DispatcherServlet
+        └── If denied → throw AccessDeniedException → 403 or redirect to login
+
+========================================================
+12. COMMON INTERVIEW QUESTIONS
+========================================================
+
+Q: What is the difference between Spring Security 5 and 6?
+A: Spring Security 6 (with Spring Boot 3):
+   - Requires Java 17+
+   - Removed all deprecated APIs (including WebSecurityConfigurerAdapter)
+   - Replaced antMatchers() with requestMatchers()
+   - AuthorizationFilter replaced FilterSecurityInterceptor
+   - Method security uses @EnableMethodSecurity (replaces @EnableGlobalMethodSecurity)
+   - OAuth2 improvements, better reactive support
+
+Q: How does Spring Security integrate with Spring Boot?
+A: Spring Boot auto-configuration (SecurityAutoConfiguration) activates when
+   spring-security-web is on the classpath. It creates default beans. When you
+   define a SecurityFilterChain bean, it overrides the auto-configuration.
+
+Q: What is the SecurityContextHolder?
+A: A ThreadLocal-based storage mechanism that holds the SecurityContext (which
+   contains the Authentication) for the duration of a request. The
+   SecurityContextHolderFilter saves it before the request and clears it after.
+
+Q: What is the difference between AuthenticationManager and AuthenticationProvider?
+A: AuthenticationManager is the interface for authentication. ProviderManager is
+   the default implementation that delegates to a list of AuthenticationProviders.
+   Each AuthenticationProvider handles a specific Authentication type (e.g.,
+   DaoAuthenticationProvider for username/password, JwtAuthenticationProvider
+   for JWT tokens).
+
+Q: Why is WebSecurityConfigurerAdapter removed in Spring Security 6?
+A: It was removed to promote the use of component-based security configuration
+   (SecurityFilterChain beans) which is more composable, testable, and aligns
+   with Spring's general philosophy of favoring composition over inheritance.
+
+Q: How do you secure actuator endpoints?
+A: Use a separate SecurityFilterChain with @Order targeting /actuator/**,
+   optionally with HTTP Basic or IP-based access. For production:
+   - Expose only /actuator/health and /actuator/info publicly
+   - Put other actuator endpoints behind authentication
+   - Consider placing actuator on a different port (management.server.port=8081)
+
+Q: What is the difference between hasRole() and hasAuthority()?
+A: hasRole("ADMIN") checks for the authority "ROLE_ADMIN" (auto-prefixes "ROLE_").
+   hasAuthority("ROLE_ADMIN") checks for the exact string "ROLE_ADMIN".
+   hasAuthority("SCOPE_read") checks for OAuth2 scope "read" (no auto-prefixing).
+
+Q: How does Spring Security prevent session fixation attacks?
+A: By default, Spring Security creates a new session after successful authentication
+   (SessionFixationProtectionStrategy). The old session ID is invalidated and a new
+   one is created, preventing an attacker from pre-planting a session ID.
+
+Q: What happens if no SecurityFilterChain matches a request?
+A: If no SecurityFilterChain matches, the request is processed without security
+   (passes through). Use a catch-all chain with @Order(Integer.MAX_VALUE) as fallback.

@@ -1,0 +1,242 @@
+================================================================================
+INFRASTRUCTURE AS CODE — BEST PRACTICES
+================================================================================
+
+(See also: 01_Terraform_Fundamentals.txt, 03_Terraform_Advanced_and_Best_Practices.txt)
+
+This file covers cross-tool IaC best practices that apply regardless of whether
+you use Terraform, CloudFormation, Pulumi, or CDK.
+
+TABLE OF CONTENTS
+-----------------
+1.  IaC Design Principles
+2.  Code Organization
+3.  State Management
+4.  Testing IaC
+5.  Security Best Practices
+6.  Documentation Standards
+7.  Quick Reference
+
+================================================================================
+1. IAC DESIGN PRINCIPLES
+================================================================================
+
+Idempotency:
+  Running the same IaC multiple times produces the same result.
+  Terraform and CloudFormation are designed to be idempotent.
+  Ensure custom scripts within IaC are also idempotent.
+
+Immutable Infrastructure:
+  Don't modify running infrastructure — replace it.
+  Instead of updating a running EC2 instance in-place:
+  → Build new AMI with changes → Launch new instances → Drain and terminate old
+  Benefits: no configuration drift, rollback = deploy previous version
+
+Declarative over Imperative:
+  Declare WHAT you want, not HOW to achieve it.
+  Terraform/CF are declarative — system figures out the operations needed.
+  Ansible (imperative) is complementary: use it for OS-level configuration.
+
+Single Source of Truth:
+  One Git repo holds all IaC for a service.
+  No manual changes in cloud consoles (drift will be overwritten on next apply).
+  If you make a manual change, immediately codify it.
+
+Version Control Everything:
+  ALL IaC in Git — no exceptions.
+  Include: provider versions, module versions, backend configuration.
+  Exclude: .terraform/ directory, *.tfstate files, sensitive .tfvars.
+
+================================================================================
+2. CODE ORGANIZATION
+================================================================================
+
+Monorepo vs Polyrepo for IaC:
+
+  Monorepo (recommended for most teams):
+  infrastructure/
+  ├── modules/          # Reusable modules
+  │   ├── vpc/
+  │   ├── eks/
+  │   └── rds/
+  ├── environments/
+  │   ├── dev/
+  │   ├── staging/
+  │   └── production/
+  └── shared/           # Shared resources (DNS, certificates)
+  
+  Benefits: single PR touches both app code and infrastructure changes.
+  Easier to enforce: code review requires both app and infra changes.
+
+Module Guidelines:
+  - One concern per module (vpc, database, compute — not "everything")
+  - Expose only needed outputs
+  - Document all variables (description field)
+  - Provide sensible defaults
+  - Version-pin all upstream module dependencies
+  - Never use hardcoded environment or region names in modules
+  
+  # Good module variable:
+  variable "instance_type" {
+    description = "EC2 instance type for the application server"
+    type        = string
+    default     = "t3.micro"
+    
+    validation {
+      condition     = can(regex("^[a-z][0-9].[a-z0-9]+$", var.instance_type))
+      error_message = "Instance type must be a valid EC2 instance type."
+    }
+  }
+
+================================================================================
+3. STATE MANAGEMENT
+================================================================================
+
+Remote State (Required for team environments):
+  Never use local state for shared infrastructure.
+  
+  Terraform:
+  - State in S3 + DynamoDB locking (see 01_Terraform_Fundamentals.txt)
+  - Consider Terraform Cloud / HCP Terraform for managed state + runs
+  
+  CloudFormation:
+  - State is managed by AWS (not a concern)
+  
+  State security:
+  - Enable S3 versioning (state history)
+  - Enable S3 bucket encryption
+  - Restrict IAM access: only CI/CD role + break-glass access
+  - State file contains sensitive data — treat as secret
+
+State Isolation:
+  Separate state per:
+  - Environment (dev, staging, production)
+  - Service/team (networking team owns VPC state; app team owns app state)
+  
+  Benefits:
+  - Mistake in dev can't affect production state
+  - Smaller blast radius: one team's error doesn't lock everyone out
+
+================================================================================
+4. TESTING IAC
+================================================================================
+
+Linting and Static Analysis:
+  # Terraform:
+  terraform fmt -check     # Format check
+  terraform validate       # Syntax validation
+  tfsec ./                 # Security misconfigs
+  checkov -d ./            # Broader misconfig checks
+  
+  # CloudFormation:
+  cfn-lint template.yaml   # AWS CloudFormation Linter
+
+Policy as Code:
+  # Conftest + OPA for custom policies:
+  # Enforce: all S3 buckets must have versioning
+  package main
+  deny[msg] {
+    bucket := input.resource.aws_s3_bucket[name]
+    not bucket.versioning[_].enabled
+    msg := sprintf("S3 bucket %v must have versioning enabled", [name])
+  }
+  conftest test plan.json
+
+Integration Testing (Terratest):
+  Create real resources, test they work, destroy.
+  Run in a dedicated test AWS account.
+  
+  # Example: test VPC module creates correct CIDR:
+  func TestVpcCIDR(t *testing.T) {
+    opts := &terraform.Options{
+      TerraformDir: "../modules/vpc",
+      Vars: map[string]interface{}{"cidr": "10.99.0.0/16"},
+    }
+    defer terraform.Destroy(t, opts)
+    terraform.InitAndApply(t, opts)
+    
+    vpcId := terraform.Output(t, opts, "vpc_id")
+    vpc := aws.GetVpcById(t, vpcId, "us-east-1")
+    assert.Equal(t, "10.99.0.0/16", *vpc.CidrBlock)
+  }
+
+================================================================================
+5. SECURITY BEST PRACTICES
+================================================================================
+
+Least Privilege for IaC Execution:
+  CI/CD pipeline should run IaC with a role that has:
+  - Only the permissions needed for the resources in that stack
+  - No AdministratorAccess
+  - Separate roles per environment (prod role is stricter)
+
+No Secrets in IaC:
+  - Use dynamic references (AWS Secrets Manager, SSM Parameter Store)
+  - Never hardcode passwords, API keys, or certificates in templates
+  - .tfvars files with secrets must be in .gitignore
+
+Encryption by Default:
+  - All storage encrypted (S3 SSE, EBS, RDS)
+  - All data in transit via TLS
+  - KMS keys for sensitive data
+
+Network Security:
+  - No 0.0.0.0/0 ingress on security groups (except ALB on 443)
+  - Private subnets for all application and database resources
+  - VPC endpoints for AWS service access (no internet traversal)
+
+Drift Detection:
+  Detect when real resources diverge from IaC definition.
+  
+  Terraform:  terraform plan -refresh-only → shows out-of-band changes
+  CloudFormation: aws cloudformation detect-stack-drift --stack-name mystack
+  Schedule: run drift detection weekly in CI/CD
+
+================================================================================
+6. DOCUMENTATION STANDARDS
+================================================================================
+
+Every Module Should Have:
+  README.md with:
+  - Purpose of the module
+  - Input variables table (name, type, description, default, required)
+  - Output values table
+  - Example usage code block
+  - Known limitations or dependencies
+
+  # Auto-generate with terraform-docs:
+  terraform-docs markdown table . > README.md
+
+Every Stack/Environment Should Have:
+  - Architecture diagram (draw.io or Mermaid in README)
+  - List of created resources and their purpose
+  - Access patterns: who/what reads from and writes to these resources
+  - Runbook: how to destroy, recreate, or restore from backup
+
+================================================================================
+7. QUICK REFERENCE
+================================================================================
+
+IaC TOOL SELECTION:
+  AWS only:         CloudFormation or Terraform
+  Multi-cloud:      Terraform
+  K8s resources:    Helm, Kustomize, or CDK8s
+  App config:       Ansible (not Terraform)
+  Policy/compliance: OPA/Conftest, Kyverno (K8s)
+
+TESTING PYRAMID:
+  Static analysis:  terraform validate, tfsec, cfn-lint (fast, no cloud)
+  Policy tests:     Conftest + OPA (fast, no cloud)
+  Integration:      Terratest (slow, costs money, use for modules)
+
+SECURITY CHECKLIST:
+  ✓ No hardcoded secrets
+  ✓ All storage encrypted at rest
+  ✓ Least privilege IAM for IaC execution role
+  ✓ Remote state with encryption + locking
+  ✓ Drift detection on schedule
+  ✓ tfsec/checkov passes in CI
+
+================================================================================
+END OF FILE
+================================================================================

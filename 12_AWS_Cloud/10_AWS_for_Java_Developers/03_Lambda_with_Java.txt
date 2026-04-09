@@ -1,0 +1,540 @@
+================================================================
+AWS FOR JAVA DEVELOPERS — LAMBDA WITH JAVA
+Complete Interview Preparation Guide
+================================================================
+
+1. LAMBDA JAVA BASICS
+================================================================
+
+  Lambda supports Java 8, 11, 17, 21 (all LTS versions).
+  
+  Two handler interfaces:
+  1. RequestHandler<I,O>   — SDK handles serialization (I/O are POJOs, auto-JSON)
+  2. RequestStreamHandler  — manual InputStream/OutputStream handling (full control)
+
+  ── RequestHandler ──────────────────────────────────────
+  
+  public class OrderHandler implements RequestHandler<OrderRequest, OrderResponse> {
+      
+      @Override
+      public OrderResponse handleRequest(OrderRequest request, Context context) {
+          LambdaLogger logger = context.getLogger();
+          logger.log("Processing order: " + request.getOrderId());
+          
+          // context.getRemainingTimeInMillis() — time before timeout
+          // context.getFunctionName(), context.getFunctionArn()
+          // context.getMemoryLimitInMB()
+          
+          return new OrderResponse("PROCESSED", request.getOrderId());
+      }
+  }
+  
+  // Handler config in Lambda console or SAM: "com.example.OrderHandler::handleRequest"
+  
+  ── RequestStreamHandler (for raw control) ───────────────
+  
+  public class RawHandler implements RequestStreamHandler {
+      
+      @Override
+      public void handleRequest(InputStream inputStream, 
+                                 OutputStream outputStream, 
+                                 Context context) throws IOException {
+          // Use when: custom serialization, binary responses, 
+          //           working with non-JSON protocols
+          ObjectMapper mapper = new ObjectMapper();
+          JsonNode input = mapper.readTree(inputStream);
+          
+          Map<String, String> response = Map.of("message", "OK");
+          mapper.writeValue(outputStream, response);
+      }
+  }
+
+================================================================
+2. COMMON EVENT TYPES
+================================================================
+
+  ── API GATEWAY PROXY ──────────────────────────────────
+  
+  <!-- pom.xml -->
+  <dependency>
+    <groupId>com.amazonaws</groupId>
+    <artifactId>aws-lambda-java-events</artifactId>
+    <version>3.11.4</version>
+  </dependency>
+  
+  public class ApiGatewayHandler 
+      implements RequestHandler<APIGatewayProxyRequestEvent, APIGatewayProxyResponseEvent> {
+      
+      @Override
+      public APIGatewayProxyResponseEvent handleRequest(
+              APIGatewayProxyRequestEvent request, Context context) {
+          
+          String method = request.getHttpMethod();           // GET, POST, etc.
+          String path = request.getPath();                   // /api/orders
+          Map<String, String> headers = request.getHeaders();
+          Map<String, String> queryParams = request.getQueryStringParameters();
+          String body = request.getBody();                   // JSON string
+          Map<String, String> pathParams = request.getPathParameters();  // {orderId}
+          
+          // Parse body
+          Order order = objectMapper.readValue(body, Order.class);
+          
+          // Return response
+          return new APIGatewayProxyResponseEvent()
+              .withStatusCode(200)
+              .withHeaders(Map.of("Content-Type", "application/json"))
+              .withBody(objectMapper.writeValueAsString(order));
+      }
+  }
+
+  ── SQS EVENT ──────────────────────────────────────────
+  
+  public class SqsHandler implements RequestHandler<SQSEvent, Void> {
+      
+      @Override
+      public Void handleRequest(SQSEvent event, Context context) {
+          for (SQSEvent.SQSMessage msg : event.getRecords()) {
+              String body = msg.getBody();
+              String messageId = msg.getMessageId();
+              String receiptHandle = msg.getReceiptHandle();
+              Map<String, SQSEvent.MessageAttribute> attrs = msg.getMessageAttributes();
+              
+              processOrder(objectMapper.readValue(body, Order.class));
+              // On success: Lambda tells SQS to delete the message(s)
+              // On exception: batch fails, messages re-become visible
+          }
+          return null;
+      }
+  }
+
+  ── S3 EVENT ───────────────────────────────────────────
+  
+  public class S3EventHandler implements RequestHandler<S3Event, String> {
+      
+      @Override
+      public String handleRequest(S3Event event, Context context) {
+          for (S3EventNotification.S3EventNotificationRecord record : event.getRecords()) {
+              String bucket = record.getS3().getBucket().getName();
+              String key = record.getS3().getObject().getUrlDecodedKey();
+              String eventName = record.getEventName();  // ObjectCreated:Put, etc.
+              
+              // Process the uploaded object
+              processUpload(bucket, key);
+          }
+          return "OK";
+      }
+  }
+
+  ── DYNAMODB STREAMS EVENT ─────────────────────────────
+  
+  public class DdbStreamHandler implements RequestHandler<DynamodbEvent, Void> {
+      
+      @Override
+      public Void handleRequest(DynamodbEvent event, Context context) {
+          for (DynamodbEvent.DynamodbStreamRecord record : event.getRecords()) {
+              String eventName = record.getEventName();  // INSERT, MODIFY, REMOVE
+              StreamRecord streamRecord = record.getDynamodb();
+              
+              if ("INSERT".equals(eventName)) {
+                  Map<String, AttributeValue> newImage = streamRecord.getNewImage();
+                  // Process new item
+              } else if ("MODIFY".equals(eventName)) {
+                  Map<String, AttributeValue> oldImage = streamRecord.getOldImage();
+                  Map<String, AttributeValue> newImage = streamRecord.getNewImage();
+                  // Compare changes
+              }
+          }
+          return null;
+      }
+  }
+
+  ── SCHEDULED EVENT (EventBridge Scheduler) ─────────────
+  
+  public class CronHandler implements RequestHandler<ScheduledEvent, String> {
+      
+      @Override
+      public String handleRequest(ScheduledEvent event, Context context) {
+          // event.getSource() → "aws.events"
+          // event.getDetailType() → "Scheduled Event"
+          // event.getTime() → when it was triggered
+          runDailyReport();
+          return "Done";
+      }
+  }
+
+================================================================
+3. COLD START DEEP DIVE
+================================================================
+
+  COLD START PHASES:
+  1. Container provisioning (AWS side, ~100-300ms, not visible)
+  2. JVM startup (~200-500ms for JVM + basic class loading)
+  3. Class loading & initialization (your code's static blocks)
+  4. Handler method execution (actual work)
+  
+  JVM cold starts are 1-3 seconds. After cold start, JVM stays warm.
+  Warm invocations: < 50ms (no JVM startup, no re-initialization)
+  
+  COLD START OPTIMIZATION STRATEGIES:
+  
+  1. STATIC INITIALIZATION (most impactful):
+     // These run ONCE on cold start, reused on warm invocations
+     private static final S3Client S3 = S3Client.create();
+     private static final ObjectMapper MAPPER = new ObjectMapper();
+     private static final SomeDependency DEP = new SomeDependency();
+  
+  2. REDUCE DEPLOYMENT PACKAGE SIZE:
+     - Smaller JAR = faster class loading
+     - Use Maven Shade plugin with minimizeJar
+     - Exclude unused SDK modules (SDK v2 is modular for this reason)
+  
+  3. INCREASE MEMORY:
+     - More memory → more CPU → faster class loading
+     - Lambda: 1 vCPU at 1,769 MB (above this, 2 vCPUs)
+     - Going 256MB→1024MB often halves cold start time
+     - Cost: duration × memory — but faster warm runs may offset
+  
+  4. PROVISIONED CONCURRENCY:
+     - Pre-warms N instances, eliminating cold starts entirely
+     - $ cost: billed even when idle ($0.000004646/GB-second + $0.0000097/invocation)
+     - Best for predictable traffic (e-commerce during business hours)
+     - Can schedule with Application Auto Scaling
+
+================================================================
+4. LAMBDA SNAPSTART (JAVA 21)
+================================================================
+
+  SnapStart (powered by Amazon CRaC — Coordinated Restore at Checkpoint):
+  
+  HOW IT WORKS:
+  1. Lambda initializes your function (JVM startup + your init code)
+  2. Takes a snapshot of the JVM state (memory + disk)
+  3. On invocation: restores from snapshot instead of cold-starting JVM
+  4. Cold start reduced from 1-3 seconds to ~100-200ms
+  
+  ENABLING SNAPSTART:
+  SnapStart is enabled in the Lambda configuration (SnapStart: PublishedVersions)
+  Must publish a version to use SnapStart.
+  
+  HOOKS for restore lifecycle:
+  <!-- pom.xml -->
+  <dependency>
+    <groupId>org.crac</groupId>
+    <artifactId>crac</artifactId>
+    <version>1.4.0</version>
+  </dependency>
+  
+  import org.crac.Core;
+  import org.crac.Resource;
+  
+  public class SnapStartAwareHandler 
+      implements RequestHandler<SQSEvent, Void>, Resource {
+      
+      private static Connection dbConnection;
+      
+      public SnapStartAwareHandler() {
+          Core.getGlobalContext().register(this);
+          dbConnection = createConnection();
+      }
+      
+      @Override
+      public void beforeCheckpoint(Context<? extends Resource> ctx) {
+          // Called before snapshot: close connections that can't be serialized
+          // Network connections, file handles, random seeds
+          dbConnection.close();
+      }
+      
+      @Override
+      public void afterRestore(Context<? extends Resource> ctx) {
+          // Called after restore from snapshot: re-initialize resources
+          dbConnection = createConnection();
+      }
+      
+      @Override
+      public Void handleRequest(SQSEvent event, Context context) {
+          // Use dbConnection
+          return null;
+      }
+  }
+  
+  WHAT SNAPSTART DOESN'T SNAPSHOT:
+  - Network connections (must re-establish after restore)
+  - Entropy pools (Random/SecureRandom → use CRT-random or re-seed after restore)
+  - Timestamps (Instant.now() captured at init time, must refresh after restore)
+
+================================================================
+5. LAMBDA POWERTOOLS FOR JAVA
+================================================================
+
+  <!-- pom.xml -->
+  <dependency>
+    <groupId>software.amazon.lambda</groupId>
+    <artifactId>powertools-logging</artifactId>
+    <version>1.18.0</version>
+  </dependency>
+  <dependency>
+    <groupId>software.amazon.lambda</groupId>
+    <artifactId>powertools-tracing</artifactId>
+    <version>1.18.0</version>
+  </dependency>
+  <dependency>
+    <groupId>software.amazon.lambda</groupId>
+    <artifactId>powertools-metrics</artifactId>
+    <version>1.18.0</version>
+  </dependency>
+  
+  @Logging(logEvent = true)       // Log entire incoming event at DEBUG
+  @Tracing                        // Auto-creates X-Ray subsegments
+  @Metrics(namespace = "OrderService", service = "order-api")
+  public class PowertoolsHandler implements RequestHandler<APIGatewayProxyRequestEvent, 
+                                                            APIGatewayProxyResponseEvent> {
+      
+      Logger log = LogManager.getLogger(PowertoolsHandler.class);
+      
+      @Override
+      @Logging(correlationIdPath = CorrelationIdPaths.API_GATEWAY_REST)
+      public APIGatewayProxyResponseEvent handleRequest(
+              APIGatewayProxyRequestEvent event, Context context) {
+          
+          // Structured JSON logging (searchable in CloudWatch Logs Insights)
+          log.info("Processing request");
+          log.appendKey("orderId", "abc-123");
+          
+          // Custom metrics — emitted as CloudWatch Embedded Metric Format (EMF)
+          MetricsLogger metrics = MetricsUtils.metricsLogger();
+          metrics.putMetric("OrdersProcessed", 1, Unit.COUNT);
+          metrics.putMetric("OrderValue", 49.99, Unit.NONE);
+          
+          // Custom tracing annotations
+          TracingUtils.putAnnotation("orderId", "abc-123");
+          TracingUtils.putMetadata("rawInput", event.getBody());
+          
+          return new APIGatewayProxyResponseEvent().withStatusCode(200);
+      }
+  }
+
+================================================================
+6. LAMBDA LAYERS
+================================================================
+
+  Layers: shared code/libraries uploaded once, referenced by multiple functions.
+  
+  USE CASES:
+  - Common library JARs (ObjectMapper, logging framework)
+  - Custom runtime
+  - Shared domain model classes
+  
+  Layer structure (ZIP):
+    java/lib/my-shared-lib.jar
+    java/lib/jackson-databind-2.15.jar
+  
+  Create layer:
+  aws lambda publish-layer-version \
+    --layer-name my-java-deps \
+    --zip-file fileb://layer.zip \
+    --compatible-runtimes java21
+  
+  Function references layer:
+  # serverless.yml or SAM template.yml
+  layers:
+    - arn:aws:lambda:us-east-1:123456789:layer:my-java-deps:3
+  
+  Lambda adds layer's java/lib/ to the classpath automatically.
+
+================================================================
+7. LAMBDA CONTAINER IMAGE (UP TO 10 GB)
+================================================================
+
+  When to use container images:
+  - Dependencies > 50 MB (Lambda ZIP limit)
+  - Custom runtime (GraalVM native-image)
+  - Complex build process
+  - Consistent dev/prod environments
+  
+  # Dockerfile
+  FROM public.ecr.aws/lambda/java:21
+  
+  # Copy built JAR (fat JAR with all dependencies)
+  COPY target/order-function-1.0.jar ${LAMBDA_TASK_ROOT}/lib/
+  
+  # Set handler
+  CMD ["com.example.OrderHandler::handleRequest"]
+  
+  # Build and push to ECR
+  # docker build -t order-function .
+  # docker tag order-function:latest 123456789.dkr.ecr.us-east-1.amazonaws.com/order-function:latest
+  # docker push ...
+
+================================================================
+8. SAM — SERVERLESS APPLICATION MODEL
+================================================================
+
+  # template.yml (SAM)
+  AWSTemplateFormatVersion: '2010-09-09'
+  Transform: AWS::Serverless-2016-10-31
+  
+  Globals:
+    Function:
+      Runtime: java21
+      Architectures: [arm64]          # Graviton2 — cheaper + faster for Java
+      MemorySize: 1024
+      Timeout: 30
+      Tracing: Active                 # X-Ray
+      Environment:
+        Variables:
+          JAVA_TOOL_OPTIONS: -XX:+TieredCompilation -XX:TieredStopAtLevel=1
+          # TieredCompilation reduces JIT compilation overhead (faster cold start)
+  
+  Resources:
+    OrderFunction:
+      Type: AWS::Serverless::Function
+      Properties:
+        Handler: com.example.OrderHandler::handleRequest
+        CodeUri: target/order-function.jar
+        SnapStart:
+          ApplyOn: PublishedVersions
+        AutoPublishAlias: live         # Creates a version + alias on each deploy
+        Policies:
+          - DynamoDBCrudPolicy:
+              TableName: Orders
+          - SQSPollerPolicy:
+              QueueName: order-queue
+        Events:
+          OrderApi:
+            Type: Api
+            Properties:
+              Path: /orders
+              Method: POST
+          OrderQueue:
+            Type: SQS
+            Properties:
+              Queue: !GetAtt OrderQueue.Arn
+              BatchSize: 10
+              FunctionResponseTypes:
+                - ReportBatchItemFailures  # Partial batch failure support
+  
+  # SAM CLI
+  sam build
+  sam local invoke OrderFunction --event events/test-event.json
+  sam local start-api       # Local API Gateway + Lambda
+  sam deploy --guided       # First deploy (creates samconfig.toml)
+  sam deploy                # Subsequent deploys
+
+================================================================
+9. PARTIAL BATCH FAILURE (SQS)
+================================================================
+
+  // Without partial batch failure: 
+  // If ANY message fails, ALL messages in batch are retried
+  
+  // With ReportBatchItemFailures enabled:
+  public class SqsBatchHandler implements RequestHandler<SQSEvent, SQSBatchResponse> {
+      
+      @Override
+      public SQSBatchResponse handleRequest(SQSEvent event, Context context) {
+          List<SQSBatchResponse.BatchItemFailure> failures = new ArrayList<>();
+          
+          for (SQSEvent.SQSMessage message : event.getRecords()) {
+              try {
+                  processMessage(message.getBody());
+              } catch (Exception e) {
+                  // Only fail THIS message — others succeed
+                  failures.add(SQSBatchResponse.BatchItemFailure.builder()
+                      .withItemIdentifier(message.getMessageId())
+                      .build());
+              }
+          }
+          
+          return SQSBatchResponse.builder()
+              .withBatchItemFailures(failures)
+              .build();
+      }
+  }
+  // Lambda will delete successful messages, leave failed ones to retry
+  
+================================================================
+10. INTERVIEW QUESTIONS
+================================================================
+
+Q: Explain Lambda cold start in Java and all strategies to mitigate it.
+A: Cold start = time to initialize a new Lambda execution environment (container + JVM).
+   
+   Java cold start breakdown:
+   - Container provisioning: 100-300ms (AWS-managed, invisible to developer)
+   - JVM startup: 200-500ms
+   - Class loading of your code + dependencies: 300ms-2s (depends on JAR size)
+   - Static initialization blocks: your custom init code
+   Total: typically 1-5 seconds
+   
+   Mitigation strategies (ordered by effectiveness):
+   
+   1. SnapStart (Java 21): CRaC-based snapshot after init → ~100ms cold start.
+      Best solution. Note: must handle reconnection in afterRestore() hook.
+   
+   2. Provisioned Concurrency: Pre-warm N instances. Eliminates cold starts completely.
+      Cost: billed even when idle. Use Auto Scaling to schedule (on at 8am, off at 10pm).
+   
+   3. GraalVM Native Image: AOT compilation to native binary → JVM cold start eliminated.
+      Cold start <100ms. Trade-off: longer build times, reflection configuration needed.
+   
+   4. More memory: Lambda CPU scales with memory. More CPU = faster class loading.
+      128MB→1024MB often cuts cold start by 50%. Also reduces warm invocation time.
+   
+   5. Reduce JAR size: Fewer classes to load. Use SDK v2 modular dependencies.
+      maven-shade-plugin with minimizeJar. Target <10MB for JAR.
+   
+   6. Static initialization: Initialize expensive objects (SDK clients, DB connections)
+      in static fields. They survive across warm invocations.
+   
+   7. JVM tuning: JAVA_TOOL_OPTIONS=-XX:+TieredCompilation -XX:TieredStopAtLevel=1
+      Disables C2 JIT compiler (used for long-running processes, not needed in Lambda).
+
+Q: What is Lambda SnapStart and how does it differ from Provisioned Concurrency?
+A: Both eliminate cold starts but with different mechanisms and trade-offs:
+   
+   SnapStart:
+   - Mechanism: Takes a microVM snapshot of fully-initialized JVM state.
+   - When Lambda is invoked, restores from snapshot instead of re-initializing.
+   - Available for: Java 21 (also Java 11+ for some regions).
+   - Cost: No additional charge (just pay normal Lambda pricing).
+   - Limitation: Must handle stateful resources in beforeCheckpoint/afterRestore hooks
+     (network connections, random seeds, cached tokens must be refreshed).
+   - Cold start: ~100-200ms (restore time) vs 1-3s without SnapStart.
+   - Scales to 0 when idle (unlike Provisioned Concurrency which always costs money).
+   
+   Provisioned Concurrency:
+   - Mechanism: Keeps N Lambda instances always warm (JVM initialized, handler loaded).
+   - Any request to those instances has 0 cold start.
+   - Cost: ~$0.000004646/GB-second (even when idle) + invocation costs.
+   - Flexibility: Can be scheduled (scale up before peak, down after).
+   - Works with all runtimes, not just Java.
+   
+   Choose SnapStart when: Cost matters, traffic is unpredictable, Java 21 is available.
+   Choose Provisioned Concurrency when: Need guaranteed sub-ms initialization,
+   non-Java runtimes, or have steady predictable traffic where idle cost is acceptable.
+
+Q: How do you implement partial batch failure for SQS → Lambda?
+A: Default SQS trigger behavior: If the handler throws an exception, ALL messages in the 
+   batch are not deleted and become visible again (full batch retry). This causes 
+   duplicates if some messages were processed successfully.
+   
+   Solution: Report partial batch item failures.
+   
+   1. Configure FunctionResponseTypes: [ReportBatchItemFailures] on the event source mapping
+      (SAM, CloudFormation, or Lambda console).
+   
+   2. Return SQSBatchResponse from handler (instead of Void/String):
+      - Collect failed messageIds in BatchItemFailure list
+      - Return SQSBatchResponse with the failures list
+      - Lambda deletes successful messages, leaves failed ones for retry
+   
+   3. Failed messages retry after Visibility Timeout, then go to DLQ after MaxReceiveCount.
+   
+   4. Idempotency critical: A message that previously succeeded but was in a batch with 
+      a failure won't be re-processed with ReportBatchItemFailures. But with full-batch 
+      retries (old behavior), it would. Design handlers to be idempotent anyway because 
+      SQS guarantees at-least-once delivery.
+   
+   With Lambda Powertools: @SqsLambdaHandler annotation handles this automatically.
+
+================================================================

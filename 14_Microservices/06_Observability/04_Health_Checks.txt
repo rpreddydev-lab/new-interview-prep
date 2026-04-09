@@ -1,0 +1,248 @@
+================================================================================
+HEALTH CHECKS IN MICROSERVICES
+================================================================================
+
+WHY HEALTH CHECKS MATTER
+--------------------------
+In microservices, health checks tell the platform:
+  - Is this service ready to receive traffic? (readiness)
+  - Is this service still alive? (liveness)
+  - Is this service's dependencies healthy? (deep health)
+
+Kubernetes uses these to:
+  - Route traffic only to healthy pods (readiness probe)
+  - Restart crashed/hung pods (liveness probe)
+  - Know when a new pod is ready during rolling deployments (readiness)
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING BOOT ACTUATOR HEALTH
+============================
+
+Auto-configured health indicators:
+  - DB connectivity (DataSourceHealthIndicator)
+  - Disk space (DiskSpaceHealthIndicator)
+  - Redis connectivity (RedisHealthIndicator)
+  - Kafka (KafkaHealthIndicator)
+  - Circuit breaker state (Resilience4j)
+  - Eureka registration status
+
+  application.yml:
+  management:
+    endpoint:
+      health:
+        show-details: when-authorized  # "always" in dev, "when-authorized" in prod
+        show-components: always
+        group:
+          readiness:
+            include: "db,redis,diskSpace"
+          liveness:
+            include: "livenessState"
+    health:
+      circuitbreakers:
+        enabled: true
+      ratelimiters:
+        enabled: true
+
+  Endpoints:
+    /actuator/health          → overall health
+    /actuator/health/readiness → readiness group
+    /actuator/health/liveness  → liveness group
+
+  Response when healthy:
+  {
+    "status": "UP",
+    "components": {
+      "db": { "status": "UP", "details": { "database": "PostgreSQL", "validationQuery": "isValid()" }},
+      "redis": { "status": "UP", "details": { "version": "7.0.11" }},
+      "diskSpace": { "status": "UP", "details": { "free": 107374182400 }},
+      "circuitBreakers": {
+        "status": "UP",
+        "details": {
+          "paymentService": { "status": "CIRCUIT_OPEN" }  → This makes overall DOWN
+        }
+      }
+    }
+  }
+
+Custom Health Indicator:
+  @Component
+  public class KafkaHealthIndicator implements HealthIndicator {
+
+    @Autowired private KafkaTemplate<String, String> kafkaTemplate;
+
+    @Override
+    public Health health() {
+      try {
+        // Check Kafka connectivity by listing topics
+        kafkaTemplate.partitionsFor("order-events");
+        return Health.up()
+          .withDetail("kafka", "Available")
+          .withDetail("topic", "order-events")
+          .build();
+      } catch (Exception e) {
+        return Health.down()
+          .withDetail("kafka", "Unavailable")
+          .withDetail("error", e.getMessage())
+          .build();
+      }
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+KUBERNETES PROBES
+==================
+
+Three types of probes in Kubernetes:
+
+1. LIVENESS PROBE
+   - "Is the container alive or should I kill and restart it?"
+   - Fails: JVM deadlock, out of memory, application hung
+   - Action on failure: Kill and restart the container
+   - Spring Boot liveness = /actuator/health/liveness
+
+2. READINESS PROBE
+   - "Should traffic be routed to this container?"
+   - Fails: DB not available, startup not complete, high load
+   - Action on failure: Remove from Service endpoints (no traffic)
+   - Spring Boot readiness = /actuator/health/readiness
+
+3. STARTUP PROBE (for slow-starting apps)
+   - "Has the application finished starting up?"
+   - Disables liveness probe until startup is confirmed
+   - Prevents premature liveness kill during long startup
+
+Kubernetes probe configuration:
+  apiVersion: apps/v1
+  kind: Deployment
+  spec:
+    template:
+      spec:
+        containers:
+        - name: order-service
+          image: order-service:latest
+          ports:
+          - containerPort: 8080
+
+          # Startup Probe (give it time to start)
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            failureThreshold: 30     # 30 × 10s = 300s to start
+            periodSeconds: 10
+
+          # Liveness Probe (is it alive?)
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 30  # Wait 30s before first check
+            periodSeconds: 10        # Check every 10 seconds
+            failureThreshold: 3      # 3 failures → restart
+            timeoutSeconds: 5        # Each probe gets 5 seconds
+
+          # Readiness Probe (is it ready for traffic?)
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 5         # More frequent — faster routing decisions
+            failureThreshold: 3
+            successThreshold: 1      # 1 success → back in rotation
+
+────────────────────────────────────────────────────────────────────────────────
+
+HEALTH CHECK GROUPS (SPRING BOOT 3)
+=====================================
+
+Spring Boot 3 separates liveness and readiness automatically:
+
+  management:
+    endpoint:
+      health:
+        group:
+          readiness:
+            include: "db,redis,kafka,diskSpace"  # All dependencies
+          liveness:
+            include: "livenessState"  # Only JVM state, no dependencies
+
+Why separate?
+  - Liveness: should only reflect if the JVM is healthy (alive, not deadlocked)
+    If a DB goes down, DON'T restart the pod — it won't fix the DB
+  - Readiness: reflect if dependencies are available — if DB is down, stop traffic
+
+Mark readiness down programmatically (e.g., during warm-up):
+  @Autowired
+  private ApplicationContext applicationContext;
+
+  @EventListener(ApplicationReadyEvent.class)
+  public void onReady() {
+    // After event warming (load caches, etc.)
+    AvailabilityChangeEvent.publish(applicationContext, ReadinessState.ACCEPTING_TRAFFIC);
+  }
+
+  // Manually mark as not ready (e.g., graceful shutdown):
+  @PreDestroy
+  public void onShutdown() {
+    AvailabilityChangeEvent.publish(applicationContext, ReadinessState.REFUSING_TRAFFIC);
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+GRACEFUL SHUTDOWN
+==================
+Spring Boot handles Kubernetes termination gracefully:
+
+  spring:
+    lifecycle:
+      timeout-per-shutdown-phase: 30s  # Wait 30s for in-flight requests
+
+  server:
+    shutdown: graceful  # Drain in-flight requests before shutdown
+
+Kubernetes terminationGracePeriodSeconds should be > timeout-per-shutdown-phase:
+  spec:
+    template:
+      spec:
+        terminationGracePeriodSeconds: 60  # K8s waits 60s before SIGKILL
+
+Flow:
+  1. K8s sends SIGTERM to pod
+  2. Spring Boot marks readiness as DOWN (stops receiving new requests)
+  3. Spring Boot waits for in-flight requests to complete (up to 30s)
+  4. Spring Boot shuts down
+  5. K8s sends SIGKILL after 60s if still running (shouldn't reach this)
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What's the difference between liveness and readiness probes?
+A: Liveness probe: "Is the container alive?" — if fails, Kubernetes restarts it.
+   Used for JVM deadlocks, OOM, hung processes. Readiness probe: "Should traffic
+   be sent here?" — if fails, removes pod from load balancer. Used for dependency
+   unavailability, warm-up, graceful shutdown.
+
+Q: Why should liveness probe NOT include database checks?
+A: If the database goes down, the liveness probe would fail → pod gets restarted.
+   But restarting the pod can't fix the database! It would cause a restart loop
+   and increase load. Database checks belong in readiness (stops traffic until
+   DB recovers, but doesn't restart the service).
+
+Q: What is a startup probe and when do you need it?
+A: A startup probe disables the liveness probe during application startup.
+   Needed for applications with long startup times (Spring Boot + caches,
+   large classpath). Without it, the liveness probe might kill the app before
+   it finishes starting.
+
+Q: How does Spring Boot implement graceful shutdown?
+A: Set `server.shutdown: graceful` and `spring.lifecycle.timeout-per-shutdown-phase`.
+   On SIGTERM, Spring Boot marks readiness as DOWN (no new traffic), waits for
+   in-flight requests to complete, then shuts down. Kubernetes terminationGracePeriod
+   should be set larger than the timeout.
+
+================================================================================

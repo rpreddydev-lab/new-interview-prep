@@ -1,0 +1,247 @@
+================================================================================
+  KAFKA MONITORING
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. MONITORING OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Kafka exposes metrics via JMX (Java Management Extensions).
+A complete monitoring stack typically includes:
+
+  Kafka Broker → JMX → [Prometheus JMX Exporter] → Prometheus → Grafana
+  Kafka Consumer → [metrics()] → Prometheus → Grafana
+  Burrow/kafka-exporter → Prometheus → Grafana
+
+Key metric categories:
+  1. Broker metrics (throughput, under-replicated partitions, leader counts)
+  2. Producer metrics (send rate, error rate, batch size, latency)
+  3. Consumer metrics (fetch rate, lag, commit rate)
+  4. Topic/partition metrics (LEO, HW, log size)
+  5. OS metrics (CPU, disk I/O, network, memory, file descriptors)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. CRITICAL BROKER METRICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────────────────────────────────────────────────┬────────────────────────────────┐
+  │ Metric                                               │ Alert Threshold                │
+  ├──────────────────────────────────────────────────────┼────────────────────────────────┤
+  │ UnderReplicatedPartitions (kafka.server:             │ > 0 (CRITICAL)                 │
+  │   ReplicaManager.UnderReplicatedPartitions)          │                                │
+  │ OfflinePartitionsCount                               │ > 0 (CRITICAL)                 │
+  │ ActiveControllerCount                                │ != 1 (CRITICAL)                │
+  │ BytesInPerSec                                        │ Monitor for growth trends      │
+  │ BytesOutPerSec                                       │ Monitor for growth trends      │
+  │ MessagesInPerSec                                     │ Monitor for growth trends      │
+  │ RequestHandlerAvgIdlePercent                         │ < 30% = bottleneck             │
+  │ NetworkProcessorAvgIdlePercent                       │ < 30% = bottleneck             │
+  │ LeaderCount                                          │ Should be balanced across      │
+  │ PartitionCount                                       │ Compare to expected            │
+  │ LogEndOffset                                         │ Use for lag calculation        │
+  └──────────────────────────────────────────────────────┴────────────────────────────────┘
+
+Under-Replicated Partitions (URP):
+  - THE most important Kafka health metric
+  - URPs > 0 means partitions don't have full replication → data at risk
+  - Causes: broker down, GC pause on follower, network partition, disk I/O saturation
+  - Alert immediately; investigate broker health
+
+Offline Partitions:
+  - Partition has NO available leader → reads/writes FAIL for that partition
+  - A truly critical incident (partition is unavailable)
+
+Active Controller Count:
+  - Should ALWAYS be exactly 1
+  - 0 = no controller elected (cluster paralyzed)
+  - > 1 = brain split (shouldn't happen with KRaft but monitor anyway)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. PRODUCER METRICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Metric path: kafka.producer:type=producer-metrics,client-id=<id>
+
+  ┌──────────────────────────────────┬────────────────────────────────────────┐
+  │ Metric                           │ Description                            │
+  ├──────────────────────────────────┼────────────────────────────────────────┤
+  │ record-send-rate                 │ Records sent per second                │
+  │ record-error-rate                │ Records failed per second (alert > 0)  │
+  │ request-latency-avg              │ Average request round-trip             │
+  │ request-latency-max              │ Max request latency (SLA breach)       │
+  │ batch-size-avg                   │ Average batch size (tuning indicator)  │
+  │ compression-rate-avg             │ < 1.0 = compression working            │
+  │ record-queue-time-avg            │ Time record spent in RecordAccumulator │
+  │ produce-throttle-time-avg        │ > 0 = producer being throttled by broker│
+  │ buffer-available-bytes           │ → 0 = producer buffer full (backpressure)│
+  └──────────────────────────────────┴────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. CONSUMER METRICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Metric path: kafka.consumer:type=consumer-fetch-manager-metrics,client-id=<id>
+
+  ┌──────────────────────────────────────┬──────────────────────────────────────┐
+  │ Metric                               │ Description                          │
+  ├──────────────────────────────────────┼──────────────────────────────────────┤
+  │ records-lag-max                      │ Maximum lag across all partitions    │
+  │ records-consumed-rate                │ Records processed per second         │
+  │ fetch-rate                           │ Fetch requests per second            │
+  │ fetch-latency-avg                    │ Average fetch request latency        │
+  │ commit-rate                          │ Offset commits per second            │
+  │ commit-latency-avg                   │ How long commits take                │
+  │ bytes-consumed-rate                  │ Bytes per second consumed            │
+  │ assigned-partitions                  │ Number of partitions assigned        │
+  └──────────────────────────────────────┴──────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. CONSUMER LAG MONITORING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CLI tools:
+  # Check current lag for all consumer groups
+  kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --all-groups
+
+  # Check specific group
+  kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+    --group my-group --describe
+
+  # Watch lag continuously
+  watch -n 5 'kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+    --group my-group --describe'
+
+Programmatic lag check (AdminClient):
+  AdminClient admin = AdminClient.create(props);
+  
+  // Get committed offsets for a group
+  Map<TopicPartition, OffsetAndMetadata> committed =
+    admin.listConsumerGroupOffsets("my-group")
+         .partitionsToOffsetAndMetadata()
+         .get();
+  
+  // Get log end offsets
+  Map<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> endOffsets =
+    admin.listOffsets(topicPartitionOffsetSpec).all().get();
+  
+  // Calculate lag
+  committed.forEach((tp, om) -> {
+    long endOffset = endOffsets.get(tp).offset();
+    long lag = endOffset - om.offset();
+    System.out.printf("Partition %s lag: %d%n", tp, lag);
+  });
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. MONITORING STACK — PROMETHEUS + GRAFANA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Setup:
+  1. Add JMX Exporter agent to Kafka broker JVM:
+     KAFKA_JMX_OPTS="-javaagent:/opt/jmx_prometheus_javaagent.jar=7071:kafka-2_0_0.yml"
+
+  2. Prometheus scrapes /metrics from each broker's port 7071
+
+  3. Grafana queries Prometheus → dashboards (use community Kafka dashboards:
+     Grafana dashboard ID 7589, 12483, 721)
+
+  Key Prometheus metrics (kafka-exporter based):
+    kafka_topic_partition_under_replicated_partition
+    kafka_brokers
+    kafka_consumergroup_lag{consumergroup="x", topic="y", partition="0"}
+    kafka_topic_partition_current_offset
+    kafka_topic_partition_oldest_offset
+
+  Recommended alert rules (Prometheus AlertManager):
+    # Under-replicated partitions
+    - alert: KafkaUnderReplicatedPartitions
+      expr: kafka_server_replicamanager_underreplicatedpartitions > 0
+      for: 1m
+      severity: critical
+
+    # Consumer lag
+    - alert: KafkaConsumerLagHigh
+      expr: kafka_consumergroup_lag{consumergroup="payment-processor"} > 10000
+      for: 5m
+      severity: warning
+
+    # Offline partitions
+    - alert: KafkaOfflinePartitions
+      expr: kafka_controller_kafkacontroller_offlinepartitionscount > 0
+      for: 30s
+      severity: critical
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. KAFKA ADMIN CLI COMMANDS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  # List topics
+  kafka-topics.sh --bootstrap-server localhost:9092 --list
+
+  # Describe topic (partition count, replicas, ISR, leader)
+  kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic orders
+
+  # Check broker health (log-dirs)
+  kafka-log-dirs.sh --bootstrap-server localhost:9092 --broker-list 1,2,3 --topic-list orders
+
+  # Check leader balance
+  kafka-topics.sh --bootstrap-server localhost:9092 --describe | \
+    grep "Leader" | awk '{print $4}' | sort | uniq -c
+
+  # Trigger preferred replica election
+  kafka-leader-election.sh --bootstrap-server localhost:9092 \
+    --election-type preferred --all-topic-partitions
+
+  # Describe consumer group
+  kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+    --group my-group --describe
+
+  # Dump log file contents (debugging)
+  kafka-dump-log.sh --files /var/kafka/logs/orders-0/00000000000000000000.log \
+    --print-data-log
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the single most important Kafka health metric to monitor?
+A: UnderReplicatedPartitions (URP). A value > 0 means one or more partitions don't
+   have all their ISR replicas in sync. This indicates a broker may be down, falling
+   behind due to GC/disk I/O, or experiencing a network issue. High URPs mean
+   reduced fault tolerance — if the leader also dies, data could be lost. Alert
+   immediately on URP > 0. Investigate: check broker logs, disk utilization,
+   network, and GC logs.
+
+Q: How do you set up consumer lag monitoring in production?
+A: Typically via a Prometheus + Grafana stack. Use kafka-exporter (or JMX Exporter
+   on the broker) to expose Kafka metrics to Prometheus. The key metric is
+   kafka_consumergroup_lag. Set alert rules in AlertManager for lag exceeding your
+   SLA threshold. Also consider Burrow for smarter lag evaluation (trend-based, not
+   just static threshold). kafka-consumer-groups.sh --describe is the CLI approach
+   for quick manual checks.
+
+Q: What does ActiveControllerCount != 1 mean and how is it diagnosed?
+A: Every Kafka cluster must have exactly one active controller (which manages
+   leader elections and partition assignments). If ActiveControllerCount is 0,
+   no controller is elected and the cluster cannot perform leadership changes
+   (metadata operations stall). If > 1 (shouldn't happen with KRaft, but could in
+   edge cases), two brokers think they are controller → inconsistent state. Diagnose
+   via broker logs, cluster metadata topic, or KRaft log. Resolution may require
+   rolling restart.
+
+Q: What is produce-throttle-time-avg and when does it go up?
+A: Kafka brokers can throttle producers (and consumers) when they exceed quotas
+   (producer/consumer byte rate quotas per client). produce-throttle-time-avg shows
+   how many milliseconds per request the producer is being delayed. If this metric
+   is non-zero, the producer is being rate-limited by the broker. Solutions: increase
+   the quota for that client, reduce the producer's send rate, or evaluate if the
+   broker is overloaded.
+
+Q: How would you debug a situation where a consumer shows lag but no messages are
+   visible past a certain offset?
+A: Check if the consumer uses isolation.level=read_committed. If so, the consumer
+   can only read up to the Last Stable Offset (LSO) — not the High Watermark. If
+   there's an open (uncommitted/long-running) transaction at the LSO, the consumer
+   appears stuck. Check for stalled transactions using kafka-transactions.sh or
+   Confluent Control Center. The LSO stalling is a known issue with long-running
+   Kafka transactions; tune transaction.timeout.ms to auto-abort them.

@@ -1,0 +1,237 @@
+================================================================================
+  KAFKA PARTITIONING STRATEGIES
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHY PARTITIONING MATTERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Partitioning determines:
+  1. ORDERING: Messages with same key → same partition → ordered delivery
+  2. LOAD DISTRIBUTION: How evenly data is spread across brokers
+  3. PARALLELISM: Number of partitions = max parallel consumers in a group
+  4. HOT SPOTTING: Bad partitioning creates one overloaded partition ("hot partition")
+
+The goal: distribute messages as evenly as possible while preserving ordering
+for related messages.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. DEFAULT PARTITIONING STRATEGIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Strategy 1: KEY-BASED HASHING (when key is provided)
+  partition = Utils.toPositive(Utils.murmur2(keyBytes)) % numPartitions;
+
+  Properties:
+  - Deterministic: same key ALWAYS goes to same partition
+  - Uniform distribution (murmur2 provides good hash distribution)
+  - Guarantees ordering for messages with same key
+  - Standard for all key-based use cases
+
+  Use for:
+  - Order events by orderId (all order-123 events in same partition)
+  - User events by userId
+  - Session events by sessionId
+  - Device telemetry by deviceId
+
+  Example:
+  // All events for "order-456" go to the same partition
+  producer.send(new ProducerRecord<>("orders", "order-456", event));
+
+  Warning about changing partition count:
+  - hash("order-456") % 6 = partition 3 (before)
+  - hash("order-456") % 12 = partition 9 (after adding partitions)
+  - BREAKS: existing in-flight processing may route order-456 to two different partitions
+
+Strategy 2: ROUND-ROBIN (no key, Kafka ≤ 2.3)
+  - Messages distributed one-by-one across partitions: 0, 1, 2, 0, 1, 2, ...
+  - Perfect even distribution
+  - But: creates many small batches (one per partition) → poor batching efficiency
+  - High number of requests to broker → higher CPU and network overhead
+
+Strategy 3: STICKY PARTITIONER (no key, Kafka 2.4+, default)
+  - Messages accumulate in a single partition batch
+  - When batch is full (batch.size) OR linger.ms expires: switch to next partition
+  - Result: larger batches → better compression and fewer requests
+  - Distribution is approximately uniform over time (not per-message)
+  - SIGNIFICANT throughput improvement over round-robin
+
+  Configuration: automatically used for keyless messages in Kafka 2.4+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. CUSTOM PARTITIONER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Implement the Partitioner interface for custom routing logic.
+
+Use cases:
+  a) Multi-tenant: route data for specific tenants to dedicated partitions
+  b) Priority: VIP users/events go to low-partition numbers (consumed first)
+  c) Geographic: US data → partition 0, EU data → partition 1
+  d) Load balancing: custom aware partitioning based on current load
+
+Example — Priority Partitioner:
+  public class PriorityPartitioner implements Partitioner {
+    
+    @Override
+    public int partition(String topic, Object key, byte[] keyBytes,
+                         Object value, byte[] valueBytes, Cluster cluster) {
+      
+      int numPartitions = cluster.partitionCountForTopic(topic);
+      
+      // Reserve first half of partitions for VIP messages
+      if (key != null && key.toString().startsWith("VIP-")) {
+        return Math.abs(Utils.murmur2(keyBytes)) % (numPartitions / 2);
+      }
+      // Rest go to second half
+      return numPartitions / 2 + 
+             Math.abs(Utils.murmur2(keyBytes)) % (numPartitions / 2);
+    }
+    
+    @Override
+    public void close() {}
+    
+    @Override
+    public void configure(Map<String, ?> configs) {}
+  }
+
+  // Register:
+  props.put(ProducerConfig.PARTITIONER_CLASS_CONFIG,
+            PriorityPartitioner.class.getName());
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. THE HOT PARTITION PROBLEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+What is a hot partition?
+  A partition that receives disproportionately more traffic than others.
+  This overloads one broker while others are idle.
+
+Causes:
+  1. Non-uniform key distribution (e.g., one customer generates 80% of traffic)
+  2. Bad partitioner design (all "urgent" messages to partition 0)
+  3. Small number of unique keys relative to partition count
+
+Examples:
+  - E-commerce: A few large sellers generate most orders
+  - Social media: Celebrity posts have much higher engagement
+  - Multi-tenant: One tenant generates 10x more events
+
+Detection:
+  - Monitor BytesInPerSec per partition — outliers indicate hot partitions
+  - Consumer lag: one partition lags far behind others
+
+Solutions:
+
+  Option 1: Key-salt approach (add random suffix to key)
+    // Original: key = "seller-123" → always partition 3
+    // Salted: key = "seller-123-" + random(0,10) → distributes to multiple partitions
+    // Problem: loses strict ordering for seller-123
+    // Use when: ordering by seller is NOT required, just need distribution
+
+  Option 2: Custom partitioner with load awareness
+    // Monitor per-partition message rates, route away from hot partitions
+
+  Option 3: Null key + sticky partitioner
+    // Lose key-based ordering in exchange for even distribution
+    producer.send(new ProducerRecord<>("topic", null, event));
+
+  Option 4: Increase partition count
+    // If distributing by key: more partitions → better distribution
+    // BUT: doesn't fix if truly one key dominates
+
+  Option 5: Pre-aggregate before Kafka
+    // If seller-123 events can be batched/aggregated before publishing, 
+    // send fewer, larger messages
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. EXPLICIT PARTITION OVERRIDE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  // Force send to partition 0 (bypasses partitioner entirely)
+  producer.send(new ProducerRecord<>("orders", 0, null, event));
+
+  Use cases:
+  - Replaying specific partitions during debugging
+  - Forcing admin messages to a known partition
+  - Custom partitioning where the partition number is pre-computed externally
+
+  Warning: with explicit partition, if that partition's leader moves to another
+  broker, the producer automatically connects to the new leader (transparent).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. CHOOSING THE RIGHT PARTITION KEY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Decision criteria:
+  1. What needs to be ordered? → Use that as the key
+  2. Is the cardinality high enough? → Low cardinality = potential hot partitions
+  3. Is the distribution uniform? → Skewed data = hot partitions
+
+Common patterns:
+
+  Domain               Key               Reason
+  ─────────────────────────────────────────────────────────────────────────────
+  E-commerce orders    orderId           All order events for one order in order
+  User activity        userId            All user events for one user in order
+  Account statements   accountId         Account events sequential
+  CDC (DB changes)     primary key       Row changes for same row in order
+  IoT sensors          deviceId          Readings per device sequential
+  Financial trades     tradeId           Trade lifecycle events sequential
+  Session events       sessionId         Session events sequential
+  Logs                 null or hostname  No ordering needed; distribution > ordering
+
+For CDC with Debezium:
+  - The key is automatically set to the primary key(s) of the table row
+  - Ensures INSERT/UPDATE/DELETE for the same row are always in the same partition
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. PARTITIONER API (KAFKA 2.4+ UniformStickyPartitioner)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Kafka 2.4 introduced UniformStickyPartitioner as the default for keyless messages.
+Kafka 3.3 unified the logic: the default partitioner handles both keyed and 
+keyless messages with sticky behavior (sticky only for keyless).
+
+To explicitly configure:
+  props.put(ProducerConfig.PARTITIONER_CLASS_CONFIG,
+            "org.apache.kafka.clients.producer.internals.DefaultPartitioner");
+  // Default behavior: key → hash, no key → sticky
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: How does Kafka determine which partition a message goes to?
+A: If a key is provided: partition = murmur2(key) % numPartitions (deterministic).
+   If no key: sticky partitioning (Kafka 2.4+) — messages accumulate in one
+   partition until the batch is full or linger.ms expires, then moves to next.
+   Alternatively, a custom Partitioner implementation can override this logic.
+
+Q: What is a hot partition and how do you fix it?
+A: A hot partition receives disproportionately more messages than others, creating
+   a bottleneck on one broker. It occurs when the partition key has low cardinality
+   or skewed distribution. Solutions: (1) add salt to the key to spread load
+   (but loses strict ordering), (2) increase partition count, (3) custom partitioner
+   with load-aware routing, or (4) null key + sticky partitioner if ordering isn't needed.
+
+Q: Why does changing partition count break key-based ordering?
+A: The partition assignment is hash(key) % numPartitions. Changing numPartitions
+   changes the modulus, so the same key maps to a different partition. Messages
+   already in the old partition will be consumed before the new partition, creating
+   ordering gaps. This is why partition count should be decided upfront.
+
+Q: When would you use a custom partitioner?
+A: When the default hash-based partitioner doesn't meet your requirements:
+   (1) VIP/priority routing — important events to specific partitions served by
+   more capable consumers, (2) geographic routing — data locality requirements,
+   (3) tenant isolation — ensuring tenant data never mixes, (4) load balancing
+   based on current partition lag/throughput metrics.
+
+Q: What is sticky partitioning and why is it better than round-robin?
+A: Sticky partitioning (default for keyless messages in Kafka 2.4+) accumulates
+   messages into a single partition until the batch is full (batch.size) or
+   linger.ms expires, then switches to the next partition. This creates larger
+   batches, improving compression efficiency and reducing the number of network
+   requests vs round-robin which creates one small batch per partition per message.

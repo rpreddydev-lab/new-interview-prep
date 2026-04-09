@@ -1,0 +1,387 @@
+================================================================
+gRPC ERROR HANDLING IN SPRING BOOT
+================================================================
+
+----------------------------------------------------------------
+1. THE gRPC STATUS MODEL
+----------------------------------------------------------------
+
+gRPC uses a Status object instead of HTTP status codes.
+Every RPC terminates with a Status — either OK or an error code.
+
+Status has two parts:
+  1. Code — enum from io.grpc.Status.Code (16 possible codes)
+  2. Description — optional human-readable message string
+
+Full status code reference:
+
+Code                 HTTP Analog    Description
+───────────────────  ─────────────  ─────────────────────────────
+OK                   200            Success
+CANCELLED            499 (client)   Client cancelled the request
+UNKNOWN              500            Unknown error
+INVALID_ARGUMENT     400            Bad request data
+DEADLINE_EXCEEDED    504            Request timed out
+NOT_FOUND            404            Entity not found
+ALREADY_EXISTS       409            Conflict
+PERMISSION_DENIED    403            Auth OK but not authorized
+RESOURCE_EXHAUSTED   429            Rate limit / quota exceeded
+FAILED_PRECONDITION  400            State mismatch (e.g., try delete on empty list)
+ABORTED              409            Concurrency conflict (optimistic lock)
+OUT_OF_RANGE         400            Iteration past valid range
+UNIMPLEMENTED        501            Method not implemented
+INTERNAL             500            Internal server error
+UNAVAILABLE          503            Service unavailable (retry)
+DATA_LOSS            500            Unrecoverable data corruption
+UNAUTHENTICATED      401            Not authenticated
+
+Retryable status codes (safe to retry):
+  UNAVAILABLE, RESOURCE_EXHAUSTED (with backoff), ABORTED (with retry)
+
+----------------------------------------------------------------
+2. SENDING ERRORS FROM THE SERVER
+----------------------------------------------------------------
+
+Method 1: responseObserver.onError(StatusException)
+  responseObserver.onError(
+      Status.NOT_FOUND
+          .withDescription("Order " + orderId + " not found")
+          .asException());    // ← StatusException (checked)
+
+Method 2: responseObserver.onError(StatusRuntimeException)
+  responseObserver.onError(
+      Status.INVALID_ARGUMENT
+          .withDescription("quantity must be > 0")
+          .asRuntimeException());  // ← StatusRuntimeException (unchecked)
+
+Method 3: throw StatusRuntimeException (uncaught)
+  // The gRPC framework catches it and sends UNKNOWN status
+  // AVOID — always use responseObserver.onError() instead
+
+Method 4: Close a stream with error
+  call.close(Status.PERMISSION_DENIED.withDescription("Not allowed"), new Metadata());
+
+Full example with multiple error cases:
+  @Override
+  public void createOrder(CreateOrderRequest request,
+                          StreamObserver<CreateOrderResponse> responseObserver) {
+    try {
+      // Validation
+      if (request.getCustomerId().isBlank()) {
+        responseObserver.onError(
+            Status.INVALID_ARGUMENT.withDescription("customer_id required").asException());
+        return;
+      }
+      
+      // Not found
+      Customer customer = customerRepo.findById(request.getCustomerId())
+          .orElseThrow(() -> new EntityNotFoundException(
+              "Customer not found: " + request.getCustomerId()));
+      
+      // Business rule
+      if (!customer.isActive()) {
+        responseObserver.onError(
+            Status.FAILED_PRECONDITION
+                .withDescription("Customer account is suspended")
+                .asException());
+        return;
+      }
+      
+      // Main logic...
+      Order order = orderService.create(request);
+      
+      responseObserver.onNext(CreateOrderResponse.newBuilder()
+          .setOrderId(order.getId()).build());
+      responseObserver.onCompleted();
+      
+    } catch (EntityNotFoundException e) {
+      responseObserver.onError(
+          Status.NOT_FOUND.withDescription(e.getMessage()).asException());
+    } catch (OptimisticLockException e) {
+      responseObserver.onError(
+          Status.ABORTED.withDescription("Concurrent modification, retry").asException());
+    } catch (Exception e) {
+      log.error("Unexpected error in createOrder", e);
+      responseObserver.onError(
+          Status.INTERNAL.withDescription("Internal server error").asException());
+    }
+  }
+
+----------------------------------------------------------------
+3. RICH ERROR DETAILS (google.rpc.Status)
+----------------------------------------------------------------
+
+Standard Status only has code + description.
+For richer error details, use google.rpc.Status with error detail types.
+
+Required dependency:
+  <dependency>
+    <groupId>com.google.api.grpc</groupId>
+    <artifactId>proto-google-common-protos</artifactId>
+    <version>2.33.0</version>
+  </dependency>
+
+Available detail types (in google.rpc package):
+  - BadRequest (field violation details)
+  - ErrorInfo (error reason + metadata)
+  - RetryInfo (backoff duration)
+  - DebugInfo (stack trace, detail text)
+  - QuotaFailure (quota violation)
+  - PreconditionFailure (condition violated)
+  - RequestInfo (request/correlation ID)
+  - ResourceInfo (resource that caused the error)
+  - Help (documentation links)
+  - LocalizedMessage (localized error for the end user)
+
+// ── SERVER: SENDING RICH ERROR DETAILS ───────────────────────
+
+import com.google.rpc.Code;
+import com.google.rpc.BadRequest;
+import com.google.rpc.Status;
+import io.grpc.protobuf.StatusProto;
+
+private StatusRuntimeException buildValidationError(
+    String fieldName, String description) {
+  
+  com.google.rpc.Status richStatus = com.google.rpc.Status.newBuilder()
+      .setCode(Code.INVALID_ARGUMENT.getNumber())
+      .setMessage("Request validation failed")
+      .addDetails(Any.pack(BadRequest.newBuilder()
+          .addFieldViolations(BadRequest.FieldViolation.newBuilder()
+              .setField(fieldName)
+              .setDescription(description)
+              .build())
+          .build()))
+      .build();
+  
+  return StatusProto.toStatusRuntimeException(richStatus);
+}
+
+// In service method:
+responseObserver.onError(buildValidationError("quantity", "must be between 1 and 1000"));
+
+// ── CLIENT: EXTRACTING RICH ERROR DETAILS ────────────────────
+
+import io.grpc.protobuf.StatusProto;
+import com.google.rpc.BadRequest;
+
+try {
+  stub.createOrder(request);
+} catch (StatusRuntimeException e) {
+  com.google.rpc.Status richStatus = StatusProto.fromThrowable(e);
+  
+  if (richStatus != null) {
+    for (Any detail : richStatus.getDetailsList()) {
+      if (detail.is(BadRequest.class)) {
+        BadRequest badRequest = detail.unpack(BadRequest.class);
+        for (BadRequest.FieldViolation v : badRequest.getFieldViolationsList()) {
+          System.out.println("Field: " + v.getField() + " - " + v.getDescription());
+        }
+      }
+    }
+  }
+}
+
+----------------------------------------------------------------
+4. GLOBAL EXCEPTION HANDLING WITH INTERCEPTORS
+----------------------------------------------------------------
+
+Instead of adding try-catch to every service method, centralize
+error translation using a server interceptor:
+
+@GrpcGlobalServerInterceptor
+@Order(Ordered.LOWEST_PRECEDENCE)  // should be innermost (runs last)
+@Slf4j
+public class GlobalExceptionHandlingInterceptor implements ServerInterceptor {
+  
+  @Override
+  public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+      ServerCall<ReqT, RespT> call,
+      Metadata headers,
+      ServerCallHandler<ReqT, RespT> next) {
+    
+    ServerCall<ReqT, RespT> exceptionHandlingCall =
+        new ForwardingServerCall.SimpleForwardingServerCall<>(call) {};
+    
+    try {
+      return new ExceptionHandlingServerCallListener<>(
+          next.startCall(exceptionHandlingCall, headers), exceptionHandlingCall);
+    } catch (Exception e) {
+      call.close(translate(e), new Metadata());
+      return new ServerCall.Listener<>() {};
+    }
+  }
+  
+  private static class ExceptionHandlingServerCallListener<ReqT, RespT>
+      extends ForwardingServerCallListener.SimpleForwardingServerCallListener<ReqT> {
+    
+    private final ServerCall<ReqT, RespT> call;
+    
+    ExceptionHandlingServerCallListener(
+        ServerCall.Listener<ReqT> delegate, ServerCall<ReqT, RespT> call) {
+      super(delegate);
+      this.call = call;
+    }
+    
+    @Override
+    public void onMessage(ReqT message) {
+      try {
+        super.onMessage(message);
+      } catch (Exception e) {
+        call.close(translate(e), new Metadata());
+      }
+    }
+    
+    @Override
+    public void onHalfClose() {
+      try {
+        super.onHalfClose();
+      } catch (Exception e) {
+        call.close(translate(e), new Metadata());
+      }
+    }
+  }
+  
+  private static Status translate(Throwable e) {
+    if (e instanceof StatusRuntimeException sre) return sre.getStatus();
+    if (e instanceof StatusException se) return se.getStatus();
+    if (e instanceof EntityNotFoundException) return Status.NOT_FOUND.withDescription(e.getMessage());
+    if (e instanceof ValidationException) return Status.INVALID_ARGUMENT.withDescription(e.getMessage());
+    if (e instanceof AccessDeniedException) return Status.PERMISSION_DENIED.withDescription("Access denied");
+    
+    log.error("Unhandled exception in gRPC service", e);
+    return Status.INTERNAL.withDescription("Internal server error");
+  }
+}
+
+----------------------------------------------------------------
+5. CLIENT-SIDE ERROR HANDLING
+----------------------------------------------------------------
+
+// ── PATTERN 1: Switch on status code ─────────────────────────
+
+try {
+  CreateOrderResponse response = stub.createOrder(request);
+  // success
+} catch (StatusRuntimeException e) {
+  switch (e.getStatus().getCode()) {
+    case INVALID_ARGUMENT -> {
+      // e.getStatus().getDescription() has the message
+      throw new BadRequestException(e.getStatus().getDescription());
+    }
+    case NOT_FOUND -> throw new ResourceNotFoundException(e.getStatus().getDescription());
+    case DEADLINE_EXCEEDED -> throw new ServiceTimeoutException("Order service timed out");
+    case UNAVAILABLE -> throw new ServiceUnavailableException("Order service is down");
+    case UNAUTHENTICATED -> throw new UnauthorizedException("Authentication required");
+    case PERMISSION_DENIED -> throw new ForbiddenException("Access denied");
+    default -> throw new RuntimeException("gRPC error: " + e.getStatus(), e);
+  }
+}
+
+// ── PATTERN 2: Central error translator ──────────────────────
+
+public class GrpcErrorTranslator {
+  
+  public static RuntimeException translate(StatusRuntimeException e) {
+    Status status = e.getStatus();
+    String message = status.getDescription();
+    
+    return switch (status.getCode()) {
+      case NOT_FOUND -> new ResourceNotFoundException(message);
+      case INVALID_ARGUMENT -> new ValidationException(message);
+      case DEADLINE_EXCEEDED -> new ServiceTimeoutException(message);
+      case UNAVAILABLE -> new ServiceUnavailableException(message);
+      case PERMISSION_DENIED -> new ForbiddenException(message);
+      case UNAUTHENTICATED -> new UnauthorizedException(message);
+      case ALREADY_EXISTS -> new ConflictException(message);
+      case RESOURCE_EXHAUSTED -> new RateLimitException(message);
+      default -> new InternalException("Unexpected gRPC error: " + status);
+    };
+  }
+}
+
+// Usage in client:
+try {
+  return stub.createOrder(request);
+} catch (StatusRuntimeException e) {
+  throw GrpcErrorTranslator.translate(e);
+}
+
+// ── PATTERN 3: Extracting trailers ───────────────────────────
+
+catch (StatusRuntimeException e) {
+  Metadata trailers = e.getTrailers();
+  if (trailers != null) {
+    String requestId = trailers.get(
+        Metadata.Key.of("x-request-id", Metadata.ASCII_STRING_MARSHALLER));
+    log.error("Failed request ID: {}", requestId);
+  }
+}
+
+----------------------------------------------------------------
+6. DEADLINE AND CANCELLATION ERRORS
+----------------------------------------------------------------
+
+Client-initiated deadline:
+  stub.withDeadlineAfter(5, TimeUnit.SECONDS).createOrder(request);
+  // throws StatusRuntimeException with Code.DEADLINE_EXCEEDED
+
+Context-propagated deadline:
+  // Server propagates parent deadline to downstream call
+  // Downstream returns DEADLINE_EXCEEDED
+  // The server's own context then shows Context.current().isCancelled() == true
+
+Checking cancellation in streaming:
+  @Override
+  public void listOrders(ListOrdersRequest request,
+                         StreamObserver<Order> responseObserver) {
+    ServerCallStreamObserver<Order> serverObserver =
+        (ServerCallStreamObserver<Order>) responseObserver;
+    
+    for (Order order : orderRepository.findAll()) {
+      if (Context.current().isCancelled()) {
+        // Client cancelled or deadline exceeded — stop immediately
+        return;
+      }
+      serverObserver.onNext(order);
+    }
+    serverObserver.onCompleted();
+  }
+
+----------------------------------------------------------------
+7. INTERVIEW KEY POINTS
+----------------------------------------------------------------
+
+Q: What is the difference between Status.asException() and asRuntimeException()?
+A: asException() creates a StatusException (a checked exception).
+   asRuntimeException() creates a StatusRuntimeException (an unchecked
+   exception). Both carry the Status. In practice, asRuntimeException()
+   is used more often because you can throw it without declaring it in
+   throws clauses. Both are caught the same way: catch (StatusRuntimeException e).
+
+Q: What status code should you return for a business rule violation
+   (e.g., "cannot cancel a completed order")?
+A: FAILED_PRECONDITION. The request is syntactically valid (INVALID_ARGUMENT
+   is for syntax/validation), but a system state precondition is not met.
+   This maps to "the operation was rejected because the system is not in
+   a state where it can execute the request." Another option is ABORTED
+   if the conflict is due to concurrency/optimistic locking.
+
+Q: How do you send field-level validation errors to the client?
+A: Use google.rpc.Status with a BadRequest detail. Add the rich
+   Status proto using StatusProto.toStatusRuntimeException(richStatus).
+   On the client side, extract it with StatusProto.fromThrowable(e)
+   and iterate detail.unpack(BadRequest.class).getFieldViolationsList().
+   This gives structured validation errors similar to bean validation responses.
+
+Q: What happens to in-flight requests during a server restart?
+A: The server calls server.shutdown() which stops accepting new connections
+   but allows in-flight RPCs to complete (up to the grace period). When
+   the grace period expires (or all RPCs complete), the server closes.
+   Clients that are mid-RPC receive Status.UNAVAILABLE. For long streaming
+   RPCs, the server's onCancelHandler is triggered. Clients should detect
+   UNAVAILABLE and retry with exponential backoff.
+
+================================================================
+END OF FILE
+================================================================

@@ -1,0 +1,197 @@
+================================================================================
+CONSUMER-DRIVEN CONTRACT TESTING (DEEP DIVE)
+================================================================================
+
+This file provides additional depth on the Consumer-Driven Contract Testing
+strategy. See 02_Contract_Testing_Pact.txt for the implementation details.
+
+════════════════════════════════════════════════════════════════════════════════
+
+WHAT IS CONSUMER-DRIVEN CONTRACT TESTING?
+------------------------------------------
+A testing approach where the CONSUMER of an API defines the contract.
+
+Traditional approach: Provider defines API spec (OpenAPI/Swagger).
+Consumer implements to that spec. Changes break consumers silently.
+
+Consumer-Driven Contract: Consumer writes tests defining exactly what it needs.
+Provider runs those tests to verify it fulfills consumer requirements.
+Provider knows EXACTLY which consumers use which API fields.
+
+KEY INSIGHT: If provider removes a field that no consumer uses → safe to remove.
+If provider removes a field that consumers use → tests fail → blocked.
+
+────────────────────────────────────────────────────────────────────────────────
+
+CONSUMER-DRIVEN vs PROVIDER-DRIVEN
+=====================================
+
+                      │ Provider-Driven     │ Consumer-Driven
+──────────────────────┼─────────────────────┼────────────────────────
+Who defines contract  │ Provider            │ Consumer
+──────────────────────┼─────────────────────┼────────────────────────
+Breaking change       │ Provider responsible │ Automated detection
+detection             │ (manual)             │ before deployment
+──────────────────────┼─────────────────────┼────────────────────────
+Unused fields         │ Unknown             │ Known (no consumer
+                      │                     │ tests use them)
+──────────────────────┼─────────────────────┼────────────────────────
+Communication needed  │ High (coordinate)   │ Low (contracts are
+                      │                     │ the communication)
+──────────────────────┼─────────────────────┼────────────────────────
+Tools                 │ OpenAPI, Swagger     │ Pact, Spring Cloud Contract
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING CLOUD CONTRACT
+======================
+
+Alternative to Pact, Spring-native. Producer defines contract stubs.
+Consumers use stubs for testing. Tighter integration with Spring Boot.
+
+Provider writes contracts (Groovy DSL):
+  # src/test/resources/contracts/order/shouldCreateOrder.groovy
+  Contract.make {
+    description "Should create a valid order"
+    request {
+      method 'POST'
+      url '/api/orders'
+      headers {
+        contentType('application/json')
+        header('Authorization', matching('Bearer .*'))
+      }
+      body([
+        userId: 1,
+        items: [[productId: 100, quantity: 2]]
+      ])
+    }
+    response {
+      status 201
+      headers {
+        contentType('application/json')
+      }
+      body([
+        id: $(producer(regex('[0-9]+')), consumer(42)),
+        status: 'PENDING',
+        userId: 1
+      ])
+    }
+  }
+
+Provider test — Spring Cloud Contract generates test from contracts:
+  @SpringBootTest(webEnvironment = RANDOM_PORT)
+  public abstract class ContractBase {
+    // Setup needed by generated tests
+    @Autowired protected WebApplicationContext context;
+
+    @BeforeEach
+    void setUp() {
+      RestAssuredMockMvc.webAppContextSetup(context);
+    }
+  }
+
+  // Spring Cloud Contract generates the actual test class at build time
+  // You just run: mvn verify
+
+Provider stub generation:
+  // Stubs are packaged as a JAR: order-service-stubs-1.0.jar
+  // Published to Maven repository (or Artifact Registry)
+
+Consumer uses stubs:
+  @AutoConfigureStubRunner(
+    ids = "com.example:order-service-stubs:+:stubs:8090",  // Latest version
+    stubsMode = StubRunnerProperties.StubsMode.REMOTE,
+    repositoryRoot = "https://repo.example.com/stubs"
+  )
+  @SpringBootTest
+  class DashboardServiceTest {
+    // DashboardService calls order service (runs against stub on :8090)
+
+    @Test
+    void shouldAggregateOrdersForUser() {
+      // Order service stub returns the predefined response
+      DashboardDTO dashboard = dashboardService.getDashboard(userId);
+      assertThat(dashboard.getRecentOrders()).isNotEmpty();
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+PACT vs SPRING CLOUD CONTRACT
+===============================
+
+                    │ Pact                     │ Spring Cloud Contract
+────────────────────┼──────────────────────────┼──────────────────────────────
+Ownership           │ Consumer owns contracts  │ Producer owns contracts
+────────────────────┼──────────────────────────┼──────────────────────────────
+Language support    │ 10+ languages            │ JVM/Spring focused
+────────────────────┼──────────────────────────┼──────────────────────────────
+Central registry    │ Pact Broker              │ Maven/Artifact registry
+────────────────────┼──────────────────────────┼──────────────────────────────
+Direction           │ Consumer-driven          │ Producer-driven
+────────────────────┼──────────────────────────┼──────────────────────────────
+Stub generation     │ Consumer generates stubs │ Producer generates stubs
+────────────────────┼──────────────────────────┼──────────────────────────────
+Best for            │ Polyglot, decoupled teams│ All-Spring, same org teams
+
+────────────────────────────────────────────────────────────────────────────────
+
+CI/CD INTEGRATION — CAN-I-DEPLOY
+====================================
+
+Pact Broker's can-i-deploy prevents deploying breaking changes:
+
+  # In CI pipeline for ORDER-SERVICE:
+  # Before deploying to production, check:
+  pact-broker can-i-deploy \
+    --pacticipant order-service \
+    --version ${VERSION} \
+    --to-environment production
+
+  # This checks:
+  # 1. Has order-service verified all consumer pacts for this version?
+  # 2. Are all consumers (dashboard-service, reporting-service, etc.) 
+  #    verified against this order-service version?
+
+  # If any consumer contract would be broken → exit code 1 → pipeline fails
+  # If all contracts verified → exit code 0 → safe to deploy
+
+Pipeline integration:
+  stages:
+  - build
+  - test
+  - can-i-deploy     ← NEW STAGE
+  - deploy
+
+  can-i-deploy:
+    script:
+      - pact-broker can-i-deploy
+          --pacticipant $SERVICE_NAME
+          --version $CI_COMMIT_SHA
+          --to-environment production
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is the difference between Pact and Spring Cloud Contract?
+A: Pact is consumer-driven — consumers write contracts and providers verify.
+   Supports 10+ languages (Java, JS, Python, Go). Spring Cloud Contract is
+   producer-driven — producers write contracts, generate stubs for consumers.
+   Spring-native. Pact is better for polyglot teams; Spring Cloud Contract
+   for all-Spring shops.
+
+Q: How does contract testing fit into CI/CD?
+A: Consumer tests generate pact files, published to Pact Broker. Provider
+   verification runs in provider's CI. Pact Broker's `can-i-deploy` checks
+   whether a new version of a service has been verified against all its
+   consumers before allowing deployment to production.
+
+Q: Can contract tests replace E2E tests?
+A: Partially. Contract tests catch API breaking changes (field removal, type
+   changes, status code changes) without running both services. But they cannot
+   test: business logic correctness, async event flows, infrastructure
+   problems, performance. E2E tests are still needed for critical user journeys.
+
+================================================================================

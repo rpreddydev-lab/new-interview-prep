@@ -1,0 +1,374 @@
+================================================================
+  SPRING AOP — COMMON AOP USE CASES
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+AOP is best applied to cross-cutting concerns — logic that spans
+multiple layers and doesn't belong in business methods.
+
+Common use cases:
+  - Logging method entry/exit and arguments
+  - Performance/execution-time measurement
+  - Audit logging for sensitive operations
+  - Exception handling and alerting
+  - Retry logic with backoff
+  - Caching (light-weight alternative to @Cacheable)
+  - Rate limiting
+  - Security / permission checks
+  - Distributed tracing (MDC context)
+  - Soft-delete or tenant filtering
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. USE CASE: LOGGING ASPECT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Logs every service method entry and exit with arguments and return value.
+
+@Aspect
+@Component
+@Order(10)
+public class LoggingAspect {
+
+    private static final Logger log = LoggerFactory.getLogger(LoggingAspect.class);
+
+    @Around("execution(* com.example.service..*(..))")
+    public Object logServiceMethod(ProceedingJoinPoint pjp) throws Throwable {
+        String signature = pjp.getSignature().toShortString();
+        Object[] args = pjp.getArgs();
+
+        log.debug(">> {} args={}", signature, sanitize(args));
+
+        try {
+            Object result = pjp.proceed();
+            log.debug("<< {} returned={}", signature, result);
+            return result;
+        } catch (Throwable ex) {
+            log.error("<< {} threw={}: {}", signature,
+                ex.getClass().getSimpleName(), ex.getMessage());
+            throw ex;
+        }
+    }
+
+    // Mask sensitive fields (passwords, tokens, cards)
+    private Object[] sanitize(Object[] args) {
+        return Arrays.stream(args)
+            .map(a -> a instanceof Sensitive ? "***" : a)
+            .toArray();
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. USE CASE: PERFORMANCE TIMING + MICROMETER METRICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Publish execution time to Micrometer (Prometheus/Grafana-ready).
+
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface TrackTime {
+    String metric() default "";
+}
+
+@Aspect
+@Component
+public class PerformanceAspect {
+
+    private final MeterRegistry meterRegistry;
+
+    public PerformanceAspect(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
+    }
+
+    @Around("@annotation(trackTime)")
+    public Object trackTime(ProceedingJoinPoint pjp, TrackTime trackTime) throws Throwable {
+        String metricName = trackTime.metric().isBlank()
+            ? "method." + pjp.getSignature().getName()
+            : trackTime.metric();
+
+        Timer.Sample sample = Timer.start(meterRegistry);
+        String status = "success";
+        try {
+            return pjp.proceed();
+        } catch (Throwable ex) {
+            status = "error";
+            throw ex;
+        } finally {
+            sample.stop(meterRegistry.timer(metricName,
+                "class", pjp.getTarget().getClass().getSimpleName(),
+                "status", status));
+        }
+    }
+}
+
+// Usage
+@Service
+public class PaymentService {
+
+    @TrackTime(metric = "payment.process")
+    public PaymentResult processPayment(PaymentRequest req) { ... }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. USE CASE: AUDIT LOGGING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Record who did what and when for sensitive operations.
+
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface Auditable {
+    String action();
+    String resource() default "";
+}
+
+@Aspect
+@Component
+public class AuditAspect {
+
+    @Autowired
+    private AuditLogRepository auditRepo;
+
+    @AfterReturning(
+        pointcut = "@annotation(auditable)",
+        returning = "result"
+    )
+    public void auditSuccess(JoinPoint jp, Auditable auditable, Object result) {
+        String user = currentUser();
+        AuditLog entry = AuditLog.builder()
+            .user(user)
+            .action(auditable.action())
+            .resource(auditable.resource())
+            .timestamp(Instant.now())
+            .outcome("SUCCESS")
+            .build();
+        auditRepo.save(entry);
+    }
+
+    @AfterThrowing(
+        pointcut = "@annotation(auditable)",
+        throwing = "ex"
+    )
+    public void auditFailure(JoinPoint jp, Auditable auditable, Throwable ex) {
+        AuditLog entry = AuditLog.builder()
+            .user(currentUser())
+            .action(auditable.action())
+            .timestamp(Instant.now())
+            .outcome("FAILURE")
+            .details(ex.getMessage())
+            .build();
+        auditRepo.save(entry);
+    }
+
+    private String currentUser() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        return auth != null ? auth.getName() : "SYSTEM";
+    }
+}
+
+// Usage
+@Service
+public class AccountService {
+
+    @Auditable(action = "TRANSFER_FUNDS", resource = "account")
+    public void transferFunds(Long fromId, Long toId, BigDecimal amount) { ... }
+
+    @Auditable(action = "DELETE_ACCOUNT", resource = "account")
+    public void deleteAccount(Long accountId) { ... }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. USE CASE: RETRY WITH EXPONENTIAL BACKOFF
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Custom retry mechanism without Spring Retry dependency.
+
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface Retry {
+    int maxAttempts() default 3;
+    long initialDelayMs() default 500;
+    Class<? extends Exception>[] retryOn() default {Exception.class};
+}
+
+@Aspect
+@Component
+public class RetryAspect {
+
+    @Around("@annotation(retry)")
+    public Object retry(ProceedingJoinPoint pjp, Retry retry) throws Throwable {
+        int maxAttempts = retry.maxAttempts();
+        long delay = retry.initialDelayMs();
+        List<Class<? extends Exception>> retryOn = Arrays.asList(retry.retryOn());
+
+        Throwable lastException = null;
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                return pjp.proceed();
+            } catch (Throwable ex) {
+                // Only retry on specified exception types
+                boolean shouldRetry = retryOn.stream()
+                    .anyMatch(cls -> cls.isInstance(ex));
+
+                if (!shouldRetry || attempt == maxAttempts) {
+                    throw ex;
+                }
+
+                lastException = ex;
+                log.warn("[Retry {}/{}] {} failed: {}. Retrying in {}ms...",
+                    attempt, maxAttempts,
+                    pjp.getSignature().getName(),
+                    ex.getMessage(),
+                    delay);
+
+                Thread.sleep(delay);
+                delay *= 2;  // exponential backoff
+            }
+        }
+        throw lastException;
+    }
+}
+
+// Usage
+@Service
+public class ExternalApiService {
+
+    @Retry(maxAttempts = 3, initialDelayMs = 200,
+           retryOn = {HttpClientErrorException.class, SocketTimeoutException.class})
+    public ApiResponse callExternalApi(String payload) {
+        return restClient.post()
+            .uri("/api/endpoint")
+            .body(payload)
+            .retrieve()
+            .body(ApiResponse.class);
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. USE CASE: MDC CONTEXT PROPAGATION (DISTRIBUTED TRACING)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Automatically enrich MDC (SLF4J Mapped Diagnostic Context) with
+correlation IDs, user, tenant info for structured logging.
+
+@Aspect
+@Component
+@Order(1)   // earliest — set MDC before any other advice runs
+public class MdcAspect {
+
+    @Around("execution(* com.example.controller..*(..))")
+    public Object enrichMdc(ProceedingJoinPoint pjp) throws Throwable {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+
+        try (MDC.MDCCloseable u = MDC.putCloseable(
+                "user", auth != null ? auth.getName() : "anonymous");
+             MDC.MDCCloseable r = MDC.putCloseable(
+                "requestId", RequestContextHolder.currentRequestId())) {
+
+            return pjp.proceed();
+
+        } // MDC.putCloseable auto-removes on close
+    }
+}
+
+// Now every log line from inside the annotated methods carries:
+// user=john.doe requestId=abc-123
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. USE CASE: SOFT DELETE ENFORCEMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Intercept repository delete calls and route them to mark-as-deleted instead.
+
+@Aspect
+@Component
+public class SoftDeleteAspect {
+
+    @Around("execution(* com.example.repository.*Repository.delete*(..))")
+    public Object interceptDelete(ProceedingJoinPoint pjp) throws Throwable {
+        Object[] args = pjp.getArgs();
+
+        if (args.length > 0 && args[0] instanceof SoftDeletable entity) {
+            entity.setDeleted(true);
+            entity.setDeletedAt(Instant.now());
+            // Call save instead of delete
+            // (access the repository via pjp or a separate injected bean)
+            return null;  // suppress the actual delete
+        }
+
+        return pjp.proceed();  // fallback: actual delete
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. USE CASE: VALIDATION ASPECT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Programmatic cross-field or domain validation that doesn't fit Bean Validation.
+
+@Aspect
+@Component
+public class BusinessValidationAspect {
+
+    @Before("execution(* com.example.service.OrderService.placeOrder(..)) && args(request,..)")
+    public void validateOrder(JoinPoint jp, CreateOrderRequest request) {
+        if (request.getItems().isEmpty()) {
+            throw new IllegalArgumentException("Order must have at least one item");
+        }
+        if (request.getDeliveryDate().isBefore(LocalDate.now().plusDays(1))) {
+            throw new IllegalArgumentException("Delivery date must be at least tomorrow");
+        }
+        // domain-specific rules that @Valid/@NotNull don't cover
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  9. ASPECT VS ALTERNATIVES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Use Case              | AOP     | HandlerInterceptor | Filter    | @Transactional
+----------------------|---------|--------------------|-----------|----------------
+Service-layer cross   | ✓ Best  | ✗ (controller only)| ✗         | ✗
+HTTP pre/post         | ✓       | ✓ Best             | ✓         | ✗
+Request/response body | ✗       | ✗                  | ✓ Best    | ✗
+Transactions          | ✓       | ✗                  | ✗         | ✓ Best
+Retry                 | ✓ Best  | ✗                  | ✗         | ✗
+Metrics               | ✓ Best  | ✓                  | ✓         | ✗
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  10. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: How does @Transactional work under the hood?
+A: @Transactional is implemented as a Spring AOP @Around advice.
+   When you call a @Transactional method, the CGLIB/JDK proxy intercepts
+   the call, opens a transaction, invokes the real method, and then
+   commits or rolls back based on the outcome.
+
+Q: Can AOP be used for caching instead of @Cacheable?
+A: Yes, @Cacheable itself is an AOP-based abstraction. You can write
+   a custom @Around aspect that checks a cache before proceed() and
+   stores the result after. This is useful when you need cache logic
+   @Cacheable doesn't support (e.g., conditional, composite keys).
+
+Q: How do you prevent an aspect from applying to a class?
+A: Use negation in the pointcut:
+   !within(com.example.service.AdminService)
+   Or qualify the pointcut to match specific packages/annotations only.
+   The @Primary annotation or excluding specific beans with bean()
+   also works.
+
+Q: When should you NOT use AOP?
+A: Avoid AOP when: (1) business logic is involved — keep it in the class;
+   (2) the behavior is highly specific to one method — just put it inline;
+   (3) debugging difficulty is unacceptable — AOP makes stack traces less
+   obvious; (4) performance is critical in hot paths — proxy invocation
+   adds overhead.
+
+Q: Can you apply multiple aspects to the same method?
+A: Yes. Multiple aspects apply to the same join point. Use @Order on
+   aspect classes to control the execution order. Lower @Order value
+   runs outermost in @Around (first before, last after).

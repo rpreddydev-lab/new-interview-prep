@@ -1,0 +1,434 @@
+================================================================
+MODULE FEDERATION - MICRO-FRONTEND ARCHITECTURE
+================================================================
+
+WHAT IS MODULE FEDERATION?
+───────────────────────────
+Module Federation is a webpack 5 feature that allows multiple separate
+builds to form a single application. Each build can dynamically load
+code from other builds at runtime, enabling true micro-frontend
+architecture and runtime code sharing.
+
+Introduced in: Webpack 5 (October 2020)
+Maintained by: Zack Jackson (original creator), webpack team
+
+THE CORE IDEA:
+  Instead of all code living in one monolithic bundle, multiple teams
+  build and deploy independent applications. These "federated modules"
+  can expose components or utilities that other apps consume at runtime
+  — without rebuilding either application.
+
+  App Shell (Host)         ← orchestrates the micro-frontends
+    ├── Team A: /products  ← loaded from products.example.com/remoteEntry.js
+    ├── Team B: /cart      ← loaded from cart.example.com/remoteEntry.js
+    └── Team C: /checkout  ← loaded from checkout.example.com/remoteEntry.js
+
+================================================================
+KEY CONCEPTS
+================================================================
+
+HOST (CONSUMER):
+  An application that LOADS code from remote containers at runtime.
+  It's the "shell" or "orchestrator."
+
+REMOTE (PROVIDER):
+  An application that EXPOSES code for other applications to use.
+  It publishes a "remoteEntry.js" manifest file.
+
+SHARED MODULES:
+  Libraries that should only be loaded ONCE across all federated apps.
+  Most importantly: React, ReactDOM, react-router.
+  Without sharing: each micro-frontend loads its own copy of React
+  (3 copies of React = 3x the size, and React hooks break across copies!)
+
+REMOTE ENTRY:
+  A small JavaScript manifest file (remoteEntry.js) that federated
+  modules publish. Contains metadata about what is exposed and
+  what version of shared dependencies they use.
+
+================================================================
+BASIC MODULE FEDERATION SETUP
+================================================================
+
+SCENARIO:
+  - Shell app (host): main application
+  - Products app (remote): exposes ProductList component
+  - Cart app (remote): exposes CartWidget component
+
+// ─── PRODUCTS APP (REMOTE) webpack.config.js ───
+const { ModuleFederationPlugin } = require('webpack').container;
+
+module.exports = {
+  output: {
+    publicPath: 'https://products.example.com/', // Required for remote loading
+  },
+  plugins: [
+    new ModuleFederationPlugin({
+      name: 'products',                     // Unique name for this app
+      filename: 'remoteEntry.js',           // Manifest file to publish
+      exposes: {
+        // './LocalName': 'path-to-module'
+        './ProductList': './src/components/ProductList',
+        './ProductCard': './src/components/ProductCard',
+        './hooks/useProduct': './src/hooks/useProduct',
+      },
+      shared: {
+        react: {
+          singleton: true,                  // Only ONE React instance allowed
+          requiredVersion: '^18.0.0',
+        },
+        'react-dom': {
+          singleton: true,
+          requiredVersion: '^18.0.0',
+        },
+      },
+    })
+  ]
+};
+
+// ─── SHELL APP (HOST) webpack.config.js ───
+module.exports = {
+  plugins: [
+    new ModuleFederationPlugin({
+      name: 'shell',
+      remotes: {
+        // 'localAlias': 'remoteName@url/remoteEntry.js'
+        products: 'products@https://products.example.com/remoteEntry.js',
+        cart: 'cart@https://cart.example.com/remoteEntry.js',
+      },
+      shared: {
+        react: { singleton: true, requiredVersion: '^18.0.0' },
+        'react-dom': { singleton: true, requiredVersion: '^18.0.0' },
+      },
+    })
+  ]
+};
+
+// ─── CONSUMING IN SHELL (Host) ───
+// IMPORTANT: Use dynamic import (async!) — Module Federation is async
+import React, { lazy, Suspense } from 'react';
+
+const ProductList = lazy(() => import('products/ProductList'));
+//                                    ↑ remote alias  ↑ exposed name
+
+function App() {
+  return (
+    <Suspense fallback={<div>Loading products...</div>}>
+      <ProductList />
+    </Suspense>
+  );
+}
+
+================================================================
+BOOTSTRAP FILE PATTERN (REQUIRED!)
+================================================================
+
+Module Federation needs async initialization. You MUST use a bootstrap
+file to avoid "Shared module is not available for eager consumption" error.
+
+// ❌ Won't work — synchronous import can't wait for federation
+// src/index.js
+import React from 'react';
+import App from './App';
+ReactDOM.render(<App />, document.getElementById('root'));
+
+// ✅ Use bootstrap pattern
+// src/index.js
+import('./bootstrap'); // Dynamic import → async!
+
+// src/bootstrap.js
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App';
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+
+// WHY: Dynamic import creates an async boundary.
+// webpack can negotiate shared module versions across
+// all federated apps before any module code runs.
+
+================================================================
+DYNAMIC REMOTES (RUNTIME CONFIGURATION)
+================================================================
+
+PROBLEM: Hard-coding remote URLs means rebuilding to change URLs.
+SOLUTION: Load remote URLs from configuration at runtime.
+
+// src/loadRemote.js
+async function loadRemote(scope, module) {
+  // Get URL from config (could be from API, environment variable, etc.)
+  const remoteUrl = window.__MICRO_FRONTEND_CONFIG__[scope];
+  
+  // Dynamically load the remoteEntry.js
+  await __webpack_init_sharing__('default');
+  
+  // Load the script
+  await new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = remoteUrl;
+    script.onload = resolve;
+    script.onerror = reject;
+    document.head.appendChild(script);
+  });
+  
+  // Initialize the container
+  const container = window[scope];
+  await container.init(__webpack_share_scopes__.default);
+  
+  // Get the module factory
+  const factory = await container.get(module);
+  return factory();
+}
+
+// Usage:
+const ProductModule = await loadRemote('products', './ProductList');
+const ProductList = ProductModule.default;
+
+================================================================
+SHARED DEPENDENCIES CONFIGURATION
+================================================================
+
+SHARING CONFIGURATION OPTIONS:
+  shared: {
+    react: {
+      singleton: true,      // Only one instance allowed (CRITICAL for React)
+      eager: false,         // Don't bundle eagerly (async loading)
+      requiredVersion: '^18.0.0',  // Semantic version requirement
+      strictVersion: false, // Whether to fail if version doesn't match
+    },
+    lodash: {
+      singleton: false,     // Multiple versions OK
+      shareScope: 'default',
+    }
+  }
+
+SINGLETON: true — CRITICAL FOR REACT:
+  React uses module-level state (useState, useContext, etc.)
+  If two copies of React load, hooks break with errors like:
+  "Invalid hook call. Hooks can only be called inside of a function component."
+  
+  singleton: true ensures only ONE React instance loads, even if multiple
+  remotes each require React.
+
+VERSION NEGOTIATION:
+  If Shell requires React ^18.0.0 and Products requires React ^17.0.0:
+  - Without strictVersion: highest compatible version loads (React 18)
+  - With strictVersion: ERROR — versions don't match
+
+EAGER SHARING (for app shell pattern):
+  shared: {
+    react: {
+      singleton: true,
+      eager: true,  // Bundle React directly (no async loading delay)
+                    // Good for the shell/host app only!
+    }
+  }
+
+================================================================
+MODULE FEDERATION IN NEXT.JS (with @module-federation/nextjs-mf)
+================================================================
+
+// NOTE: Next.js has limited native support for Module Federation
+// Use the @module-federation/nextjs-mf plugin or
+// Next.js built-in support (Next.js 13+ with experimental federation)
+
+npm install @module-federation/nextjs-mf
+
+// next.config.js (REMOTE app)
+const NextFederationPlugin = require('@module-federation/nextjs-mf');
+
+module.exports = {
+  webpack(config, options) {
+    config.plugins.push(
+      new NextFederationPlugin({
+        name: 'products',
+        filename: 'static/chunks/remoteEntry.js',
+        exposes: {
+          './ProductList': './components/ProductList',
+        },
+        shared: {
+          react: { singleton: true },
+          'react-dom': { singleton: true },
+        },
+      })
+    );
+    return config;
+  },
+};
+
+// next.config.js (HOST app)
+module.exports = {
+  webpack(config, options) {
+    config.plugins.push(
+      new NextFederationPlugin({
+        name: 'shell',
+        remotes: {
+          products: `products@${
+            process.env.PRODUCTS_URL
+          }/static/chunks/remoteEntry.js`,
+        },
+        shared: {
+          react: { singleton: true },
+          'react-dom': { singleton: true },
+        },
+      })
+    );
+    return config;
+  },
+};
+
+================================================================
+INDEPENDENT DEPLOYMENT WORKFLOW
+================================================================
+
+DIRECTORY STRUCTURE (monorepo approach):
+  packages/
+  ├── shell/          # Host app
+  ├── products/       # Remote: product features
+  ├── cart/           # Remote: cart features
+  └── shared/         # Shared utilities (NOT via Module Federation)
+                      # (Module Federation handles npm packages;
+                      #  use npm workspace for shared types/utils)
+
+DEPLOYMENT FLOW:
+  1. Team A merges to main in products/ → CI builds products
+  2. products/remoteEntry.js deployed to products.example.com
+  3. Shell loads latest remoteEntry.js on next user visit
+  4. Users immediately see Team A's changes WITHOUT deploying shell!
+  
+  THIS IS THE KEY BENEFIT: Independent deployment without coordination.
+
+================================================================
+USE CASES
+================================================================
+
+1. MICRO-FRONTENDS:
+   Different teams own different sections of an app.
+   Each team deploys independently.
+   Shell loads their code at runtime.
+
+2. A/B TESTING WITHOUT REBUILD:
+   Experiment: 'products@https://products-v2.example.com/remoteEntry.js'
+   Load different versions of components for different users.
+
+3. SHARING DESIGN SYSTEM:
+   Design system team publishes components via Module Federation.
+   All apps load from single source — no version drift.
+   Update design system → all apps see update immediately.
+
+4. PARTIAL UPGRADES:
+   Migrate from React 17 to React 18 page-by-page.
+   (Difficult with singleton: React version must match across all)
+
+5. PLUGIN ARCHITECTURE:
+   CMS or app builder that loads user-installed plugins at runtime.
+
+================================================================
+DRAWBACKS AND TRADE-OFFS
+================================================================
+
+COMPLEXITY:
+  - Debugging across multiple repositories is harder
+  - Error boundaries needed everywhere (remote may fail to load)
+  - Shared state management becomes complex (Redux? Context? Which?)
+  - Testing integration requires multiple services running
+
+PERFORMANCE:
+  - Each remote is a separate network request for remoteEntry.js
+  - More round trips than monolithic bundle
+  - Version mismatches can cause double-loading of libraries
+  - Waterfall: shell loads → discovers remotes → loads remote chunks
+
+VERSIONING:
+  - Shared library version conflicts (singleton issues)
+  - API contracts between host and remotes must be maintained
+  - Breaking change in exposed component can break host
+
+WHEN NOT TO USE:
+  - Small teams that own the entire product
+  - Simple applications that don't need independent deployment
+  - When the performance overhead outweighs organizational benefits
+  - When team communication overhead is manageable
+
+================================================================
+ERROR BOUNDARIES FOR FEDERATED COMPONENTS
+================================================================
+
+// Remote components can fail to load (network error, version mismatch)
+// ALWAYS wrap in Error Boundary
+
+class RemoteErrorBoundary extends React.Component {
+  state = { hasError: false, error: null };
+  
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  
+  componentDidCatch(error, info) {
+    console.error('Remote component failed to load:', error);
+    // Log to monitoring (Sentry, DataDog)
+  }
+  
+  render() {
+    if (this.state.hasError) {
+      return this.props.fallback || <div>Failed to load this section</div>;
+    }
+    return this.props.children;
+  }
+}
+
+// Usage:
+<RemoteErrorBoundary fallback={<ProductListFallback />}>
+  <Suspense fallback={<Spinner />}>
+    <ProductList /> {/* Federated component */}
+  </Suspense>
+</RemoteErrorBoundary>
+
+================================================================
+INTERVIEW ANSWERS
+================================================================
+
+Q: What is Module Federation and when would you use it?
+A: Module Federation is a webpack 5 feature that allows separate applications
+   to dynamically load code from each other at runtime. The main use case is
+   micro-frontends — multiple teams building independently deployable sections
+   of an application. Each team deploys their app and exposes components via
+   a remoteEntry.js manifest. The host (shell) app loads these at runtime.
+   The benefit is independent deployability: Team A can ship new features
+   without coordinating with other teams or rebuilding the shell. I'd use it
+   when: team sizes and organizational structure genuinely benefit from
+   independent deployment, and when the added complexity is justified.
+
+Q: What is the bootstrap file pattern and why is it necessary?
+A: Module Federation needs to negotiate shared module versions asynchronously
+   before any module code runs. If you have synchronous imports in your entry
+   file (import React from 'react'), webpack tries to load React eagerly
+   before federation is initialized, causing an error: "Shared module is not
+   available for eager consumption." The solution is to make the entry file
+   only contain a dynamic import: import('./bootstrap'). The dynamic import
+   creates an async boundary, giving webpack time to initialize federation
+   and negotiate shared dependencies before bootstrap.js runs.
+
+Q: Why must React be configured as singleton: true in Module Federation?
+A: React stores state (hooks, context) in module-level variables. If two
+   separate React instances load (e.g., Shell has React 18.2.0 and Remote
+   has React 18.0.0), hooks calls in components from the remote will use
+   a different React instance than the host. This breaks hooks with the
+   error: "Invalid hook call." Context also breaks — createContext in one
+   instance is invisible to the other. singleton: true forces only one
+   React instance to load — the highest compatible version — and any
+   remote that tries to load a different version is forced to use the
+   existing one instead.
+
+Q: What are the performance implications of Module Federation?
+A: Module Federation adds overhead: (1) Extra network requests — each remote's
+   remoteEntry.js must be fetched before the component can load, causing
+   waterfall loading; (2) Possible duplicate code if shared module version
+   negotiation fails and libraries load twice; (3) Increased bundle complexity
+   means harder debugging and monitoring. To mitigate: preload remoteEntry.js
+   files with <link rel="preload">, use proper Suspense boundaries with
+   meaningful loading states, and monitor remote load failures with error
+   boundaries + alerting. The benefit of independent deployment must outweigh
+   these costs — for small teams or simple apps, a monorepo with shared
+   packages is usually better.

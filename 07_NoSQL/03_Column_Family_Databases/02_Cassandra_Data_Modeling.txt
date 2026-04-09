@@ -1,0 +1,166 @@
+================================================================
+  CASSANDRA DATA MODELING
+================================================================
+
+================================================================
+GUIDING PRINCIPLE
+================================================================
+
+  "Model your data around your queries, not your entities."
+
+  In relational: normalize data, then query with JOINs.
+  In Cassandra:  define queries first, then design tables around each query.
+
+  One query = one table (often).
+  Denormalization and data duplication are expected and encouraged.
+
+================================================================
+PRIMARY KEY DESIGN
+================================================================
+
+  PRIMARY KEY = Partition Key + Clustering Columns
+
+  Partition Key:
+  - Determines which node stores the row
+  - All rows with the same partition key are stored together
+  - Must appear in every query WHERE clause
+  - Choose for even data distribution (avoid hot partitions)
+
+  Clustering Columns:
+  - Sort data within a partition
+  - Enable range queries within a partition
+  - Determine ORDER BY options
+
+  Composite partition key:
+  PRIMARY KEY ((year, month), user_id, event_ts)
+  -- (year, month) together form the partition key
+
+================================================================
+EXAMPLE: USER EVENTS TABLE
+================================================================
+
+  Query: "Get the 20 most recent events for a specific user"
+
+  CREATE TABLE user_events_by_user (
+      user_id    UUID,
+      event_ts   TIMESTAMP,
+      event_type TEXT,
+      amount     DECIMAL,
+      PRIMARY KEY (user_id, event_ts)
+  ) WITH CLUSTERING ORDER BY (event_ts DESC);
+
+  -- This supports:
+  SELECT * FROM user_events_by_user WHERE user_id = ? LIMIT 20;
+  SELECT * FROM user_events_by_user WHERE user_id = ? AND event_ts > ?;
+
+================================================================
+EXAMPLE: MULTIPLE ACCESS PATTERNS
+================================================================
+
+  Query 1: "Get orders by user, sorted by date"
+  Query 2: "Get all orders with status PENDING"
+
+  CREATE TABLE orders_by_user (
+      user_id    UUID,
+      created_at TIMESTAMP,
+      order_id   UUID,
+      status     TEXT,
+      total      DECIMAL,
+      PRIMARY KEY (user_id, created_at, order_id)
+  ) WITH CLUSTERING ORDER BY (created_at DESC);
+
+  CREATE TABLE orders_by_status (
+      status     TEXT,
+      created_at TIMESTAMP,
+      order_id   UUID,
+      user_id    UUID,
+      total      DECIMAL,
+      PRIMARY KEY (status, created_at, order_id)
+  ) WITH CLUSTERING ORDER BY (created_at DESC);
+
+  -- Insert BOTH tables for every new order
+  -- This is the expected pattern: duplicate writes for multiple reads
+
+================================================================
+PARTITION SIZING
+================================================================
+
+  A partition should ideally be:
+  - Small: < 100MB
+  - Wide rows: up to 2 billion columns per partition
+  - Bounded: should not grow infinitely
+
+  Anti-pattern: using a low-cardinality value as partition key
+  status TEXT as partition key --> all PENDING orders on one node
+  = HOT PARTITION (bottleneck)
+
+  Fix: use bucketing -- (status, date_bucket) as composite partition key
+
+================================================================
+TIME BUCKETING
+================================================================
+
+  For time-series data, prevent unbounded partition growth:
+
+  CREATE TABLE events_by_day (
+      date_bucket DATE,       -- partition key (one bucket per day)
+      event_ts    TIMESTAMP,  -- clustering column
+      sensor_id   UUID,
+      value       DECIMAL,
+      PRIMARY KEY (date_bucket, event_ts, sensor_id)
+  ) WITH CLUSTERING ORDER BY (event_ts DESC);
+
+  -- Query last 7 days:
+  SELECT * FROM events_by_day
+  WHERE date_bucket IN ('2024-01-15','2024-01-14','2024-01-13',
+                        '2024-01-12','2024-01-11','2024-01-10','2024-01-09')
+  LIMIT 1000;
+
+================================================================
+ALLOW FILTERING -- AVOID
+================================================================
+
+  Querying by non-primary-key column requires ALLOW FILTERING:
+
+  SELECT * FROM orders_by_user WHERE total > 100 ALLOW FILTERING;
+  -- Cassandra scans ALL partitions! O(n) on entire dataset.
+  -- Never use in production for large tables.
+
+  Solution: Create a new table designed for that access pattern.
+
+================================================================
+TOMBSTONES
+================================================================
+
+  DELETE in Cassandra writes a tombstone marker (soft delete).
+  Tombstones are kept until compaction.
+  Too many tombstones slow down reads (must scan past them).
+
+  Avoid:
+  - Deleting and re-inserting rows frequently
+  - Short TTLs on high-volume data (generates many tombstones)
+
+  Use TTL for expiring data (rows auto-delete cleanly):
+  INSERT INTO sessions (id, data) VALUES (?,?) USING TTL 3600;
+
+================================================================
+INTERVIEW Q&A
+================================================================
+
+  Q: Why is data modeling different in Cassandra than in SQL?
+  A: In Cassandra you design tables around queries (query-first design).
+     There are no JOINs, so each access pattern gets its own table.
+     Data duplication is expected; denormalization is the norm.
+
+  Q: What is a hot partition in Cassandra?
+  A: When many requests are routed to the same partition key,
+     overloading one node while others are idle.
+     Fix by choosing a high-cardinality partition key or
+     using time bucketing for time-series data.
+
+  Q: What are tombstones in Cassandra?
+  A: Soft delete markers written when you DELETE data.
+     Kept until compaction. Too many tombstones slow reads.
+     Prefer TTL over explicit deletes for time-bound data.
+
+================================================================

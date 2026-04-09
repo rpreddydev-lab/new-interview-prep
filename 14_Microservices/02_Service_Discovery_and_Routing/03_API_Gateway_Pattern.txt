@@ -1,0 +1,345 @@
+================================================================================
+API GATEWAY PATTERN
+================================================================================
+
+WHAT IS AN API GATEWAY?
+------------------------
+An API Gateway is a server that acts as the single entry point for all client
+requests in a microservices architecture. It routes requests to the appropriate
+downstream services and can handle cross-cutting concerns.
+
+Think of it as the "front door" to your microservices ecosystem.
+
+Without API Gateway:
+  Client → OrderService (port 8081)
+  Client → InventoryService (port 8082)
+  Client → UserService (port 8083)
+  Client → PaymentService (port 8084)
+  [Client knows all service URLs, handles auth per service, etc.]
+
+With API Gateway:
+  Client → API Gateway (port 443) → OrderService
+                                  → InventoryService
+                                  → UserService
+                                  → PaymentService
+  [Client knows only one endpoint]
+
+────────────────────────────────────────────────────────────────────────────────
+
+API GATEWAY RESPONSIBILITIES
+==============================
+
+1. ROUTING
+   - Route requests to appropriate microservice
+   - Path-based routing: /api/orders/** → OrderService
+   - Header-based routing: API-Version: v2 → OrderServiceV2
+
+2. AUTHENTICATION & AUTHORIZATION
+   - Validate JWT tokens / API keys centrally
+   - Reject unauthorized requests before they reach services
+   - Services don't need to re-implement auth logic
+   - OAuth2 Resource Server validation at gateway
+
+3. LOAD BALANCING
+   - Distribute requests across service instances
+   - Integration with service registry (Eureka, Consul, K8s)
+
+4. RATE LIMITING & THROTTLING
+   - Prevent API abuse (protect backend services)
+   - Per-client, per-endpoint rate limits
+   - Return 429 Too Many Requests when exceeded
+
+5. SSL/TLS TERMINATION
+   - Handle HTTPS at the gateway; internal traffic can be HTTP
+   - Simplifies certificate management (one cert, not per-service)
+
+6. REQUEST/RESPONSE TRANSFORMATION
+   - Modify headers, strip sensitive fields
+   - Protocol translation (e.g., HTTP/1.1 externally → gRPC internally)
+   - Request enrichment (add user context from token to headers)
+
+7. CIRCUIT BREAKING
+   - Apply circuit breakers on downstream service calls
+   - Prevent cascade failures from reaching clients
+
+8. CACHING
+   - Cache responses for repeated identical requests
+   - Reduce load on backend services
+
+9. MONITORING & LOGGING
+   - Centralized access logs for all API calls
+   - Metrics: request count, latency, error rates per endpoint
+
+10. API COMPOSITION / AGGREGATION (BFF use case)
+    - Aggregate calls to multiple services into one client response
+    - Reduces round trips for mobile/web clients
+
+────────────────────────────────────────────────────────────────────────────────
+
+POPULAR API GATEWAY SOLUTIONS
+================================
+
+Spring Cloud Gateway:  Java/Spring ecosystem, reactive, lightweight
+Kong:                  Nginx-based, powerful plugins, polyglot
+AWS API Gateway:       Managed cloud service (AWS)
+Netflix Zuul:          Older Netflix OSS (largely superseded by SCG)
+Nginx:                 High-performance proxy, manual config
+Traefik:               Cloud-native, auto-discovery from K8s/Docker
+Ambassador/Emissary:   K8s-native, Envoy-based
+APISIX:                High-perf, plugin-rich, Apache project
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING CLOUD GATEWAY — IN DEPTH
+=================================
+
+Spring Cloud Gateway is a reactive, non-blocking API Gateway built on
+Spring WebFlux (Project Reactor) and Netty.
+Key concepts: Route, Predicate, Filter
+
+ROUTE:
+  The basic building block — defines where to send requests.
+  A route has: ID, URI (destination), Predicates (when to apply), Filters
+
+PREDICATE:
+  A condition that must be true to apply the route.
+  Examples:
+    - Path="/api/orders/**"
+    - Method="POST"
+    - Header="X-Request-Id, \d+"
+    - Host="**.mycompany.com"
+    - After=2024-01-01T00:00:00Z  (time-based routing)
+    - Weight("group1", 8)         (weighted traffic splitting)
+
+FILTER:
+  Pre/post processing of requests and responses.
+  Pre-filters: modify request before sending to downstream
+  Post-filters: modify response before returning to client
+
+BASIC CONFIGURATION (YAML):
+  spring:
+    cloud:
+      gateway:
+        routes:
+          - id: order-service
+            uri: lb://order-service        # lb:// = Load-balanced (uses service registry)
+            predicates:
+              - Path=/api/v1/orders/**
+            filters:
+              - StripPrefix=2              # Remove /api/v1 prefix before forwarding
+              - AddRequestHeader=X-Source, gateway
+              - CircuitBreaker=name:orderCB,fallbackUri:forward:/fallback/orders
+              - RequestRateLimiter=redis-rate-limiter
+
+          - id: inventory-service
+            uri: http://inventory-service:8082
+            predicates:
+              - Path=/api/v1/inventory/**
+            filters:
+              - RewritePath=/api/v1/inventory/(?<segment>.*), /inventory/$\{segment}
+
+          - id: user-service-v2
+            uri: lb://user-service-v2
+            predicates:
+              - Path=/api/v2/users/**
+              - Header=X-Feature-Flag, new-users
+
+FULL SPRING CLOUD GATEWAY APPLICATION:
+
+  @SpringBootApplication
+  public class ApiGatewayApplication { ... }
+
+  application.yml:
+    server:
+      port: 8080
+    spring:
+      application:
+        name: api-gateway
+      cloud:
+        gateway:
+          # Default filters applied to all routes
+          default-filters:
+            - DedupeResponseHeader=Access-Control-Allow-Credentials Access-Control-Allow-Origin
+          # CORS configuration
+          globalcors:
+            cors-configurations:
+              '[/**]':
+                allowedOrigins: "*"
+                allowedMethods: "*"
+                allowedHeaders: "*"
+        loadbalancer:
+          ribbon:
+            enabled: false          # Use Spring Cloud LoadBalancer instead of Ribbon
+
+PROGRAMMATIC ROUTE CONFIGURATION:
+  @Configuration
+  public class GatewayConfig {
+    @Bean
+    public RouteLocator routes(RouteLocatorBuilder builder) {
+      return builder.routes()
+        .route("order-service", r -> r
+          .path("/api/v1/orders/**")
+          .filters(f -> f
+            .stripPrefix(2)
+            .addRequestHeader("X-Source", "gateway")
+            .circuitBreaker(c -> c
+              .setName("orderCB")
+              .setFallbackUri("forward:/fallback/orders")
+            )
+          )
+          .uri("lb://order-service")
+        )
+        .build();
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+AUTHENTICATION AT THE GATEWAY
+================================
+Validate JWT tokens at the gateway so services don't need to:
+
+  @Component
+  public class JwtAuthFilter implements GlobalFilter, Ordered {
+
+    @Autowired
+    private JwtTokenValidator jwtValidator;
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+      String token = exchange.getRequest().getHeaders()
+          .getFirst(HttpHeaders.AUTHORIZATION);
+
+      if (token == null || !token.startsWith("Bearer ")) {
+        exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+        return exchange.getResponse().setComplete();
+      }
+
+      try {
+        Claims claims = jwtValidator.validate(token.substring(7));
+        // Inject user info as downstream header
+        ServerHttpRequest mutatedRequest = exchange.getRequest().mutate()
+          .header("X-User-Id", claims.getSubject())
+          .header("X-User-Roles", String.join(",", claims.get("roles", List.class)))
+          .build();
+        return chain.filter(exchange.mutate().request(mutatedRequest).build());
+      } catch (JwtException e) {
+        exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+        return exchange.getResponse().setComplete();
+      }
+    }
+
+    @Override
+    public int getOrder() { return -1; } // Run before routing filters
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+RATE LIMITING (with Redis)
+===========================
+  spring:
+    cloud:
+      gateway:
+        routes:
+          - id: order-service
+            filters:
+              - name: RequestRateLimiter
+                args:
+                  redis-rate-limiter.replenishRate: 10   # tokens per second
+                  redis-rate-limiter.burstCapacity: 20   # max burst
+                  key-resolver: "#{@userKeyResolver}"    # rate-limit per user
+
+  @Bean
+  public KeyResolver userKeyResolver() {
+    return exchange -> Mono.just(
+      exchange.getRequest().getHeaders().getFirst("X-User-Id")
+    );
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+CIRCUIT BREAKER AT GATEWAY
+============================
+  spring:
+    cloud:
+      gateway:
+        routes:
+          - id: order-service
+            filters:
+              - name: CircuitBreaker
+                args:
+                  name: orderServiceCB
+                  fallbackUri: forward:/fallback/orders
+
+  resilience4j:
+    circuitbreaker:
+      instances:
+        orderServiceCB:
+          slidingWindowSize: 10
+          failureRateThreshold: 50
+          waitDurationInOpenState: 10s
+
+  // Fallback controller
+  @RestController
+  public class FallbackController {
+    @GetMapping("/fallback/orders")
+    public ResponseEntity<String> ordersFallback() {
+      return ResponseEntity.status(503).body("Order service is temporarily unavailable");
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+API GATEWAY ANTI-PATTERNS
+==========================
+
+1. SMART GATEWAY (God Gateway)
+   - Don't put business logic in the gateway
+   - Gateway should be transparent routing/cross-cutting, not orchestration
+   - Logic in gateway → hard to test, maintain, deploy independently
+
+2. SINGLE GATEWAY FOR EVERYTHING
+   - One gateway handling external clients + internal services
+   - Better: separate gateway for public API vs internal traffic
+   - Internal services should call each other directly or via service mesh
+
+3. GATEWAY AS A BOTTLENECK
+   - All traffic through one unscaled gateway → SPOF
+   - Gateway must be horizontally scaled
+   - Use K8s HPA on gateway deployment
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: What is an API Gateway and what is it responsible for?
+A: Single entry point for all client requests. Responsible for: routing,
+   authentication, rate limiting, SSL termination, load balancing, circuit
+   breaking, request/response transformation, and observability (access logs,
+   metrics).
+
+Q: What's the difference between API Gateway and Load Balancer?
+A: Load balancer operates at L4 (TCP/IP) or L7 (HTTP) routing to distribute
+   traffic. API Gateway operates at L7 with richer application-layer logic:
+   authentication, rate limiting, request transformation, circuit breaking, and
+   API composition. API Gateway is often backed by a load balancer.
+
+Q: Why validate JWT at the gateway instead of each service?
+A: Centralizes security enforcement — no need to implement JWT validation in
+   every service. The gateway also enriches downstream requests with user
+   context headers (X-User-Id, X-User-Roles) so services can trust these
+   headers. Reduces code duplication.
+
+Q: What's a filter in Spring Cloud Gateway?
+A: Filters process requests before (pre-filter) or after (post-filter) routing.
+   Common uses: add/remove headers, rate limiting, authentication, circuit
+   breaking, request rewriting. Global filters apply to all routes; route filters
+   apply to specific routes.
+
+Q: How do you rate limit API requests?
+A: Using RequestRateLimiter filter in Spring Cloud Gateway backed by Redis.
+   Configure replenish rate (tokens/sec) and burst capacity. Define a KeyResolver
+   to rate-limit per user, per IP, or per API key.
+
+================================================================================

@@ -1,0 +1,183 @@
+================================================================
+Transaction Propagation and Isolation Levels
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. PROPAGATION — What happens when a @Transactional method calls another?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Propagation level    | Behavior
+─────────────────────|─────────────────────────────────────────────────────────
+REQUIRED (default)   | Join existing tx. If none, create new. Same commit/rollback.
+REQUIRES_NEW         | ALWAYS create new tx. Suspend existing. Independent commit/rollback.
+SUPPORTS             | Join existing tx. If none, run WITHOUT tx.
+NOT_SUPPORTED        | ALWAYS run without tx. Suspend any existing tx.
+MANDATORY            | MUST have existing tx. Throw if none exists.
+NEVER                | MUST NOT have tx. Throw if one exists.
+NESTED               | Create a savepoint inside existing tx. Partial rollback possible.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. PROPAGATION.REQUIRED (Default) — Example
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Service
+public class OrderService {
+    @Autowired private PaymentService paymentService;
+
+    @Transactional   // creates tx (REQUIRED)
+    public void placeOrder(Order order) {
+        orderRepo.save(order);
+        paymentService.charge(order);  // joins SAME tx
+        // If charge() throws → ENTIRE tx rolls back (both order and payment)
+    }
+}
+
+@Service
+public class PaymentService {
+    @Transactional   // joins existing tx (REQUIRED default)
+    public void charge(Order order) {
+        paymentRepo.save(new Payment(order));
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. PROPAGATION.REQUIRES_NEW — Example
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Use case: Audit log should be saved even if main transaction rolls back.
+
+@Service
+public class AuditService {
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void logEvent(String event) {
+        auditRepo.save(new AuditLog(event));
+        // Runs in its OWN transaction
+        // Even if caller's tx rolls back, this is independently committed!
+    }
+}
+
+@Service
+public class OrderService {
+    @Transactional
+    public void placeOrder(Order order) {
+        orderRepo.save(order);
+        auditService.logEvent("ORDER_PLACED");  // separate tx, committed now
+        throw new RuntimeException("Intentional rollback");
+        // orderRepo.save is rolled back, but auditLog IS committed!
+    }
+}
+
+⚠ Pitfall: With REQUIRES_NEW, the outer transaction is SUSPENDED.
+  The inner transaction uses a DIFFERENT connection.
+  Be aware of deadlock risk if both need to lock the same rows.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. PROPAGATION.NESTED — Savepoint
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+NESTED creates a SAVEPOINT inside the outer transaction.
+Rolling back the nested portion rolls back to the savepoint only.
+The outer transaction can still commit.
+
+@Transactional
+public void process() {
+    orderRepo.save(order);
+    try {
+        notificationService.sendEmail();  // NESTED propagation
+    } catch (Exception e) {
+        // rollback to savepoint — email attempt undone, order NOT rolled back
+        log.warn("Email failed, continuing...");
+    }
+    // Outer tx commits; order is saved even if email notification failed
+}
+
+@Transactional(propagation = Propagation.NESTED)
+public void sendEmail() { ... }
+
+Note: NESTED is only supported by JDBC DataSourceTransactionManager, not JTA.
+Hibernate uses JDBC savepoints under the hood.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. ISOLATION LEVELS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Isolation controls what partial data a transaction can see from concurrent transactions.
+
+Level                 | Dirty Read | Non-Repeatable Read | Phantom Read
+──────────────────────|────────────|─────────────────────|─────────────
+READ_UNCOMMITTED      | Possible   | Possible            | Possible
+READ_COMMITTED        | Prevented  | Possible            | Possible
+REPEATABLE_READ       | Prevented  | Prevented           | Possible
+SERIALIZABLE          | Prevented  | Prevented           | Prevented
+
+DEFAULT: Uses the DB default.
+  PostgreSQL / Oracle: READ_COMMITTED
+  MySQL: REPEATABLE_READ
+
+Setting isolation:
+  @Transactional(isolation = Isolation.REPEATABLE_READ)
+  public BigDecimal calculateTotal(Long userId) { ... }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. CONCURRENCY PHENOMENA EXPLAINED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Dirty Read:
+  Transaction A reads data written by Transaction B (not yet committed).
+  If B rolls back, A read data that never existed.
+
+Non-Repeatable Read:
+  Transaction A reads a row. Transaction B updates it and commits.
+  Transaction A re-reads the same row and gets a different value.
+  (Two SELECTs of same row in same tx return different results)
+
+Phantom Read:
+  Transaction A queries rows matching a condition. Transaction B inserts
+  a new row that matches. Transaction A re-queries and gets a different row count.
+  (New rows appear between two identical queries in same tx)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. WHEN TO USE EACH ISOLATION LEVEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Level               | Use case
+────────────────────|────────────────────────────────────────────────────────────────
+READ_UNCOMMITTED    | Almost never (dirty reads dangerous); reporting tools only
+READ_COMMITTED      | Default for most apps; acceptable for typical CRUD operations
+REPEATABLE_READ     | Financial calculations within a transaction; multi-step reports
+SERIALIZABLE        | Critical financial operations; inventory allocation; rare but safest
+
+Higher isolation = more locking = less concurrency = slower performance.
+Default (READ_COMMITTED) is the practical choice for most CRUD apps.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. INTERVIEW QUICK HITS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the default propagation in Spring @Transactional?
+A: Propagation.REQUIRED. If a transaction already exists, the method
+   joins it. If no transaction exists, a new one is created.
+   Both the caller and callee participate in the same transaction.
+
+Q: When would you use Propagation.REQUIRES_NEW?
+A: When you need a method to run in its own independent transaction,
+   unaffected by the caller's transaction. Common use case: audit logging
+   that must persist even if the main business transaction rolls back.
+
+Q: What is the difference between REQUIRES_NEW and NESTED?
+A: REQUIRES_NEW suspends the outer tx and creates a fully independent tx
+   (different connection). If the outer rolls back, the inner is unaffected.
+   NESTED creates a savepoint within the outer tx — if nested rolls back,
+   only work since the savepoint is undone; the outer continues normally.
+   NESTED is not independent — if the outer rolls back, nested is also lost.
+
+Q: What is a phantom read?
+A: A phantom read occurs when the same query runs twice in a transaction and
+   returns different rows because another transaction inserted matching rows
+   between the two reads. SERIALIZABLE isolation prevents phantom reads.
+
+Q: What is the default isolation level in Spring?
+A: Isolation.DEFAULT — it delegates to the underlying DB's default.
+   PostgreSQL uses READ_COMMITTED. MySQL InnoDB uses REPEATABLE_READ.
+   REPEATABLE_READ in MySQL prevents dirty and non-repeatable reads,
+   while PostgreSQL's READ_COMMITTED does not prevent non-repeatable reads.

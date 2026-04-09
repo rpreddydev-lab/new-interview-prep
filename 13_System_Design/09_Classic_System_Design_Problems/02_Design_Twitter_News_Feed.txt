@@ -1,0 +1,230 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DESIGN: TWITTER / NEWS FEED SYSTEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FUNCTIONAL:
+  - Users can post tweets (text, images, videos)
+  - Users can follow/unfollow other users
+  - Home timeline: see tweets from followed users (most recent first)
+  - User profile timeline: see tweets from a specific user
+  - Like, retweet, reply to tweets
+  - Search tweets (basic full-text)
+  - Trending topics (#hashtags)
+
+NON-FUNCTIONAL:
+  - 300M DAU, 100M tweets posted per day
+  - Read-heavy: 300K QPS reads peak (timeline fetches)
+  - Write: ~1,200 tweet writes/second
+  - Timeline load: p99 < 300ms
+  - Eventual consistency acceptable for feed (can be slightly stale)
+  - High availability: 99.99%
+  - Data retention: Forever (tweets don't expire)
+
+OUT OF SCOPE: DMs, ads, notifications, recommendations
+
+
+2. ESTIMATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WRITE QPS:
+  100M tweets/day / 86,400 = 1,160 writes/s (peak ~3,000/s)
+
+READ QPS (timeline fetches):
+  300M DAU × 5 timeline loads/day / 86,400 = 17,400 avg QPS
+  Peak: ~50,000 QPS timeline reads
+
+STORAGE (tweets):
+  100M tweets/day × 300 bytes = 30GB/day
+  10 years: 30GB × 3,650 ≈ 109TB tweet text
+  Media: 1M images/day × 300KB = 300GB/day → stored in object storage
+
+TIMELINE CACHE:
+  300M users × 100 tweets × 200 bytes = 6TB of timeline cache
+  (Only active users cached: 300M × 20% active = 60M users × 100 tweets × 200 bytes = 1.2TB)
+
+
+3. API DESIGN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+POST /api/v1/tweets
+  Body: { "text": "Hello world", "mediaIds": [...] }
+  Response: { "tweetId": "12345", "createdAt": "...", "author": {...} }
+
+GET /api/v1/timeline/home?cursor=&limit=20
+  Response: { "tweets": [...], "nextCursor": "..." }
+
+GET /api/v1/timeline/user/{userId}?cursor=&limit=20
+
+POST /api/v1/follows
+  Body: { "followeeId": "12345" }
+
+POST /api/v1/tweets/{tweetId}/like
+POST /api/v1/tweets/{tweetId}/retweet
+
+GET /api/v1/search?q=keyword&cursor=&limit=20
+
+
+4. HIGH-LEVEL ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WRITE PATH (Tweet Creation):
+  Client → API Gateway → Tweet Service
+                              ├→ Store tweet in DB (Cassandra)
+                              ├→ Publish to Kafka topic "new-tweets"
+                              └→ Return 201 Created
+
+  Kafka consumer: Fan-out Service
+                      → Push tweet ID to each follower's timeline cache (Redis)
+
+READ PATH (Home Timeline):
+  Client → API Gateway → Timeline Service
+                              └→ Fetch from Redis Timeline Cache (pre-populated list)
+                              → If cache miss: query Tweet DB
+                              → Hydrate tweet objects (author info, media URLs)
+                              → Return paginated timeline
+
+
+5. THE CORE PROBLEM: FEED GENERATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+APPROACH 1: PULL MODEL (Fan-out on Read)
+  When user requests home timeline:
+    1. Fetch user's follow list (N users)
+    2. Query each user's recent tweets
+    3. Merge all N lists by timestamp
+    4. Return top K tweets
+
+  Pros: Low write cost (posting = just write to DB)
+  Cons: Extremely slow reads for active users following 1,000 people
+        N database queries per timeline load → not scalable
+        "N+1 query problem" at scale
+
+APPROACH 2: PUSH MODEL (Fan-out on Write) ← TWITTER'S ORIGINAL
+  When user posts a tweet:
+    1. Fan-out service reads all N followers
+    2. Push tweet ID to each follower's timeline cache in Redis
+    3. Home timeline fetch = simple list read from Redis (O(1))
+
+  Pros: Fast reads (pre-computed, sorted timeline in Redis)
+  Cons: Slow writes for popular users
+        Justin Bieber (100M followers) posts 1 tweet → 100M Redis writes!
+        This was the cause of Twitter's early scale problems
+
+  CELEBRITY PROBLEM:
+    If user has 100M followers and posts 1 tweet:
+    100M Redis writes at ~10K writes/s = 10,000 seconds = 2.7 hours!!
+    This causes backlog, and timeline freshness degrades
+
+APPROACH 3: HYBRID MODEL (Twitter's Current Solution)
+  Classification:
+    Regular user (<= 1M followers): Push model (fan-out on write)
+    Celebrity (> 1M followers): Pull model (fan-out on read at query time)
+  
+  Home Timeline Fetch Algorithm:
+    1. Fetch user's pre-populated Redis timeline (push model tweets)
+    2. Fetch list of celebrity accounts user follows (cached separately)
+    3. For each celebrity: fetch their latest N tweets directly
+    4. Merge all sources by timestamp
+    5. Return top 20 results
+  
+  This works because:
+    - Only a small % of follows are celebrities
+    - Celebrity tweets are read from their own timeline (already cached)
+    - Merging K celebrity feeds at read time is fast (K is small, ~10-20)
+
+
+6. DATA MODEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TWEETS TABLE (Cassandra):
+  Primary key: tweet_id (Snowflake ID — time-sortable)
+  user_id, text, created_at, like_count, retweet_count, reply_count
+  media_ids (list of object storage keys)
+  
+  Access pattern: GET tweet by ID → partition on tweet_id
+
+USER TIMELINE (Cassandra - wide row per user):
+  Partition key: user_id
+  Clustering key: tweet_id (descending — most recent first)
+  
+  SELECT tweet_id FROM user_timeline WHERE user_id = ? ORDER BY tweet_id DESC LIMIT 20
+
+FOLLOWS TABLE (Graph DB or Cassandra):
+  Following: (follower_id, followee_id, created_at)
+  Followers: (followee_id, follower_id, created_at) ← denormalized for reads
+  
+  "Who does user X follow?" → query Following table, partition on follower_id
+  "Who follows user X?" → query Followers table, partition on followee_id
+
+REDIS TIMELINE CACHE:
+  Key: "timeline:{user_id}"
+  Value: Redis Sorted Set (score = tweet_id, member = tweet_id)
+  Operations:
+    ZADD timeline:{user_id} tweet_id tweet_id  (fan-out write)
+    ZREVRANGE timeline:{user_id} 0 19          (fetch top 20)
+  TTL: 7 days (inactive users' caches expire)
+  Max size: 800 entries per user (Twitter's actual limit)
+
+
+7. MEDIA HANDLING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+UPLOAD:
+  1. Client requests presigned S3 URL from Media Service
+  2. Client uploads directly to S3 (bypasses app servers)
+  3. S3 event → Media Processing Service (async)
+     → Generate thumbnails (multiple sizes: 150px, 600px, 1200px)
+     → Video transcoding (multiple bitrates for adaptive streaming)
+  4. CDN (CloudFront) in front of S3
+
+DISPLAY:
+  Tweet object contains: mediaUrls: ["https://cdn.twitter.com/img/abc.jpg"]
+  CDN serves all media — no origin hits for static content
+  CDN TTL for images: 1 year (content-addressed, immutable once uploaded)
+
+
+8. SEARCH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RECENT TWEETS SEARCH:
+  Elasticsearch index for full-text search
+  Async indexing: Tweet service → Kafka → Elasticsearch consumer
+  Index mapping: text (analyzed), created_at, user_id, hashtags
+  Query: multi-match + date range + relevance scoring
+
+TRENDING TOPICS:
+  Hashtag counter: Redis sorted set "trending:global" 
+  On each tweet: ZINCRBY trending:global 1 {hashtag}
+  Window: Sliding 24-hour window (use Redis expiry + periodic reset)
+  Fetch: ZREVRANGE trending:global 0 9 (top 10)
+  
+  Sharding trending by region:
+    Key: "trending:{region}:{window}" (trending:us:2024-01-15)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWER — "How does Twitter's news feed work?"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"The core challenge is the fan-out problem: when a user posts, their
+tweet needs to appear in all followers' home timelines.
+
+The naive pull model (compute timeline at read time) is too slow —
+it requires N database queries for N followees.
+
+Twitter uses a hybrid push-pull model: For regular users, tweets are
+pre-pushed to all followers' Redis timeline caches on write. The cache
+is a sorted set keyed by user_id, scored by tweet_id (which encodes
+timestamp). Reading a timeline is a single O(1) Redis sorted set query.
+
+The celebrity problem: Katy Perry has 100M followers. Pushing to 100M
+Redis keys on every tweet would take hours and collapse the write pipeline.
+The solution: classify users above 1M followers as celebrities. Their tweets
+are NOT pushed; instead, at read time, the timeline service fetches celebrity
+feeds separately and merges them with the pre-populated Redis timeline.
+
+This hybrid approach limits push fan-out to reasonable scales (most users
+have < 10K followers) while keeping reads fast for celebrity content."

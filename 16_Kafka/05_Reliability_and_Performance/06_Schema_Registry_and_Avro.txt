@@ -1,0 +1,261 @@
+================================================================================
+  KAFKA SCHEMA REGISTRY AND AVRO
+  Interview Prep Deep Dive
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. THE SCHEMA PROBLEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Kafka itself is schema-agnostic — it stores and delivers raw bytes.
+Without a schema contract, producers and consumers can diverge:
+
+  Producer (v1): {"orderId": 123, "amount": 99.99}
+  Producer (v2): {"orderId": 123, "totalAmount": 99.99}  ← renamed field!
+  Consumer:      tries to read "amount" → field missing → NullPointerException
+
+Problems without schema management:
+  - Breaking changes silently corrupt downstream consumers
+  - No documentation of what fields exist in a topic
+  - Consumers must coordinate with producers out-of-band
+  - Cannot enforce backwards/forwards compatibility
+
+Solution: Schema Registry + Avro/Protobuf/JSON Schema
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. SCHEMA REGISTRY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The Confluent Schema Registry is a separate service that:
+  - Stores schemas indexed by SUBJECT (topic name + type)
+  - Assigns a unique integer SCHEMA ID to each schema version
+  - Enforces compatibility rules on schema evolution
+  - Provides REST API for schema registration and lookup
+
+  Producer → [serialize with Avro + Schema ID] → Kafka
+  Consumer → [read Schema ID from record] → [fetch schema from Registry] → [deserialize]
+
+The Confluent wire format (Avro):
+  ┌────────────────────────────────────────────────────────┐
+  │ Magic byte (0x00) │ Schema ID (4 bytes) │ Avro payload │
+  └────────────────────────────────────────────────────────┘
+  - Magic byte: identifies this as a Schema Registry record (not raw JSON)
+  - Schema ID: 4-byte big-endian integer → consumer uses this to fetch schema
+  - Avro payload: Avro-encoded binary data
+
+Subjects:
+  - Default naming: <topic>-value and <topic>-key
+  - E.g., orders-value subject holds schemas for the value of the "orders" topic
+  - Each subject has a version history (v1, v2, v3...)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. APACHE AVRO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Avro is a binary serialization format developed by the Apache Hadoop project.
+
+Features:
+  - Schema defined in JSON
+  - Compact binary encoding (no field names in the wire format)
+  - Rich types: null, boolean, int, long, float, double, bytes, string,
+                record, enum, array, map, union, fixed
+  - Schema evolution with reader/writer schema support
+  - Language-neutral (Java, Python, Go, C#, Ruby...)
+
+Avro schema example (Order):
+  {
+    "type": "record",
+    "name": "Order",
+    "namespace": "com.mycompany.kafka",
+    "fields": [
+      {"name": "orderId", "type": "string"},
+      {"name": "customerId", "type": "string"},
+      {"name": "amount", "type": "double"},
+      {"name": "status", "type": {
+        "type": "enum",
+        "name": "OrderStatus",
+        "symbols": ["PLACED", "PAYMENT_RECEIVED", "SHIPPED", "DELIVERED", "CANCELLED"]
+      }},
+      {"name": "tags", "type": {"type": "array", "items": "string"}, "default": []},
+      {"name": "notes", "type": ["null", "string"], "default": null}
+    ]
+  }
+
+Avro vs JSON vs Protobuf:
+  ┌────────────────────┬──────────┬──────────┬───────────┐
+  │ Feature            │ Avro     │ JSON     │ Protobuf  │
+  ├────────────────────┼──────────┼──────────┼───────────┤
+  │ Format             │ Binary   │ Text     │ Binary    │
+  │ Schema in message  │ No (ID)  │ Optional │ No (ID)   │
+  │ Size (relative)    │ Small    │ Large    │ Smallest  │
+  │ Schema evolution   │ ✓ Strong │ ✗ Loose  │ ✓ Strong  │
+  │ Human readable     │ No       │ Yes      │ No        │
+  │ Registry support   │ Native   │ Yes      │ Yes       │
+  │ Ecosystem maturity │ Kafka    │ Universal│ gRPC/APIs │
+  └────────────────────┴──────────┴──────────┴───────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. SCHEMA COMPATIBILITY MODES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The Schema Registry enforces compatibility rules on schema evolution.
+
+  BACKWARD (default):
+    - New schema can read data written with PREVIOUS schema
+    - Consumer can be upgraded first; producer later
+    - Allowed: add optional fields with defaults; delete required fields
+    - Forbidden: add required fields without defaults; change field types
+
+  FORWARD:
+    - Previous schema can read data written with NEW schema
+    - Producer can be upgraded first; consumer later
+    - Allowed: delete optional fields with defaults; add required fields
+    - Forbidden: add optional fields (old consumer won't know about them)
+
+  FULL (BACKWARD + FORWARD):
+    - New schema is both backward AND forward compatible with previous version
+    - Most restrictive: only add/remove optional fields with defaults
+    - Allows producer and consumer to be updated in either order
+
+  BACKWARD_TRANSITIVE:
+    - New schema must be backward compatible with ALL previous versions (not just latest)
+    - Most conservative; use for long-lived topics with many schema versions
+
+  NONE:
+    - No compatibility checking; any schema can be registered
+    - Use only for development; never for production
+
+  Setting per subject:
+    curl -X PUT http://schema-registry:8081/config/orders-value \
+      -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+      -d '{"compatibility": "FULL"}'
+
+Safe schema changes under FULL compatibility:
+  ✓ Add optional field with default value
+  ✓ Delete optional field (had default value)
+  ✗ Add required field (no default)
+  ✗ Delete required field (no default)
+  ✗ Rename a field
+  ✗ Change field type (e.g., int → string)
+  ✓ Add value to enum (backward compatible only)
+  ✗ Remove value from enum
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. USING AVRO WITH KAFKA IN JAVA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Maven dependency:
+  <dependency>
+    <groupId>io.confluent</groupId>
+    <artifactId>kafka-avro-serializer</artifactId>
+    <version>7.6.0</version>
+  </dependency>
+
+Producer with Avro + Schema Registry:
+  props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+  props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, KafkaAvroSerializer.class);
+  props.put("schema.registry.url", "http://schema-registry:8081");
+
+  // Using generated Avro class (from avro-maven-plugin):
+  Order order = Order.newBuilder()
+    .setOrderId("order-123")
+    .setCustomerId("customer-456")
+    .setAmount(99.99)
+    .setStatus(OrderStatus.PLACED)
+    .build();
+
+  producer.send(new ProducerRecord<>("orders", order.getOrderId(), order));
+
+  // Producer automatically:
+  //  1. Registers schema in Registry (or finds existing schema ID)
+  //  2. Serializes: magic byte + schema ID + Avro binary
+
+Consumer with Avro + Schema Registry:
+  props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+  props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, KafkaAvroDeserializer.class);
+  props.put("schema.registry.url", "http://schema-registry:8081");
+  props.put(KafkaAvroDeserializerConfig.SPECIFIC_AVRO_READER_CONFIG, true);
+
+  ConsumerRecords<String, Order> records = consumer.poll(Duration.ofMillis(100));
+  for (ConsumerRecord<String, Order> record : records) {
+    Order order = record.value();
+    System.out.println("Order: " + order.getOrderId());
+  }
+
+  // Consumer automatically:
+  //  1. Reads magic byte + schema ID
+  //  2. Fetches writer schema from Registry (cached after first lookup)
+  //  3. Deserializes using reader schema (your class) with schema evolution
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. SCHEMA REGISTRY REST API
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  # List all subjects
+  GET /subjects
+  
+  # List versions of a subject
+  GET /subjects/orders-value/versions
+  
+  # Get specific version
+  GET /subjects/orders-value/versions/1
+  
+  # Get latest schema
+  GET /subjects/orders-value/versions/latest
+  
+  # Register a new schema
+  POST /subjects/orders-value/versions
+  Content-Type: application/vnd.schemaregistry.v1+json
+  { "schema": "<json-escaped-avro-schema>" }
+  
+  # Check compatibility with latest
+  POST /compatibility/subjects/orders-value/versions/latest
+  
+  # Get schema by ID
+  GET /schemas/ids/42
+  
+  # Set compatibility mode
+  PUT /config/orders-value
+  { "compatibility": "FULL" }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. KEY INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: Why use Avro with Schema Registry instead of plain JSON?
+A: JSON serializes field names in every record (redundant, large). Avro binary has
+   no field names — it uses a schema to interpret bytes, making records much smaller
+   (typically 5-10x compression vs JSON). Schema Registry stores schemas centrally;
+   records only carry a 4-byte schema ID. Also, Avro with Schema Registry enforces
+   schema compatibility rules (backward/forward/full), preventing accidental breaking
+   changes that would corrupt consumers.
+
+Q: What is backward compatibility in Avro Schema Registry?
+A: Backward compatibility means the NEW schema can deserialize data written with the
+   OLD schema. This lets you upgrade consumers first (they know about the new fields)
+   and then upgrade producers. Backward-compatible changes: add a new optional field
+   with a default value. Non-compatible: add a required field (old producers didn't
+   write it — consumers can't derive it), rename a field, or change a field's type.
+
+Q: What happens at the wire level when an Avro record is sent to Kafka?
+A: The record is serialized as: [0x00 magic byte][4-byte schema ID big-endian][Avro binary data].
+   The magic byte (0) identifies it as a Schema Registry record. The 4-byte ID tells
+   the consumer which schema to fetch from the Registry for deserialization. The Avro
+   binary is compact (no field names). The consumer reads the ID, caches the schema
+   after the first lookup, and uses reader+writer schema resolution for evolution.
+
+Q: What is the difference between BACKWARD and FULL compatibility?
+A: BACKWARD: new schema can read data written by old schema (upgrade consumer first).
+   FORWARD: old schema can read data written by new schema (upgrade producer first).
+   FULL: new schema is both backward AND forward compatible — you can upgrade consumer
+   and producer in either order. FULL is the safest but most restrictive; only
+   adding/removing optional fields with defaults is allowed.
+
+Q: What happens if Schema Registry goes down?
+A: If the Schema Registry is down, producers using KafkaAvroSerializer will fail to
+   register or look up schemas → cannot produce. Consumers using KafkaAvroDeserializer
+   have a local cache — they can continue deserializing schemas already cached in
+   memory. Fresh consumer instances without cached schemas will fail. To mitigate:
+   run Schema Registry in HA mode (multiple instances backed by Kafka topic), enable
+   local schema caching (auto.register.schemas=false + pre-register), and include
+   Schema Registry in your infrastructure reliability SLAs.

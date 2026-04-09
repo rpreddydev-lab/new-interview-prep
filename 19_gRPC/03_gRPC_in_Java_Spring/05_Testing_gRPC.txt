@@ -1,0 +1,480 @@
+================================================================
+TESTING gRPC SERVICES IN SPRING BOOT
+================================================================
+
+----------------------------------------------------------------
+1. TESTING STRATEGIES OVERVIEW
+----------------------------------------------------------------
+
+Three levels of gRPC testing:
+
+1. UNIT TESTS (fastest, no network)
+   - Test service logic in isolation
+   - Mock dependencies with Mockito
+   - Use fake StreamObserver to capture responses
+   - No Spring context needed
+
+2. INTEGRATION TESTS (in-process gRPC server)
+   - Start an in-process gRPC server (no network overhead)
+   - Real gRPC serialization/deserialization
+   - Real interceptor chain
+   - Use @SpringBootTest or @GrpcTest
+
+3. END-TO-END TESTS (real network)
+   - Start a real server on a port
+   - Use real stubs to call it
+   - Tests full stack including TLS, load balancing, etc.
+   - Usually reserved for CI/CD pipelines
+
+Recommended approach:
+  Unit tests for business logic
+  Integration tests for gRPC behavior (interceptors, error codes)
+  E2E tests for critical paths only
+
+----------------------------------------------------------------
+2. DEPENDENCIES FOR TESTING
+----------------------------------------------------------------
+
+<dependency>
+  <groupId>io.grpc</groupId>
+  <artifactId>grpc-testing</artifactId>
+  <version>${grpc.version}</version>
+  <scope>test</scope>
+</dependency>
+<dependency>
+  <groupId>net.devh</groupId>
+  <artifactId>grpc-server-spring-boot-starter</artifactId>
+  <scope>test</scope>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-test</artifactId>
+  <scope>test</scope>
+</dependency>
+<dependency>
+  <groupId>org.mockito</groupId>
+  <artifactId>mockito-core</artifactId>
+  <scope>test</scope>
+</dependency>
+
+----------------------------------------------------------------
+3. UNIT TESTING — FAKE StreamObserver
+----------------------------------------------------------------
+
+The simplest approach: no Spring, no gRPC server, just test logic.
+
+// Fake StreamObserver to capture responses
+public class TestStreamObserver<T> implements StreamObserver<T> {
+  
+  private final List<T> values = new ArrayList<>();
+  private Throwable error;
+  private boolean completed = false;
+  
+  @Override
+  public void onNext(T value) {
+    values.add(value);
+  }
+  
+  @Override
+  public void onError(Throwable t) {
+    this.error = t;
+  }
+  
+  @Override
+  public void onCompleted() {
+    this.completed = true;
+  }
+  
+  public List<T> getValues() { return values; }
+  public T getSingleValue() {
+    assertEquals(1, values.size(), "Expected exactly one response");
+    return values.get(0);
+  }
+  public Throwable getError() { return error; }
+  public boolean isCompleted() { return completed; }
+  
+  public void assertCompleted() {
+    assertTrue(completed, "Stream was not completed");
+    assertNull(error, "Stream had an error: " + error);
+  }
+  
+  public StatusRuntimeException getStatusRuntimeException() {
+    assertNotNull(error, "Expected an error but none occurred");
+    assertInstanceOf(StatusRuntimeException.class, error);
+    return (StatusRuntimeException) error;
+  }
+}
+
+// ── UNIT TEST FOR UNARY RPC ───────────────────────────────────
+
+@ExtendWith(MockitoExtension.class)
+class OrderServiceImplTest {
+  
+  @Mock
+  private OrderRepository orderRepository;
+  
+  @Mock
+  private InventoryClient inventoryClient;
+  
+  private OrderServiceImpl orderService;
+  
+  @BeforeEach
+  void setUp() {
+    orderService = new OrderServiceImpl(orderRepository, inventoryClient);
+  }
+  
+  @Test
+  void createOrder_success() {
+    // Given
+    CreateOrderRequest request = CreateOrderRequest.newBuilder()
+        .setCustomerId("cust-1")
+        .setProductId("prod-1")
+        .setQuantity(2)
+        .build();
+    
+    when(inventoryClient.checkAvailability("prod-1", 2)).thenReturn(true);
+    when(orderRepository.create(any(), any(), anyInt()))
+        .thenReturn(new OrderEntity("order-123"));
+    
+    // When
+    TestStreamObserver<CreateOrderResponse> responseObserver = new TestStreamObserver<>();
+    orderService.createOrder(request, responseObserver);
+    
+    // Then
+    responseObserver.assertCompleted();
+    CreateOrderResponse response = responseObserver.getSingleValue();
+    assertEquals("order-123", response.getOrderId());
+    assertEquals("CREATED", response.getStatus());
+  }
+  
+  @Test
+  void createOrder_invalidArgument_missingCustomerId() {
+    // Given
+    CreateOrderRequest request = CreateOrderRequest.newBuilder()
+        .setCustomerId("")  // blank
+        .setProductId("prod-1")
+        .setQuantity(2)
+        .build();
+    
+    // When
+    TestStreamObserver<CreateOrderResponse> responseObserver = new TestStreamObserver<>();
+    orderService.createOrder(request, responseObserver);
+    
+    // Then
+    StatusRuntimeException ex = responseObserver.getStatusRuntimeException();
+    assertEquals(Status.Code.INVALID_ARGUMENT, ex.getStatus().getCode());
+    assertThat(ex.getStatus().getDescription()).contains("customer_id");
+  }
+  
+  @Test
+  void createOrder_notFound_productNotInInventory() {
+    // Given
+    when(inventoryClient.checkAvailability(any(), anyInt())).thenReturn(false);
+    
+    CreateOrderRequest request = CreateOrderRequest.newBuilder()
+        .setCustomerId("cust-1")
+        .setProductId("prod-999")
+        .setQuantity(1)
+        .build();
+    
+    // When
+    TestStreamObserver<CreateOrderResponse> responseObserver = new TestStreamObserver<>();
+    orderService.createOrder(request, responseObserver);
+    
+    // Then
+    StatusRuntimeException ex = responseObserver.getStatusRuntimeException();
+    assertEquals(Status.Code.FAILED_PRECONDITION, ex.getStatus().getCode());
+  }
+  
+  // ── UNIT TEST FOR SERVER STREAMING ───────────────────────
+  
+  @Test
+  void listOrders_streamsAllOrders() {
+    // Given
+    String customerId = "cust-1";
+    List<OrderEntity> mockOrders = List.of(
+        new OrderEntity("order-1"),
+        new OrderEntity("order-2"),
+        new OrderEntity("order-3")
+    );
+    
+    when(orderRepository.streamByCustomerId(customerId))
+        .thenReturn(mockOrders.stream());
+    
+    // When
+    TestStreamObserver<Order> responseObserver = new TestStreamObserver<>();
+    orderService.listOrders(
+        ListOrdersRequest.newBuilder().setCustomerId(customerId).build(),
+        responseObserver);
+    
+    // Then
+    responseObserver.assertCompleted();
+    assertEquals(3, responseObserver.getValues().size());
+    assertEquals("order-1", responseObserver.getValues().get(0).getOrderId());
+  }
+}
+
+----------------------------------------------------------------
+4. IN-PROCESS gRPC SERVER TESTS
+----------------------------------------------------------------
+
+GrpcInProcessServerRule creates a real in-process gRPC server
+and a matching client channel. No TCP overhead, but full gRPC
+serialization, interceptors, and error propagation.
+
+// ── JUnit 5 with GrpcServerExtension ─────────────────────────
+
+@SpringBootTest
+@TestPropertySource(properties = {
+    "grpc.server.in-process-name=test",
+    "grpc.server.port=-1"               // disable real port
+})
+class OrderServiceIntegrationTest {
+  
+  @Autowired
+  private OrderServiceImpl orderService;
+  
+  private ManagedChannel channel;
+  private OrderServiceGrpc.OrderServiceBlockingStub stub;
+  
+  @BeforeEach
+  void setUp() {
+    // Create an in-process server
+    String serverName = InProcessServerBuilder.generateName();
+    
+    InProcessServerBuilder.forName(serverName)
+        .directExecutor()
+        .addService(orderService)
+        .build()
+        .start();
+    
+    channel = InProcessChannelBuilder.forName(serverName)
+        .directExecutor()
+        .build();
+    
+    stub = OrderServiceGrpc.newBlockingStub(channel);
+  }
+  
+  @AfterEach
+  void tearDown() throws InterruptedException {
+    channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
+  }
+  
+  @Test
+  void createOrder_returnsOrderId() {
+    CreateOrderResponse response = stub
+        .withDeadlineAfter(5, TimeUnit.SECONDS)
+        .createOrder(CreateOrderRequest.newBuilder()
+            .setCustomerId("cust-1")
+            .setProductId("prod-1")
+            .setQuantity(2)
+            .build());
+    
+    assertNotNull(response.getOrderId());
+    assertFalse(response.getOrderId().isBlank());
+  }
+  
+  @Test
+  void createOrder_invalidInput_throwsStatusRuntimeException() {
+    StatusRuntimeException ex = assertThrows(StatusRuntimeException.class, () ->
+        stub.createOrder(CreateOrderRequest.newBuilder()
+            .setCustomerId("")   // invalid
+            .setProductId("p1")
+            .setQuantity(1)
+            .build()));
+    
+    assertEquals(Status.Code.INVALID_ARGUMENT, ex.getStatus().getCode());
+  }
+}
+
+----------------------------------------------------------------
+5. TESTING INTERCEPTORS
+----------------------------------------------------------------
+
+// ── TEST THAT AUTH INTERCEPTOR BLOCKS UNAUTHORIZED CALLS ─────
+
+class JwtAuthInterceptorTest {
+  
+  private ManagedChannel channel;
+  private OrderServiceGrpc.OrderServiceBlockingStub stub;
+  private final JwtService jwtService = mock(JwtService.class);
+  
+  @BeforeEach
+  void setUp() throws Exception {
+    JwtAuthInterceptor authInterceptor = new JwtAuthInterceptor(jwtService);
+    OrderServiceImpl service = new OrderServiceImpl(...);
+    
+    String serverName = InProcessServerBuilder.generateName();
+    InProcessServerBuilder.forName(serverName)
+        .directExecutor()
+        .addService(ServerInterceptors.intercept(service, authInterceptor))
+        .build()
+        .start();
+    
+    channel = InProcessChannelBuilder.forName(serverName).directExecutor().build();
+    stub = OrderServiceGrpc.newBlockingStub(channel);
+  }
+  
+  @Test
+  void call_withoutToken_returnsUnauthenticated() {
+    // No auth header
+    StatusRuntimeException ex = assertThrows(StatusRuntimeException.class, () ->
+        stub.createOrder(validRequest()));
+    
+    assertEquals(Status.Code.UNAUTHENTICATED, ex.getStatus().getCode());
+  }
+  
+  @Test
+  void call_withValidToken_proceeds() {
+    UserPrincipal user = new UserPrincipal("user-1", Set.of("ORDER_CREATE"));
+    when(jwtService.validateAndParse("valid-token")).thenReturn(user);
+    
+    // Add auth header
+    Metadata headers = new Metadata();
+    headers.put(Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER),
+        "Bearer valid-token");
+    
+    stub = MetadataUtils.attachHeaders(stub, headers);
+    
+    // Should not throw
+    assertDoesNotThrow(() -> stub.createOrder(validRequest()));
+  }
+  
+  @Test
+  void call_withInvalidToken_returnsUnauthenticated() {
+    when(jwtService.validateAndParse("bad-token")).thenThrow(new JwtException("invalid"));
+    
+    Metadata headers = new Metadata();
+    headers.put(Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER),
+        "Bearer bad-token");
+    
+    stub = MetadataUtils.attachHeaders(stub, headers);
+    
+    StatusRuntimeException ex = assertThrows(StatusRuntimeException.class, () ->
+        stub.createOrder(validRequest()));
+    
+    assertEquals(Status.Code.UNAUTHENTICATED, ex.getStatus().getCode());
+  }
+}
+
+----------------------------------------------------------------
+6. TESTING STREAMING RPCs
+----------------------------------------------------------------
+
+// ── TEST SERVER STREAMING ─────────────────────────────────────
+
+@Test
+void listOrders_streamsOrdersToClient() throws InterruptedException {
+  // Setup mock data
+  when(orderRepository.streamByCustomerId("cust-1"))
+      .thenReturn(Stream.of(orderEntity1, orderEntity2));
+  
+  // Use blocking iterator
+  Iterator<Order> iterator = stub.listOrders(
+      ListOrdersRequest.newBuilder().setCustomerId("cust-1").build());
+  
+  List<Order> orders = new ArrayList<>();
+  while (iterator.hasNext()) {
+    orders.add(iterator.next());
+  }
+  
+  assertEquals(2, orders.size());
+}
+
+// ── TEST CLIENT STREAMING ─────────────────────────────────────
+
+@Test
+void batchCreateOrders_returnsCorrectSummary() throws InterruptedException {
+  CountDownLatch latch = new CountDownLatch(1);
+  AtomicReference<BatchCreateResult> result = new AtomicReference<>();
+  
+  StreamObserver<CreateOrderRequest> requestObserver =
+      OrderServiceGrpc.newStub(channel)
+          .batchCreateOrders(new StreamObserver<BatchCreateResult>() {
+            @Override public void onNext(BatchCreateResult r) { result.set(r); }
+            @Override public void onError(Throwable t) { latch.countDown(); }
+            @Override public void onCompleted() { latch.countDown(); }
+          });
+  
+  // Send 3 requests
+  for (int i = 0; i < 3; i++) {
+    requestObserver.onNext(CreateOrderRequest.newBuilder()
+        .setCustomerId("cust-1").setProductId("prod-" + i).setQuantity(1).build());
+  }
+  requestObserver.onCompleted();
+  
+  assertTrue(latch.await(10, TimeUnit.SECONDS));
+  assertNotNull(result.get());
+  assertEquals(3, result.get().getTotalReceived());
+}
+
+----------------------------------------------------------------
+7. GRPC TEST ANNOTATIONS (grpc-spring-boot-starter)
+----------------------------------------------------------------
+
+@SpringBootTest sets up the full context.
+For lighter tests, use @GrpcTest (available in grpc-spring-boot-starter):
+
+@GrpcTest(controllers = OrderServiceImpl.class)
+class OrderServiceGrpcTest {
+  
+  @Autowired
+  private OrderServiceGrpc.OrderServiceBlockingStub stub;
+  
+  @MockBean
+  private OrderRepository orderRepository;
+  
+  @Test
+  void getOrder_notFound() {
+    when(orderRepository.findById("xyz")).thenReturn(Optional.empty());
+    
+    StatusRuntimeException ex = assertThrows(StatusRuntimeException.class,
+        () -> stub.getOrder(GetOrderRequest.newBuilder().setOrderId("xyz").build()));
+    
+    assertEquals(Status.Code.NOT_FOUND, ex.getStatus().getCode());
+  }
+}
+
+@GrpcTest:
+  - Starts only the gRPC slice (not web layer)
+  - Auto-configures an in-process server
+  - Injects stubs directly into test class
+  - Supports @MockBean for dependencies
+
+----------------------------------------------------------------
+8. INTERVIEW KEY POINTS
+----------------------------------------------------------------
+
+Q: How do you test a gRPC service without starting a real server?
+A: Use an in-process gRPC server. InProcessServerBuilder creates a
+   gRPC server that communicates via in-memory channels (no TCP).
+   InProcessChannelBuilder creates a channel to that server. This
+   gives full gRPC semantics (serialization, interceptors, status codes)
+   with no network overhead. Tests run in milliseconds.
+
+Q: Why use TestStreamObserver instead of Mockito for StreamObserver?
+A: Mockito creates mocks where you set up expectations. But
+   StreamObserver has methods called BY the code under test (onNext,
+   onError, onCompleted). A TestStreamObserver captures these calls so
+   you can assert on them. You could use Mockito.verify() on a mock,
+   but a TestStreamObserver lets you inspect the actual values and order
+   of calls, which is more expressive and less brittle.
+
+Q: How do you test that the correct metadata/headers are sent?
+A: Use MetadataUtils.captureMetadata() to create a forwarding client
+   interceptor that records headers. Alternatively, add a server-side
+   interceptor in the test server that stores received headers in a
+   thread-local, then assert on those headers after the RPC call.
+
+Q: What is @GrpcTest and when do you use it?
+A: @GrpcTest (from grpc-spring-boot-starter) is a test slice annotation
+   similar to @WebMvcTest. It creates a limited Spring context with only
+   gRPC-related beans — no web layer, no JPA, etc. It auto-configures
+   an in-process server and injects stubs into the test. Use @MockBean
+   to mock service dependencies. Use it when you want to test the gRPC
+   binding layer (interceptors, serialization) without loading the full
+   application context.
+
+================================================================
+END OF FILE
+================================================================

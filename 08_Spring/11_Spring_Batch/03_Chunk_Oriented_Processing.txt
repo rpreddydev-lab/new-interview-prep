@@ -1,0 +1,264 @@
+================================================================
+  SPRING BATCH — CHUNK PROCESSING
+================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. CHUNK-ORIENTED PROCESSING MECHANICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Read-Process-Write cycle (per chunk):
+
+1. Open transaction
+2. For i = 1 to chunkSize:
+     item = reader.read()
+     if item == null → end of input → break loop
+     processed = processor.process(item)
+     if processed != null → add to chunk buffer
+3. writer.write(chunk)  → bulk write all items in buffer
+4. Commit transaction
+5. Repeat from step 1 until reader returns null
+
+A single step may execute many chunks (commit-intervals):
+
+      [Chunk 1: read 100, process, write 100] — commit
+      [Chunk 2: read 100, process, write 100] — commit
+      ...
+      [Chunk N: read remaining, process, write] — commit
+
+If write fails → only that chunk's transaction rolls back.
+Previous chunks remain committed. Restart continues from next chunk.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. BASIC CHUNK STEP CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@Bean
+public Step processOrdersStep(JobRepository jobRepository,
+                              PlatformTransactionManager txManager,
+                              FlatFileItemReader<RawOrder> reader,
+                              OrderProcessor processor,
+                              JdbcBatchItemWriter<Order> writer) {
+
+    return new StepBuilder("processOrdersStep", jobRepository)
+        .<RawOrder, Order>chunk(100, txManager)   // chunk size = 100
+        .reader(reader)
+        .processor(processor)
+        .writer(writer)
+        .build();
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. SKIP — TOLERATING BAD RECORDS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When a processing exception occurs, you can configure the step to
+skip that item instead of failing the entire job.
+
+@Bean
+public Step processOrdersStep(JobRepository jobRepository,
+                              PlatformTransactionManager txManager,
+                              ItemReader<RawOrder> reader,
+                              ItemProcessor<RawOrder, Order> processor,
+                              ItemWriter<Order> writer) {
+
+    return new StepBuilder("processOrdersStep", jobRepository)
+        .<RawOrder, Order>chunk(100, txManager)
+        .reader(reader)
+        .processor(processor)
+        .writer(writer)
+        // Skip configuration
+        .faultTolerant()
+        .skip(ValidationException.class)         // skip items that throw this
+        .skip(UnknownCustomerException.class)
+        .skipLimit(50)                           // fail if more than 50 skips
+        .noSkip(CriticalDataException.class)     // never skip this exception
+        // Listener for skip events
+        .listener(new SkipListener<RawOrder, Order>() {
+            @Override
+            public void onSkipInRead(Throwable t) {
+                log.warn("Skipped in read: {}", t.getMessage());
+            }
+            @Override
+            public void onSkipInProcess(RawOrder item, Throwable t) {
+                log.warn("Skipped in process for item {}: {}", item.getOrderId(), t.getMessage());
+            }
+            @Override
+            public void onSkipInWrite(Order item, Throwable t) {
+                log.warn("Skipped in write for order {}: {}", item.getExternalId(), t.getMessage());
+            }
+        })
+        .build();
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. RETRY — HANDLING TRANSIENT FAILURES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Retry is useful for transient errors (deadlocks, network timeouts).
+
+@Bean
+public Step processOrdersStep(...) {
+    return new StepBuilder("processOrdersStep", jobRepository)
+        .<RawOrder, Order>chunk(100, txManager)
+        .reader(reader)
+        .processor(processor)
+        .writer(writer)
+        .faultTolerant()
+        .retry(DeadlockLoserDataAccessException.class)
+        .retry(TransientDataAccessException.class)
+        .retryLimit(3)      // retry up to 3 times before failing the item
+        .build();
+}
+
+// Combining skip + retry:
+.faultTolerant()
+.retry(TransientDataAccessException.class)
+.retryLimit(3)
+.skip(NonTransientDataAccessException.class)
+.skipLimit(10)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. MULTI-THREADED STEP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Run multiple chunks in parallel within a single step. Each thread
+processes a separate chunk concurrently.
+
+IMPORTANT: Reader must be thread-safe (JdbcCursorItemReader is NOT —
+           use JdbcPagingItemReader or SynchronizedItemStreamReader).
+
+@Bean
+public TaskExecutor stepTaskExecutor() {
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(4);
+    executor.setMaxPoolSize(8);
+    executor.setQueueCapacity(25);
+    executor.setThreadNamePrefix("batch-");
+    executor.initialize();
+    return executor;
+}
+
+@Bean
+public Step multiThreadedStep(JobRepository jobRepository,
+                              PlatformTransactionManager txManager,
+                              JdbcPagingItemReader<RawOrder> reader,   // thread-safe reader
+                              OrderProcessor processor,
+                              JdbcBatchItemWriter<Order> writer,
+                              TaskExecutor stepTaskExecutor) {
+    return new StepBuilder("multiThreadedStep", jobRepository)
+        .<RawOrder, Order>chunk(100, txManager)
+        .reader(new SynchronizedItemStreamReader<>(reader))  // extra safety
+        .processor(processor)
+        .writer(writer)
+        .taskExecutor(stepTaskExecutor)
+        .throttleLimit(4)   // max concurrent threads (deprecated in SB 5 — use pool size)
+        .build();
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. PARTITIONED STEP (HORIZONTAL SCALING)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Partitioned steps split the data into non-overlapping ranges and
+process each partition independently (can run on different servers).
+
+// Partitioner: defines the partitions
+@Component
+public class OrderIdRangePartitioner implements Partitioner {
+
+    private final DataSource dataSource;
+
+    @Override
+    public Map<String, ExecutionContext> partition(int gridSize) {
+        JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+        Long minId = jdbc.queryForObject("SELECT MIN(id) FROM orders WHERE status='PENDING'", Long.class);
+        Long maxId = jdbc.queryForObject("SELECT MAX(id) FROM orders WHERE status='PENDING'", Long.class);
+
+        long range = (maxId - minId) / gridSize + 1;
+        Map<String, ExecutionContext> result = new HashMap<>();
+        long start = minId;
+
+        for (int i = 0; i < gridSize; i++) {
+            ExecutionContext ctx = new ExecutionContext();
+            ctx.putLong("minId", start);
+            ctx.putLong("maxId", Math.min(start + range - 1, maxId));
+            result.put("partition" + i, ctx);
+            start += range;
+        }
+        return result;
+    }
+}
+
+// Worker step (reads only its partition range)
+@Bean
+@StepScope
+public JdbcPagingItemReader<RawOrder> partitionedReader(
+    DataSource dataSource,
+    @Value("#{stepExecutionContext['minId']}") Long minId,
+    @Value("#{stepExecutionContext['maxId']}") Long maxId) {
+
+    return new JdbcPagingItemReaderBuilder<RawOrder>()
+        .name("partitionedReader")
+        .dataSource(dataSource)
+        .selectClause("SELECT *")
+        .fromClause("FROM orders")
+        .whereClause("WHERE id >= :minId AND id <= :maxId AND status='PENDING'")
+        .sortKeys(Map.of("id", Order.SortOrder.ASCENDING))
+        .parameterValues(Map.of("minId", minId, "maxId", maxId))
+        .pageSize(100)
+        .rowMapper(new BeanPropertyRowMapper<>(RawOrder.class))
+        .build();
+}
+
+// Master step (orchestrates partitions)
+@Bean
+public Step masterStep(JobRepository jobRepository, Step workerStep,
+                       OrderIdRangePartitioner partitioner, TaskExecutor executor) {
+    return new StepBuilder("masterStep", jobRepository)
+        .partitioner("workerStep", partitioner)
+        .step(workerStep)
+        .gridSize(4)              // 4 partitions
+        .taskExecutor(executor)   // run partitions in parallel
+        .build();
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. INTERVIEW Q&A
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is the commit interval (chunk size) and how do you choose it?
+A: The commit interval determines how many items are processed before a
+   transaction is committed. Smaller chunks = more commits = lower memory
+   usage + better restart granularity but more DB overhead. Larger chunks
+   = fewer commits = faster throughput but higher memory per chunk + longer
+   rollback on failure. Typical range: 50–500. Profile with your actual data
+   volume and DB performance.
+
+Q: What is the difference between skip and retry?
+A: Skip: if processing an item throws a configured exception, the item is
+   discarded and processing continues with the next item. The bad item is
+   permanently excluded. Retry: if processing fails with a transient exception,
+   the same item is attempted again up to retryLimit times before eventually
+   skipping or failing. Use retry for network/DB timeouts; use skip for data
+   quality issues.
+
+Q: What happens to items already committed when a step fails?
+A: They remain committed in the database. Spring Batch only rolls back the
+   current chunk. On restart, the step picks up from the last committed
+   checkpoint (tracked in the JobRepository). This is why idempotent writes
+   (upsert/ON CONFLICT) are important — if a chunk is partially written before
+   failure, on retry it may attempt to write the same items again.
+
+Q: When do you use partitioned steps vs multi-threaded steps?
+A: Multi-threaded step: multiple threads process different chunks from the same
+   data source concurrently. Good for I/O-bound processing on a single node.
+   Partitioned step: data is split into independent non-overlapping partitions,
+   each processed by a separate worker step (can run on different nodes in remote
+   partitioning). Use partitioning for massive data sets that need distributed processing.
+
+Q: Why is JdbcCursorItemReader not safe for multi-threaded steps?
+A: JdbcCursorItemReader maintains a single open database cursor and reads from
+   it sequentially. If multiple threads call read() concurrently, the cursor
+   position becomes inconsistent, leading to duplicate reads or skipped items.
+   Use JdbcPagingItemReader (issues separate paginated queries) or wrap with
+   SynchronizedItemStreamReader for thread safety.
