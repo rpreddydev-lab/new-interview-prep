@@ -1,0 +1,262 @@
+PRODUCER-CONSUMER WITH BLOCKINGQUEUE
+======================================
+
+PURPOSE
+--------
+  The Producer-Consumer pattern decouples the producer of data from the consumer.
+  A shared buffer (queue) between them allows them to operate at different rates.
+  Key benefits:
+  - Producers don't block waiting for consumers (up to buffer capacity)
+  - Consumers don't busy-wait for producers (block when queue empty)
+  - Backpressure: bounded queue prevents consumers from being overwhelmed
+
+  In Java, BlockingQueue is the standard mechanism — it handles all thread coordination
+  internally (no explicit wait/notify needed).
+
+BLOCKINGQUEUE API
+------------------
+  Interface: java.util.concurrent.BlockingQueue<E>
+
+  | Method          | When Queue Full       | When Queue Empty      |
+  |-----------------|----------------------|-----------------------|
+  | add(e)          | Throws IllegalStateException | —             |
+  | offer(e)        | Returns false         | —                     |
+  | offer(e,t,unit) | Blocks for t time     | —                     |
+  | put(e)          | Blocks indefinitely   | —                     |
+  | remove()        | —                     | Throws NoSuchElementException |
+  | poll()          | —                     | Returns null          |
+  | poll(t,unit)    | —                     | Blocks for t time     |
+  | take()          | —                     | Blocks indefinitely   |
+  | peek()          | —                     | Returns null (no remove) |
+
+  Implementations:
+  LinkedBlockingQueue(capacity)  — linked nodes, optionally bounded (FIFO)
+  ArrayBlockingQueue(capacity)   — array-based, bounded (FIFO), fixed size
+  PriorityBlockingQueue          — unbounded, ordered by priority
+  SynchronousQueue               — no capacity; each put() must be paired with a take() (rendezvous)
+  DelayQueue                     — elements become available after a delay (scheduled work)
+
+BASIC PRODUCER-CONSUMER EXAMPLE
+---------------------------------
+  public class ProducerConsumerDemo {
+      private static final int CAPACITY = 50;
+      private static final int PRODUCERS = 3;
+      private static final int CONSUMERS = 2;
+      private static final int TASKS_PER_PRODUCER = 10;
+
+      // Bounded blocking queue — natural backpressure
+      private static final BlockingQueue<String> queue = new ArrayBlockingQueue<>(CAPACITY);
+
+      // Poison pill: signals consumers to stop
+      private static final String POISON_PILL = "__STOP__";
+
+      static class Producer implements Runnable {
+          private final int id;
+          Producer(int id) { this.id = id; }
+
+          @Override
+          public void run() {
+              try {
+                  for (int i = 0; i < TASKS_PER_PRODUCER; i++) {
+                      String task = "Task-P" + id + "-" + i;
+                      queue.put(task);    // blocks if queue full (backpressure)
+                      System.out.println("Produced: " + task);
+                      Thread.sleep(50);  // simulate production time
+                  }
+              } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+              }
+          }
+      }
+
+      static class Consumer implements Runnable {
+          private final int id;
+          Consumer(int id) { this.id = id; }
+
+          @Override
+          public void run() {
+              try {
+                  while (true) {
+                      String task = queue.take();   // blocks if queue empty
+                      if (POISON_PILL.equals(task)) {
+                          // Re-enqueue poison pill for other consumers
+                          queue.put(POISON_PILL);
+                          System.out.println("Consumer-" + id + " received poison pill, stopping.");
+                          break;
+                      }
+                      System.out.println("Consumer-" + id + " processing: " + task);
+                      Thread.sleep(100);   // simulate processing time
+                  }
+              } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+              }
+          }
+      }
+
+      public static void main(String[] args) throws InterruptedException {
+          ExecutorService producerPool = Executors.newFixedThreadPool(PRODUCERS);
+          ExecutorService consumerPool = Executors.newFixedThreadPool(CONSUMERS);
+
+          // Start consumers first
+          for (int i = 0; i < CONSUMERS; i++) {
+              consumerPool.submit(new Consumer(i + 1));
+          }
+
+          // Start producers
+          for (int i = 0; i < PRODUCERS; i++) {
+              producerPool.submit(new Producer(i + 1));
+          }
+
+          // Wait for all producers to finish
+          producerPool.shutdown();
+          producerPool.awaitTermination(30, TimeUnit.SECONDS);
+
+          // Signal consumers to stop with poison pill (one per consumer)
+          for (int i = 0; i < CONSUMERS; i++) {
+              queue.put(POISON_PILL);
+          }
+
+          consumerPool.shutdown();
+          consumerPool.awaitTermination(30, TimeUnit.SECONDS);
+          System.out.println("All done.");
+      }
+  }
+
+PRODUCER-CONSUMER WITH CompletableFuture AND ExecutorService
+-------------------------------------------------------------
+  // Modern approach: task pipeline using CompletableFuture chains
+  // Producer submits tasks; consumer stages applied as async callbacks
+
+  ExecutorService processPool = Executors.newFixedThreadPool(4);
+
+  List<CompletableFuture<Void>> futures = IntStream.range(0, 30)
+      .mapToObj(i -> CompletableFuture
+          .supplyAsync(() -> produce(i))          // producer stage (runs on ForkJoinPool by default)
+          .thenApplyAsync(data -> transform(data), processPool)  // transform stage
+          .thenAcceptAsync(result -> consume(result), processPool) // consumer stage
+          .exceptionally(ex -> { System.err.println("Error: " + ex.getMessage()); return null; })
+      )
+      .collect(Collectors.toList());
+
+  CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+  processPool.shutdown();
+
+PRODUCER-CONSUMER WITH VIRTUAL THREADS (JAVA 21)
+--------------------------------------------------
+  Virtual threads make thread-per-task trivially scalable.
+  Each producer and consumer can be a virtual thread — no thread pool sizing needed.
+
+  BlockingQueue<String> queue = new LinkedBlockingQueue<>(100);
+  ExecutorService vExec = Executors.newVirtualThreadPerTaskExecutor();
+
+  // 1000 producers
+  for (int i = 0; i < 1000; i++) {
+      final int id = i;
+      vExec.submit(() -> {
+          String item = "item-" + id;
+          try {
+              queue.put(item);    // blocking I/O is safe with virtual threads
+          } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+      });
+  }
+
+  // 500 consumers
+  for (int i = 0; i < 500; i++) {
+      vExec.submit(() -> {
+          try {
+              String item = queue.take();
+              processItem(item);
+          } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+      });
+  }
+
+ALTERNATIVE: wait()/notifyAll() (LOW-LEVEL — DO NOT USE IN NEW CODE)
+----------------------------------------------------------------------
+  // Shows the classic pattern for comparison; always prefer BlockingQueue in practice
+  public class BoundedBuffer<E> {
+      private final Queue<E> buffer;
+      private final int capacity;
+
+      public BoundedBuffer(int capacity) {
+          this.buffer = new LinkedList<>();
+          this.capacity = capacity;
+      }
+
+      public synchronized void put(E item) throws InterruptedException {
+          while (buffer.size() == capacity) wait();   // must use while, not if (spurious wakeups!)
+          buffer.offer(item);
+          notifyAll();  // wake up waiting consumers (notifyAll safer than notify)
+      }
+
+      public synchronized E take() throws InterruptedException {
+          while (buffer.isEmpty()) wait();
+          E item = buffer.poll();
+          notifyAll();   // wake up waiting producers
+          return item;
+      }
+  }
+  // Issues: coarse-grained locking (one lock for both put and take);
+  // notifyAll wakes all threads (O(n) wake-ups, most go back to sleep).
+  // BlockingQueue (ArrayBlockingQueue) uses two separate ReentrantLocks (putLock/takeLock)
+  // with Conditions for much better concurrency.
+
+STOPPING CONSUMERS CLEANLY
+----------------------------
+  Strategy 1: Poison Pill (shown above) — a sentinel value in the queue.
+              N consumers need N poison pills, or each passes it on (see above example).
+
+  Strategy 2: Interrupt + volatile flag
+  private volatile boolean running = true;
+  // Consumer:
+  while (running) {
+      String task = queue.poll(100, TimeUnit.MILLISECONDS);  // timeout poll — check flag
+      if (task != null) process(task);
+  }
+  // Shutdown: running = false; (consumers exit after next poll timeout)
+
+  Strategy 3: ExecutorService.shutdownNow() + interrupt
+  exec.shutdownNow();  // interrupts all running threads
+  // Consumer must check Thread.currentThread().isInterrupted() or catch InterruptedException
+
+COMMON PITFALLS
+----------------
+  1. Using unbounded queue (LinkedBlockingQueue() without capacity) → OOM if producer much faster than consumer.
+     Fix: always specify capacity: new LinkedBlockingQueue<>(1000)
+
+  2. Calling queue.take() without handling InterruptedException properly:
+     catch (InterruptedException e) { /* swallowing! */ }
+     Fix: Thread.currentThread().interrupt(); // re-set the interrupt flag
+
+  3. Using notify() instead of notifyAll() in custom wait/notify code — only one thread
+     woken up; if it's not the right one, system deadlocks. Prefer notifyAll() or Conditions.
+
+  4. Forgetting to shutdown ExecutorServices — JVM won't exit if non-daemon threads still running.
+     Fix: exec.shutdown(); exec.awaitTermination(...);
+
+INTERVIEW DISCUSSION POINTS
+-----------------------------
+  Q: Why use BlockingQueue instead of implementing your own with wait/notify?
+  A: BlockingQueue (e.g., ArrayBlockingQueue) encapsulates all coordination internally:
+     it uses two separate Conditions (notFull for producers, notEmpty for consumers) backed
+     by two ReentrantLocks. This allows producers and consumers to wait on different
+     conditions concurrently without waking each other unnecessarily. Implementing this
+     correctly with wait/notify is error-prone and verbose. BlockingQueue is the idiomatic
+     Java solution tested by millions of production deployments.
+
+  Q: What is the difference between put() and offer() in BlockingQueue?
+  A: put() blocks indefinitely when the queue is full — the producer waits until space is
+     available. offer() returns false immediately if the queue is full (non-blocking) or,
+     with a timeout argument, blocks for up to that duration. Use put() when producers
+     should naturally slow down due to backpressure. Use offer() with timeout when you need
+     to detect and handle backpressure explicitly (e.g., log an alert or reject the task).
+
+  Q: How do you gracefully stop consumers in a producer-consumer setup?
+  A: Three main approaches:
+     (1) Poison Pill: enqueue a sentinel value. Each consumer exits when it sees it and
+         re-enqueues the pill for the next consumer. Need N pills for N consumers, or chain.
+     (2) Volatile flag + timed poll: consumer polls with a timeout and checks a volatile
+         boolean running flag between polls.
+     (3) Thread interruption: call shutdownNow() or interrupt consumer threads. Consumer
+         must handle InterruptedException and re-set the interrupt flag before exiting.
+     The poison pill approach is cleanest for work-stealing scenarios where all work must
+     be processed before stopping.

@@ -1,0 +1,221 @@
+THREAD-SAFE COUNTER AND SINGLETON
+===================================
+
+PURPOSE
+--------
+  Building a thread-safe counter and singleton demonstrates:
+  - Race conditions and how to prevent them
+  - AtomicInteger/AtomicLong vs synchronized vs volatile
+  - LongAdder for high-throughput counting
+  - Thread-safe singleton patterns (DCL, holder idiom, enum)
+  - How to unit test thread-safety with concurrent workers
+
+THREAD-SAFE COUNTER — IMPLEMENTATION VARIANTS
+----------------------------------------------
+
+VARIANT 1: synchronized method (simple but contention-prone)
+  public class SynchronizedCounter {
+      private long count = 0;
+
+      public synchronized void increment() { count++; }
+      public synchronized void decrement() { count--; }
+      public synchronized long get()       { return count; }
+
+      // Pro: simple, correct, supports compound operations (compare-then-act)
+      // Con: monitor lock acquired on every call → contention under high parallelism
+  }
+
+VARIANT 2: AtomicLong (lock-free, CAS-based — preferred for single counters)
+  public class AtomicCounter {
+      private final AtomicLong count = new AtomicLong(0);
+
+      public void increment()       { count.incrementAndGet(); }
+      public void decrement()       { count.decrementAndGet(); }
+      public void add(long delta)   { count.addAndGet(delta); }
+      public long get()             { return count.get(); }
+      public void reset()           { count.set(0); }
+
+      // Pro: lock-free (CAS loop), faster than synchronized in low-medium contention
+      // Con: CAS spinning under extreme contention — see LongAdder below
+  }
+
+VARIANT 3: LongAdder (Java 8+ — highest throughput under contention)
+  public class HighThroughputCounter {
+      private final LongAdder adder = new LongAdder();
+
+      public void increment()    { adder.increment(); }
+      public void add(long n)    { adder.add(n); }
+
+      // sum() returns approximate total (summation may race with increments)
+      // Use when you need total at the end, not real-time consistent reads
+      public long get()          { return adder.sum(); }
+      public void reset()        { adder.reset(); }
+
+      // Pro: strips internally across multiple cells to reduce contention — extremely fast
+      //      when many threads increment simultaneously (e.g., server request counter)
+      // Con: sum() is NOT atomic with increments — may be slightly stale during heavy concrement
+      //      Not suitable if you need precise CAS semantics (compareAndSet)
+  }
+
+VARIANT 4: volatile (visibility only — NOT sufficient for counter!)
+  public class VolatileCounter {
+      private volatile int count = 0;
+
+      // WRONG — volatile does NOT make i++ atomic!
+      // volatile ensures visibility of the write, but read-increment-write is still three steps.
+      public void increment() { count++; }  // DATA RACE! Do NOT use volatile for counters.
+      public int get()        { return count; }
+  }
+
+COUNTER WITH NAMED METRICS EXAMPLE
+-------------------------------------
+  public class MetricsCounter {
+      private final AtomicLong requestCount    = new AtomicLong(0);
+      private final AtomicLong errorCount      = new AtomicLong(0);
+      private final LongAdder  totalDurationMs = new LongAdder();
+
+      public void recordRequest(boolean isError, long durationMs) {
+          requestCount.incrementAndGet();
+          if (isError) errorCount.incrementAndGet();
+          totalDurationMs.add(durationMs);
+      }
+
+      public long getRequestCount() { return requestCount.get(); }
+      public long getErrorCount()   { return errorCount.get(); }
+      public double getAvgDuration() {
+          long total = requestCount.get();
+          return total == 0 ? 0.0 : (double) totalDurationMs.sum() / total;
+      }
+  }
+
+THREAD-SAFE SINGLETON — RECAP OF BEST PATTERNS
+------------------------------------------------
+
+Pattern 1: Initialization-On-Demand Holder (recommended for lazy init)
+  public class ConnectionPool {
+      private final int maxSize;
+      private final Queue<Connection> pool;
+
+      private ConnectionPool() {
+          this.maxSize = Integer.parseInt(System.getProperty("pool.size", "10"));
+          this.pool = new ConcurrentLinkedQueue<>();
+          // initialize pool ...
+      }
+
+      private static final class Holder {
+          static final ConnectionPool INSTANCE = new ConnectionPool();
+          // Class initialization is thread-safe; Holder is only loaded on first call to getInstance()
+      }
+
+      public static ConnectionPool getInstance() {
+          return Holder.INSTANCE;
+      }
+
+      public Connection acquire() { return pool.poll(); }
+      public void release(Connection c) { pool.offer(c); }
+  }
+
+Pattern 2: Enum (simplest, serialization-safe)
+  public enum AppConfig {
+      INSTANCE;
+
+      private final Properties props;
+
+      AppConfig() {
+          props = new Properties();
+          try (InputStream is = getClass().getResourceAsStream("/app.properties")) {
+              if (is != null) props.load(is);
+          } catch (IOException e) {
+              throw new RuntimeException("Failed to load config", e);
+          }
+      }
+
+      public String get(String key) { return props.getProperty(key); }
+      public String get(String key, String defaultValue) { return props.getProperty(key, defaultValue); }
+  }
+  // Usage: AppConfig.INSTANCE.get("server.port", "8080")
+
+Pattern 3: DCL with volatile (when you need lazy init with expensive setup)
+  public class ExpensiveSingleton {
+      private static volatile ExpensiveSingleton instance;
+      private final List<String> data;
+
+      private ExpensiveSingleton() {
+          // simulate expensive initialization
+          this.data = loadHeavyData();
+      }
+
+      public static ExpensiveSingleton getInstance() {
+          if (instance == null) {                       // fast path (no lock)
+              synchronized (ExpensiveSingleton.class) {
+                  if (instance == null) {               // critical section
+                      instance = new ExpensiveSingleton();
+                  }
+              }
+          }
+          return instance;
+      }
+
+      private List<String> loadHeavyData() { return new ArrayList<>(); }
+      public List<String> getData()        { return Collections.unmodifiableList(data); }
+  }
+
+TESTING THREAD-SAFETY WITH CONCURRENT WORKERS
+----------------------------------------------
+  // Test that AtomicCounter is correct with 10 threads each incrementing 10,000 times
+  @Test
+  void atomicCounterIsThreadSafe() throws InterruptedException {
+      AtomicCounter counter = new AtomicCounter();
+      int threads = 10;
+      int increments = 10_000;
+      ExecutorService exec = Executors.newFixedThreadPool(threads);
+      CountDownLatch latch = new CountDownLatch(threads);
+
+      for (int i = 0; i < threads; i++) {
+          exec.submit(() -> {
+              try {
+                  for (int j = 0; j < increments; j++) counter.increment();
+              } finally {
+                  latch.countDown();
+              }
+          });
+      }
+
+      latch.await();
+      exec.shutdown();
+      assertEquals(threads * increments, counter.get());
+  }
+
+PERFORMANCE COMPARISON TABLE
+------------------------------
+  | Implementation       | Thread-Safe? | Throughput (high contention) | Use Case         |
+  |----------------------|--------------|------------------------------|------------------|
+  | int (unsynchronized) | NO           | Fastest (WRONG)              | Single-threaded  |
+  | volatile int         | NO (i++ race)| Fast (WRONG for i++)         | Simple flags     |
+  | synchronized         | Yes          | Low (lock contention)        | Low concurrency  |
+  | AtomicLong           | Yes          | Medium-High (CAS)            | Most counters    |
+  | LongAdder            | Yes          | Very High (stripe cells)     | Hot counters     |
+
+INTERVIEW DISCUSSION POINTS
+-----------------------------
+  Q: Why isn't volatile sufficient for a counter?
+  A: volatile ensures memory visibility — when one thread writes a volatile field, other
+     threads immediately see the new value (no CPU cache staleness). BUT it does NOT make
+     compound operations atomic. i++ is: (1) read i, (2) add 1, (3) write new value.
+     Between steps 1 and 3, another thread can read and write the same value, causing a
+     lost update. AtomicInteger.incrementAndGet() uses a CAS (compare-and-swap) hardware
+     instruction that performs all three steps atomically.
+
+  Q: When would you use LongAdder over AtomicLong?
+  A: LongAdder is optimized for scenarios with many concurrent writers but infrequent reads
+     (e.g., server request count, event counters). It maintains multiple internal cells
+     (one per CPU thread, roughly) — threads mostly update different cells, eliminating
+     contention. sum() aggregates all cells. If you need the current value frequently and
+     precisely, AtomicLong is better. If you need compareAndSet, only AtomicLong has it.
+
+  Q: Is the singleton pattern still useful with Spring/CDI?
+  A: In modern applications, frameworks (Spring, CDI, Guice) manage object lifecycle and
+     serve as "singleton registries" via dependency injection containers. You rarely need
+     to implement Singleton manually. However, understanding the pattern is essential for:
+     interviews, code without a DI framework (e.g., pure library code, standalone utilities),
+     and understanding how DI containers work internally.
