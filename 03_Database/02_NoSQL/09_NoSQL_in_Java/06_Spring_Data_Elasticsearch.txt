@@ -1,0 +1,445 @@
+================================================================
+  SPRING DATA ELASTICSEARCH — JAVA INTEGRATION
+================================================================
+
+  What to use this for:
+  "How do you use Elasticsearch from a Spring Boot application?"
+  "How do you keep Elasticsearch in sync with your database?"
+  "How do you do a custom search query in Spring?"
+
+  Prerequisites (already covered elsewhere — don't repeat):
+  - Core ES concepts, mapping, Query DSL → 06_Search_Engines/02 and 03
+  - text vs keyword, shards, bool query  → 06_Search_Engines/02 and 03
+
+================================================================
+DEPENDENCY SETUP
+================================================================
+
+  <!-- Spring Boot 3.x -->
+  <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-elasticsearch</artifactId>
+  </dependency>
+
+  # application.yml
+  spring:
+    elasticsearch:
+      uris: http://localhost:9200
+      username: elastic          # if security enabled
+      password: ${ES_PASSWORD}
+
+  Spring Boot auto-configures:
+  - ElasticsearchClient (co.elastic.clients — new Java API client)
+  - ElasticsearchOperations (high-level abstraction)
+  - ElasticsearchRestTemplate
+
+================================================================
+ENTITY MAPPING
+================================================================
+
+  @Document(indexName = "products", createIndex = true)
+  public class ProductDocument {
+
+      @Id
+      private String id;                          // maps to _id
+
+      @Field(type = FieldType.Text,
+             analyzer = "standard",
+             searchAnalyzer = "standard")
+      private String name;
+
+      @Field(type = FieldType.Keyword)
+      private String category;                   // exact match, aggregations
+
+      @Field(type = FieldType.Double)
+      private double price;
+
+      @Field(type = FieldType.Text, analyzer = "english")
+      private String description;                // stemming: "running" → "run"
+
+      @Field(type = FieldType.Keyword)
+      private List<String> tags;
+
+      @Field(type = FieldType.Boolean)
+      private boolean inStock;
+
+      @Field(type = FieldType.Date,
+             format = DateFormat.date_time)
+      private Instant createdAt;
+  }
+
+  Key annotations:
+  @Document       → marks this class as an ES document; indexName = the index
+  @Id             → maps to ES _id field (String type recommended)
+  @Field          → controls mapping type, analyzer, format
+  createIndex=true → creates the index on startup if it doesn't exist
+
+================================================================
+REPOSITORY APPROACH (SIMPLE QUERIES)
+================================================================
+
+  public interface ProductSearchRepository
+      extends ElasticsearchRepository<ProductDocument, String> {
+
+      // Derived query methods (auto-implemented)
+      List<ProductDocument> findByCategory(String category);
+      List<ProductDocument> findByInStockTrue();
+      List<ProductDocument> findByPriceBetween(double min, double max);
+
+      // Pagination
+      Page<ProductDocument> findByCategory(String category, Pageable pageable);
+
+      // Sorting
+      List<ProductDocument> findByInStockTrueOrderByPriceAsc();
+
+      // Full-text on text fields
+      List<ProductDocument> findByNameContaining(String keyword);
+  }
+
+  // Usage:
+  Page<ProductDocument> results = repo.findByCategory(
+      "electronics",
+      PageRequest.of(0, 10, Sort.by("price").ascending())
+  );
+
+  Limitation: derived methods only support simple equality / range / contains.
+  For bool queries, fuzzy, boosting, or aggregations → use ElasticsearchOperations.
+
+================================================================
+ELASTICSEARCHOPERATIONS (CUSTOM QUERIES)
+================================================================
+
+  @Service
+  public class ProductSearchService {
+
+      private final ElasticsearchOperations esOps;
+
+      public ProductSearchService(ElasticsearchOperations esOps) {
+          this.esOps = esOps;
+      }
+
+      // Full-text search with filters (bool query)
+      public SearchHits<ProductDocument> search(
+              String keyword, String category, double maxPrice, int page) {
+
+          Query query = NativeQuery.builder()
+              .withQuery(q -> q
+                  .bool(b -> b
+                      .must(m -> m.match(mt -> mt
+                          .field("name").query(keyword)))
+                      .filter(f -> f
+                          .term(t -> t.field("category").value(category)))
+                      .filter(f -> f
+                          .range(r -> r.field("price").lte(JsonData.of(maxPrice))))
+                      .filter(f -> f
+                          .term(t -> t.field("inStock").value(true)))
+                  )
+              )
+              .withPageable(PageRequest.of(page, 10))
+              .withSort(Sort.by(Sort.Direction.DESC, "_score"))
+              .build();
+
+          return esOps.search(query, ProductDocument.class);
+      }
+
+      // Fuzzy search (typo tolerance)
+      public SearchHits<ProductDocument> fuzzySearch(String term) {
+          Query query = NativeQuery.builder()
+              .withQuery(q -> q
+                  .fuzzy(f -> f
+                      .field("name")
+                      .value(term)
+                      .fuzziness("AUTO")    // AUTO: 0 edits ≤2 chars, 1 edit ≤5, 2 edit 5+
+                      .prefixLength(1))     // first char must match exactly
+              )
+              .build();
+
+          return esOps.search(query, ProductDocument.class);
+      }
+
+      // Multi-field search with field boosting
+      public SearchHits<ProductDocument> multiFieldSearch(String keyword) {
+          Query query = NativeQuery.builder()
+              .withQuery(q -> q
+                  .multiMatch(m -> m
+                      .query(keyword)
+                      .fields("name^3", "description^1", "tags^2")
+                      // ^3 means name field contributes 3x to relevance score
+                      .type(TextQueryType.BestFields))
+              )
+              .build();
+
+          return esOps.search(query, ProductDocument.class);
+      }
+
+      // Aggregation: faceted search (count by category)
+      public Map<String, Long> categoryFacets(String keyword) {
+          Query query = NativeQuery.builder()
+              .withQuery(q -> q.match(m -> m.field("name").query(keyword)))
+              .withAggregation("by_category",
+                  Aggregation.of(a -> a.terms(t -> t.field("category").size(20))))
+              .build();
+
+          SearchHits<ProductDocument> hits = esOps.search(query, ProductDocument.class);
+
+          return hits.getAggregations()
+              .get("by_category")
+              .sterms()
+              .buckets().array()
+              .stream()
+              .collect(Collectors.toMap(
+                  b -> b.key().stringValue(),
+                  StringTermsBucket::docCount
+              ));
+      }
+
+      // Save / index a document
+      public ProductDocument index(ProductDocument doc) {
+          return esOps.save(doc);
+      }
+
+      // Delete by id
+      public void delete(String id) {
+          esOps.delete(id, ProductDocument.class);
+      }
+  }
+
+================================================================
+KEEPING ELASTICSEARCH IN SYNC (DUAL-WRITE PATTERN)
+================================================================
+
+  ES is almost always a secondary store. Primary truth = PostgreSQL/MongoDB.
+  Three sync strategies:
+
+  STRATEGY 1: Application Dual-Write (simplest)
+  -----------------------------------------------
+  @Transactional
+  public Product createProduct(ProductRequest req) {
+      // 1. Write to primary DB (PostgreSQL)
+      Product saved = productRepository.save(req.toEntity());
+
+      // 2. Write to ES (best effort — non-transactional)
+      try {
+          searchRepository.save(ProductDocument.from(saved));
+      } catch (Exception e) {
+          log.error("ES sync failed for product {}: {}", saved.getId(), e.getMessage());
+          // Don't fail the request — schedule retry or accept eventual consistency
+      }
+
+      return saved;
+  }
+
+  Problem: ES write can fail silently after DB commit → inconsistency.
+  Fix: wrap ES write in a @TransactionalEventListener(phase = AFTER_COMMIT)
+  so ES write only happens if DB transaction committed.
+
+  @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+  public void onProductSaved(ProductSavedEvent event) {
+      searchRepository.save(ProductDocument.from(event.getProduct()));
+  }
+
+  STRATEGY 2: Kafka-based Async Sync (recommended for microservices)
+  ------------------------------------------------------------------
+  DB write → publish ProductEvent to Kafka
+  → Kafka consumer reads event → writes to ES
+
+  Pros: decoupled, retryable, ES failures don't affect product service
+  Cons: eventual consistency (ES lags by seconds)
+
+  STRATEGY 3: Debezium CDC (Change Data Capture)
+  -----------------------------------------------
+  Debezium monitors PostgreSQL WAL (write-ahead log).
+  Every INSERT/UPDATE/DELETE automatically produces a Kafka event.
+  A Kafka Connect Elasticsearch Sink Connector writes to ES.
+  Zero application code for sync — fully infrastructure-driven.
+
+  Pros: no dual-write code, captures all DB changes including migrations
+  Cons: operational complexity, schema evolution needs careful handling
+
+================================================================
+BULK INDEXING (INITIAL LOAD / REINDEX)
+================================================================
+
+  // Efficient: use save(Iterable) instead of save one by one
+  public void bulkIndex(List<Product> products) {
+      List<ProductDocument> docs = products.stream()
+          .map(ProductDocument::from)
+          .collect(Collectors.toList());
+
+      searchRepository.saveAll(docs);  // uses _bulk API under the hood
+  }
+
+  // For very large datasets: use ElasticsearchOperations.bulkIndex()
+  public void bulkIndexLarge(List<ProductDocument> docs) {
+      List<IndexQuery> queries = docs.stream()
+          .map(doc -> new IndexQueryBuilder()
+              .withId(doc.getId())
+              .withObject(doc)
+              .build())
+          .collect(Collectors.toList());
+
+      esOps.bulkIndex(queries, ProductDocument.class);
+  }
+
+  Best practices for bulk indexing:
+  - Batch size: 500–2,000 documents per bulk request
+  - Disable replicas during initial load, enable after (speeds up ingestion 3-5x)
+  - Increase refresh_interval to 30s during load (default 1s)
+
+================================================================
+SEARCH HIT PROCESSING
+================================================================
+
+  SearchHits<ProductDocument> hits = searchService.search("wireless", "electronics", 200.0, 0);
+
+  // Total count (before pagination)
+  long total = hits.getTotalHits();
+
+  // Iterate results
+  for (SearchHit<ProductDocument> hit : hits.getSearchHits()) {
+      ProductDocument doc = hit.getContent();   // the entity
+      float score = hit.getScore();             // relevance score
+      Map<String, List<String>> highlights = hit.getHighlightFields(); // if configured
+  }
+
+  // Highlighting (show matched terms in context)
+  Query query = NativeQuery.builder()
+      .withQuery(q -> q.match(m -> m.field("description").query("wireless")))
+      .withHighlightQuery(new HighlightQuery(
+          Highlight.of(h -> h
+              .fields("description", f -> f
+                  .preTags("<em>").postTags("</em>")
+                  .numberOfFragments(2)
+                  .fragmentSize(150))),
+          null))
+      .build();
+
+================================================================
+TESTING WITH TESTCONTAINERS
+================================================================
+
+  @SpringBootTest
+  @Testcontainers
+  class ProductSearchServiceTest {
+
+      @Container
+      static ElasticsearchContainer esContainer =
+          new ElasticsearchContainer(
+              DockerImageName.parse("docker.elastic.co/elasticsearch/elasticsearch:8.13.0"))
+          .withEnv("discovery.type", "single-node")
+          .withEnv("xpack.security.enabled", "false");
+
+      @DynamicPropertySource
+      static void esProperties(DynamicPropertyRegistry registry) {
+          registry.add("spring.elasticsearch.uris", esContainer::getHttpHostAddress);
+      }
+
+      @Autowired
+      private ProductSearchService searchService;
+
+      @Autowired
+      private ProductSearchRepository repo;
+
+      @BeforeEach
+      void setUp() {
+          repo.deleteAll();
+          repo.saveAll(List.of(
+              buildDoc("1", "Wireless Headphones", "electronics", 79.99, true),
+              buildDoc("2", "Bluetooth Speaker",  "electronics", 49.99, true),
+              buildDoc("3", "USB-C Cable",         "accessories", 9.99, true)
+          ));
+          // ES is near-real-time: wait for index refresh
+          // Use index refresh=true on save, or add a small sleep in tests
+      }
+
+      @Test
+      void search_byKeywordAndCategory_returnsMatchingDocuments() {
+          var hits = searchService.search("wireless", "electronics", 100.0, 0);
+          assertThat(hits.getTotalHits()).isEqualTo(1);
+          assertThat(hits.getSearchHit(0).getContent().getName())
+              .isEqualTo("Wireless Headphones");
+      }
+
+      @Test
+      void search_fuzzy_toleratesTypos() {
+          var hits = searchService.fuzzySearch("headphonse"); // typo
+          assertThat(hits.getTotalHits()).isGreaterThan(0);
+      }
+  }
+
+  Note: ES is near-real-time (default 1s refresh interval).
+  In tests: either set refresh=true on index operations OR
+  call esOps.indexOps(ProductDocument.class).refresh() after saving.
+
+================================================================
+INTERVIEW Q&A
+================================================================
+
+  Q: "How do you use Elasticsearch in Spring Boot?"
+  A: "We use spring-boot-starter-data-elasticsearch. For simple CRUD and
+     derived queries we use ElasticsearchRepository. For custom bool queries,
+     fuzzy search, and aggregations we use ElasticsearchOperations with
+     NativeQuery — the Java API client's fluent builder. Entities are annotated
+     with @Document and @Field to control the mapping."
+
+  Q: "How do you keep Elasticsearch in sync with your PostgreSQL database?"
+  A: "Three options depending on team maturity:
+     1. Dual-write: app writes to DB then publishes ES update in a
+        @TransactionalEventListener(AFTER_COMMIT) — simple but ES failures
+        must be retried manually.
+     2. Kafka pipeline: DB write publishes an event to Kafka; a dedicated
+        consumer syncs ES — decoupled and retryable, but eventual consistency.
+     3. Debezium CDC: captures PostgreSQL WAL changes automatically and
+        streams them to ES via Kafka Connect — zero application code, most
+        operationally complex.
+     On Minerva we used the Kafka pipeline for report data and dual-write
+     for config changes."
+
+  Q: "What is the difference between ElasticsearchRepository and ElasticsearchOperations?"
+  A: "Repository gives you Spring Data derived query methods — fast to write
+     but limited to simple field-equality and range queries. ElasticsearchOperations
+     gives you direct access to the full Elasticsearch query DSL via NativeQuery —
+     required for bool queries, fuzzy, aggregations, highlighting, and search_after
+     pagination. Think of it like JpaRepository vs. EntityManager in JPA."
+
+  Q: "How do you handle the near-real-time nature of Elasticsearch in tests?"
+  A: "By default ES refreshes its index every 1 second, so a document saved
+     won't be searchable immediately. In tests we either force a refresh via
+     esOps.indexOps(clazz).refresh() after writes, or configure the test index
+     with refresh_interval=-1 and refresh manually. Testcontainers spins up a
+     real ES instance so the behavior is identical to production."
+
+  Q: "How do you implement autocomplete / search-as-you-type?"
+  A: "Two approaches:
+     1. completion suggester: ES's native suggest API — optimized for speed,
+        returns completions as you type from a dedicated 'suggest' field.
+     2. search_as_you_type field type: auto-creates edge n-gram subfields,
+        allowing prefix matching across whole terms. Simpler to set up than
+        the completion suggester.
+     For prefix-only matching on keywords, a simple prefix query on a
+     keyword field also works at smaller scale."
+
+  Q: "What is the risk of deleting and recreating an ES index in production?"
+  A: "Zero-downtime reindex: create a new index with updated mappings,
+     bulk-reindex from the old index using the _reindex API, then atomically
+     switch an alias from the old index to the new one. Application code
+     always uses the alias, never the concrete index name. This way there's
+     no downtime and you can roll back by flipping the alias back."
+
+================================================================
+QUICK REFERENCE: WHEN TO USE WHAT
+================================================================
+
+  Use Case                         | Tool
+  ---------------------------------|------------------------------------------
+  Simple CRUD by field value       | ElasticsearchRepository derived method
+  Full-text + filters + pagination | ElasticsearchOperations + NativeQuery bool
+  Faceted search (counts)          | Aggregations via ElasticsearchOperations
+  Typo tolerance                   | fuzzy query or search_as_you_type
+  Highlighting matched terms       | HighlightQuery on ElasticsearchOperations
+  Deep pagination                  | search_after (not from/size beyond 10k)
+  Initial bulk load                | saveAll() or bulkIndex()
+  Keeping ES in sync               | @TransactionalEventListener / Kafka / Debezium
+  Integration tests                | Testcontainers + ElasticsearchContainer
+
+================================================================

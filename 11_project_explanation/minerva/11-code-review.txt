@@ -1,0 +1,450 @@
+11 — CODE REVIEW: WHAT TO SAY IN INTERVIEWS
+============================================
+
+What to use this for: Any question about "How do you do code review?", "What do you look for in a PR?",
+"Tell me about your engineering practices", "How do you maintain code quality?"
+
+==============================================================
+THE OPENING PITCH (Say This First)
+==============================================================
+
+"Code review was a core part of our engineering culture on Minerva. As tech lead, I reviewed every
+PR that went to main. We treated code review not just as a bug-catching exercise, but as a knowledge
+transfer and architecture alignment tool — especially important because we had a junior engineer and
+a mid-level engineer who needed to internalize the config-driven model quickly.
+
+We had a tiered review process:
+  - Junior engineer PRs → I reviewed every line
+  - Mid-level engineer PRs → I reviewed architecture + security + data layer; they self-reviewed style
+  - My own PRs → the mid-level engineer reviewed, I reviewed my own before requesting
+
+Every PR had to pass GitLab CI (build, unit tests, integration tests, SonarQube gate) before I'd
+even open it for review."
+
+==============================================================
+WHAT I ACTUALLY CHECK IN A CODE REVIEW (The Checklist)
+==============================================================
+
+I organize code review into 6 layers. Mention 2-3 of these in an interview depending on
+what they're asking about.
+
+---
+
+LAYER 1: CORRECTNESS & LOGIC
+------------------------------
+
+What to say:
+"First pass is always — does this code do what it says it does?
+  - Does it handle the happy path correctly?
+  - What happens on null inputs, empty collections, boundary values?
+  - Are conditionals correct — right operator, right precedence?
+  - Is error propagation handled or swallowed?"
+
+Minerva-specific examples you lived:
+  - SQL parameter binding: did they use named parameters (:filterValue) not string concat?
+    If a junior wrote: "SELECT * FROM coverage WHERE state = '" + userInput + "'"
+    → that's a blocker. SQL injection through config layer was our #1 security risk.
+  
+  - Tenant isolation: every query must include AND tenant_id = :tenantId
+    Forgot this once in the Report Service → data from other tenants could appear in reports.
+    → blocker, security issue.
+
+  - Cache key uniqueness: if two different users' queries produce the same Redis key
+    → cache poisoning. Key must include tenantId + dashboardId + filterHash.
+
+---
+
+LAYER 2: SECURITY
+------------------------------
+
+What to say:
+"Security review is non-negotiable on every PR. I look for:
+  - Authentication: is the endpoint behind @PreAuthorize or Spring Security config?
+  - Authorization: does it check the right role AND the right tenant?
+  - Input validation: is user input validated before it reaches the DB or a query engine?
+  - Secrets: no hardcoded credentials, no API keys in code — checked by GitLab Secret Detection
+  - Sensitive data in logs: no PII, no tokens logged at INFO/DEBUG level"
+
+Minerva-specific examples:
+  - RBAC on every endpoint:
+    @PreAuthorize("hasRole('CONFIGURATOR') and @tenantService.belongsToTenant(authentication, #tenantId)")
+    → if missing the tenantId check, a CONFIGURATOR from Tenant A could modify Tenant B's dashboards
+
+  - WebSocket subscribe validation:
+    Found a bug where STOMP SUBSCRIBE frames weren't checking tenant_id — any authenticated
+    user could subscribe to any dashboard's notification channel.
+    Fixed with a ChannelInterceptor that validates JWT on every SUBSCRIBE frame.
+    → That came out of a code review / security audit, not a user report.
+
+  - JWT in logs:
+    A junior engineer logged the full Authorization header for debugging.
+    JWT is a bearer credential — logging it means anyone with log access could replay the token.
+    → Immediate blocker, reverted and taught the pattern: log only the sub (email) and jti (token ID).
+
+---
+
+LAYER 3: DESIGN & ARCHITECTURE
+------------------------------
+
+What to say:
+"I look at whether the change fits our architecture — not just whether it works.
+  - Single Responsibility: does this class/method do one thing?
+  - Right layer: is business logic in the service layer, not the controller or repo?
+  - Config-driven vs. hardcoded: in Minerva, if something could be driven by config, it should be
+  - Coupling: is this change adding a dependency that's going to be hard to test or change later?
+  - API contract: does this change break any existing consumers?"
+
+Minerva-specific examples:
+  - Filter rendering in React:
+    Junior engineer added a special case: if (filter.type === 'NETWORK_ELEMENT') { ... }
+    → hardcoded dashboard-specific logic in the generic component.
+    → Should be: the filter config has a renderHint field; the component reads that.
+    → Config-driven model is the law. Hardcoding is always a PR comment.
+
+  - Service coupling:
+    Mid-level engineer made Report Service call Dashboard Service's internal DB directly
+    (shared datasource). That couples the two services to the same DB schema.
+    → Correct pattern: Report Service calls Dashboard Service's REST API.
+    → If Dashboard Service changes its schema, Report Service should not care.
+
+  - God method:
+    A method that validates SQL, checks RBAC, calls BigQuery dry-run, and updates the audit log —
+    all in one method. Split it: SqlValidator, RbacChecker, BigQueryDryRunService, AuditService.
+    Each tested independently.
+
+---
+
+LAYER 4: TESTABILITY & TEST QUALITY
+------------------------------
+
+What to say:
+"I check that the PR includes tests — not just that tests exist, but that they test the right things.
+  - Unit tests cover the business logic paths (happy path + error cases)
+  - Integration tests cover the real wiring (Spring context + DB)
+  - Test names describe the scenario: 'shouldReturnCachedResult_whenRedisHit' not 'testQuery1'
+  - No 'test always passes' tests: tests that mock everything including the thing being tested"
+
+Minerva-specific examples:
+  - SQL validation unit tests:
+    We tested the SqlValidationService with ~20 parameterized test cases:
+      - valid SELECT ✅
+      - SELECT with subquery ✅
+      - INSERT → rejected ❌
+      - DROP TABLE → rejected ❌
+      - SELECT with UNION (allowed, but must still be SELECT) ✅
+      - Unbound parameter (:missingFilter) → rejected ❌
+    If a PR added a new SQL feature but didn't add a test case → PR comment.
+
+  - Tenant isolation tests:
+    Every service had an integration test: 'tenantA_cannotAccess_tenantB_data'
+    If a PR touched the data layer and this test didn't exist or was deleted → blocker.
+
+  - Mocking too much:
+    Junior engineer mocked the entire BigQueryService in a test of QueryExecutionService.
+    The test was essentially testing that mocks return mocked values — zero value.
+    Correct: use @SpringBootTest with Testcontainers (PostgreSQL) and a BigQuery mock server
+    that simulates real responses.
+
+---
+
+LAYER 5: PERFORMANCE & RESOURCE MANAGEMENT
+------------------------------
+
+What to say:
+"I look for patterns that work fine in development but fail at scale:
+  - N+1 queries: fetching a list of dashboards, then looping and calling DB per dashboard
+  - Missing cache: result that should be cached goes to DB every time
+  - Unbounded queries: SELECT * with no LIMIT in an API that paginates client-side
+  - Connection leaks: streams/connections not closed in try-with-resources
+  - Thread safety: shared mutable state accessed from multiple threads"
+
+Minerva-specific examples:
+  - N+1 in Dashboard Service:
+    Loading dashboards → for each dashboard, fetch its filters → separate DB call per dashboard.
+    50 dashboards = 51 DB calls. Fixed with JOIN and result mapping.
+
+  - BigQuery scan cost:
+    A CONFIGURATOR wrote a query without a partition filter.
+    SQL dry-run estimated 200GB scan = $1 per execution.
+    With 200 users × multiple loads = potentially thousands of dollars per day.
+    Code review on the SQL validation service caught this:
+    "We need to check estimated bytes and warn/block if > threshold (configurable, default 10GB)."
+
+  - Redis TTL not set:
+    A junior added Redis caching but forgot to set TTL → key never expires → memory leak.
+    Standard pattern: redisTemplate.opsForValue().set(key, value, Duration.ofMinutes(60));
+    If TTL is missing → PR comment with the fix.
+
+  - Streaming large results:
+    Report Service initially loaded entire BigQuery result into memory (List<Row>).
+    500K rows × 10 columns = potentially gigabytes in heap → OOM.
+    Fixed: stream results, write to temp file incrementally, upload to S3 in multipart chunks.
+
+---
+
+LAYER 6: READABILITY & MAINTAINABILITY
+------------------------------
+
+What to say:
+"Code is read 10x more than it's written. I look for:
+  - Naming: does the variable/method name tell you what it does without reading the body?
+  - Comments: comment the WHY, not the WHAT (code shows the what)
+  - Magic numbers/strings: replace with named constants
+  - Dead code: remove it, git history preserves it
+  - Complexity: cyclomatic complexity > 10 → refactor or explain"
+
+Minerva-specific examples:
+  - TenantContext usage:
+    Engineers occasionally forgot to call TenantContext.clear() in a finally block.
+    ThreadLocal context leaks between requests if not cleared.
+    → Standard review point: if you set TenantContext, you must clear it.
+    → We extracted this to a TenantContextFilter that handles set + clear, so engineers
+       didn't need to manage it manually.
+
+  - Constants for role names:
+    String "CONFIGURATOR" scattered across 6 services.
+    → Introduced a shared RoleConstants class in a common library module.
+    If a PR had a hardcoded role string → always a PR comment.
+
+  - Config field naming:
+    Dashboard config JSON fields were inconsistent: 'filterType' vs 'filter_type' vs 'type'.
+    Created a naming convention doc and enforced it in code review.
+
+==============================================================
+HOW CODE REVIEW WORKED DAY-TO-DAY (Process Details)
+==============================================================
+
+If they ask "What was your actual process?"
+
+"Our process:
+
+1. Engineer opens a PR in GitLab against main (or a feature branch for larger features).
+   PR template required:
+   - What does this PR do?
+   - How was it tested?
+   - Any security considerations?
+   - Screenshots for UI changes
+
+2. GitLab CI pipeline runs automatically:
+   - mvn clean verify (unit + integration tests)
+   - SonarQube quality gate (coverage ≥ 80%, no new critical issues)
+   - GitLab Secret Detection (no credentials in code)
+   - Docker build (catches Dockerfile issues early)
+
+3. I review:
+   - I use the 6-layer checklist mentally
+   - I leave inline comments with severity: [BLOCKER] [SUGGESTION] [NITPICK]
+     [BLOCKER] → must fix before merge (security issue, correctness bug, arch violation)
+     [SUGGESTION] → should fix (performance, better pattern)
+     [NITPICK] → minor style / naming (fix if easy, ok to skip with a note)
+
+4. Engineer addresses comments, re-requests review.
+
+5. I approve → engineer merges. On sensitive changes (security, DB schema) I merged myself.
+
+6. Merge to main triggers CD pipeline → staging deployment automatically."
+
+==============================================================
+STAR STORIES: CODE REVIEW SPECIFIC
+==============================================================
+
+STORY A: The SQL Injection Through Config
+
+S: A mid-level engineer built a filter that let CONFIGURATORs write free-text SQL for
+   dropdown options (optionsSql field). The implementation built the query with string
+   concatenation using the user-provided value.
+
+T: Catch this in code review before it merged to main — SQL injection in the config layer
+   was our #1 threat model concern.
+
+A: During PR review, I noticed the pattern:
+     String sql = "SELECT DISTINCT " + filter.getColumnName() + " FROM " + filter.getTableName();
+   This is textbook SQL injection — a CONFIGURATOR could set columnName to
+   "* FROM towers; DROP TABLE dashboards; --"
+   I left a [BLOCKER] comment with:
+   - Why it's dangerous (explained injection vector even though CONFIGURATORs are trusted users)
+   - The correct pattern: whitelist validation for column/table names (regex [a-zA-Z0-9_.]+)
+   - Plus: even trusted users make mistakes — the validation protects against accidents, not just attacks
+   I also added: "Let's add this to our security checklist for any PR touching SQL construction."
+
+R: Engineer fixed within a day. We added "SQL construction must use parameterized queries or
+   whitelisted identifiers" to our PR template's security section. That checklist caught 2 more
+   similar issues in the following 3 months.
+
+---
+
+STORY B: Tenant Isolation Bug Found In Review
+
+S: The Report Service was being extended to support cross-department report sharing
+   (a PLATFORMADMIN feature). The engineer wrote a query that fetched reports without
+   filtering by tenant_id, because PLATFORMADMIN is supposed to see everything.
+
+T: Catch the fact that 'PLATFORMADMIN sees everything' was not yet implemented in the
+   JWT validation layer — the role existed but cross-tenant access wasn't wired up yet.
+
+A: In review, I noticed the missing tenant_id filter and asked:
+   "How does this query know the requesting PLATFORMADMIN's own tenant vs. another tenant's data?"
+   The engineer's answer: "PLATFORMADMINs can see all tenants, so no filter."
+   I pulled up the JWT — PLATFORMADMINs still have a tenant_id claim (they belong to one tenant).
+   The feature needed: if PLATFORMADMIN, fetch all tenants; else filter by tenant_id.
+   But more importantly: cross-tenant queries need an explicit audit log entry (compliance).
+   We hadn't designed that audit flow yet.
+   → Blocked the PR, created a design spike for cross-tenant access pattern first.
+
+R: We designed proper cross-tenant access (explicit tenant param + audit log) in a design
+   doc before coding. The feature shipped 2 sprints later with correct isolation and a full
+   audit trail. The premature implementation would have been a data governance violation.
+
+---
+
+STORY C: Performance Issue Caught Before Production
+
+S: Query Execution Service was adding support for filter dependencies (cascading filters —
+   selecting a state updates the city filter). The implementation fetched options for ALL
+   dependent filters on every parent filter change.
+
+T: Catch that this creates N dependent filter queries on every user interaction — potentially
+   5-10 BigQuery calls per filter click.
+
+A: In review, I traced the execution path:
+   User selects "California" in State filter →
+   Frontend calls /filters/options for each dependent filter →
+   Each call goes to BigQuery (not Redis) because dependent filter options use dynamic SQL →
+   10 filters × 1 BigQuery call = 10 concurrent BigQuery queries per user interaction.
+   With 200 users, this is 2,000 BigQuery calls per second during peak usage.
+   
+   Left [BLOCKER] comment with a design suggestion:
+   - Cache dependent filter options with a composite key: (tenantId, filterId, parentFilterValue)
+   - TTL: 1 hour (options don't change mid-day)
+   - Cache warm-up: pre-compute common parent values during data refresh
+
+R: Engineer implemented the caching strategy. In load testing, the change reduced BigQuery
+   calls for filter interaction by 85%. Added cascading filter caching as a standard pattern
+   to our internal architecture doc.
+
+==============================================================
+HOW TO DISCUSS CODE REVIEW IN BEHAVIORAL QUESTIONS
+==============================================================
+
+Q: "How do you handle disagreements in code review?"
+
+"I separate the technical from the personal. If I leave a [BLOCKER] comment, I always explain
+WHY it's a blocker — not just what to change, but the risk I'm protecting against.
+For architectural disagreements, I prefer to discuss synchronously (Slack call, not async comments)
+because text doesn't carry tone well.
+
+Example: A senior engineer wanted to add a direct DB query to the Dashboard Service from
+the Notification Service — they argued it was simpler than an HTTP call.
+I explained: shared DB coupling means you can't evolve the Dashboard Service schema without
+coordinating with Notification Service. It also bypasses the Dashboard Service's RBAC layer.
+We discussed it on a call. He agreed once he saw the schema evolution argument.
+The rule became: inter-service data access is always via the owning service's API, never direct DB."
+
+---
+
+Q: "What's the most important thing you look for in code review?"
+
+"Security first — specifically tenant isolation and input validation — because the cost of a
+security bug in production is orders of magnitude higher than any other class of bug.
+A performance bug slows users down. A security bug can expose customer data, trigger compliance
+violations, and create legal liability.
+
+After security: correctness at the boundary conditions. The happy path usually works.
+What fails is: null inputs, empty collections, concurrent access, partial failures.
+I always ask: 'What happens if this returns null? What happens if Kafka is down here?'"
+
+---
+
+Q: "What's a code review anti-pattern you've seen?"
+
+"'LGTM' reviews — rubber-stamping without reading. We had this early on when the team was
+under sprint pressure. I raised it in our retrospective.
+Our fix: PR size limits. Any PR > 400 lines of code diff requires splitting into smaller PRs.
+This forces smaller, reviewable units. It also improved PR turnaround time from 2-3 days
+to same-day in most cases.
+
+The second anti-pattern: review comments that say what to do, not why.
+'Use Optional here' → engineer learns nothing, just applies a pattern mechanically.
+'Use Optional here because null return forces callers to do null checks they'll forget —
+Optional makes the emptiness explicit in the type system' → engineer understands the principle."
+
+---
+
+Q: "How do you make sure junior developers improve through code review?"
+
+"Two practices:
+First, I comment differently for junior vs. senior engineers.
+For juniors: [SUGGESTION] 'Have you considered X? Here's why it's better: [explanation]'
+I'm teaching, not just correcting. My goal is that by sprint 6, the junior is thinking
+about these things before I see the PR.
+
+Second, I assign ownership of specific services. Our junior engineer owned the React config
+rendering components. Even though I reviewed, when I left a comment, I'd ask them to explain
+the tradeoff back to me in a reply before I'd accept their fix. That forces understanding, not
+just mechanical fixing.
+
+On Minerva: our junior engineer went from needing line-by-line review to proposing the
+cascading filter feature (depends_on field) independently by sprint 8. That's the goal."
+
+==============================================================
+TOOLS & AUTOMATION WE USED
+==============================================================
+
+If they ask about your tooling:
+
+"We didn't rely on manual review alone. Automation caught the low-hanging fruit:
+
+  - SonarQube: static analysis — code smells, duplicate code, security hotspots (SQL concat, hardcoded passwords)
+  - JaCoCo: code coverage reports in CI — 80% minimum coverage gate, per-module
+  - GitLab Secret Detection: scans commits for credentials before they land in the repo
+  - Checkstyle: enforced code formatting (Google Java Style Guide) — no style debates in review
+  - SpotBugs: bytecode analysis — catches null pointer patterns, thread safety issues
+  - OWASP Dependency Check: CVE scanning of all Maven dependencies on every build
+  - Testcontainers: real DB and Kafka in integration tests — no mocked infrastructure
+
+The principle: if a machine can catch it, let the machine catch it.
+Code review is for the things machines can't catch: design decisions, business logic correctness,
+architectural alignment, security intent."
+
+==============================================================
+CODE REVIEW PHILOSOPHY (The One-Liner)
+==============================================================
+
+If they ask "What's your philosophy on code review?" — give them this:
+
+"Code review is the last gate before production. But more importantly, it's the highest-leverage
+teaching moment in engineering. A comment in a PR teaches a pattern to an engineer who will
+apply it in 100 future PRs. I treat every comment as documentation — not just 'fix this', but
+'here's the principle, here's why it matters, here's how to apply it going forward.'"
+
+==============================================================
+QUICK REFERENCE: WHAT EACH LAYER CATCHES
+==============================================================
+
+| Layer | What It Catches | Minerva Example |
+|-------|----------------|-----------------|
+| Correctness | Logic bugs, null handling, boundary cases | Missing tenant_id in Report query |
+| Security | SQL injection, auth bypass, PII in logs | JWT logged at DEBUG, STOMP subscribe not validated |
+| Design | SRP violations, service coupling, hardcoding | Notification Service reading Dashboard DB directly |
+| Testing | Missing test cases, mocked-too-much tests, bad test names | optionsSql validation had no injection test |
+| Performance | N+1, unbounded queries, missing cache, memory leaks | Cascading filters calling BigQuery per interaction |
+| Readability | Naming, magic strings, missing WHY comments | "CONFIGURATOR" hardcoded across 6 services |
+
+==============================================================
+WHAT TO SAY IF THEY ASK "SHOW ME CODE" (Code Review Scenario)
+==============================================================
+
+If interviewer gives you a code snippet to review, use this structure:
+
+1. Read it fully before commenting (say: "Give me a moment to read the full method.")
+2. Start with correctness (does it work?)
+3. Then security (is it safe?)
+4. Then design (is it right for the architecture?)
+5. Then performance (will it scale?)
+6. Then readability (is it maintainable?)
+
+Say out loud:
+"First thing I notice is [X] — that's a [BLOCKER/SUGGESTION] because [reason].
+Next, I'd ask about [Y] — specifically, what happens when [edge case]?
+From a performance perspective, [Z] could be a problem at scale because [reason].
+Overall, the approach is [solid/needs rethinking] — I'd [approve with comments / request changes]."
