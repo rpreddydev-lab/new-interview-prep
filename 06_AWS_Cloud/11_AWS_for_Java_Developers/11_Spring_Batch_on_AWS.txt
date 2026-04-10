@@ -1,0 +1,398 @@
+================================================================
+AWS FOR JAVA DEVELOPERS — SPRING BATCH ON AWS
+Complete Interview Preparation Guide
+================================================================
+
+1. SPRING BATCH ON AWS — OVERVIEW
+================================================================
+
+  Spring Batch is a framework for large-scale batch processing in Java.
+  On AWS, it can run on multiple compute targets:
+
+  ┌────────────────────┬──────────────────────────────────────────────────────────┐
+  │ Platform           │ Best For                                                 │
+  ├────────────────────┼──────────────────────────────────────────────────────────┤
+  │ AWS Batch          │ Large-scale, variable workloads. Managed compute (EC2,   │
+  │                    │ Fargate, Spot). Pay-per-use. No always-on servers.        │
+  ├────────────────────┼──────────────────────────────────────────────────────────┤
+  │ ECS/Fargate        │ Containerized batch jobs with predictable sizing.         │
+  │                    │ Simpler than AWS Batch for straightforward workloads.     │
+  ├────────────────────┼──────────────────────────────────────────────────────────┤
+  │ Lambda             │ Short jobs < 15 min, event-triggered micro-batches.      │
+  │                    │ NOT recommended for long Spring Batch jobs.              │
+  ├────────────────────┼──────────────────────────────────────────────────────────┤
+  │ EC2 (always-on)    │ Legacy. Predictable load. Not cost-optimal for batch.    │
+  └────────────────────┴──────────────────────────────────────────────────────────┘
+
+  SPRING BATCH CORE CONCEPTS:
+    Job → Steps → (Reader → Processor → Writer)  [chunk-oriented]
+               → Tasklet                         [single-task step]
+
+================================================================
+2. SPRING BATCH ARCHITECTURE
+================================================================
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  JOB                                                                    │
+  │  ┌────────────────────┐    ┌────────────────────┐    ┌───────────────┐ │
+  │  │     Step 1         │───▶│     Step 2         │───▶│    Step 3     │ │
+  │  │ (Chunk-oriented)   │    │ (Chunk-oriented)   │    │  (Tasklet)    │ │
+  │  │                    │    │                    │    │               │ │
+  │  │ Reader → Processor │    │ Reader → Processor │    │ Send report   │ │
+  │  │        → Writer    │    │        → Writer    │    │ email         │ │
+  │  └────────────────────┘    └────────────────────┘    └───────────────┘ │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  JobRepository: Persists job execution state (restart, skip tracking)
+  JobLauncher:   Starts a Job with given JobParameters
+  JobParameters: Identify a unique job instance (e.g., date, file name)
+
+================================================================
+3. COMPLETE EXAMPLE — S3 CSV → PROCESS → RDS (Spring Batch)
+================================================================
+
+  SCENARIO: Nightly job reads a CSV from S3, transforms records, writes to RDS.
+
+  ── POM DEPENDENCIES ─────────────────────────────────────────
+
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-batch</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-jpa</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>software.amazon.awssdk</groupId>
+    <artifactId>s3</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>io.awspring.cloud</groupId>
+    <artifactId>spring-cloud-aws-starter-s3</artifactId>
+  </dependency>
+
+  ── JOB CONFIGURATION ─────────────────────────────────────────
+
+  @Configuration
+  @EnableBatchProcessing
+  public class OrderImportJobConfig {
+
+      @Bean
+      public Job orderImportJob(JobRepository jobRepository,
+                                 Step readAndProcessStep,
+                                 Step reportStep) {
+          return new JobBuilder("orderImportJob", jobRepository)
+              .incrementer(new RunIdIncrementer())
+              .start(readAndProcessStep)
+              .next(reportStep)
+              .build();
+      }
+
+      @Bean
+      @StepScope
+      public FlatFileItemReader<RawOrder> s3CsvReader(
+              @Value("#{jobParameters['s3Key']}") String s3Key,
+              S3Client s3Client) {
+
+          // Download file from S3 to temp location for FlatFileItemReader
+          Path tempFile = downloadFromS3(s3Client, "my-batch-bucket", s3Key);
+
+          return new FlatFileItemReaderBuilder<RawOrder>()
+              .name("orderReader")
+              .resource(new FileSystemResource(tempFile))
+              .delimited()
+              .names("orderId", "customerId", "amount", "date")
+              .targetType(RawOrder.class)
+              .linesToSkip(1)          // Skip header row
+              .build();
+      }
+
+      @Bean
+      public ItemProcessor<RawOrder, Order> orderProcessor() {
+          return rawOrder -> {
+              if (rawOrder.getAmount() <= 0) {
+                  return null;  // null → skip this item (not written)
+              }
+              return Order.builder()
+                  .orderId(rawOrder.getOrderId())
+                  .customerId(rawOrder.getCustomerId())
+                  .amount(rawOrder.getAmount())
+                  .processedAt(LocalDateTime.now())
+                  .status("IMPORTED")
+                  .build();
+          };
+      }
+
+      @Bean
+      public JpaItemWriter<Order> orderWriter(EntityManagerFactory entityManagerFactory) {
+          JpaItemWriter<Order> writer = new JpaItemWriter<>();
+          writer.setEntityManagerFactory(entityManagerFactory);
+          return writer;
+      }
+
+      @Bean
+      public Step readAndProcessStep(JobRepository jobRepository,
+                                      PlatformTransactionManager transactionManager,
+                                      FlatFileItemReader<RawOrder> reader,
+                                      ItemProcessor<RawOrder, Order> processor,
+                                      JpaItemWriter<Order> writer) {
+          return new StepBuilder("readAndProcessStep", jobRepository)
+              .<RawOrder, Order>chunk(100, transactionManager)  // Process 100 at a time
+              .reader(reader)
+              .processor(processor)
+              .writer(writer)
+              .faultTolerant()
+              .skip(ValidationException.class)      // Skip bad records
+              .skipLimit(50)                         // But no more than 50 skips
+              .retry(DeadlockLoserDataAccessException.class)
+              .retryLimit(3)
+              .listener(new ItemReadListener<>() {
+                  @Override
+                  public void onReadError(Exception ex) {
+                      log.error("Read error: {}", ex.getMessage());
+                  }
+              })
+              .build();
+      }
+
+      @Bean
+      public Step reportStep(JobRepository jobRepository,
+                              PlatformTransactionManager transactionManager) {
+          return new StepBuilder("reportStep", jobRepository)
+              .tasklet((contribution, chunkContext) -> {
+                  JobExecution jobExecution = chunkContext.getStepContext().getStepExecution().getJobExecution();
+                  long readCount = jobExecution.getStepExecutions().stream()
+                      .filter(s -> s.getStepName().equals("readAndProcessStep"))
+                      .mapToLong(StepExecution::getWriteCount).sum();
+                  emailService.sendReport("Imported " + readCount + " orders");
+                  return RepeatStatus.FINISHED;
+              }, transactionManager)
+              .build();
+      }
+
+      private Path downloadFromS3(S3Client s3, String bucket, String key) {
+          try {
+              Path temp = Files.createTempFile("batch-", ".csv");
+              s3.getObject(GetObjectRequest.builder().bucket(bucket).key(key).build(),
+                           ResponseTransformer.toFile(temp));
+              return temp;
+          } catch (IOException e) {
+              throw new RuntimeException("Failed to download from S3: " + key, e);
+          }
+      }
+  }
+
+================================================================
+4. RUNNING ON AWS BATCH (Managed Compute)
+================================================================
+
+  AWS BATCH COMPONENTS:
+  ┌──────────────────────┬──────────────────────────────────────────────────────┐
+  │ Component            │ Description                                          │
+  ├──────────────────────┼──────────────────────────────────────────────────────┤
+  │ Compute Environment  │ Managed or unmanaged. EC2, Fargate, or Spot.         │
+  │ Job Queue            │ Receives submitted jobs, assigns to compute env.     │
+  │ Job Definition       │ Blueprint: Docker image, vCPUs, memory, env vars.   │
+  │ Job                  │ Single execution of a Job Definition.                │
+  └──────────────────────┴──────────────────────────────────────────────────────┘
+
+  PATTERN:
+  EventBridge (schedule/event) → AWS Batch Job → Spring Boot JAR in Docker
+
+  // Spring Boot batch app entry point (for AWS Batch):
+  @SpringBootApplication
+  @EnableBatchProcessing
+  public class BatchApplication {
+  
+      public static void main(String[] args) {
+          // AWS Batch passes job parameters as environment variables
+          // or command-line arguments
+          
+          System.exit(SpringApplication.exit(
+              SpringApplication.run(BatchApplication.class, args)));
+          // exit() ensures container exits with proper code (0=success, non-0=failure)
+          // AWS Batch uses exit code to determine job success/failure
+      }
+  }
+
+  // application.yml — JobRepository backed by RDS (not in-memory):
+  spring:
+    datasource:
+      url: jdbc:postgresql://${DB_HOST}:5432/batchdb
+      username: ${DB_USER}
+      password: ${DB_PASSWORD}
+    batch:
+      jdbc:
+        initialize-schema: always    # Creates Spring Batch metadata tables
+      job:
+        enabled: false               # Don't auto-run — AWS Batch controls execution
+
+  // Pass job parameters via environment variables:
+  @Bean
+  public ApplicationRunner jobRunner(JobLauncher jobLauncher, Job orderImportJob) {
+      return args -> {
+          String s3Key = System.getenv("S3_INPUT_KEY");
+          String runDate = System.getenv("RUN_DATE");
+          
+          JobParameters params = new JobParametersBuilder()
+              .addString("s3Key", s3Key)
+              .addString("runDate", runDate)
+              .addLong("timestamp", System.currentTimeMillis())  // Ensures uniqueness
+              .toJobParameters();
+          
+          JobExecution execution = jobLauncher.run(orderImportJob, params);
+          if (execution.getStatus() == BatchStatus.FAILED) {
+              System.exit(1);   // Signal failure to AWS Batch
+          }
+      };
+  }
+
+================================================================
+5. RUNNING ON ECS/FARGATE (Containerized)
+================================================================
+
+  PATTERN: EventBridge Scheduler → ECS RunTask (Fargate) → Spring Batch Job
+
+  // Trigger from EventBridge:
+  Target:
+    Arn: arn:aws:ecs:us-east-1:123456789:cluster/batch-cluster
+    RoleArn: arn:aws:iam::123456789:role/EventBridgeECSRole
+    EcsParameters:
+      TaskDefinitionArn: arn:aws:ecs:us-east-1:123456789:task-definition/order-import:5
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [subnet-xxx]
+          SecurityGroups: [sg-xxx]
+      Overrides:
+        ContainerOverrides:
+          - Name: batch-container
+            Environment:
+              - Name: S3_INPUT_KEY
+                Value: "orders/2026-04-09/orders.csv"
+
+  TRIGGERING ECS TASK FROM JAVA (SDK v2):
+
+  EcsClient ecs = EcsClient.create();
+
+  ecs.runTask(RunTaskRequest.builder()
+      .cluster("batch-cluster")
+      .taskDefinition("order-import:5")
+      .launchType(LaunchType.FARGATE)
+      .networkConfiguration(NetworkConfiguration.builder()
+          .awsvpcConfiguration(AwsVpcConfiguration.builder()
+              .subnets("subnet-xxx")
+              .securityGroups("sg-xxx")
+              .assignPublicIp(AssignPublicIp.DISABLED)
+              .build())
+          .build())
+      .overrides(TaskOverride.builder()
+          .containerOverrides(ContainerOverride.builder()
+              .name("batch-container")
+              .environment(KeyValuePair.builder()
+                  .name("S3_INPUT_KEY").value(s3Key).build())
+              .build())
+          .build())
+      .build());
+
+================================================================
+6. PARTITIONED (PARALLEL) BATCH JOBS ON AWS
+================================================================
+
+  Partitioning: Split large dataset into chunks processed in parallel.
+
+  // Partition by date range, customer segment, or file prefix:
+  @Bean
+  public Partitioner orderPartitioner(S3Client s3Client) {
+      return gridSize -> {
+          // List S3 files and create a partition for each
+          List<String> files = listS3Files(s3Client, "orders/2026-04-09/");
+          Map<String, ExecutionContext> partitions = new HashMap<>();
+          
+          for (int i = 0; i < files.size(); i++) {
+              ExecutionContext context = new ExecutionContext();
+              context.putString("s3Key", files.get(i));
+              context.putInt("partition", i);
+              partitions.put("partition" + i, context);
+          }
+          return partitions;
+      };
+  }
+
+  // Remote partitioning on AWS: Master Lambda/ECS triggers Worker ECS tasks
+  // Each worker processes one partition independently
+
+================================================================
+7. JOBREPOSITORY — PERSISTENCE ON AWS
+================================================================
+
+  By default, Spring Batch JobRepository uses in-memory H2.
+  For AWS, persist to RDS (MySQL/PostgreSQL) for:
+  - Job restart capability (resume failed jobs from last checkpoint)
+  - Multi-instance coordination (only one instance runs a given JobInstance)
+  - Audit trail of all executions
+
+  // RDS JobRepository with auto-schema creation:
+  spring:
+    batch:
+      jdbc:
+        initialize-schema: always   # Creates BATCH_JOB_INSTANCE, BATCH_JOB_EXECUTION, etc.
+
+  SPRING BATCH METADATA TABLES:
+    BATCH_JOB_INSTANCE      — unique combination of Job + JobParameters
+    BATCH_JOB_EXECUTION     — each run of a JobInstance
+    BATCH_JOB_EXECUTION_PARAMS — parameters for each execution
+    BATCH_STEP_EXECUTION    — per-step metrics (read/write/skip counts)
+
+================================================================
+8. INTERVIEW QUESTIONS
+================================================================
+
+Q: How do you run Spring Batch on AWS? Which platform do you choose?
+
+A: Three main options:
+   1. AWS Batch: best for variable workloads — manages compute (EC2/Fargate/Spot) 
+      automatically. Pay-per-use. Spring Boot app runs in Docker, AWS Batch 
+      controls scheduling and scaling. Good for irregular, large-scale jobs.
+   2. ECS/Fargate: containerized Spring Batch. Use when you need predictable 
+      sizing and simpler setup than AWS Batch. Triggered by EventBridge scheduler.
+   3. Lambda: only for very short micro-batch jobs (< 15 min). Not suitable for 
+      large Spring Batch jobs due to the 15-minute timeout.
+   
+   For persistence: always use RDS as JobRepository (not in-memory H2) to enable 
+   job restartability and prevent duplicate runs.
+
+---
+
+Q: How does Spring Batch handle failures and restarts?
+
+A: Spring Batch tracks job execution state in the JobRepository (database). 
+   If a job fails mid-way, you can restart it — Spring Batch resumes from the 
+   last successful checkpoint (step or chunk boundary), not from the beginning. 
+   At the step level: configure skip (skip bad records up to a limit) and retry 
+   (retry transient errors like deadlocks). On AWS, if an ECS task or AWS Batch 
+   job fails, restart with the same JobParameters — Spring Batch detects the 
+   failed JobExecution and resumes it.
+
+---
+
+Q: What is chunk-oriented processing and what chunk size do you use?
+
+A: Chunk-oriented processing reads N items, processes them, and writes them 
+   in one transaction. If the write fails, only that chunk is rolled back.
+   Typical chunk sizes: 50–500 depending on record size and DB write cost.
+   Too small: too many transactions (slow). Too large: long-running transactions, 
+   risk of timeout and large rollback on failure. On AWS with RDS: 100–200 is 
+   a common sweet spot. Always tune with load testing against your actual DB.
+
+---
+
+Q: How do you trigger a Spring Batch job from an S3 event?
+
+A: S3 → EventBridge → (Lambda or AWS Batch/ECS RunTask). 
+   Option A: S3 event → EventBridge → Lambda → launch ECS RunTask with S3 key 
+   as environment variable. Spring Batch job reads from S3 using the key.
+   Option B: S3 event → EventBridge → AWS Batch SubmitJob with the S3 key as 
+   a job parameter. Both patterns decouple the trigger from the batch execution 
+   and allow the job to access the specific file without hardcoding paths.

@@ -1,0 +1,557 @@
+================================================================================
+DOMAIN-DRIVEN DESIGN (DDD) — DEEP DIVE FOR MICROSERVICES
+================================================================================
+
+WHAT IS DDD?
+-------------
+Domain-Driven Design is a software design approach by Eric Evans ("DDD Blue Book",
+2003) that focuses on modeling software around the BUSINESS DOMAIN, not the
+technology. The domain model becomes the heart of the system.
+
+Key principle: The software should speak the same language as the business
+               (Ubiquitous Language).
+
+WHY DDD FOR MICROSERVICES?
+  DDD is the primary tool for answering: "How do I decompose this into services?"
+  Bounded Contexts naturally map to microservices.
+
+────────────────────────────────────────────────────────────────────────────────
+
+UBIQUITOUS LANGUAGE
+====================
+A shared language between developers and domain experts, used consistently
+in code, conversations, and documentation.
+
+Problem:
+  Business says "customer". Sales team calls them "lead". Billing calls them "client".
+  Order team calls them "buyer". Each team has their own model — confusion ensues.
+
+Solution:
+  Define a precise vocabulary per Bounded Context.
+  "Customer" in Sales Context means: person interested in products.
+  "Client" in Billing Context means: entity with a billing account.
+  Code must match: class Customer (not class User or class Person).
+
+  Bad: class UserAccount, class PersonRecord, class ClientEntity
+  Good: class Customer (in the CustomerContext)
+       class Client (in the BillingContext)
+
+────────────────────────────────────────────────────────────────────────────────
+
+BOUNDED CONTEXT
+================
+A Bounded Context is a explicit boundary within which a domain model applies
+consistently. Each Bounded Context:
+  - Has its own Ubiquitous Language
+  - Has its own model for shared concepts (Customer, Order, etc.)
+  - Is owned by one team
+  - Maps (approximately) to one microservice
+
+E-COMMERCE BOUNDED CONTEXTS:
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  Sales Context        │  Fulfillment Context  │  Billing Context     │
+  │  ─────────────────    │  ──────────────────   │  ──────────────────  │
+  │  Customer             │  Shipment             │  Client              │
+  │  Product (catalog)    │  Package              │  Invoice             │
+  │  Order (intent)       │  Order (to ship)      │  Payment             │
+  │  Cart                 │  PickList             │  Receipt             │
+  │                       │  Warehouse            │                      │
+  ├──────────────────────────────────────────────────────────────────────┤
+  │  Inventory Context    │  Notification Context │  Analytics Context   │
+  │  ─────────────────    │  ──────────────────   │  ──────────────────  │
+  │  Product (stock unit) │  Message              │  Event               │
+  │  StockLevel           │  Template             │  Metric              │
+  │  Reservation          │  Channel              │  Report              │
+  └──────────────────────────────────────────────────────────────────────┘
+
+CRITICAL INSIGHT: "Order" has DIFFERENT MEANINGS in different contexts.
+  Sales:       Order = customer's intent to purchase
+  Fulfillment: Order = list of items to ship
+  Billing:     Order = financial transaction record
+  Never try to create one "Order" class that works for all — it becomes bloated.
+
+────────────────────────────────────────────────────────────────────────────────
+
+ENTITIES
+=========
+An Entity is an object with a unique identity that persists over time.
+Identity defines it, not its attributes.
+
+  public class Order {
+    private final OrderId id;           // Identity — never changes
+    private CustomerId customerId;
+    private OrderStatus status;         // Can change over time
+    private List<OrderItem> items;
+    private Money totalAmount;
+
+    // Identity-based equality
+    @Override
+    public boolean equals(Object other) {
+      if (!(other instanceof Order order)) return false;
+      return this.id.equals(order.id);   // Only ID matters for equality
+    }
+  }
+
+  public class Customer {
+    private final CustomerId id;        // UUID or domain-specific ID
+    private String name;                // Can change (name change)
+    private Email email;                // Can change
+    private Address shippingAddress;    // Can change
+
+    @Override
+    public boolean equals(Object other) {
+      if (!(other instanceof Customer c)) return false;
+      return this.id.equals(c.id);
+    }
+  }
+
+TWO CUSTOMERS with different IDs are DIFFERENT even if same name.
+SAME CUSTOMER remains SAME even after name change (same ID).
+
+────────────────────────────────────────────────────────────────────────────────
+
+VALUE OBJECTS
+==============
+A Value Object has NO identity. It is defined entirely by its attributes.
+Two Value Objects with the same attributes are EQUAL (like numbers).
+Value Objects are IMMUTABLE.
+
+  // Money — a classic Value Object
+  public record Money(BigDecimal amount, Currency currency) {
+    public Money {
+      Objects.requireNonNull(amount);
+      Objects.requireNonNull(currency);
+      if (amount.compareTo(BigDecimal.ZERO) < 0)
+        throw new IllegalArgumentException("Money cannot be negative");
+    }
+
+    public Money add(Money other) {
+      if (!this.currency.equals(other.currency))
+        throw new IllegalArgumentException("Cannot add different currencies");
+      return new Money(this.amount.add(other.amount), this.currency);
+    }
+
+    public Money multiply(int quantity) {
+      return new Money(this.amount.multiply(BigDecimal.valueOf(quantity)), this.currency);
+    }
+  }
+
+  // Email — Value Object
+  public record Email(String value) {
+    public Email {
+      if (!value.matches("^[A-Za-z0-9+_.-]+@(.+)$"))
+        throw new IllegalArgumentException("Invalid email: " + value);
+    }
+  }
+
+  // Address — Value Object
+  public record Address(String street, String city, String state, String zipCode, String country) {}
+
+  // OrderId — strongly typed ID (Value Object) instead of raw Long/String
+  public record OrderId(UUID value) {
+    public static OrderId generate() { return new OrderId(UUID.randomUUID()); }
+    public static OrderId of(String id) { return new OrderId(UUID.fromString(id)); }
+    @Override public String toString() { return value.toString(); }
+  }
+
+WHY STRONGLY TYPED IDs?
+  void ship(Long orderId, Long customerId) → can accidentally swap args: ship(customerId, orderId)
+  void ship(OrderId orderId, CustomerId customerId) → compiler prevents swap
+
+VALUE OBJECTS vs ENTITIES:
+  Entity:        Has identity (OrderId), mutable over time
+  Value Object:  No identity, defined by value, IMMUTABLE
+  Rule:          When in doubt, prefer Value Objects — they're simpler, thread-safe
+
+────────────────────────────────────────────────────────────────────────────────
+
+AGGREGATES
+===========
+An Aggregate is a cluster of Entities and Value Objects treated as a SINGLE UNIT
+for data changes. Every Aggregate has a ROOT ENTITY (Aggregate Root).
+
+Rules:
+  1. External code can only reference the Aggregate ROOT (not internal entities)
+  2. All changes go through the Aggregate Root
+  3. The Aggregate Root enforces invariants (business rules)
+  4. One transaction = one Aggregate (never span transactions across aggregates)
+
+ORDER AGGREGATE EXAMPLE:
+
+  // Aggregate Root
+  public class Order {
+    private final OrderId id;
+    private CustomerId customerId;
+    private OrderStatus status;
+    private final List<OrderItem> items;  // Part of the aggregate
+    private Money totalAmount;
+    private final List<DomainEvent> domainEvents = new ArrayList<>();
+
+    // Factory method — encapsulates creation invariants
+    public static Order create(CustomerId customerId, List<OrderItem> items) {
+      if (items.isEmpty()) throw new InvalidOrderException("Order must have items");
+      Order order = new Order(OrderId.generate(), customerId, items);
+      order.domainEvents.add(new OrderCreatedEvent(order.id, customerId, items));
+      return order;
+    }
+
+    // Business operations — enforces invariants
+    public void confirm() {
+      if (status != OrderStatus.PENDING)
+        throw new InvalidOrderStatusException("Can only confirm PENDING orders");
+      this.status = OrderStatus.CONFIRMED;
+      domainEvents.add(new OrderConfirmedEvent(this.id));
+    }
+
+    public void cancel(String reason) {
+      if (status == OrderStatus.SHIPPED || status == OrderStatus.DELIVERED)
+        throw new InvalidOrderStatusException("Cannot cancel SHIPPED/DELIVERED orders");
+      this.status = OrderStatus.CANCELLED;
+      domainEvents.add(new OrderCancelledEvent(this.id, reason));
+    }
+
+    public void addItem(OrderItem item) {
+      if (status != OrderStatus.PENDING)
+        throw new InvalidOrderStatusException("Can only add items to PENDING orders");
+      this.items.add(item);
+      recalculateTotal();
+    }
+
+    // External code accesses items through the root, not directly
+    public List<OrderItem> getItems() { return Collections.unmodifiableList(items); }
+
+    public List<DomainEvent> getDomainEvents() {
+      return Collections.unmodifiableList(domainEvents);
+    }
+
+    public void clearDomainEvents() { domainEvents.clear(); }
+
+    private void recalculateTotal() {
+      this.totalAmount = items.stream()
+          .map(item -> item.getUnitPrice().multiply(item.getQuantity()))
+          .reduce(Money.ZERO_USD, Money::add);
+    }
+  }
+
+  // OrderItem — Entity within the Order aggregate
+  public class OrderItem {
+    private final OrderItemId id;
+    private final ProductId productId;
+    private int quantity;
+    private final Money unitPrice;
+    // No public setter — changed only through Order.addItem()
+  }
+
+  // External code CANNOT do: order.getItems().get(0).setQuantity(5)
+  // Must go through: order.updateItemQuantity(itemId, newQuantity)
+
+AGGREGATE SIZE:
+  Small aggregates = better concurrency (fewer locks)
+  WRONG: Order contains full Customer and full Products → giant aggregate, slow
+  RIGHT: Order contains CustomerId (reference), ProductId (reference) — not full objects
+
+────────────────────────────────────────────────────────────────────────────────
+
+DOMAIN EVENTS
+==============
+Domain Events represent something significant that happened in the domain.
+Named in past tense: OrderCreated, PaymentProcessed, InventoryReserved.
+
+  // Base Domain Event
+  public abstract class DomainEvent {
+    private final String eventId = UUID.randomUUID().toString();
+    private final Instant occurredAt = Instant.now();
+    public String getEventId() { return eventId; }
+    public Instant getOccurredAt() { return occurredAt; }
+  }
+
+  public class OrderCreatedEvent extends DomainEvent {
+    private final OrderId orderId;
+    private final CustomerId customerId;
+    private final List<OrderItem> items;
+    private final Money totalAmount;
+    // constructor + getters
+  }
+
+PUBLISHING DOMAIN EVENTS WITH SPRING:
+
+  @Service
+  @RequiredArgsConstructor
+  public class OrderApplicationService {
+
+    private final OrderRepository orderRepository;
+    private final ApplicationEventPublisher eventPublisher;
+
+    @Transactional
+    public OrderId createOrder(CreateOrderCommand command) {
+      Order order = Order.create(command.customerId(), command.items());
+      orderRepository.save(order);
+
+      // Publish domain events AFTER successful save
+      order.getDomainEvents().forEach(eventPublisher::publishEvent);
+      order.clearDomainEvents();
+
+      return order.getId();
+    }
+  }
+
+  // Spring listener in same service
+  @Component
+  public class OrderEventListener {
+    @EventListener
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void on(OrderCreatedEvent event) {
+      // Send to Kafka / trigger side effects / notify other services
+    }
+  }
+
+DOMAIN EVENTS vs INTEGRATION EVENTS:
+  Domain Event:      Internal — within the same service/bounded context
+                     Rich object with full domain types
+  Integration Event: External — published to Kafka/RabbitMQ for other services
+                     Simplified DTO (serializable, no domain types)
+                     Maps to: OrderCreatedIntegrationEvent (has product IDs, not Product objects)
+
+────────────────────────────────────────────────────────────────────────────────
+
+REPOSITORIES
+=============
+A Repository provides a collection-like interface for accessing aggregates.
+It hides persistence details from the domain model.
+
+  // Repository interface — in domain layer (no Spring/JPA dependencies)
+  public interface OrderRepository {
+    Optional<Order> findById(OrderId id);
+    List<Order> findByCustomerId(CustomerId customerId);
+    void save(Order order);
+    void delete(OrderId id);
+  }
+
+  // JPA implementation — in infrastructure layer
+  @Repository
+  @RequiredArgsConstructor
+  public class JpaOrderRepository implements OrderRepository {
+
+    private final OrderJpaRepository jpaRepository;
+    private final OrderMapper mapper;
+
+    @Override
+    public Optional<Order> findById(OrderId id) {
+      return jpaRepository.findById(id.value().toString())
+          .map(mapper::toDomain);
+    }
+
+    @Override
+    public void save(Order order) {
+      OrderEntity entity = mapper.toEntity(order);
+      jpaRepository.save(entity);
+    }
+  }
+
+REPOSITORY vs DAO:
+  DAO: Data Access Object — database-centric, CRUD operations on tables
+  Repository: Domain-centric — works with Aggregates, hides storage details
+  Repository returns domain objects; DAO returns database records (DTOs/entities)
+
+────────────────────────────────────────────────────────────────────────────────
+
+DOMAIN SERVICES
+================
+When a business operation doesn't naturally belong to an Entity or Value Object,
+use a Domain Service.
+
+  // OrderPricingService — doesn't belong to Order or Product alone
+  public class OrderPricingService {
+
+    public Money calculateTotal(List<OrderItem> items,
+                                 DiscountPolicy discountPolicy,
+                                 TaxPolicy taxPolicy) {
+      Money subtotal = items.stream()
+          .map(item -> item.getUnitPrice().multiply(item.getQuantity()))
+          .reduce(Money.ZERO_USD, Money::add);
+
+      Money discount = discountPolicy.calculate(subtotal);
+      Money taxableAmount = subtotal.subtract(discount);
+      Money tax = taxPolicy.calculate(taxableAmount);
+
+      return taxableAmount.add(tax);
+    }
+  }
+
+  // PaymentDomainService — coordinates Payment + Order
+  public class PaymentDomainService {
+    public PaymentResult processPayment(Order order, PaymentMethod paymentMethod) {
+      // Validates business rules spanning both Order and PaymentMethod
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+APPLICATION SERVICES
+=====================
+Application Services orchestrate domain objects to fulfill use cases.
+They are the entry point for business operations (called by controllers/handlers).
+
+  @Service
+  @RequiredArgsConstructor
+  public class OrderApplicationService {
+
+    private final OrderRepository orderRepository;
+    private final CustomerRepository customerRepository;
+    private final InventoryClient inventoryClient;
+    private final ApplicationEventPublisher eventPublisher;
+
+    @Transactional
+    public OrderId placeOrder(PlaceOrderCommand command) {
+      // 1. Validate customer
+      Customer customer = customerRepository.findById(command.customerId())
+          .orElseThrow(() -> new CustomerNotFoundException(command.customerId()));
+
+      // 2. Validate inventory (calls external service)
+      command.items().forEach(item ->
+          inventoryClient.validateAvailability(item.productId(), item.quantity()));
+
+      // 3. Create Order aggregate (domain logic here)
+      Order order = Order.create(customer.getId(), command.items());
+
+      // 4. Persist
+      orderRepository.save(order);
+
+      // 5. Publish domain events
+      order.getDomainEvents().forEach(eventPublisher::publishEvent);
+      order.clearDomainEvents();
+
+      return order.getId();
+    }
+  }
+
+Application Service vs Domain Service:
+  Domain Service:      Pure domain logic, no infrastructure, no use case orchestration
+  Application Service: Use case orchestration, calls repositories, publishes events,
+                        coordinates domain objects and external services
+
+────────────────────────────────────────────────────────────────────────────────
+
+CONTEXT MAPPING — RELATIONSHIPS BETWEEN BOUNDED CONTEXTS
+==========================================================
+
+When two Bounded Contexts interact, they form a relationship:
+
+SHARED KERNEL:
+  Two teams share a small part of the model (e.g., common value types like Money).
+  High coordination overhead. Use sparingly.
+
+CUSTOMER-SUPPLIER:
+  Supplier (upstream) defines the API; Customer (downstream) consumes it.
+  Supplier must consider customer needs in planning.
+
+CONFORMIST:
+  Downstream conforms to upstream's model with no influence.
+  Risky — changes in upstream break downstream.
+
+ANTI-CORRUPTION LAYER (ACL):
+  Downstream creates a translation layer between its model and upstream.
+  Protects domain model from external system's model. Most recommended.
+
+OPEN HOST SERVICE:
+  Provider publishes a well-defined protocol (REST API, gRPC, Kafka events).
+  Multiple consumers use it. Like a public API.
+
+PUBLISHED LANGUAGE:
+  A well-documented shared language (Avro/Protobuf schema, OpenAPI spec).
+  Combined with Open Host Service.
+
+SEPARATE WAYS:
+  Teams go their own way — no integration. Duplicate logic if needed.
+
+PRACTICAL MAPPING:
+  Order Service → Payment Service: Customer-Supplier (Order depends on Payment)
+  Order Service → Legacy ERP: Conformist (can't change ERP) with ACL
+  Order Service → Notification Service: Published Language (Kafka event schema)
+
+────────────────────────────────────────────────────────────────────────────────
+
+HEXAGONAL ARCHITECTURE (PORTS & ADAPTERS) WITH DDD
+=====================================================
+
+Hexagonal Architecture complements DDD by keeping the domain model isolated.
+
+  ┌────────────────────────────────────────────────────────────┐
+  │  PRIMARY ADAPTERS (Driving)                                 │
+  │  REST Controller | gRPC Service | Message Consumer          │
+  └─────────────────────────┬──────────────────────────────────┘
+                            │ Port (Interface)
+  ┌─────────────────────────▼──────────────────────────────────┐
+  │               APPLICATION CORE                              │
+  │  Application Services → Domain Model (Entities, VOs, etc.) │
+  └─────────────────────────┬──────────────────────────────────┘
+                            │ Port (Interface)
+  ┌─────────────────────────▼──────────────────────────────────┐
+  │  SECONDARY ADAPTERS (Driven)                                │
+  │  JPA Repository | Kafka Producer | Feign Client | Redis     │
+  └────────────────────────────────────────────────────────────┘
+
+Package structure:
+  com.example.order/
+    domain/           ← No Spring/JPA dependencies
+      model/          Order, OrderItem, Money, OrderId (Entities + VOs)
+      event/          OrderCreatedEvent, OrderCancelledEvent
+      repository/     OrderRepository (interface)
+      service/        OrderPricingService (domain service)
+    application/      ← Use cases, orchestration
+      service/        OrderApplicationService
+      command/        PlaceOrderCommand, CancelOrderCommand
+      port/
+        in/           PlaceOrderUseCase (interface)
+        out/          InventoryPort (interface), PaymentPort
+    infrastructure/   ← Spring, JPA, Kafka — implements interfaces
+      persistence/    JpaOrderRepository, OrderEntity, OrderMapper
+      messaging/      KafkaOrderEventPublisher
+      http/           FeignInventoryClient, FeignPaymentClient
+    presentation/     ← REST controllers, gRPC services
+      rest/           OrderController, OrderRequest/Response DTOs
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS — DDD
+===========================
+
+Q: What is a Bounded Context and how does it map to microservices?
+A: A Bounded Context is an explicit boundary within which a domain model and
+   its language apply consistently. It defines the scope of a model — what
+   "Customer" or "Order" means within that context. One Bounded Context roughly
+   maps to one microservice. Different contexts can use the same word (Order)
+   for different concepts — cross-context communication goes through ACLs or
+   integration events, never by sharing domain objects.
+
+Q: What is an Aggregate and why is the "one transaction per aggregate" rule important?
+A: An Aggregate is a cluster of entities and value objects with a root entity that
+   enforces consistency invariants. All changes go through the Aggregate Root.
+   One transaction should modify one aggregate because spanning transactions
+   across aggregates in different services requires distributed transactions
+   (Saga), which are complex. Keeping aggregates small and transactions local
+   is a key design principle in microservices.
+
+Q: What is the difference between an Entity and a Value Object?
+A: An Entity has a unique identity that persists over time — two Entities are equal
+   if they have the same ID, regardless of attribute values. A Value Object has no
+   identity — it is defined entirely by its attributes, is immutable, and two
+   Value Objects with the same attributes are equal. Examples: Customer (Entity),
+   Money (Value Object), OrderId (Value Object — strongly typed identity wrapper).
+
+Q: What is an Anti-Corruption Layer and when do you use it?
+A: An ACL is a translation layer that isolates your domain model from an external
+   system's model. When integrating with a legacy system or third-party API with
+   a different domain model, the ACL translates between models so your domain stays
+   clean. Without it, your model gets polluted with foreign concepts. Example:
+   integrating with a legacy ERP where "Order" has 50 fields — the ACL maps only
+   what you need into your clean domain objects.
+
+Q: How do Domain Events help in microservices communication?
+A: Domain Events capture significant state changes in business terms (OrderCreated,
+   PaymentProcessed). Within a service, they decouple domain logic from side effects.
+   Across services, they become Integration Events (published to Kafka) enabling
+   async, decoupled communication. The producing service publishes what happened;
+   consuming services react independently. This preserves bounded context isolation —
+   services don't share domain objects, only serializable event payloads.
+================================================================================

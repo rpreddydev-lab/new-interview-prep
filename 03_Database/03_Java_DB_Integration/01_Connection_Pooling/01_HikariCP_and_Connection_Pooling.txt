@@ -1,0 +1,277 @@
+CONNECTION POOLING IN JAVA — HikariCP & DATASOURCE CONFIGURATION
+===========================================================================================================
+
+WHY CONNECTION POOLING?
+-----------------------
+Creating a database connection is expensive:
+  - TCP/IP handshake
+  - Authentication
+  - Session setup on the DB server
+  Cost: ~50–100ms per connection creation
+
+Connection pooling maintains a pool of pre-established connections.
+Each request checks out a connection from the pool, uses it, and returns it.
+This reduces overhead to sub-millisecond per request.
+
+===========================================================================================================
+HIKARICP — THE DEFAULT IN SPRING BOOT
+===========================================================================================================
+
+HikariCP is the fastest and most production-ready Java connection pool.
+It has been the default pool in Spring Boot since version 2.0.
+
+Maven Dependency (included transitively via spring-boot-starter-jdbc or spring-boot-starter-data-jpa):
+  <dependency>
+    <groupId>com.zaxxer</groupId>
+    <artifactId>HikariCP</artifactId>
+  </dependency>
+
+---
+
+SPRING BOOT CONFIGURATION (application.properties / application.yml)
+----------------------------------------------------------------------
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/mydb
+    username: dbuser
+    password: secret
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      pool-name: MyAppPool
+      maximum-pool-size: 10          # Max connections in pool
+      minimum-idle: 5                # Min idle connections kept alive
+      connection-timeout: 30000      # Max wait time for connection (ms) — 30 sec
+      idle-timeout: 600000           # Idle connection removal time (ms) — 10 min
+      max-lifetime: 1800000          # Max connection lifetime (ms) — 30 min
+      keepalive-time: 300000         # Keepalive ping interval (ms) — 5 min
+      validation-timeout: 5000       # Timeout for validating connection — 5 sec
+      connection-test-query: SELECT 1 # Use only if JDBC4 not supported (legacy)
+      auto-commit: true              # Default true
+      leak-detection-threshold: 60000 # Log connections held longer than 60s (dev use)
+
+---
+
+KEY PROPERTIES EXPLAINED
+-------------------------
+
+maximum-pool-size:
+  The most critical setting. Total connections HikariCP will open.
+  NOT more = better. Too many connections exhaust DB server resources.
+  
+  Formula (PostgreSQL recommendation):
+    pool_size = (number of CPU cores) * 2 + effective_spindle_count
+    
+  Examples:
+    8-core machine, SSD storage: ~17 connections maximum
+    8-core machine, 2 spindle HDD: ~19 connections
+    
+  In practice: Start at 10, monitor, adjust based on:
+    - DB connection limit (max_connections in postgresql.conf)
+    - Number of app instances (total = max-pool-size * instance count)
+    - Observed pool wait times
+
+minimum-idle:
+  HikariCP tries to maintain at least this many idle connections.
+  Setting equal to maximum-pool-size → fixed pool size (better for high-throughput).
+  Setting lower → pool shrinks during low traffic (saves DB connections).
+
+connection-timeout:
+  How long to wait for a connection from the pool before throwing SQLException.
+  Too low: Fails fast under burst traffic.
+  Too high: Long request queuing.
+  Default 30s is usually too long for user-facing APIs. Consider 5000ms.
+
+max-lifetime:
+  Maximum lifetime of a connection in the pool regardless of usage.
+  Must be shorter than the DB's wait_timeout (MySQL) or tcp_keepalives_idle (PostgreSQL).
+  Prevents stale connections due to network infrastructure timeouts.
+  Default 30 min is usually fine.
+
+idle-timeout:
+  How long idle connections are removed from pool.
+  Only applies when minimum-idle < maximum-pool-size.
+  Default 10 min is reasonable.
+
+leak-detection-threshold:
+  If a connection is not returned within this time, HikariCP logs a warning with stack trace.
+  Set to 0 in production (disabled). Use in dev/QA to catch connection leaks.
+  Typical value in dev: 60000 (60 seconds).
+
+---
+
+PROGRAMMATIC CONFIGURATION
+---------------------------
+@Configuration
+public class DataSourceConfig {
+
+  @Bean
+  public DataSource dataSource() {
+    HikariConfig config = new HikariConfig();
+    config.setJdbcUrl("jdbc:postgresql://localhost:5432/mydb");
+    config.setUsername("dbuser");
+    config.setPassword("secret");
+    config.setPoolName("MyAppPool");
+    config.setMaximumPoolSize(10);
+    config.setMinimumIdle(5);
+    config.setConnectionTimeout(5000);
+    config.setMaxLifetime(1800000);
+    config.setIdleTimeout(600000);
+    config.setKeepaliveTime(300000);
+    
+    // PostgreSQL-specific performance settings
+    config.addDataSourceProperty("cachePrepStmts", "true");
+    config.addDataSourceProperty("prepStmtCacheSize", "250");
+    config.addDataSourceProperty("prepStmtCacheSqlLimit", "2048");
+    
+    return new HikariDataSource(config);
+  }
+}
+
+---
+
+MULTIPLE DATASOURCES (e.g., Primary + Read Replica)
+----------------------------------------------------
+@Configuration
+public class DataSourceConfig {
+
+  @Primary
+  @Bean("primaryDataSource")
+  @ConfigurationProperties("spring.datasource.primary.hikari")
+  public DataSource primaryDataSource() {
+    return new HikariDataSource();
+  }
+
+  @Bean("replicaDataSource")
+  @ConfigurationProperties("spring.datasource.replica.hikari")
+  public DataSource replicaDataSource() {
+    return new HikariDataSource();
+  }
+}
+
+# application.yml
+spring:
+  datasource:
+    primary:
+      hikari:
+        jdbc-url: jdbc:postgresql://primary-host:5432/mydb
+        maximum-pool-size: 10
+    replica:
+      hikari:
+        jdbc-url: jdbc:postgresql://replica-host:5432/mydb
+        maximum-pool-size: 20   # More connections for read-heavy workload
+
+---
+
+ROUTING BETWEEN PRIMARY AND REPLICA
+------------------------------------
+@Component
+public class RoutingDataSource extends AbstractRoutingDataSource {
+  
+  @Override
+  protected Object determineCurrentLookupKey() {
+    // Route read-only transactions to replica
+    return TransactionSynchronizationManager.isCurrentTransactionReadOnly()
+        ? DataSourceType.REPLICA
+        : DataSourceType.PRIMARY;
+  }
+}
+
+// In service layer:
+@Transactional(readOnly = true)   // → routed to replica
+public List<Product> findAll() { return productRepo.findAll(); }
+
+@Transactional                    // → routed to primary
+public Product save(Product p) { return productRepo.save(p); }
+
+---
+
+MONITORING HIKARICP
+-------------------
+HikariCP exposes metrics via:
+  - JMX (enabled by default)
+  - Micrometer (Spring Boot Actuator)
+
+Metrics to watch:
+  hikaricp.connections.active    — Currently used connections
+  hikaricp.connections.idle      — Currently idle connections
+  hikaricp.connections.pending   — Threads waiting for a connection (MOST IMPORTANT)
+  hikaricp.connections.timeout   — Connection timeouts (indicates undersizing)
+  hikaricp.connections.acquire   — Time to acquire a connection (latency)
+
+Alert if:
+  connections.pending > 0 consistently → pool too small
+  connections.acquire > 100ms consistently → pool under pressure or DB slow
+  connections.timeout > 0 → critical, requests are failing
+
+Add to Prometheus/Grafana via Spring Boot Actuator + Micrometer.
+
+---
+
+COMMON MISTAKES
+---------------
+❌ Setting maximum-pool-size too high
+   More connections ≠ better performance. Each DB connection uses memory.
+   PostgreSQL default max_connections = 100. With multiple services, plan total.
+
+❌ Not setting max-lifetime
+   DB firewalls/load balancers close idle connections silently after N minutes.
+   Without max-lifetime, HikariCP uses a connection the DB has already closed → error.
+
+❌ Performing blocking I/O while holding a connection
+   // WRONG: HTTP call while holding DB connection
+   @Transactional
+   public void processOrder(Order order) {
+     orderRepo.save(order);
+     httpClient.callPaymentService(order);  // This blocks the connection!
+   }
+   
+   // CORRECT: Keep transaction short, do HTTP call outside
+   public void processOrder(Order order) {
+     saveOrder(order);               // @Transactional — short
+     httpClient.callPaymentService(order);  // Outside transaction
+   }
+
+❌ Not using connection-test-query with old JDBC drivers
+   Modern JDBC 4+ drivers support isValid() — no need for SELECT 1.
+   Only set connection-test-query if using an old driver.
+
+---
+
+HIKARICP VS OTHER POOLS
+-----------------------
+| Pool        | Performance | Features | Recommended for     |
+|-------------|-------------|----------|---------------------|
+| HikariCP    | Fastest     | Excellent | Spring Boot (default) |
+| c3p0        | Slow        | Good      | Legacy              |
+| DBCP2       | Medium      | Good      | Non-Spring projects |
+| Tomcat JDBC | Medium      | Good      | Embedded Tomcat     |
+| Vibur       | Fast        | Basic     | Alternative         |
+
+Use HikariCP. It is the industry standard for Java applications.
+
+---
+
+INTERVIEW QUESTIONS ON CONNECTION POOLING
+-----------------------------------------
+Q: What happens when all connections in the pool are in use and a new request comes in?
+A: The new request BLOCKS for up to connection-timeout milliseconds waiting for a connection
+   to be returned. If none is returned in time, HikariCP throws SQLTimeoutException.
+
+Q: Why should max-pool-size not be set to a very high number?
+A: Each connection on the DB server uses memory (~2-5MB for PostgreSQL context per connection).
+   Many idle connections still hold server resources. DB throughput peaks at a certain
+   parallelism level — beyond that, more connections just queue. More connections can also
+   increase context-switching overhead.
+
+Q: What is connection leak? How do you detect it?
+A: A connection leak occurs when code checks out a connection but never returns it
+   (e.g., missing try-with-resources, exception path skipped close()).
+   Detection: Set leak-detection-threshold in HikariCP. Logs warning with stack trace
+   of where the connection was acquired.
+   Fix: Always use try-with-resources or Spring's DataSourceUtils.releaseConnection().
+
+Q: How does HikariCP differ from connection pooling in reactive/R2DBC applications?
+A: R2DBC (reactive) uses non-blocking connections — cannot use HikariCP which is thread-based.
+   R2DBC has its own pool: r2dbc-pool. Works with Spring WebFlux.
+   Traditional HikariCP + JDBC = blocking I/O.
+   R2DBC pool = non-blocking I/O for reactive pipelines.

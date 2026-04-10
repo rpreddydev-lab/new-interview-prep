@@ -1,0 +1,705 @@
+================================================================================
+REST AND gRPC DEEP DIVE — JAVA / SPRING BOOT
+================================================================================
+
+REST vs gRPC — QUICK COMPARISON
+---------------------------------
+Feature              │ REST (HTTP/1.1 + JSON)      │ gRPC (HTTP/2 + Protobuf)
+─────────────────────┼─────────────────────────────┼────────────────────────────
+Protocol             │ HTTP/1.1                    │ HTTP/2
+Payload format       │ JSON (text, human-readable) │ Protocol Buffers (binary)
+Schema               │ Optional (OpenAPI/Swagger)  │ Mandatory (.proto file)
+Performance          │ Moderate                    │ High (5-10x faster)
+Browser support      │ Native                      │ Requires gRPC-Web proxy
+Streaming            │ Limited (SSE, WebSocket)    │ Native (4 modes)
+Code generation      │ Optional (OpenAPI codegen)  │ Mandatory (protoc compiler)
+Error model          │ HTTP status codes           │ Rich gRPC status codes
+Use case             │ External APIs, CRUD         │ Internal service-to-service
+
+Rule of thumb:
+  External APIs (browser, mobile, third-party) → REST
+  Internal service-to-service (high throughput, low latency) → gRPC
+
+────────────────────────────────────────────────────────────────────────────────
+
+REST IN SPRING BOOT — PRODUCTION PATTERNS
+==========================================
+
+CONTROLLER DESIGN (7+ years level):
+
+  @RestController
+  @RequestMapping("/api/v1/orders")
+  @RequiredArgsConstructor
+  @Validated
+  public class OrderController {
+
+    private final OrderService orderService;
+
+    @GetMapping("/{id}")
+    public ResponseEntity<OrderResponse> getOrder(
+        @PathVariable @Positive Long id) {
+      return ResponseEntity.ok(orderService.getOrder(id));
+    }
+
+    @PostMapping
+    public ResponseEntity<OrderResponse> createOrder(
+        @Valid @RequestBody CreateOrderRequest request) {
+      OrderResponse response = orderService.createOrder(request);
+      URI location = URI.create("/api/v1/orders/" + response.id());
+      return ResponseEntity.created(location).body(response);
+    }
+
+    @PatchMapping("/{id}/status")
+    public ResponseEntity<Void> updateStatus(
+        @PathVariable Long id,
+        @Valid @RequestBody UpdateStatusRequest request) {
+      orderService.updateStatus(id, request);
+      return ResponseEntity.noContent().build();
+    }
+
+    @DeleteMapping("/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void cancelOrder(@PathVariable Long id) {
+      orderService.cancelOrder(id);
+    }
+  }
+
+GLOBAL EXCEPTION HANDLER (mandatory in production):
+
+  @RestControllerAdvice
+  public class GlobalExceptionHandler {
+
+    @ExceptionHandler(OrderNotFoundException.class)
+    public ProblemDetail handleOrderNotFound(OrderNotFoundException ex) {
+      ProblemDetail detail = ProblemDetail.forStatus(HttpStatus.NOT_FOUND);
+      detail.setTitle("Order Not Found");
+      detail.setDetail(ex.getMessage());
+      detail.setProperty("orderId", ex.getOrderId());
+      return detail;
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ProblemDetail handleValidation(MethodArgumentNotValidException ex) {
+      ProblemDetail detail = ProblemDetail.forStatus(HttpStatus.BAD_REQUEST);
+      detail.setTitle("Validation Failed");
+      Map<String, String> errors = ex.getBindingResult().getFieldErrors()
+          .stream()
+          .collect(Collectors.toMap(
+              FieldError::getField,
+              fe -> Objects.requireNonNullElse(fe.getDefaultMessage(), "Invalid")));
+      detail.setProperty("errors", errors);
+      return detail;
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ProblemDetail handleUnexpected(Exception ex) {
+      ProblemDetail detail = ProblemDetail.forStatus(HttpStatus.INTERNAL_SERVER_ERROR);
+      detail.setTitle("Internal Server Error");
+      // Don't expose internals in production — log instead
+      log.error("Unexpected error", ex);
+      return detail;
+    }
+  }
+
+  Note: ProblemDetail (RFC 7807) is natively supported in Spring Boot 3.
+  Enable in application.yml: spring.mvc.problemdetails.enabled=true
+
+FEIGN CLIENT (Declarative HTTP Client):
+
+  @FeignClient(name = "inventory-service", url = "${services.inventory.url}",
+               configuration = FeignClientConfig.class)
+  public interface InventoryClient {
+
+    @GetMapping("/api/v1/inventory/{productId}")
+    InventoryResponse getInventory(@PathVariable Long productId);
+
+    @PutMapping("/api/v1/inventory/{productId}/reserve")
+    void reserveInventory(@PathVariable Long productId,
+                          @RequestBody ReserveRequest request);
+  }
+
+  @Configuration
+  public class FeignClientConfig {
+    @Bean
+    public Retryer retryer() {
+      // 3 retries, 100ms initial interval, 1s max interval
+      return new Retryer.Default(100, 1000, 3);
+    }
+
+    @Bean
+    public ErrorDecoder errorDecoder() {
+      return (methodKey, response) -> {
+        if (response.status() == 404) return new InventoryNotFoundException();
+        if (response.status() >= 500) return new ServiceUnavailableException();
+        return new Default().decode(methodKey, response);
+      };
+    }
+  }
+
+RestTemplate (legacy — prefer WebClient or Feign):
+  - Blocking, synchronous
+  - Being deprecated in favor of WebClient
+  - Still seen in older Spring Boot 2.x codebases
+
+WebClient (reactive, non-blocking):
+
+  @Bean
+  public WebClient inventoryWebClient(WebClient.Builder builder) {
+    return builder
+        .baseUrl("http://inventory-service")
+        .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+        .build();
+  }
+
+  // Synchronous call from WebClient (in non-reactive context)
+  InventoryResponse inventory = webClient.get()
+      .uri("/api/v1/inventory/{id}", productId)
+      .retrieve()
+      .onStatus(HttpStatusCode::is4xxClientError, res ->
+          Mono.error(new InventoryNotFoundException(productId)))
+      .onStatus(HttpStatusCode::is5xxServerError, res ->
+          Mono.error(new ServiceUnavailableException()))
+      .bodyToMono(InventoryResponse.class)
+      .block();
+
+────────────────────────────────────────────────────────────────────────────────
+
+gRPC — FUNDAMENTALS
+====================
+
+gRPC is Google's Remote Procedure Call framework. Instead of JSON over HTTP/1.1,
+it uses Protocol Buffers (binary serialization) over HTTP/2.
+
+WHY gRPC FOR INTERNAL MICROSERVICES?
+  - Binary Protobuf serialization: 3-10x smaller payload, 5-10x faster parsing
+  - HTTP/2: multiplexing (multiple streams on single connection), header compression
+  - Strongly typed contract (.proto file = source of truth)
+  - 4 communication modes (unary, server streaming, client streaming, bidirectional)
+  - Native deadline/timeout propagation across services
+  - Code generation in 12+ languages (polyglot microservices)
+
+────────────────────────────────────────────────────────────────────────────────
+
+PROTOCOL BUFFERS (PROTOBUF) — .proto FILE
+==========================================
+
+  // src/main/proto/order.proto
+  syntax = "proto3";
+
+  package com.example.order;
+
+  option java_package = "com.example.order.grpc";
+  option java_outer_classname = "OrderProto";
+  option java_multiple_files = true;
+
+  // ── Messages ────────────────────────────────────────────────────────────────
+
+  message CreateOrderRequest {
+    string customer_id = 1;                 // Field numbers must be unique
+    repeated OrderItem items = 2;
+    string delivery_address = 3;
+  }
+
+  message OrderItem {
+    string product_id = 1;
+    int32 quantity = 2;
+    double unit_price = 3;
+  }
+
+  message OrderResponse {
+    string order_id = 1;
+    string status = 2;
+    double total_amount = 3;
+    google.protobuf.Timestamp created_at = 4;  // Well-known types
+  }
+
+  message GetOrderRequest {
+    string order_id = 1;
+  }
+
+  message ListOrdersRequest {
+    string customer_id = 1;
+    int32 page_size = 2;
+    string page_token = 3;
+  }
+
+  message ListOrdersResponse {
+    repeated OrderResponse orders = 1;
+    string next_page_token = 2;
+  }
+
+  // ── Service Definition ──────────────────────────────────────────────────────
+
+  service OrderService {
+    // Unary RPC (like REST request/response)
+    rpc CreateOrder(CreateOrderRequest) returns (OrderResponse);
+
+    // Unary RPC
+    rpc GetOrder(GetOrderRequest) returns (OrderResponse);
+
+    // Server Streaming: client sends one request, server streams multiple responses
+    rpc ListOrders(ListOrdersRequest) returns (stream OrderResponse);
+
+    // Bidirectional Streaming: both sides stream
+    rpc TrackOrders(stream GetOrderRequest) returns (stream OrderResponse);
+  }
+
+FIELD NUMBERS:
+  - 1-15 take 1 byte (use for frequently occurring fields)
+  - 16-2047 take 2 bytes
+  - Never reuse field numbers (breaks binary compatibility)
+  - Reserved numbers for deleted fields: reserved 5, 6;
+
+────────────────────────────────────────────────────────────────────────────────
+
+gRPC WITH SPRING BOOT — SETUP
+================================
+
+pom.xml:
+  <properties>
+    <grpc.version>1.62.2</grpc.version>
+    <protobuf.version>3.25.3</protobuf.version>
+  </properties>
+
+  <dependencies>
+    <!-- gRPC Spring Boot starter (LogNet) -->
+    <dependency>
+      <groupId>net.devh</groupId>
+      <artifactId>grpc-spring-boot-starter</artifactId>
+      <version>3.1.0.RELEASE</version>
+    </dependency>
+    <!-- For gRPC client in other services -->
+    <dependency>
+      <groupId>net.devh</groupId>
+      <artifactId>grpc-client-spring-boot-starter</artifactId>
+      <version>3.1.0.RELEASE</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <extensions>
+      <extension>
+        <groupId>kr.motd.maven</groupId>
+        <artifactId>os-maven-plugin</artifactId>
+        <version>1.7.1</version>
+      </extension>
+    </extensions>
+    <plugins>
+      <plugin>
+        <groupId>org.xolstice.maven.plugins</groupId>
+        <artifactId>protobuf-maven-plugin</artifactId>
+        <version>0.6.1</version>
+        <configuration>
+          <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
+          <pluginId>grpc-java</pluginId>
+          <pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc.version}:exe:${os.detected.classifier}</pluginArtifact>
+        </configuration>
+        <executions>
+          <execution>
+            <goals>
+              <goal>compile</goal>
+              <goal>compile-custom</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+
+application.yml (server):
+  grpc:
+    server:
+      port: 9090
+      security:
+        enabled: false   # enable mTLS in production
+
+application.yml (client):
+  grpc:
+    client:
+      order-service:
+        address: static://order-service:9090
+        negotiation-type: plaintext   # TLS in production
+
+────────────────────────────────────────────────────────────────────────────────
+
+gRPC SERVER IMPLEMENTATION
+============================
+
+  @GrpcService                        // @GrpcService = @Service + registers with gRPC server
+  @RequiredArgsConstructor
+  public class OrderGrpcService extends OrderServiceGrpc.OrderServiceImplBase {
+
+    private final OrderDomainService orderDomainService;
+
+    // ── Unary RPC ────────────────────────────────────────────────────────────
+    @Override
+    public void createOrder(CreateOrderRequest request,
+                            StreamObserver<OrderResponse> responseObserver) {
+      try {
+        Order order = orderDomainService.createOrder(
+            request.getCustomerId(),
+            mapItems(request.getItemsList()));
+
+        responseObserver.onNext(toProto(order));
+        responseObserver.onCompleted();
+
+      } catch (InvalidOrderException e) {
+        responseObserver.onError(
+            Status.INVALID_ARGUMENT
+                .withDescription(e.getMessage())
+                .asRuntimeException());
+      } catch (Exception e) {
+        responseObserver.onError(
+            Status.INTERNAL
+                .withDescription("Internal error processing order")
+                .withCause(e)
+                .asRuntimeException());
+      }
+    }
+
+    // ── Server Streaming RPC ─────────────────────────────────────────────────
+    @Override
+    public void listOrders(ListOrdersRequest request,
+                           StreamObserver<OrderResponse> responseObserver) {
+      try {
+        List<Order> orders = orderDomainService
+            .listOrdersForCustomer(request.getCustomerId());
+
+        // Stream each order individually
+        for (Order order : orders) {
+          responseObserver.onNext(toProto(order));
+        }
+        responseObserver.onCompleted();
+
+      } catch (Exception e) {
+        responseObserver.onError(Status.INTERNAL.withCause(e).asRuntimeException());
+      }
+    }
+
+    private OrderResponse toProto(Order order) {
+      return OrderResponse.newBuilder()
+          .setOrderId(order.getId().toString())
+          .setStatus(order.getStatus().name())
+          .setTotalAmount(order.getTotalAmount().doubleValue())
+          .setCreatedAt(Timestamps.fromMillis(
+              order.getCreatedAt().toInstant().toEpochMilli()))
+          .build();
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+gRPC CLIENT USAGE
+==================
+
+  @Service
+  @RequiredArgsConstructor
+  public class InventoryGrpcClient {
+
+    // @GrpcClient injects a managed channel stub automatically
+    @GrpcClient("inventory-service")
+    private InventoryServiceGrpc.InventoryServiceBlockingStub inventoryStub;
+
+    public InventoryInfo getInventory(String productId) {
+      try {
+        GetInventoryRequest request = GetInventoryRequest.newBuilder()
+            .setProductId(productId)
+            .build();
+
+        GetInventoryResponse response = inventoryStub
+            .withDeadlineAfter(3, TimeUnit.SECONDS)   // Always set deadlines!
+            .getInventory(request);
+
+        return new InventoryInfo(response.getAvailableQuantity(),
+                                 response.getReservedQuantity());
+
+      } catch (StatusRuntimeException e) {
+        if (e.getStatus().getCode() == Status.Code.NOT_FOUND) {
+          throw new ProductNotFoundException(productId);
+        }
+        if (e.getStatus().getCode() == Status.Code.UNAVAILABLE) {
+          throw new InventoryServiceUnavailableException();
+        }
+        throw new RuntimeException("gRPC call failed", e);
+      }
+    }
+  }
+
+  // Async stub (non-blocking):
+  @GrpcClient("inventory-service")
+  private InventoryServiceGrpc.InventoryServiceStub asyncInventoryStub;
+
+  public CompletableFuture<InventoryInfo> getInventoryAsync(String productId) {
+    CompletableFuture<InventoryInfo> future = new CompletableFuture<>();
+    asyncInventoryStub.withDeadlineAfter(3, TimeUnit.SECONDS)
+        .getInventory(
+            GetInventoryRequest.newBuilder().setProductId(productId).build(),
+            new StreamObserver<>() {
+              @Override public void onNext(GetInventoryResponse response) {
+                future.complete(new InventoryInfo(response.getAvailableQuantity(),
+                                                  response.getReservedQuantity()));
+              }
+              @Override public void onError(Throwable t) { future.completeExceptionally(t); }
+              @Override public void onCompleted() {}
+            });
+    return future;
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+gRPC INTERCEPTORS (Cross-Cutting Concerns)
+==========================================
+
+Server-side interceptor (logging, auth, tracing):
+
+  @Component
+  public class AuthInterceptor implements ServerInterceptor {
+
+    private static final Metadata.Key<String> AUTH_TOKEN_KEY =
+        Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER);
+
+    @Override
+    public <Q, R> ServerCall.Listener<Q> interceptCall(
+        ServerCall<Q, R> call, Metadata headers, ServerCallHandler<Q, R> next) {
+
+      String token = headers.get(AUTH_TOKEN_KEY);
+      if (token == null || !isValidToken(token)) {
+        call.close(Status.UNAUTHENTICATED.withDescription("Invalid token"), headers);
+        return new ServerCall.Listener<>() {};
+      }
+
+      Context ctx = Context.current().withValue(USER_CONTEXT_KEY, extractUser(token));
+      return Contexts.interceptCall(ctx, call, headers, next);
+    }
+  }
+
+  // Register interceptor on service:
+  @GrpcService(interceptors = {AuthInterceptor.class})
+  public class OrderGrpcService extends OrderServiceGrpc.OrderServiceImplBase { ... }
+
+Client-side interceptor (add auth token, tracing):
+
+  @Component
+  public class TokenClientInterceptor implements ClientInterceptor {
+
+    @Override
+    public <Q, R> ClientCall<Q, R> interceptCall(
+        MethodDescriptor<Q, R> method, CallOptions callOptions, Channel next) {
+
+      return new ForwardingClientCall.SimpleForwardingClientCall<>(
+          next.newCall(method, callOptions)) {
+
+        @Override
+        public void start(Listener<R> listener, Metadata headers) {
+          headers.put(AUTH_TOKEN_KEY, getCurrentUserToken());
+          super.start(listener, headers);
+        }
+      };
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+gRPC STREAMING — 4 MODES
+==========================
+
+1. UNARY (standard request/response — most common):
+   rpc GetOrder(GetOrderRequest) returns (OrderResponse);
+
+2. SERVER STREAMING (server sends a stream of responses):
+   rpc ListOrders(ListOrdersRequest) returns (stream OrderResponse);
+   Use case: Export large datasets, real-time feeds, subscriptions
+
+3. CLIENT STREAMING (client sends a stream, server responds once):
+   rpc BulkCreateOrders(stream CreateOrderRequest) returns (BulkResponse);
+   Use case: File uploads, batch ingestion
+
+4. BIDIRECTIONAL STREAMING (both sides stream simultaneously):
+   rpc TrackOrders(stream GetOrderRequest) returns (stream OrderResponse);
+   Use case: Real-time chat, live dashboards, collaborative apps
+
+────────────────────────────────────────────────────────────────────────────────
+
+gRPC ERROR HANDLING — STATUS CODES
+=====================================
+
+gRPC has 16 status codes (richer than HTTP):
+
+  Status.OK                → Success
+  Status.INVALID_ARGUMENT  → Bad input (like 400)
+  Status.NOT_FOUND         → Resource not found (like 404)
+  Status.ALREADY_EXISTS    → Conflict (like 409)
+  Status.PERMISSION_DENIED → Authorization failure (like 403)
+  Status.UNAUTHENTICATED   → Not authenticated (like 401)
+  Status.RESOURCE_EXHAUSTED→ Rate limit / quota exceeded (like 429)
+  Status.UNAVAILABLE       → Service down, retry-able (like 503)
+  Status.DEADLINE_EXCEEDED → Timeout (like 504)
+  Status.INTERNAL          → Server error (like 500)
+  Status.UNIMPLEMENTED     → Method not implemented (like 501)
+  Status.CANCELLED         → Client cancelled the call
+
+Best practice — throw on server, catch on client:
+  Server:
+    responseObserver.onError(Status.NOT_FOUND
+        .withDescription("Order " + id + " not found")
+        .asRuntimeException());
+
+  Client:
+    } catch (StatusRuntimeException e) {
+        switch (e.getStatus().getCode()) {
+          case NOT_FOUND -> throw new OrderNotFoundException(id);
+          case UNAVAILABLE -> throw new OrderServiceUnavailableException();
+          default -> throw new RuntimeException(e);
+        }
+    }
+
+────────────────────────────────────────────────────────────────────────────────
+
+gRPC vs REST — WHEN TO CHOOSE EACH
+=====================================
+
+Choose REST when:
+  ✓ API is consumed by browsers or external clients
+  ✓ Human-readable payloads are important (debugging, third-party)
+  ✓ Team is not familiar with Protobuf
+  ✓ Simple CRUD operations
+  ✓ Public API that must be stable and versioned
+  ✓ OpenAPI documentation is required
+
+Choose gRPC when:
+  ✓ Internal service-to-service communication
+  ✓ Low latency and high throughput are critical
+  ✓ Strong typing and schema enforcement needed
+  ✓ Polyglot environment (Java, Go, Python services)
+  ✓ Streaming data (logs, events, live feeds)
+  ✓ Deadlines must propagate across service calls
+
+HYBRID APPROACH (common in practice):
+  - External-facing API: REST (gateway/BFF layer)
+  - Internal service mesh: gRPC
+  - Some teams use gRPC-Gateway to expose REST + gRPC simultaneously
+
+────────────────────────────────────────────────────────────────────────────────
+
+TESTING gRPC SERVICES
+=======================
+
+Unit test with mock (gRPC test framework):
+
+  @ExtendWith(MockitoExtension.class)
+  class OrderGrpcServiceTest {
+
+    @Mock
+    private OrderDomainService orderDomainService;
+
+    private OrderGrpcService service;
+    private ManagedChannel channel;
+    private OrderServiceGrpc.OrderServiceBlockingStub stub;
+
+    @BeforeEach
+    void setUp() throws IOException {
+      service = new OrderGrpcService(orderDomainService);
+
+      // In-process server (no real network)
+      String serverName = InProcessServerBuilder.generateName();
+      InProcessServerBuilder.forName(serverName)
+          .addService(service)
+          .build()
+          .start();
+
+      channel = InProcessChannelBuilder.forName(serverName).build();
+      stub = OrderServiceGrpc.newBlockingStub(channel);
+    }
+
+    @AfterEach
+    void tearDown() { channel.shutdownNow(); }
+
+    @Test
+    void createOrder_validRequest_returnsOrder() {
+      Order mockOrder = new Order("ord-123", "CREATED", BigDecimal.TEN);
+      when(orderDomainService.createOrder(any(), any())).thenReturn(mockOrder);
+
+      CreateOrderRequest request = CreateOrderRequest.newBuilder()
+          .setCustomerId("cust-456")
+          .addItems(OrderItem.newBuilder().setProductId("prod-1").setQuantity(2).build())
+          .build();
+
+      OrderResponse response = stub.createOrder(request);
+
+      assertThat(response.getOrderId()).isEqualTo("ord-123");
+      assertThat(response.getStatus()).isEqualTo("CREATED");
+    }
+
+    @Test
+    void createOrder_invalidInput_throwsInvalidArgument() {
+      when(orderDomainService.createOrder(any(), any()))
+          .thenThrow(new InvalidOrderException("Items cannot be empty"));
+
+      StatusRuntimeException ex = assertThrows(StatusRuntimeException.class,
+          () -> stub.createOrder(CreateOrderRequest.getDefaultInstance()));
+
+      assertThat(ex.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+PROTOBUF EVOLUTION (BACKWARD COMPATIBILITY)
+=============================================
+
+Protobuf is designed for backward-compatible evolution:
+
+  SAFE CHANGES (backward compatible):
+    ✓ Add new fields (old clients ignore unknown fields)
+    ✓ Change field names (name is not serialized, only field number)
+    ✓ Add new enum values
+
+  BREAKING CHANGES (avoid):
+    ✗ Delete a field (reuse its number later → data corruption)
+    ✗ Change a field's type (int32 → string)
+    ✗ Change a field's number
+    ✗ Change a field from singular to repeated (or vice versa)
+
+  Best practices:
+    - Use `reserved` keyword for deleted fields: reserved 5;
+    - Keep .proto files in a shared repository (schema registry)
+    - Version the proto package: package com.example.order.v2;
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS — gRPC / REST
+====================================
+
+Q: Why choose gRPC over REST for internal microservices?
+A: gRPC uses HTTP/2 (multiplexing, header compression) and binary Protobuf
+   serialization → 5-10x faster than REST+JSON. Strongly typed contracts prevent
+   mismatches. Native streaming support. Deadlines propagate automatically.
+   Ideal for high-throughput internal calls where performance matters.
+
+Q: How does Protobuf ensure backward compatibility?
+A: Protobuf uses field numbers (not names) for serialization. Old services ignore
+   unknown field numbers. Never reuse deleted field numbers — use `reserved`.
+   Add new fields freely; consumers that don't know about them will ignore them.
+
+Q: How do you handle errors in gRPC?
+A: gRPC has 16 status codes (richer than HTTP). Server calls onError() with a
+   Status (NOT_FOUND, INVALID_ARGUMENT, UNAVAILABLE, etc.). Client catches
+   StatusRuntimeException and checks getStatus().getCode(). Always set deadlines
+   on client calls to prevent hanging.
+
+Q: What are the 4 gRPC communication patterns?
+A: Unary (1 req → 1 res), Server Streaming (1 req → N res), Client Streaming
+   (N req → 1 res), Bidirectional Streaming (N req → N res, simultaneously).
+
+Q: How does Feign differ from WebClient for service-to-service REST calls?
+A: Feign is a declarative, synchronous HTTP client — easy to write, reads like
+   an interface. WebClient is reactive and non-blocking — better for high
+   concurrency and async workflows. In Spring Boot 3 + reactive stacks, prefer
+   WebClient. In traditional MVC stacks, Feign is simpler and integrates well
+   with Resilience4j.
+
+Q: How do you propagate authentication in gRPC calls?
+A: Use a ClientInterceptor to attach the JWT token to gRPC metadata headers on
+   every outgoing call. On the server, use a ServerInterceptor to extract and
+   validate the token and store user context in gRPC Context for downstream use.
+================================================================================

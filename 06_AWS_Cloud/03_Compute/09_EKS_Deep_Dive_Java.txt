@@ -1,0 +1,491 @@
+================================================================
+AWS FOR JAVA DEVELOPERS — EKS DEEP DIVE FOR JAVA WORKLOADS
+Complete Interview Preparation Guide
+================================================================
+
+1. EKS OVERVIEW FOR JAVA DEVELOPERS
+================================================================
+
+  Amazon EKS (Elastic Kubernetes Service) is a managed Kubernetes control plane.
+  AWS manages the Kubernetes API server and etcd — you manage the worker nodes 
+  (or use Fargate for serverless pods).
+
+  WHY EKS FOR JAVA MICROSERVICES:
+  - Standard Kubernetes API: portable across clouds
+  - Fine-grained pod resource requests (CPU, memory) — tune per Java app
+  - Horizontal Pod Autoscaler (HPA): scale on CPU, memory, or custom metrics
+  - Service mesh (Istio/AWS App Mesh): traffic management, mTLS, observability
+  - IRSA: IAM roles per pod (better security than EC2 instance profile)
+
+  EKS WORKER NODE OPTIONS:
+  ┌─────────────────────┬──────────────────────────────────────────────────────┐
+  │ Option              │ Description                                          │
+  ├─────────────────────┼──────────────────────────────────────────────────────┤
+  │ Managed Node Groups │ AWS manages EC2 instances, auto-updates, auto-repair │
+  │ Self-managed nodes  │ You manage EC2 lifecycle (more control, more work)   │
+  │ Fargate Profiles    │ Serverless pods — no node management. Pay per pod.   │
+  └─────────────────────┴──────────────────────────────────────────────────────┘
+
+================================================================
+2. DEPLOYING A SPRING BOOT APP TO EKS
+================================================================
+
+  ── DOCKERFILE (multi-stage, optimized for Java) ─────────────
+
+  # Stage 1: Build
+  FROM maven:3.9.6-amazoncorretto-21 AS build
+  WORKDIR /app
+  COPY pom.xml .
+  RUN mvn dependency:go-offline          # Cache dependencies
+  COPY src ./src
+  RUN mvn clean package -DskipTests
+
+  # Stage 2: Runtime (smaller image)
+  FROM amazoncorretto:21-alpine
+  RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+  USER appuser
+  WORKDIR /app
+  COPY --from=build /app/target/order-service-*.jar app.jar
+
+  # JVM tuning for containers (Java 17+ is container-aware):
+  ENTRYPOINT ["java", \
+    "-XX:+UseContainerSupport", \
+    "-XX:MaxRAMPercentage=75.0", \
+    "-XX:+UseG1GC", \
+    "-Dspring.profiles.active=${SPRING_PROFILE}", \
+    "-jar", "app.jar"]
+
+  ── KUBERNETES DEPLOYMENT MANIFEST ───────────────────────────
+
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: order-service
+    namespace: production
+    labels:
+      app: order-service
+      version: "1.0.5"
+  spec:
+    replicas: 3
+    selector:
+      matchLabels:
+        app: order-service
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxSurge: 1            # Create 1 extra pod during update
+        maxUnavailable: 0      # Never take pods offline during update
+    template:
+      metadata:
+        labels:
+          app: order-service
+        annotations:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "8080"
+          prometheus.io/path: "/actuator/prometheus"
+      spec:
+        serviceAccountName: order-service-sa   # For IRSA (see below)
+        containers:
+          - name: order-service
+            image: 123456789.dkr.ecr.us-east-1.amazonaws.com/order-service:1.0.5
+            ports:
+              - containerPort: 8080
+            
+            # Resource requests and limits (CRITICAL for Java)
+            resources:
+              requests:
+                cpu: "250m"          # 0.25 vCPU requested
+                memory: "512Mi"      # JVM needs this at startup
+              limits:
+                cpu: "1000m"         # 1 vCPU max
+                memory: "1Gi"        # OOMKilled if exceeded — set above JVM heap
+            
+            env:
+              - name: SPRING_PROFILE
+                value: "production"
+              - name: DB_HOST
+                valueFrom:
+                  secretKeyRef:
+                    name: db-secret
+                    key: host
+              - name: DB_PASSWORD
+                valueFrom:
+                  secretKeyRef:
+                    name: db-secret
+                    key: password
+            
+            # Health checks — critical for rolling updates
+            livenessProbe:
+              httpGet:
+                path: /actuator/health/liveness
+                port: 8080
+              initialDelaySeconds: 30    # Give JVM time to start
+              periodSeconds: 10
+              failureThreshold: 3
+            
+            readinessProbe:
+              httpGet:
+                path: /actuator/health/readiness
+                port: 8080
+              initialDelaySeconds: 20
+              periodSeconds: 5
+              failureThreshold: 3        # Remove from service after 3 failures
+
+================================================================
+3. IRSA — IAM ROLES FOR SERVICE ACCOUNTS (Most Important Security Concept)
+================================================================
+
+  PROBLEM:
+    In EKS, if you give EC2 worker nodes an IAM role, ALL pods on that node 
+    share that IAM role. A compromised pod can access all AWS resources the 
+    node can access.
+
+  SOLUTION: IRSA (IAM Roles for Service Accounts)
+    - Each Kubernetes ServiceAccount is associated with an IAM role.
+    - Only pods using that ServiceAccount get those IAM permissions.
+    - Uses OIDC federation — EKS issues OIDC tokens, IAM validates them.
+    - Pod-level least privilege — principle of least privilege at the pod level.
+
+  SETUP:
+
+  Step 1: Enable OIDC provider on EKS cluster:
+    eksctl utils associate-iam-oidc-provider \
+      --cluster my-cluster --approve
+
+  Step 2: Create IAM Role with trust policy for the service account:
+    {
+      "Version": "2012-10-17",
+      "Statement": [{
+        "Effect": "Allow",
+        "Principal": {
+          "Federated": "arn:aws:iam::123456789:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B71EXAMPLE"
+        },
+        "Action": "sts:AssumeRoleWithWebIdentity",
+        "Condition": {
+          "StringEquals": {
+            "oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED:sub": 
+              "system:serviceaccount:production:order-service-sa"
+          }
+        }
+      }]
+    }
+
+  Step 3: Create Kubernetes ServiceAccount with IAM role annotation:
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: order-service-sa
+      namespace: production
+      annotations:
+        eks.amazonaws.com/role-arn: arn:aws:iam::123456789:role/OrderServiceRole
+
+  Step 4: Grant IAM permissions (e.g., S3 and SQS access):
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        { "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"],
+          "Resource": "arn:aws:s3:::order-uploads/*" },
+        { "Effect": "Allow", "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage"],
+          "Resource": "arn:aws:sqs:us-east-1:123:order-queue" }
+      ]
+    }
+
+  JAVA (Spring Boot):
+    // AWS SDK v2 automatically uses IRSA when running in EKS!
+    // DefaultCredentialsProvider checks for:
+    // 1. AWS_WEB_IDENTITY_TOKEN_FILE env var (set by EKS for IRSA)
+    // 2. Automatically assumes the role — no code change needed
+    
+    S3Client s3 = S3Client.builder()
+        .region(Region.US_EAST_1)
+        .credentialsProvider(DefaultCredentialsProvider.create())  // Uses IRSA
+        .build();
+    
+    // spring-cloud-aws also works automatically with IRSA — no extra config.
+
+================================================================
+4. HORIZONTAL POD AUTOSCALER (HPA) FOR JAVA SERVICES
+================================================================
+
+  ── CPU-BASED HPA ─────────────────────────────────────────────
+
+  apiVersion: autoscaling/v2
+  kind: HorizontalPodAutoscaler
+  metadata:
+    name: order-service-hpa
+  spec:
+    scaleTargetRef:
+      apiVersion: apps/v1
+      kind: Deployment
+      name: order-service
+    minReplicas: 2
+    maxReplicas: 20
+    metrics:
+      - type: Resource
+        resource:
+          name: cpu
+          target:
+            type: Utilization
+            averageUtilization: 70    # Scale up when avg CPU > 70%
+      - type: Resource
+        resource:
+          name: memory
+          target:
+            type: Utilization
+            averageUtilization: 80
+
+  ── CUSTOM METRICS HPA (SQS Queue Depth) ─────────────────────
+
+  Scale pods based on SQS queue depth (for consumer services):
+  
+  # Requires: KEDA (Kubernetes Event-Driven Autoscaling) or 
+  #           External Metrics (CloudWatch Metrics Adapter)
+  
+  # With KEDA:
+  apiVersion: keda.sh/v1alpha1
+  kind: ScaledObject
+  metadata:
+    name: order-consumer-scaler
+  spec:
+    scaleTargetRef:
+      name: order-consumer
+    minReplicaCount: 0          # Scale to zero when queue empty (cost saving!)
+    maxReplicaCount: 30
+    triggers:
+      - type: aws-sqs-queue
+        metadata:
+          queueURL: https://sqs.us-east-1.amazonaws.com/123/order-queue
+          queueLength: "5"      # 1 pod per 5 messages in queue
+          awsRegion: us-east-1
+          identityOwner: operator    # Use IRSA
+
+================================================================
+5. CONFIGMAPS AND SECRETS FOR JAVA APPS
+================================================================
+
+  ── CONFIGMAP → SPRING BOOT CONFIG ──────────────────────────
+
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: order-service-config
+  data:
+    application.yml: |
+      spring:
+        datasource:
+          hikari:
+            maximum-pool-size: 5
+      server:
+        port: 8080
+
+  // Mount as file in pod:
+  volumes:
+    - name: config-volume
+      configMap:
+        name: order-service-config
+  volumeMounts:
+    - name: config-volume
+      mountPath: /app/config
+      readOnly: true
+  
+  // Java picks it up:
+  JAVA_OPTS: "-Dspring.config.additional-location=/app/config/"
+
+  ── SECRETS FROM AWS SECRETS MANAGER VIA CSI DRIVER ──────────
+
+  Better than Kubernetes Secrets (which are base64-encoded, not encrypted):
+  
+  # Install: AWS Secrets and Configuration Provider (ASCP) for CSI Driver
+  
+  apiVersion: secrets-store.csi.x-k8s.io/v1
+  kind: SecretProviderClass
+  metadata:
+    name: aws-secrets
+  spec:
+    provider: aws
+    parameters:
+      objects: |
+        - objectName: "prod/myapp/db-credentials"
+          objectType: "secretsmanager"
+          jmesPath:
+            - path: password
+              objectAlias: db-password
+
+  // Mount in pod:
+  volumes:
+    - name: secrets-store
+      csi:
+        driver: secrets-store.csi.k8s.io
+        readOnly: true
+        volumeAttributes:
+          secretProviderClass: aws-secrets
+  volumeMounts:
+    - name: secrets-store
+      mountPath: /mnt/secrets
+      readOnly: true
+  
+  // Spring Boot reads the mounted file:
+  // /mnt/secrets/db-password → inject via environment variable or @Value
+
+================================================================
+6. EKS NETWORKING FOR JAVA MICROSERVICES
+================================================================
+
+  KUBERNETES SERVICE TYPES:
+  ┌──────────────────┬──────────────────────────────────────────────────────────┐
+  │ Type             │ Description                                              │
+  ├──────────────────┼──────────────────────────────────────────────────────────┤
+  │ ClusterIP        │ Internal only. Service-to-service within cluster.        │
+  │                  │ Java: http://order-service:8080 (DNS-resolved)           │
+  ├──────────────────┼──────────────────────────────────────────────────────────┤
+  │ NodePort         │ External access via node IP:port. Rarely used directly.  │
+  ├──────────────────┼──────────────────────────────────────────────────────────┤
+  │ LoadBalancer     │ Creates AWS NLB/ALB. External internet access.           │
+  ├──────────────────┼──────────────────────────────────────────────────────────┤
+  │ Ingress          │ L7 HTTP routing. AWS Load Balancer Controller creates ALB│
+  └──────────────────┴──────────────────────────────────────────────────────────┘
+
+  INGRESS WITH AWS LOAD BALANCER CONTROLLER:
+  apiVersion: networking.k8s.io/v1
+  kind: Ingress
+  metadata:
+    name: order-service-ingress
+    annotations:
+      kubernetes.io/ingress.class: alb
+      alb.ingress.kubernetes.io/scheme: internet-facing
+      alb.ingress.kubernetes.io/target-type: ip    # Route directly to pod IPs
+      alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:...:certificate/xxx
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+  spec:
+    rules:
+      - host: api.myapp.com
+        http:
+          paths:
+            - path: /orders
+              pathType: Prefix
+              backend:
+                service:
+                  name: order-service
+                  port:
+                    number: 8080
+
+  SERVICE DISCOVERY IN JAVA:
+  // Spring Boot microservice calling another service by Kubernetes DNS:
+  @FeignClient(url = "http://payment-service:8080")   // payment-service = K8s Service name
+  public interface PaymentClient {
+      @PostMapping("/api/payments")
+      PaymentResponse processPayment(@RequestBody PaymentRequest request);
+  }
+  
+  // Or with RestTemplate:
+  String url = "http://payment-service:8080/api/payments";
+  // Kubernetes DNS resolves "payment-service" to the ClusterIP
+
+================================================================
+7. JAVA JVM TUNING IN KUBERNETES
+================================================================
+
+  CRITICAL: JVM must be configured to respect container limits.
+
+  Java 17+ is container-aware by default. Key settings:
+
+  1. -XX:+UseContainerSupport (default in Java 17+)
+     JVM reads cgroup limits (set by K8s resources.limits) for heap sizing.
+     Without this: JVM sees host memory, allocates huge heap, OOMKilled.
+
+  2. -XX:MaxRAMPercentage=75.0
+     Set heap to 75% of container memory limit.
+     Leave 25% for: JVM metaspace, thread stacks, direct memory, OS.
+     
+     Example: limit.memory = 1Gi → heap = 768 MB. 
+     DO NOT set -Xmx greater than the remaining memory after overhead.
+
+  3. -XX:+UseG1GC (default in Java 17+)
+     G1GC balances throughput and latency. Good default for microservices.
+     For ultra-low-latency: -XX:+UseZGC (Java 17+, sub-millisecond pauses)
+
+  4. RESOURCE REQUESTS MUST MATCH ACTUAL USAGE:
+     Set request.memory ≥ JVM startup memory (usually 256-512 Mi for Spring Boot)
+     If request < actual usage: pod scheduled on node without enough memory 
+     → OOMKilled or evicted under memory pressure.
+
+  COMMON MISTAKE:
+  Limit: 512Mi but JVM heap defaults to 512Mi → no memory left for JVM overhead 
+  → random OOMKilled.
+  Fix: limit: 1Gi, -XX:MaxRAMPercentage=75 → heap = 768 Mi, headroom = 256 Mi.
+
+================================================================
+8. INTERVIEW QUESTIONS
+================================================================
+
+Q: What is IRSA and why is it preferred over EC2 instance profiles in EKS?
+
+A: IRSA (IAM Roles for Service Accounts) associates an IAM role with a 
+   Kubernetes ServiceAccount. Only pods using that ServiceAccount get those 
+   IAM permissions. This provides pod-level least privilege — each microservice 
+   has its own minimal IAM role.
+   
+   EC2 instance profiles: all pods on the node share the node's IAM role. 
+   A compromised pod can access everything the node can access — violates 
+   least privilege. Also hard to audit which pod called which AWS API.
+   
+   IRSA uses OIDC token federation — EKS injects a signed token into the pod, 
+   AWS SDK automatically exchanges it for temporary credentials via 
+   AssumeRoleWithWebIdentity. No code changes needed in Spring Boot — 
+   DefaultCredentialsProvider handles it automatically.
+
+---
+
+Q: How do you properly configure JVM memory for a Java pod in Kubernetes?
+
+A: Key principles:
+   1. Use -XX:MaxRAMPercentage=75.0 (not -Xmx) so JVM automatically sets 
+      heap as 75% of the container memory limit.
+   2. Set limits.memory large enough: heap + metaspace + thread stacks + 
+      direct memory. Rule of thumb: limits = desired_heap × 1.33.
+      For 512MB heap: set limit to ~700 Mi.
+   3. Java 17+ has container support by default (-XX:+UseContainerSupport).
+   4. Set requests.memory ≥ your JVM startup memory to ensure the pod gets 
+      scheduled on a node with enough real memory.
+   5. Monitor: kubectl top pods and JVM GC logs to validate actual usage.
+
+---
+
+Q: What is the difference between HPA and KEDA for autoscaling a Java consumer 
+   service reading from SQS?
+
+A: HPA (Horizontal Pod Autoscaler): Kubernetes-native, scales based on CPU 
+   and memory metrics. Problem: for an SQS consumer, CPU is low when the queue 
+   is full but not yet processing — HPA won't scale up. Also cannot scale to 0.
+   
+   KEDA (Kubernetes Event-Driven Autoscaling): scales based on event sources 
+   (SQS queue depth, Kafka consumer group lag, etc.). Can scale to 0 when queue 
+   is empty (cost saving). For an SQS consumer: configure target queue length 
+   per pod (e.g., 5 messages/pod) — KEDA automatically adds pods as queue 
+   grows and removes them (down to 0) when empty. Ideal for Java consumer 
+   services processing SQS/Kafka in EKS.
+
+---
+
+Q: Explain a rolling update for a Spring Boot deployment in EKS and how 
+   readiness probes ensure zero-downtime deployment.
+
+A: Rolling update strategy: Kubernetes creates new pods (with new image) while 
+   keeping old pods running. Configuration: maxSurge=1 (one extra pod above 
+   desired count), maxUnavailable=0 (never reduce below desired count).
+   
+   Process:
+   1. New pod starts — Spring Boot JVM initializes (takes 5–15 seconds).
+   2. K8s probes the readiness endpoint (/actuator/health/readiness).
+      Spring Boot returns 503 until ApplicationContext is ready and 
+      all health checks pass (DB connectivity, external services).
+   3. ONLY when readiness probe succeeds → Kubernetes adds pod to Service 
+      endpoints and starts routing traffic to it.
+   4. Kubernetes then terminates one old pod (sends SIGTERM, waits graceful 
+      shutdown timeout).
+   
+   Spring Boot graceful shutdown:
+   server.shutdown: graceful
+   spring.lifecycle.timeout-per-shutdown-phase: 20s
+   → Spring Boot finishes in-flight requests before shutdown.
+   → K8s terminationGracePeriodSeconds must be > this value.

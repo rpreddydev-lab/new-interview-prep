@@ -1,0 +1,281 @@
+================================================================
+SEARCH SYSTEMS — ELASTICSEARCH AND FULL-TEXT SEARCH DESIGN
+================================================================
+
+THE PROBLEM WITH SQL SEARCH
+-----------------------------
+SQL LIKE '%keyword%' is inefficient:
+  - Cannot use indexes (full table scan required)
+  - No relevance ranking ("how well does this match?")
+  - No typo tolerance ("colour" vs "color")
+  - No stemming ("running" matches "run")
+  - No full-text scoring
+  
+For any non-trivial search: use a dedicated search engine.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INVERTED INDEX — THE CORE DATA STRUCTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+An inverted index maps TERMS to the DOCUMENTS that contain them.
+
+Example documents:
+  Doc 1: "Java is a programming language"
+  Doc 2: "Python is a programming language"
+  Doc 3: "Java and Python are both popular"
+
+Inverted index:
+  "java"        → [Doc1, Doc3]
+  "python"      → [Doc2, Doc3]
+  "programming" → [Doc1, Doc2]
+  "language"    → [Doc1, Doc2]
+  "popular"     → [Doc3]
+  "both"        → [Doc3]
+
+Query: "java programming"
+→ Look up "java" → {Doc1, Doc3}
+→ Look up "programming" → {Doc1, Doc2}
+→ Intersection → {Doc1}
+→ Return Doc1
+
+Benefits: O(1) term lookup, O(k) where k = result count (not total docs).
+Much faster than scanning all documents.
+
+HOW TERMS ARE CREATED (Analysis Pipeline):
+  Raw text → Tokenizer → Token Filters → Index
+  
+  1. TOKENIZER: Split text into tokens (words).
+     "Java is a programming language" → ["Java", "is", "a", "programming", "language"]
+  
+  2. LOWERCASE FILTER: "Java" → "java"
+  
+  3. STOP WORD FILTER: Remove common words with no search value.
+     "is", "a", "the", "and" → removed
+     Result: ["java", "programming", "language"]
+  
+  4. STEMMING: Reduce to root form.
+     "programming" → "program", "running" → "run", "languages" → "languag"
+  
+  5. SYNONYMS: "colour" → "color", "automobile" → "car"
+
+Same pipeline applied at QUERY TIME:
+  Search "Java Programming" → analyzed → "java", "program" → matches stem "program"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ELASTICSEARCH ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Elasticsearch is a distributed, RESTful search engine built on Apache Lucene.
+
+KEY CONCEPTS:
+
+INDEX:
+  Logical container for related documents (like a database table).
+  Example: "products", "articles", "logs-2026-04-10"
+  Each index has a mapping (field types) and settings (analyzers, replicas).
+
+DOCUMENT:
+  Unit of data — a JSON object stored in an index.
+  Each document has an _id (auto-generated or user-specified).
+  { "_id": "p1", "name": "MacBook Pro", "price": 1999, "category": "laptop" }
+
+SHARD:
+  An index is split into shards (independent Lucene instances).
+  Each shard is a self-contained search engine.
+  Sharding enables horizontal scaling:
+    10M documents → 5 shards → 2M per shard → distributed across nodes.
+  
+  Primary shard: handles writes.
+  Replica shard: copy of primary, handles reads + provides redundancy.
+  
+  Number of primary shards: FIXED at index creation.
+  (Cannot change later without reindexing — choose carefully.)
+  Number of replicas: can be changed dynamically.
+
+NODE:
+  A running Elasticsearch instance (JVM process).
+  Node roles: Master, Data, Ingest, Coordinating.
+
+CLUSTER:
+  One or more nodes that share data and load.
+  One elected master node: manages cluster state (index creation, shard assignment).
+  
+  ┌─────────────────────────────────────────────────────────┐
+  │                     ES Cluster                          │
+  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+  │  │   Node 1     │  │   Node 2     │  │   Node 3     │ │
+  │  │  P0  R1  R2  │  │  P1  R0  R2  │  │  P2  R0  R1  │ │
+  │  └──────────────┘  └──────────────┘  └──────────────┘ │
+  │   P=Primary Shard, R=Replica Shard (index=3 shards)    │
+  └─────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+READ AND WRITE PATH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WRITE PATH:
+  1. Client sends document to any node (coordinating node).
+  2. Coordinating node: hash(_id) % numShards → determines primary shard.
+  3. Forwards request to primary shard's node.
+  4. Primary shard indexes document (Lucene write + transaction log).
+  5. Primary replicates to all replica shards.
+  6. Response returned to client after primary + all replicas confirm.
+  
+  Near-real-time: documents visible for search ~1 second after indexing
+  (Lucene refreshes search index every 1 second by default).
+
+READ/SEARCH PATH:
+  1. Client sends query to any node (coordinating node).
+  2. Coordinating node fans out query to all shards (primary OR any replica).
+  3. Each shard executes query locally, returns top-N results with scores.
+  4. Coordinating node MERGES results from all shards, re-ranks by score.
+  5. Fetches full documents for top-K results.
+  6. Returns final results to client.
+  
+  SCATTER-GATHER pattern: O(log N) per shard, but many shards in parallel.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RELEVANCE SCORING — BM25
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Elasticsearch uses BM25 (Best Match 25) for relevance scoring.
+Based on:
+  TF (Term Frequency): how often does the term appear in the document?
+    More occurrences → higher score (with diminishing returns)
+  IDF (Inverse Document Frequency): how rare is the term across all documents?
+    Rare terms → higher score ("quantum" is more meaningful than "the")
+  Field length normalization: short documents with the term rank higher
+    than long documents with the same term count.
+
+Result: documents are ranked by relevance, not just "does it contain the word?"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+KEEPING ELASTICSEARCH IN SYNC WITH PRIMARY DB
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Elasticsearch is NOT the primary DB — it's a search index.
+Source of truth: PostgreSQL/MySQL/MongoDB.
+ES is updated asynchronously.
+
+SYNC STRATEGIES:
+
+1. DUAL WRITE (application):
+   App writes to DB and ES in the same request handler.
+   Problem: if ES write fails, data is inconsistent.
+   Fix: async dual write with retry, accept eventual consistency.
+
+2. CHANGE DATA CAPTURE (preferred):
+   Debezium captures changes from DB binary log (MySQL binlog, Postgres WAL).
+   Publishes change events to Kafka.
+   Kafka consumer writes to Elasticsearch.
+   Decoupled, reliable, ordered.
+   
+   DB → Debezium → Kafka → Kafka Consumer → Elasticsearch
+
+3. POLLING:
+   Query DB for records updated since last poll.
+   Requires updated_at timestamp on every table.
+   Simple but adds DB load and has lag.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ELASTICSEARCH QUERY DSL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Full-text match query (analyzed):
+  POST /products/_search
+  {
+    "query": {
+      "match": {
+        "description": "fast laptop"
+      }
+    }
+  }
+
+Multi-field match:
+  {
+    "query": {
+      "multi_match": {
+        "query": "MacBook",
+        "fields": ["name^3", "description", "brand^2"]  // ^N = boost weight
+      }
+    }
+  }
+
+Filtered + full-text (bool query):
+  {
+    "query": {
+      "bool": {
+        "must": [
+          { "match": { "name": "laptop" } }
+        ],
+        "filter": [
+          { "term": { "category": "electronics" } },
+          { "range": { "price": { "gte": 500, "lte": 2000 } } }
+        ]
+      }
+    },
+    "sort": [{ "_score": "desc" }, { "price": "asc" }],
+    "from": 0, "size": 20
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SYSTEM DESIGN: SEARCH IN A PRODUCT CATALOG
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Architecture:
+  User Query → API Gateway → Search Service → Elasticsearch
+  
+  Product updates → Product Service → Kafka (product-events) → Indexer Service → Elasticsearch
+  
+  Elasticsearch cluster:
+    3 data nodes (shards + replicas)
+    Dedicated master nodes (3, quorum)
+  
+  Index design:
+    products index: 5 primary shards, 1 replica each = 10 total
+    Mapping: name (text, analyzed), brand (keyword), price (float),
+             category (keyword), description (text, analyzed), rating (float)
+  
+  Caching:
+    Cache popular search results in Redis (TTL 5 min)
+    Reduces ES load for trending queries
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ELASTICSEARCH vs ALTERNATIVES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────┬──────────────────────────────────────────────────┐
+│ Technology          │ Notes                                            │
+├─────────────────────┼──────────────────────────────────────────────────┤
+│ Elasticsearch       │ Full-featured, widely used, complex operations   │
+│ OpenSearch          │ AWS fork of Elasticsearch (post-license change)  │
+│ Apache Solr         │ Older, Lucene-based, less popular now            │
+│ Typesense           │ Simple, fast, good for e-commerce search         │
+│ Meilisearch         │ Simple REST API, fast, typo tolerant             │
+│ Algolia             │ SaaS, very fast, no infrastructure management    │
+│ PostgreSQL FTS      │ Full-text search built into Postgres (smaller scale) │
+└─────────────────────┴──────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: Why can't you use Elasticsearch as your primary database?
+A: ES is optimized for search, not ACID transactions.
+   No transactions, no foreign keys, no joins.
+   Data can be lost if cluster is unclean shutdown (not fully durable by default).
+   Near-real-time (1s delay) means freshly written data may not be searchable yet.
+   Use a relational/document DB as source of truth, sync to ES.
+
+Q: How do you scale Elasticsearch for billions of documents?
+A: Horizontal scaling: add more nodes, more shards.
+   Index lifecycle management (ILM): move old data to cheaper cold/frozen nodes.
+   Time-based indices with rollover (logs-2026-04-*, keep 30 days of hot data).
+   Tiered storage: hot (SSD) → warm (HDD) → cold → frozen (S3 snapshots).
+
+Q: How do you handle zero-downtime reindexing?
+A: Use index aliases. Point alias "products" → "products-v1".
+   Create "products-v2" with new mapping.
+   Reindex: POST /products-v1/_reindex { "dest": { "index": "products-v2" } }
+   Atomic alias swap: DELETE alias from v1, ADD to v2 in one operation.
+   Zero downtime — clients always query via alias, never index name directly.

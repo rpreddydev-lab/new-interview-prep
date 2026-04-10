@@ -1,0 +1,992 @@
+================================================================================
+FILE 15 — JAVA CODING PATTERNS: EXTENDED SENIOR-LEVEL PATTERNS
+================================================================================
+Target: Senior Java Developer interviews (5-10+ years)
+Format: Pattern name → Problem → Full implementation → Interview notes
+Topics: Dynamic Proxy, Retry with backoff, Functional patterns, Flyweight,
+        Object Pool, Template Method, Strategy, Decorator, Custom functional
+        interfaces, Lazy initialization variants
+
+================================================================================
+SECTION 1 — DYNAMIC PROXY (java.lang.reflect.Proxy)
+================================================================================
+
+Q1: Implement a logging proxy using JDK dynamic proxy without changing the
+    original class.
+
+A:
+// The pattern: wrap any interface with cross-cutting behaviour at runtime.
+// JDK dynamic proxy only works with INTERFACES. For classes, use CGLIB (Spring does this).
+
+import java.lang.reflect.*;
+import java.util.logging.Logger;
+
+public interface OrderRepository {
+    void save(Order order);
+    Order findById(String id);
+    void delete(String id);
+}
+
+// Real implementation — no logging code here
+public class PostgresOrderRepository implements OrderRepository {
+    @Override public void save(Order order)       { /* DB call */ }
+    @Override public Order findById(String id)    { return new Order(id); }
+    @Override public void delete(String id)       { /* DB call */ }
+}
+
+// Generic logging proxy factory — works for ANY interface
+public class LoggingProxyFactory {
+    private static final Logger LOG = Logger.getLogger(LoggingProxyFactory.class.getName());
+
+    @SuppressWarnings("unchecked")
+    public static <T> T wrap(T target, Class<T> interfaceType) {
+        return (T) Proxy.newProxyInstance(
+            interfaceType.getClassLoader(),
+            new Class<?>[]{ interfaceType },
+            new LoggingHandler(target)
+        );
+    }
+
+    private static class LoggingHandler implements InvocationHandler {
+        private final Object target;
+        LoggingHandler(Object target) { this.target = target; }
+
+        @Override
+        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+            long start = System.nanoTime();
+            LOG.info(() -> "ENTER: " + method.getName() + "()");
+            try {
+                Object result = method.invoke(target, args);
+                long elapsed = (System.nanoTime() - start) / 1_000_000;
+                LOG.info(() -> "EXIT: " + method.getName() + "() in " + elapsed + "ms");
+                return result;
+            } catch (InvocationTargetException e) {
+                LOG.severe("EXCEPTION in " + method.getName() + ": " + e.getCause().getMessage());
+                throw e.getCause(); // unwrap — don't leak InvocationTargetException
+            }
+        }
+    }
+}
+
+// Usage:
+OrderRepository repo = new PostgresOrderRepository();
+OrderRepository logged = LoggingProxyFactory.wrap(repo, OrderRepository.class);
+logged.save(new Order("ORD-001"));  // logs enter/exit automatically
+
+// ── Interview Notes ──────────────────────────────────────────────────────────
+// JDK proxy creates a new class at runtime implementing the interface.
+// InvocationTargetException wraps exceptions from method.invoke() — always unwrap.
+// Spring AOP uses JDK proxy for interface-based beans, CGLIB for class-based.
+// Q: "How does Spring @Transactional work?" → proxy intercepts method call,
+//    begins transaction before, commits/rolls back after.
+// Q: "What is a self-invocation problem?" → if OrderService calls its own
+//    @Transactional method, the proxy is bypassed (goes direct to 'this').
+
+================================================================================
+SECTION 2 — RETRY PATTERN WITH EXPONENTIAL BACKOFF
+================================================================================
+
+Q2: Implement a generic retry utility with exponential backoff and jitter,
+    suitable for wrapping HTTP calls and database operations.
+
+A:
+import java.time.Duration;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Supplier;
+
+public class RetryExecutor {
+
+    private final int maxAttempts;
+    private final Duration initialDelay;
+    private final double backoffMultiplier;
+    private final Duration maxDelay;
+
+    private RetryExecutor(Builder b) {
+        this.maxAttempts       = b.maxAttempts;
+        this.initialDelay      = b.initialDelay;
+        this.backoffMultiplier = b.backoffMultiplier;
+        this.maxDelay          = b.maxDelay;
+    }
+
+    // Execute a supplier, retrying on any exception
+    public <T> T execute(Supplier<T> action) {
+        Exception lastException = null;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                return action.get();
+            } catch (Exception e) {
+                lastException = e;
+                if (attempt == maxAttempts) break;
+                long delayMs = computeDelay(attempt);
+                System.out.printf("Attempt %d failed (%s). Retrying in %dms%n",
+                    attempt, e.getMessage(), delayMs);
+                sleep(delayMs);
+            }
+        }
+        throw new RetryExhaustedException("All " + maxAttempts + " attempts failed", lastException);
+    }
+
+    // Execute a void action
+    public void execute(Runnable action) {
+        execute(() -> { action.run(); return null; });
+    }
+
+    private long computeDelay(int attempt) {
+        // Exponential backoff: initialDelay * multiplier^(attempt-1)
+        double baseMs = initialDelay.toMillis() * Math.pow(backoffMultiplier, attempt - 1);
+        // Cap at maxDelay
+        long cappedMs = (long) Math.min(baseMs, maxDelay.toMillis());
+        // Add jitter: ±25% random to avoid thundering herd
+        long jitter = (long) (cappedMs * 0.25 * ThreadLocalRandom.current().nextDouble(-1, 1));
+        return Math.max(0, cappedMs + jitter);
+    }
+
+    private void sleep(long ms) {
+        try { Thread.sleep(ms); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    public static Builder builder() { return new Builder(); }
+
+    public static class Builder {
+        private int maxAttempts = 3;
+        private Duration initialDelay = Duration.ofMillis(100);
+        private double backoffMultiplier = 2.0;
+        private Duration maxDelay = Duration.ofSeconds(30);
+
+        public Builder maxAttempts(int n)             { this.maxAttempts = n; return this; }
+        public Builder initialDelay(Duration d)       { this.initialDelay = d; return this; }
+        public Builder backoffMultiplier(double m)    { this.backoffMultiplier = m; return this; }
+        public Builder maxDelay(Duration d)           { this.maxDelay = d; return this; }
+        public RetryExecutor build()                  { return new RetryExecutor(this); }
+    }
+
+    public static class RetryExhaustedException extends RuntimeException {
+        public RetryExhaustedException(String msg, Throwable cause) { super(msg, cause); }
+    }
+}
+
+// Retry only specific exceptions (e.g., transient network errors, not 4xx):
+public class SelectiveRetryExecutor {
+    private final RetryExecutor delegate;
+    private final Class<? extends Exception>[] retryableExceptions;
+
+    @SafeVarargs
+    public SelectiveRetryExecutor(RetryExecutor delegate,
+                                  Class<? extends Exception>... retryable) {
+        this.delegate = delegate;
+        this.retryableExceptions = retryable;
+    }
+
+    public <T> T execute(Supplier<T> action) {
+        return delegate.execute(() -> {
+            try { return action.get(); }
+            catch (Exception e) {
+                if (isRetryable(e)) throw e;           // let retry handle it
+                throw new RuntimeException("Non-retryable: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    private boolean isRetryable(Exception e) {
+        for (var type : retryableExceptions)
+            if (type.isInstance(e)) return true;
+        return false;
+    }
+}
+
+// Usage:
+RetryExecutor retry = RetryExecutor.builder()
+    .maxAttempts(5)
+    .initialDelay(Duration.ofMillis(200))
+    .backoffMultiplier(2.0)
+    .maxDelay(Duration.ofSeconds(10))
+    .build();
+
+String response = retry.execute(() -> httpClient.get("https://api.example.com/data"));
+
+// ── Interview Notes ──────────────────────────────────────────────────────────
+// Exponential backoff: delays grow as 200ms, 400ms, 800ms, 1600ms, ...
+// Jitter is CRITICAL: without it, all instances retry simultaneously after an
+//   outage → thundering herd → re-triggers the outage.
+// Full Jitter formula: delay = random(0, min(cap, base * 2^attempt))
+// AWS Exponential Backoff blog (Patel 2015) coined the terminology.
+// Resilience4j's Retry is the production-grade library implementation.
+// "Not-retryable" exceptions: validation errors, 400 Bad Request, 401, 403.
+// "Retryable": 429 Too Many Requests, 503 Service Unavailable, 504, network timeout.
+
+================================================================================
+SECTION 3 — FLYWEIGHT PATTERN
+================================================================================
+
+Q3: In a telecom system, millions of CDR (Call Detail Record) objects share
+    the same country code, codec, and billing zone data. Implement Flyweight
+    to reduce memory.
+
+A:
+// Flyweight = share intrinsic (immutable, context-free) state across instances.
+// Extrinsic (context-specific) state stays in the client or passed at use time.
+
+// INTRINSIC STATE — shared, immutable
+public record CallProfile(String countryCode, String codec, String billingZone) {
+    // Records are implicitly immutable — ideal for Flyweight
+}
+
+// FLYWEIGHT FACTORY — returns cached instances
+public class CallProfileFactory {
+    // ConcurrentHashMap for thread safety in multi-threaded CDR processing
+    private static final Map<String, CallProfile> CACHE = new ConcurrentHashMap<>();
+
+    public static CallProfile get(String countryCode, String codec, String billingZone) {
+        String key = countryCode + "|" + codec + "|" + billingZone;
+        return CACHE.computeIfAbsent(key, k -> new CallProfile(countryCode, codec, billingZone));
+    }
+
+    public static int cacheSize() { return CACHE.size(); }
+}
+
+// CDR uses flyweight for shared profile — stores EXTRINSIC state itself
+public class CallDetailRecord {
+    private final String callId;          // extrinsic — unique per CDR
+    private final long startEpochMs;      // extrinsic
+    private final int durationSeconds;    // extrinsic
+    private final CallProfile profile;    // INTRINSIC — shared flyweight
+
+    public CallDetailRecord(String callId, long startEpochMs,
+                            int durationSeconds, CallProfile profile) {
+        this.callId          = callId;
+        this.startEpochMs    = startEpochMs;
+        this.durationSeconds = durationSeconds;
+        this.profile         = profile;
+    }
+
+    public double computeCharge(PriceTable prices) {
+        // Extrinsic duration + intrinsic billingZone used at computation time
+        return prices.ratePerSecond(profile.billingZone()) * durationSeconds;
+    }
+}
+
+// Without flyweight: 10M CDRs × 3 Strings per profile = ~30M string objects
+// With flyweight: 10M CDRs × 1 reference to shared profile = only ~200 profiles in cache
+
+// ── Interview Notes ──────────────────────────────────────────────────────────
+// Real-world: Java String pool is the canonical Flyweight.
+// Integer.valueOf(-128..127) is another built-in Flyweight.
+// Distinguish: Intrinsic (shared) vs. Extrinsic (per-instance).
+// EnumMap / Enum itself is effectively a Flyweight (one instance per constant).
+// Gotcha: Flyweight objects MUST be immutable. Mutable shared state → data corruption.
+
+================================================================================
+SECTION 4 — OBJECT POOL PATTERN
+================================================================================
+
+Q4: Implement a generic thread-safe object pool with borrow/return semantics,
+    suitable for expensive-to-create objects (e.g., DB connections, PDF generators).
+
+A:
+import java.util.concurrent.*;
+import java.util.function.Supplier;
+
+public class ObjectPool<T> implements AutoCloseable {
+
+    private final BlockingQueue<T> pool;
+    private final Supplier<T> factory;
+    private final int maxSize;
+    private volatile boolean closed = false;
+
+    public ObjectPool(int poolSize, Supplier<T> factory) {
+        this.maxSize = poolSize;
+        this.factory = factory;
+        this.pool = new ArrayBlockingQueue<>(poolSize);
+        // Pre-populate pool
+        for (int i = 0; i < poolSize; i++) {
+            pool.offer(factory.get());
+        }
+    }
+
+    // Borrow an object — blocks up to timeout
+    public T borrow(long timeout, TimeUnit unit) throws InterruptedException {
+        if (closed) throw new IllegalStateException("Pool is closed");
+        T obj = pool.poll(timeout, unit);
+        if (obj == null) throw new TimeoutException("No object available within " + timeout + " " + unit);
+        return obj;
+    }
+
+    // Borrow with try-with-resources support
+    public PooledObject<T> borrowAuto(long timeout, TimeUnit unit) throws InterruptedException {
+        T obj = borrow(timeout, unit);
+        return new PooledObject<>(obj, this);
+    }
+
+    // Return an object to the pool
+    public void returnToPool(T obj) {
+        if (!closed) {
+            pool.offer(obj);  // non-blocking — pool can never exceed maxSize
+        }
+    }
+
+    public int available() { return pool.size(); }
+
+    @Override
+    public void close() {
+        closed = true;
+        // If T is AutoCloseable, drain and close all
+        pool.forEach(obj -> {
+            if (obj instanceof AutoCloseable ac) {
+                try { ac.close(); } catch (Exception ignored) {}
+            }
+        });
+        pool.clear();
+    }
+
+    // Wrapper for try-with-resources
+    public class PooledObject<E> implements AutoCloseable {
+        private final E object;
+        private final ObjectPool<E> pool;
+        PooledObject(E object, ObjectPool<E> pool) { this.object = object; this.pool = pool; }
+        public E get() { return object; }
+        @Override public void close() { pool.returnToPool(object); }
+    }
+}
+
+// Exception — needed since TimeUnit isn't Exception
+class TimeoutException extends RuntimeException {
+    public TimeoutException(String msg) { super(msg); }
+}
+
+// Usage — PDF generator pool:
+ObjectPool<PdfGenerator> pdfPool = new ObjectPool<>(10, PdfGenerator::new);
+
+try (var pooled = pdfPool.borrowAuto(5, TimeUnit.SECONDS)) {
+    byte[] pdf = pooled.get().render(reportData);
+    return pdf;
+} // automatically returned to pool
+
+// ── Interview Notes ──────────────────────────────────────────────────────────
+// HikariCP is the gold-standard Object Pool for JDBC connections in Java.
+// ArrayBlockingQueue is ideal: thread-safe, bounded, blocks naturally.
+// Key design decisions: pre-populate vs. lazy creation, max wait time,
+//   validation on borrow (is the connection still alive?), eviction of stale objects.
+// GenericObjectPool from Apache Commons Pool2 adds validation + eviction.
+// Pitfall: if borrower throws without returning → pool starvation.
+//   Fix: always use try-with-resources / PooledObject wrapper.
+
+================================================================================
+SECTION 5 — TEMPLATE METHOD PATTERN IN JAVA
+================================================================================
+
+Q5: Implement a data export framework using Template Method, where the steps
+    (fetch, transform, format, write) are fixed but each step is customizable.
+
+A:
+// Template Method = define the SKELETON of an algorithm in a base class.
+// Let subclasses override specific steps without changing the overall structure.
+
+public abstract class DataExporter<T> {
+
+    // TEMPLATE METHOD — final to prevent subclasses from changing the order
+    public final void export(ExportRequest request) {
+        List<T> rawData    = fetchData(request);           // step 1
+        List<T> filtered   = filterData(rawData, request); // step 2 (optional)
+        String  formatted  = formatData(filtered);         // step 3
+        validate(formatted);                               // step 4 (fixed)
+        writeOutput(formatted, request.getDestination());  // step 5
+        postExport(request);                               // step 6 (optional hook)
+    }
+
+    // Abstract steps — subclasses MUST implement
+    protected abstract List<T> fetchData(ExportRequest request);
+    protected abstract String formatData(List<T> data);
+    protected abstract void writeOutput(String content, String destination);
+
+    // Hook methods — subclasses MAY override (default: no-op)
+    protected List<T> filterData(List<T> data, ExportRequest request) {
+        return data; // default: no filtering
+    }
+    protected void postExport(ExportRequest request) {
+        // default: nothing
+    }
+
+    // Fixed step — not overridable
+    private void validate(String content) {
+        if (content == null || content.isBlank())
+            throw new ExportException("Formatted output is empty");
+    }
+}
+
+// Concrete exporter 1: CSV CDR export
+public class CsvCdrExporter extends DataExporter<CallDetailRecord> {
+
+    private final CdrRepository repository;
+
+    public CsvCdrExporter(CdrRepository repository) { this.repository = repository; }
+
+    @Override
+    protected List<CallDetailRecord> fetchData(ExportRequest request) {
+        return repository.findByDateRange(request.getFrom(), request.getTo());
+    }
+
+    @Override
+    protected String formatData(List<CallDetailRecord> cdrs) {
+        StringBuilder sb = new StringBuilder("callId,duration,charge\n");
+        for (var cdr : cdrs)
+            sb.append(cdr.getCallId()).append(",")
+              .append(cdr.getDurationSeconds()).append(",")
+              .append(cdr.getCharge()).append("\n");
+        return sb.toString();
+    }
+
+    @Override
+    protected void writeOutput(String content, String destination) {
+        Files.writeString(Path.of(destination), content);
+    }
+
+    @Override
+    protected List<CallDetailRecord> filterData(List<CallDetailRecord> data, ExportRequest req) {
+        // Only export CDRs longer than 0 seconds
+        return data.stream().filter(c -> c.getDurationSeconds() > 0).toList();
+    }
+
+    @Override
+    protected void postExport(ExportRequest request) {
+        auditLog.record("CDR export completed: " + request.getDestination());
+    }
+}
+
+// Concrete exporter 2: JSON billing export (different format, same structure)
+public class JsonBillingExporter extends DataExporter<BillingRecord> {
+    @Override
+    protected List<BillingRecord> fetchData(ExportRequest req) { /* ... */ }
+    @Override
+    protected String formatData(List<BillingRecord> records) { /* JSON serialization */ }
+    @Override
+    protected void writeOutput(String json, String dest) { /* write to S3 */ }
+}
+
+// ── Interview Notes ──────────────────────────────────────────────────────────
+// Classic GoF Behavioral pattern — Hollywood Principle: "Don't call us, we'll call you."
+// The base class calls the subclass methods (inversion of control).
+// Hooks vs. abstract: abstract forces implementation; hooks provide optional extension.
+// Real-world: JUnit's @BeforeEach/@AfterEach is Template Method.
+// Spring's JdbcTemplate, RestTemplate use Template Method (doExecute is the template).
+// Prefer composition (Strategy) over Template Method when subclassing is too rigid.
+// Final template method = prevent subclasses from breaking the invariant order.
+
+================================================================================
+SECTION 6 — STRATEGY PATTERN WITH FUNCTIONAL INTERFACES
+================================================================================
+
+Q6: Implement a billing strategy system where the algorithm for computing
+    a monthly bill varies by customer tier, using functional interfaces.
+
+A:
+// Modern Java Strategy: use functional interfaces instead of class hierarchy.
+// This eliminates boilerplate while keeping full polymorphism.
+
+@FunctionalInterface
+public interface BillingStrategy {
+    Money computeBill(List<CallDetailRecord> cdrs, TariffPlan plan);
+
+    // Default methods provide common billing utilities
+    default BillingStrategy andThen(UnaryOperator<Money> adjustment) {
+        return (cdrs, plan) -> adjustment.apply(this.computeBill(cdrs, plan));
+    }
+}
+
+// Named strategy implementations as constants — readable, testable
+public class BillingStrategies {
+
+    // Flat rate: all calls at plan's base rate
+    public static final BillingStrategy FLAT_RATE =
+        (cdrs, plan) -> plan.getBaseFee()
+            .add(cdrs.stream()
+                 .map(cdr -> plan.getRatePerMinute().multiply(cdr.getDurationMinutes()))
+                 .reduce(Money.ZERO, Money::add));
+
+    // Tiered: first 100 mins free, then rate applies
+    public static final BillingStrategy TIERED =
+        (cdrs, plan) -> {
+            double totalMinutes = cdrs.stream()
+                .mapToDouble(CallDetailRecord::getDurationMinutes).sum();
+            double billableMinutes = Math.max(0, totalMinutes - plan.getFreeMinutes());
+            return plan.getBaseFee()
+                .add(plan.getRatePerMinute().multiply(billableMinutes));
+        };
+
+    // Peak/off-peak: different rates by hour
+    public static final BillingStrategy PEAK_OFF_PEAK =
+        (cdrs, plan) -> {
+            Money total = plan.getBaseFee();
+            for (var cdr : cdrs) {
+                boolean isPeak = cdr.getStartHour() >= 8 && cdr.getStartHour() < 20;
+                Money rate = isPeak ? plan.getPeakRate() : plan.getOffPeakRate();
+                total = total.add(rate.multiply(cdr.getDurationMinutes()));
+            }
+            return total;
+        };
+
+    // Corporate: apply negotiated discount on top of flat rate
+    public static BillingStrategy corporateDiscounted(double discountFraction) {
+        return FLAT_RATE.andThen(bill -> bill.multiply(1.0 - discountFraction));
+    }
+}
+
+// Context class — holds and uses the strategy
+public class BillingEngine {
+    private BillingStrategy strategy;
+
+    public BillingEngine(BillingStrategy strategy) { this.strategy = strategy; }
+
+    // Strategy can be swapped at runtime
+    public void setStrategy(BillingStrategy strategy) { this.strategy = strategy; }
+
+    public Invoice generateInvoice(Subscriber subscriber, List<CallDetailRecord> cdrs) {
+        Money amount = strategy.computeBill(cdrs, subscriber.getTariffPlan());
+        return Invoice.of(subscriber.getId(), amount, LocalDate.now());
+    }
+}
+
+// Usage:
+var premiumEngine = new BillingEngine(BillingStrategies.TIERED);
+var corporateEngine = new BillingEngine(BillingStrategies.corporateDiscounted(0.20));
+
+// ── Interview Notes ──────────────────────────────────────────────────────────
+// Functional Strategy avoids the classic "Strategy class per algorithm" explosion.
+// Comparator<T> is the most famous built-in Strategy in Java.
+// Comparator.comparing().thenComparing() chains strategies (Decorator + Strategy).
+// Strategy vs. Template Method: Strategy = choose algorithm at runtime via composition.
+//   Template Method = fix the skeleton, vary steps via inheritance.
+// Open/Closed Principle: add a new strategy without modifying BillingEngine.
+// Test-friendly: pass a lambda in tests instead of a full strategy class.
+
+================================================================================
+SECTION 7 — DECORATOR PATTERN WITH STREAMS AND FUNCTIONAL INTERFACES
+================================================================================
+
+Q7: Implement a pipeline of data transformations on a stream of CDRs using
+    Decorator, where each decorator adds a processing step.
+
+A:
+// Functional Decorator: wrap a function with additional behaviour.
+// Identical to how Stream.filter(), map(), distinct() chain works internally.
+
+@FunctionalInterface
+public interface CdrProcessor {
+    Stream<CallDetailRecord> process(Stream<CallDetailRecord> input);
+
+    // Compose two processors: this → then
+    default CdrProcessor andThen(CdrProcessor then) {
+        return input -> then.process(this.process(input));
+    }
+}
+
+// Individual decorators — each adds one responsibility
+public class CdrProcessors {
+
+    // Remove zero-duration records (garbage calls)
+    public static final CdrProcessor REMOVE_ZERO_DURATION =
+        stream -> stream.filter(cdr -> cdr.getDurationSeconds() > 0);
+
+    // Remove duplicate call IDs (deduplication)
+    public static final CdrProcessor DEDUPLICATE =
+        stream -> stream.distinct();  // uses CDR.equals/hashCode on callId
+
+    // Normalize country codes (e.g., "+44" → "GB")
+    public static CdrProcessor normalizeCountryCode(CountryCodeMapper mapper) {
+        return stream -> stream.map(cdr -> cdr.withCountryCode(mapper.normalize(cdr.getCountryCode())));
+    }
+
+    // Filter by date range
+    public static CdrProcessor dateRange(LocalDate from, LocalDate to) {
+        return stream -> stream.filter(cdr ->
+            !cdr.getDate().isBefore(from) && !cdr.getDate().isAfter(to));
+    }
+
+    // Enrich with billing zone from geo-lookup
+    public static CdrProcessor enrichBillingZone(GeoLookupService geo) {
+        return stream -> stream.map(cdr -> cdr.withBillingZone(geo.lookupZone(cdr.getCountryCode())));
+    }
+}
+
+// Build a processing pipeline using method chaining
+CdrProcessor pipeline = CdrProcessors.REMOVE_ZERO_DURATION
+    .andThen(CdrProcessors.DEDUPLICATE)
+    .andThen(CdrProcessors.normalizeCountryCode(countryMapper))
+    .andThen(CdrProcessors.dateRange(LocalDate.of(2026, 1, 1), LocalDate.of(2026, 3, 31)))
+    .andThen(CdrProcessors.enrichBillingZone(geoService));
+
+List<CallDetailRecord> processed = pipeline
+    .process(cdrRepository.streamAll())
+    .collect(Collectors.toList());
+
+// Each decorator is independently testable:
+@Test
+void removeZeroDuration_filtersZeroSecondCalls() {
+    var input = Stream.of(
+        cdr("C1", 0),   // should be removed
+        cdr("C2", 60),  // should remain
+        cdr("C3", 0)    // should be removed
+    );
+    var result = CdrProcessors.REMOVE_ZERO_DURATION.process(input).toList();
+    assertThat(result).hasSize(1).extracting(CallDetailRecord::getCallId).contains("C2");
+}
+
+// ── Interview Notes ──────────────────────────────────────────────────────────
+// Java's Stream API IS a decorator pattern internally.
+// filter(), map(), flatMap() return new Stream objects wrapping the previous stream.
+// Function.compose() and Function.andThen() are functional decorator primitives.
+// Real-world: HttpClient interceptors, Servlet Filters, Spring Security filter chain.
+// Decorator vs. Inheritance: Decorator is composition-based → can stack at runtime.
+// Gotcha: streams are lazy — no processing until a terminal operation is called.
+
+================================================================================
+SECTION 8 — CUSTOM FUNCTIONAL INTERFACES
+================================================================================
+
+Q8: Design a set of custom functional interfaces for a CDR processing system
+    that need exception handling, input-output type mapping, and chaining.
+
+A:
+// Java's built-in FIs: Function, Predicate, Consumer, Supplier, UnaryOperator
+// When to create custom ones:
+//   1. Checked exceptions needed (Function<T,R> doesn't throw checked)
+//   2. Domain-specific semantics (naming clarity)
+//   3. More than 2 type parameters (BiFunction only goes to 2)
+
+// 1. CheckedFunction — like Function but allows checked exceptions
+@FunctionalInterface
+public interface CheckedFunction<T, R> {
+    R apply(T t) throws Exception;
+
+    // Static adapter: wrap into unchecked Function for Stream compatibility
+    static <T, R> Function<T, R> wrap(CheckedFunction<T, R> fn) {
+        return t -> {
+            try { return fn.apply(t); }
+            catch (Exception e) { throw new RuntimeException(e); }
+        };
+    }
+}
+
+// Usage in stream:
+List<CdrRecord> parsed = lines.stream()
+    .map(CheckedFunction.wrap(CdrParser::parse))  // parse() throws IOException
+    .collect(Collectors.toList());
+
+// 2. Validator — a Predicate that also provides a reason for failure
+@FunctionalInterface
+public interface Validator<T> {
+    ValidationResult validate(T input);
+
+    default Validator<T> and(Validator<T> other) {
+        return input -> {
+            var first = this.validate(input);
+            return first.isValid() ? other.validate(input) : first;
+        };
+    }
+
+    default Validator<T> or(Validator<T> other) {
+        return input -> {
+            var first = this.validate(input);
+            return first.isValid() ? first : other.validate(input);
+        };
+    }
+}
+
+public record ValidationResult(boolean isValid, String reason) {
+    public static ValidationResult ok()                  { return new ValidationResult(true, null); }
+    public static ValidationResult fail(String reason)   { return new ValidationResult(false, reason); }
+}
+
+// Domain validators composed using and()/or():
+Validator<CallDetailRecord> cdrValidator =
+    ((Validator<CallDetailRecord>) cdr ->
+        cdr.getCallId() != null ? ValidationResult.ok() : ValidationResult.fail("callId is null"))
+    .and(cdr ->
+        cdr.getDurationSeconds() >= 0 ? ValidationResult.ok() : ValidationResult.fail("negative duration"))
+    .and(cdr ->
+        cdr.getCountryCode() != null ? ValidationResult.ok() : ValidationResult.fail("country code missing"));
+
+// 3. Transformer — maps T → T (same type), chainable
+@FunctionalInterface
+public interface Transformer<T> {
+    T transform(T input);
+
+    default Transformer<T> andThen(Transformer<T> next) {
+        return input -> next.transform(this.transform(input));
+    }
+
+    static <T> Transformer<T> identity() { return input -> input; }
+}
+
+// 4. TriFunction — three-argument function (not in JDK)
+@FunctionalInterface
+public interface TriFunction<A, B, C, R> {
+    R apply(A a, B b, C c);
+}
+
+// Usage: compute charge from CDR, tariff, and subscriber tier
+TriFunction<CallDetailRecord, TariffPlan, SubscriberTier, Money> chargeCalc =
+    (cdr, plan, tier) -> {
+        Money base = plan.getRatePerMinute().multiply(cdr.getDurationMinutes());
+        return tier == SubscriberTier.PREMIUM ? base.multiply(0.8) : base;
+    };
+
+// ── Interview Notes ──────────────────────────────────────────────────────────
+// Java's @FunctionalInterface is just documentation + compiler enforcement.
+// Any interface with exactly one abstract method is a functional interface.
+// Default methods are allowed in FIs and enable fluent chaining patterns.
+// CheckedFunction.wrap() is a common idiom — Vavr library has Try<T> for this.
+// Predicate.and() / Predicate.or() / Predicate.negate() are built-in versions.
+// "Why not just use Function<T,R>?" — domain naming makes code self-documenting.
+
+================================================================================
+SECTION 9 — LAZY INITIALIZATION VARIANTS
+================================================================================
+
+Q9: Compare and implement all major lazy initialization strategies in Java:
+    synchronized, double-checked locking, holder idiom, and atomic reference.
+
+A:
+// VARIANT 1: Naive synchronized (correct but slow — locks on every read)
+public class LazyConfig_Synchronized {
+    private Config instance;
+
+    public synchronized Config get() {
+        if (instance == null) instance = Config.loadFromFile();
+        return instance;
+    }
+    // Issue: synchronized on EVERY call, even after initialization
+}
+
+// VARIANT 2: Double-Checked Locking (correct with volatile, Java 5+)
+public class LazyConfig_DCL {
+    private volatile Config instance;  // volatile is MANDATORY
+
+    public Config get() {
+        if (instance == null) {                     // first check (no lock)
+            synchronized (this) {
+                if (instance == null) {             // second check (with lock)
+                    instance = Config.loadFromFile();
+                }
+            }
+        }
+        return instance;  // fast path: no synchronization after initialization
+    }
+    // Why volatile? Without it, another thread could see partially constructed Config.
+    // Volatile prevents instruction reordering of the constructor + field write.
+}
+
+// VARIANT 3: Initialization-On-Demand Holder (BEST PRACTICE for singletons)
+public class LazyConfig_Holder {
+    private LazyConfig_Holder() {}  // prevent direct instantiation
+
+    private static class Holder {
+        // JVM guarantees class initialization is thread-safe
+        // Loaded only when Holder is first accessed
+        private static final Config INSTANCE = Config.loadFromFile();
+    }
+
+    public static Config get() { return Holder.INSTANCE; }
+    // No synchronization needed — JVM class loading is inherently thread-safe.
+    // This is the canonical singleton pattern in Effective Java (Item 83).
+}
+
+// VARIANT 4: AtomicReference (lock-free, allows retrying if init fails)
+public class LazyConfig_Atomic {
+    private final AtomicReference<Config> ref = new AtomicReference<>();
+
+    public Config get() {
+        Config existing = ref.get();
+        if (existing != null) return existing;
+
+        Config newInstance = Config.loadFromFile();
+        // compareAndSet: only one thread wins the race to set the value
+        if (ref.compareAndSet(null, newInstance)) {
+            return newInstance;
+        }
+        // Another thread won — use their value
+        // NOTE: Config was initialized twice here (one wasted init) — only ok if init is idempotent
+        return ref.get();
+    }
+    // Use when initialization is cheap/idempotent and you want lock-free reads.
+}
+
+// VARIANT 5: Java 8+ Supplier-based lazy (composition-friendly)
+public class Lazy<T> {
+    private final Supplier<T> initializer;
+    private volatile T value;
+
+    public Lazy(Supplier<T> initializer) { this.initializer = initializer; }
+
+    public T get() {
+        T result = value;
+        if (result == null) {
+            synchronized (this) {
+                result = value;
+                if (result == null) {
+                    value = result = initializer.get();
+                }
+            }
+        }
+        return result;
+    }
+}
+
+// Enum Singleton (Josh Bloch's recommendation — handles serialization too)
+public enum ConfigSingleton {
+    INSTANCE;
+    private final Config config = Config.loadFromFile();
+    public Config getConfig() { return config; }
+}
+
+// ── Interview Notes ──────────────────────────────────────────────────────────
+// RANKING (best to worst):
+//   1. Holder idiom — simplest, no locking, JVM-guaranteed safe
+//   2. Enum singleton — safe, serialization-resistant (Effective Java Item 3)
+//   3. DCL + volatile — when you need lazy init on non-singleton (e.g., instance field)
+//   4. AtomicReference — lock-free, OK for idempotent init
+//   5. Synchronized method — correct but unnecessary overhead post-init
+//
+// The classic WRONG answer: DCL WITHOUT volatile (pre-Java 5, broken by JMM).
+// "volatile ensures visibility AND prevents reordering around the assignment."
+// Spring's @Lazy annotation uses a proxy + DCL internally.
+
+================================================================================
+SECTION 10 — IMMUTABLE CLASS WITH BUILDER (COMPLETE CORRECT PATTERN)
+================================================================================
+
+Q10: Implement a fully immutable class for representing a Telecom Subscriber
+     with defensive copying, null safety, and correct equals/hashCode.
+
+A:
+import java.util.*;
+
+public final class Subscriber {                        // final — no subclassing
+
+    private final String id;                           // immutable type
+    private final String name;
+    private final String msisdn;
+    private final SubscriberTier tier;
+    private final List<String> allowedServices;        // mutable type — must copy
+    private final Map<String, String> metadata;        // mutable type — must copy
+
+    private Subscriber(Builder builder) {
+        this.id              = Objects.requireNonNull(builder.id, "id must not be null");
+        this.name            = Objects.requireNonNull(builder.name, "name must not be null");
+        this.msisdn          = Objects.requireNonNull(builder.msisdn, "msisdn must not be null");
+        this.tier            = Objects.requireNonNullElse(builder.tier, SubscriberTier.BASIC);
+        // DEFENSIVE COPY: copy mutable collections to prevent external mutation
+        this.allowedServices = List.copyOf(builder.allowedServices);
+        this.metadata        = Map.copyOf(builder.metadata);
+    }
+
+    // DEFENSIVE COPY in getters (unnecessary for List.copyOf / Map.copyOf — already immutable)
+    public String getId()                    { return id; }
+    public String getName()                  { return name; }
+    public String getMsisdn()               { return msisdn; }
+    public SubscriberTier getTier()          { return tier; }
+    public List<String> getAllowedServices() { return allowedServices; }      // already unmodifiable
+    public Map<String, String> getMetadata() { return metadata; }            // already unmodifiable
+
+    // Wither methods — return new instance with one field changed
+    public Subscriber withTier(SubscriberTier newTier) {
+        return toBuilder().tier(newTier).build();
+    }
+    public Subscriber withName(String newName) {
+        return toBuilder().name(newName).build();
+    }
+    private Builder toBuilder() {
+        return new Builder()
+            .id(id).name(name).msisdn(msisdn).tier(tier)
+            .allowedServices(new ArrayList<>(allowedServices))
+            .metadata(new HashMap<>(metadata));
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Subscriber other)) return false;
+        return Objects.equals(id, other.id);           // identity by ID — NOT all fields
+    }
+
+    @Override
+    public int hashCode() { return Objects.hash(id); } // consistent with equals
+
+    @Override
+    public String toString() {
+        return "Subscriber{id='" + id + "', msisdn='" + msisdn + "', tier=" + tier + "}";
+    }
+
+    public static Builder builder() { return new Builder(); }
+
+    public static final class Builder {
+        private String id;
+        private String name;
+        private String msisdn;
+        private SubscriberTier tier = SubscriberTier.BASIC;
+        private List<String> allowedServices = new ArrayList<>();
+        private Map<String, String> metadata = new HashMap<>();
+
+        public Builder id(String id)                           { this.id = id; return this; }
+        public Builder name(String name)                       { this.name = name; return this; }
+        public Builder msisdn(String msisdn)                   { this.msisdn = msisdn; return this; }
+        public Builder tier(SubscriberTier tier)               { this.tier = tier; return this; }
+        public Builder allowedServices(List<String> services)  { this.allowedServices = services; return this; }
+        public Builder addService(String service)              { this.allowedServices.add(service); return this; }
+        public Builder metadata(Map<String, String> meta)      { this.metadata = meta; return this; }
+        public Builder addMetadata(String key, String value)   { this.metadata.put(key, value); return this; }
+        public Subscriber build()                              { return new Subscriber(this); }
+    }
+}
+
+// Usage:
+Subscriber s = Subscriber.builder()
+    .id("SUB-001")
+    .name("Alice Johnson")
+    .msisdn("+44-7700-900000")
+    .tier(SubscriberTier.PREMIUM)
+    .addService("VoLTE")
+    .addService("VoWiFi")
+    .addMetadata("region", "EMEA")
+    .build();
+
+Subscriber upgraded = s.withTier(SubscriberTier.ENTERPRISE); // new object
+
+// ── Interview Notes ──────────────────────────────────────────────────────────
+// Immutability checklist (Effective Java Item 17):
+//   ✓ final class (no subclassing)
+//   ✓ all fields private final
+//   ✓ no setter methods
+//   ✓ defensive copy for mutable fields in constructor AND getters
+//   ✓ List.copyOf / Map.copyOf — unmodifiable + independent copy
+// equals() by business identity (id), not all fields → consistent with DB entity
+// hashCode() must use SAME fields as equals()
+// Wither methods return new instances — functional update pattern
+// Records (Java 16+) provide immutability automatically for simple cases.
+
+================================================================================
+QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+PATTERN            | KEY MECHANISM                    | REAL-WORLD EXAMPLE
+-------------------|----------------------------------|---------------------------
+Dynamic Proxy      | InvocationHandler + Proxy        | Spring @Transactional, AOP
+Retry + Backoff    | Loop + exponential sleep + jitter| AWS SDK, Resilience4j
+Flyweight          | Shared intrinsic state cache     | String pool, Integer cache
+Object Pool        | BlockingQueue borrow/return      | HikariCP, thread pools
+Template Method    | Abstract class + hooks           | JdbcTemplate, JUnit lifecycle
+Strategy (FI)      | @FunctionalInterface + lambdas   | Comparator, BillingStrategy
+Decorator (Stream) | Function.andThen chaining        | Stream.filter().map()
+Custom FI          | Single abstract method interface | CheckedFunction, Validator
+Lazy Init          | Holder / DCL+volatile / Enum     | Spring @Lazy, Singleton
+Immutable Builder  | private constructor + Builder    | String, LocalDate, records
+
+KEY INTERVIEW TRAPS:
+- DCL without volatile → BROKEN in Java before 5 (and still if volatile missing)
+- Flyweight mutable state → data corruption across shared instances
+- Decorator vs Composite → Decorator wraps ONE object; Composite wraps MANY
+- Template Method with public (non-final) template → subclasses can break invariants
+- Object Pool without try-with-resources → pool starvation on exceptions
+- Strategy with inheritance → use composition (FI) instead in modern Java
+- InvocationTargetException → always unwrap in InvocationHandler.invoke()
+================================================================================

@@ -1,0 +1,207 @@
+======================================================
+JVM TUNING FOR SPRING BOOT APPLICATIONS
+======================================================
+
+1. WHY JVM TUNING MATTERS IN SPRING BOOT
+──────────────────────────────────────────
+Spring Boot apps run on the JVM. Poor JVM settings lead to:
+  - Long GC pauses causing request timeouts
+  - OutOfMemoryError under load
+  - Thread starvation in thread-pool based servers (Tomcat)
+  - Slow startup times
+
+Key areas to tune:
+  - Garbage Collector selection and configuration
+  - Heap size (Xms, Xmx)
+  - Thread pool sizing
+  - JIT compilation flags
+
+
+2. GARBAGE COLLECTOR SELECTION
+───────────────────────────────
+
+G1GC (default, Java 9+):
+  - Low-pause, concurrent, generational
+  - Target pause: -XX:MaxGCPauseMillis=200
+  - Good for: heap sizes 4GB–32GB, general backend services
+  - JVM flags:
+    -XX:+UseG1GC
+    -XX:MaxGCPauseMillis=200
+    -XX:G1HeapRegionSize=16m
+    -XX:InitiatingHeapOccupancyPercent=45
+
+ZGC (Java 15+ production, Java 21 generational ZGC):
+  - Ultra-low pause (<1ms), concurrent, non-generational (before 21)
+  - Overhead: ~10–15% throughput reduction vs G1GC
+  - Good for: latency-sensitive services, large heaps (>32GB)
+  - JVM flags (Java 21+):
+    -XX:+UseZGC
+    -XX:+ZGenerational       # Java 21+, default in Java 23
+    -XX:SoftMaxHeapSize=6g   # ZGC can exceed this but targets staying below
+    -XX:ZCollectionInterval=0  # 0 = GC on demand
+
+Shenandoah (Red Hat, OpenJDK):
+  - Region-based, concurrent compaction
+  - Better for medium heaps with strict latency requirements
+  - JVM flag: -XX:+UseShenandoahGC
+
+Parallel GC:
+  - Maximizes throughput, but pauses can be long
+  - Good for: batch jobs, offline processing
+  - -XX:+UseParallelGC
+
+CMS (deprecated, removed in Java 14) — DO NOT USE.
+
+Comparison:
+  GC          | Pause Time | Throughput | Heap Size | Use Case
+  ─────────────────────────────────────────────────────────────
+  G1GC        | Low (<200ms) | High     | 4–32GB    | General services
+  ZGC         | Ultra-low (<1ms) | Medium | Any     | Latency-critical
+  Shenandoah  | Ultra-low    | Medium   | Any       | Latency-critical
+  ParallelGC  | High         | Highest  | Any       | Batch/offline
+
+
+3. HEAP SIZING
+──────────────
+  -Xms<size>  → initial heap (set equal to Xmx to avoid resizing overhead)
+  -Xmx<size>  → maximum heap
+
+Rules of thumb:
+  - Set Xms = Xmx to prevent heap resizing pauses
+  - Don't allocate > 75% of available RAM to heap
+    (leave room for OS, off-heap, Metaspace, thread stacks)
+  - Container-aware (Java 10+): -XX:+UseContainerSupport (default ON)
+    JVM reads cgroup limits: use -XX:MaxRAMPercentage=75.0
+
+Example for a 4GB container:
+  -Xms2g -Xmx2g
+  or
+  -XX:MaxRAMPercentage=75.0   # JVM sets Xmx = 75% of container memory
+
+Metaspace (replaces PermGen in Java 8+):
+  -XX:MetaspaceSize=256m
+  -XX:MaxMetaspaceSize=512m
+  # Spring apps with many classes need sufficient Metaspace
+
+
+4. GC LOGGING (ESSENTIAL FOR DIAGNOSIS)
+──────────────────────────────────────────
+  -Xlog:gc*:file=/var/log/app/gc.log:time,uptime,level,tags:filecount=5,filesize=10m
+
+Key GC log events:
+  - "GC pause (G1 Evacuation Pause)" → minor GC
+  - "GC pause (G1 Humongous Allocation)" → large object allocation (tune G1HeapRegionSize)
+  - "Full GC" → stop-the-world; investigate leak or heap too small
+
+
+5. THREAD STACK SIZING
+───────────────────────
+  -Xss<size>  → per-thread stack size (default 512k–1MB depending on OS)
+
+Tomcat default thread pool: 200 threads
+  200 threads × 1MB stack = 200MB of stack memory
+
+Tune stack size to reduce memory:
+  -Xss256k   # safe minimum for most Spring Boot apps
+  -Xss512k   # safer for complex recursive code
+
+Virtual Threads (Java 21+):
+  - No need to size thread pool; JVM manages scheduling
+  - Tiny stack footprint; thousands of virtual threads are fine
+  - Enable in Spring Boot 3.2+:
+    spring.threads.virtual.enabled=true
+
+
+6. JIT COMPILATION FLAGS
+──────────────────────────
+Tiered compilation (default Java 8+):
+  -XX:+TieredCompilation  # default ON
+
+For faster startup (cold optimization):
+  -XX:TieredStopAtLevel=1   # interpret + C1 only; no C2 JIT = faster start, lower peak perf
+  # Useful for short-lived containers/lambdas
+
+For peak throughput (warm production):
+  -XX:+OptimizeStringConcat
+  -XX:+UseStringDeduplication  # G1GC only; reduces String heap usage
+
+Class Data Sharing (CDS) — faster startup:
+  java -Xshare:dump  # create shared archive
+  java -Xshare:on    # use shared archive
+  Spring Boot 3.3+ supports CDS out-of-box:
+    spring.context.checkpoint=onRefresh  (with CRaC for checkpoint restore)
+
+
+7. USEFUL JVM FLAGS SUMMARY FOR SPRING BOOT
+─────────────────────────────────────────────
+General production configuration:
+  java \
+    -server \
+    -XX:+UseG1GC \
+    -Xms2g -Xmx2g \
+    -XX:MetaspaceSize=256m -XX:MaxMetaspaceSize=512m \
+    -XX:+HeapDumpOnOutOfMemoryError \
+    -XX:HeapDumpPath=/var/log/app/heap.hprof \
+    -XX:+ExitOnOutOfMemoryError \
+    -Xlog:gc*:file=/var/log/app/gc.log:time,uptime:filecount=5,filesize=10m \
+    -Xss256k \
+    -jar app.jar
+
+
+8. TOMCAT THREAD POOL SIZING
+──────────────────────────────
+application.yml:
+  server:
+    tomcat:
+      threads:
+        min-spare: 10
+        max: 200          # default
+      max-connections: 8192
+      accept-count: 100   # queue when all threads busy
+
+Formula for synchronous blocking apps (Little's Law):
+  threads = (avg_latency_ms / 1000) × requests_per_second × safety_factor
+
+Example: 50ms avg latency, 500 RPS, safety factor 1.2:
+  threads = (50/1000) × 500 × 1.2 = 30 threads
+
+With Virtual Threads (Java 21 + Spring Boot 3.2):
+  spring.threads.virtual.enabled=true
+  → Each request gets a virtual thread; thread pool sizing becomes irrelevant
+
+
+9. MEMORY AREAS IN JVM
+────────────────────────
+Area           | Tuned By          | What Lives There
+─────────────────────────────────────────────────────────────────────
+Heap (Young)   | -Xmx              | New objects, Eden + Survivor
+Heap (Old)     | -Xmx              | Long-lived objects
+Metaspace      | -XX:MaxMetaspaceSize | Class metadata, method bytecode
+Stack          | -Xss              | Per-thread call stack frames
+Direct Memory  | -XX:MaxDirectMemorySize | NIO buffers, Netty, ZGC
+
+
+10. INTERVIEW QUESTIONS
+────────────────────────
+Q: Which GC would you choose for a latency-sensitive Spring Boot microservice?
+A: ZGC (Java 21+ with generational mode) or Shenandoah — both offer sub-millisecond
+   pauses. G1GC is a good default if pause targets of 200ms are acceptable.
+
+Q: Why should Xms equal Xmx in production?
+A: Heap resizing triggers Stop-The-World pauses. Setting them equal eliminates
+   resizing overhead and makes memory footprint predictable in containers.
+
+Q: What is MaxRAMPercentage and when do you use it?
+A: A container-aware JVM flag that sets Xmx as a percentage of the cgroup
+   memory limit. Use instead of hardcoded -Xmx in containerized deployments
+   where the container size might change across environments.
+
+Q: What causes a "Full GC" and how do you fix it?
+A: Causes: heap too small, old-gen fills up, Metaspace exhaustion.
+   Fixes: increase heap, fix memory leaks, increase MetaspaceSize,
+   tune GC (G1HeapRegionSize for humongous objects), use GC logs to diagnose.
+
+Q: How do virtual threads change JVM tuning in Spring Boot 3.2+?
+A: Virtual threads make thread-per-request model highly scalable without
+   needing large thread pools. Stack sizing and thread pool sizing become
+   less critical. Focus shifts to heap and GC tuning instead.

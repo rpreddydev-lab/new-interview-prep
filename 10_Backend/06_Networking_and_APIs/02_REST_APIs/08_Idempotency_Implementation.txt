@@ -1,0 +1,248 @@
+======================================================
+IDEMPOTENCY IN SPRING BOOT APIs
+======================================================
+
+1. WHAT IS IDEMPOTENCY?
+────────────────────────
+An operation is idempotent if performing it multiple times produces the same result.
+
+HTTP methods and idempotency:
+  Method   | Idempotent | Safe | Notes
+  ─────────────────────────────────────────────────────────
+  GET      | Yes        | Yes  | No side effects
+  PUT      | Yes        | No   | Replace resource; repeated calls = same state
+  DELETE   | Yes        | No   | First call deletes; subsequent calls: 404 or no-op
+  HEAD     | Yes        | Yes  | Same as GET but no body
+  OPTIONS  | Yes        | Yes  |
+  POST     | NO         | No   | Creates new resource; repeated = duplicate
+  PATCH    | No*        | No   | *Depends on implementation
+
+Problem: POST for payments, orders, emails — network failure → client retries →
+         duplicate transaction!
+
+
+2. IDEMPOTENCY KEY PATTERN
+───────────────────────────
+Client generates a unique key (UUID) per logical operation.
+Server uses the key to detect and deduplicate duplicate requests.
+
+Flow:
+  1. Client generates: idempotency-key = UUID.randomUUID()
+  2. Client sends POST /payments with header: Idempotency-Key: <uuid>
+  3. Server checks if key exists in store (Redis/DB)
+  4a. NOT exists → process the request, store (key → response), return response
+  4b. EXISTS     → return the STORED response (don't re-process)
+  5. Key expires after a TTL (e.g., 24 hours)
+
+
+3. IMPLEMENTATION WITH REDIS
+──────────────────────────────
+
+3a. Filter/Interceptor approach (reusable):
+
+  @Component
+  public class IdempotencyFilter extends OncePerRequestFilter {
+
+      @Autowired private RedisTemplate<String, String> redisTemplate;
+      @Autowired private ObjectMapper objectMapper;
+
+      private static final Duration TTL = Duration.ofHours(24);
+      private static final String PREFIX = "idempotency:";
+
+      @Override
+      protected void doFilterInternal(HttpServletRequest request,
+              HttpServletResponse response, FilterChain chain)
+              throws ServletException, IOException {
+
+          String key = request.getHeader("Idempotency-Key");
+
+          // Only apply to POST requests with an idempotency key
+          if (!"POST".equals(request.getMethod()) || key == null) {
+              chain.doFilter(request, response);
+              return;
+          }
+
+          String redisKey = PREFIX + key;
+          String cached = redisTemplate.opsForValue().get(redisKey);
+
+          if (cached != null) {
+              // Return cached response
+              IdempotencyRecord record = objectMapper.readValue(cached, IdempotencyRecord.class);
+              response.setStatus(record.getStatus());
+              response.setContentType("application/json");
+              response.getWriter().write(record.getBody());
+              return;
+          }
+
+          // Capture the response
+          ContentCachingResponseWrapper wrappedResponse =
+              new ContentCachingResponseWrapper(response);
+          chain.doFilter(request, wrappedResponse);
+
+          // Store the response
+          IdempotencyRecord record = new IdempotencyRecord(
+              wrappedResponse.getStatus(),
+              new String(wrappedResponse.getContentAsByteArray()));
+          redisTemplate.opsForValue().set(redisKey,
+              objectMapper.writeValueAsString(record), TTL);
+
+          wrappedResponse.copyBodyToResponse();
+      }
+  }
+
+  @Data
+  @AllArgsConstructor
+  @NoArgsConstructor
+  public class IdempotencyRecord {
+      private int status;
+      private String body;
+  }
+
+3b. Service-layer approach (business logic level):
+
+  @Service
+  public class PaymentService {
+
+      @Autowired private RedisTemplate<String, String> redisTemplate;
+      @Autowired private PaymentRepository paymentRepository;
+
+      public PaymentResponse processPayment(String idempotencyKey,
+                                            PaymentRequest request) {
+          String redisKey = "payment:idempotency:" + idempotencyKey;
+
+          // Atomic check-and-set to handle concurrent duplicates
+          Boolean isNew = redisTemplate.opsForValue()
+              .setIfAbsent(redisKey, "PROCESSING", Duration.ofMinutes(5));
+
+          if (Boolean.FALSE.equals(isNew)) {
+              // Already processing or processed
+              String existingId = redisTemplate.opsForValue().get(redisKey);
+              if ("PROCESSING".equals(existingId)) {
+                  throw new ConflictException("Request is being processed");
+              }
+              return paymentRepository.findById(Long.valueOf(existingId))
+                  .map(this::toResponse)
+                  .orElseThrow();
+          }
+
+          try {
+              Payment payment = processPaymentInternal(request);
+              // Update with the result ID
+              redisTemplate.opsForValue().set(redisKey,
+                  String.valueOf(payment.getId()), Duration.ofHours(24));
+              return toResponse(payment);
+          } catch (Exception e) {
+              redisTemplate.delete(redisKey); // Allow retry on failure
+              throw e;
+          }
+      }
+  }
+
+
+4. DATABASE-BACKED IDEMPOTENCY
+────────────────────────────────
+For critical financial operations, combine Redis with DB for durability:
+
+  @Entity
+  public class IdempotencyRecord {
+      @Id
+      private String key;           // UUID from client
+      private String responseBody;
+      private int responseStatus;
+      private LocalDateTime createdAt;
+      private LocalDateTime expiresAt;
+  }
+
+  // Use unique constraint to prevent race condition
+  // INSERT or get existing record
+
+  @Transactional
+  public PaymentResponse processPayment(String idempotencyKey, PaymentRequest req) {
+      return idempotencyRepository.findById(idempotencyKey)
+          .map(record -> deserialize(record.getResponseBody(), PaymentResponse.class))
+          .orElseGet(() -> {
+              PaymentResponse result = processPaymentInternal(req);
+              saveIdempotencyRecord(idempotencyKey, result);
+              return result;
+          });
+  }
+
+Hybrid approach: Redis for fast lookup + DB for durability
+
+
+5. RACE CONDITION HANDLING
+───────────────────────────
+Problem: Two identical requests arrive simultaneously.
+  - Both check Redis: key not found
+  - Both start processing
+  - Duplicate payments!
+
+Solutions:
+  a) Redis SETNX (atomic): setIfAbsent ensures only one wins
+  b) DB unique constraint: INSERT throws on duplicate; catch and return existing
+  c) Distributed lock: acquire lock keyed by idempotency key before processing
+
+  // Atomic: only one request proceeds
+  Boolean acquired = redisTemplate.opsForValue()
+      .setIfAbsent("lock:" + idempotencyKey, "1", Duration.ofSeconds(30));
+
+  if (!acquired) {
+      // Another instance is processing — wait or return 409 Conflict
+      throw new ConflictException("Concurrent request with same idempotency key");
+  }
+
+
+6. KEY DESIGN BEST PRACTICES
+──────────────────────────────
+- Client generates UUID v4: UUID.randomUUID().toString()
+- Key should be scoped: user + operation + UUID (prevents cross-user conflicts)
+- TTL: 24 hours is common (Stripe uses this)
+- Key should be stored client-side for retry on network failure
+- Validate key format on server (reject if missing for critical endpoints)
+
+Header convention:
+  Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
+
+
+7. RESPONSE ON DUPLICATE REQUEST
+──────────────────────────────────
+On duplicate (key already processed):
+  - Return: 200 OK with original response body
+  - NOT: 201 Created again
+  - NOT: 422 Unprocessable (that's an error response)
+  - OPTIONAL: Add header: Idempotency-Replay: true
+
+On concurrent duplicate (processing in progress):
+  - Return: 409 Conflict OR ask client to retry after a delay
+  - Retry-After: 2 (seconds)
+
+
+8. INTERVIEW QUESTIONS
+──────────────────────
+Q: What is idempotency and why is it important in distributed systems?
+A: An idempotent operation produces the same result regardless of how many times
+   it's executed. In distributed systems, network failures cause retries.
+   Without idempotency, retries can cause duplicate payments, orders, or emails.
+
+Q: How do you implement idempotency in a Spring Boot payment API?
+A: Client sends a UUID as Idempotency-Key header. Server checks Redis/DB for
+   the key. If found, return cached response. If not, process and store the
+   result with a TTL. Use Redis SETNX (setIfAbsent) to handle concurrent
+   duplicate requests atomically.
+
+Q: What is the difference between idempotency and retry safety?
+A: Idempotency means the operation can be repeated with the same result.
+   Retry safety (also called safe retry) means retrying won't cause harm
+   (e.g., GET is both safe and idempotent). POST with idempotency key is
+   idempotent but not safe (it has side effects, just not duplicate ones).
+
+Q: How would you handle concurrent requests with the same idempotency key?
+A: Use Redis SETNX (setIfAbsent) to atomically set a "PROCESSING" flag.
+   The first request proceeds; concurrent duplicates get a 409 Conflict
+   or wait briefly and check again. Update Redis with the result ID on completion.
+
+Q: What TTL should you use for idempotency keys?
+A: Depends on business requirements. Stripe uses 24 hours.
+   Long enough for clients to retry failed requests; short enough to not
+   accumulate stale data. Financial systems may keep records indefinitely
+   in DB for audit, with Redis TTL as fast-path cache.

@@ -1,0 +1,152 @@
+======================================================
+REFRESH TOKEN ROTATION STRATEGY
+======================================================
+
+1. WHY REFRESH TOKEN ROTATION?
+──────────────────────────────
+Problem: Access tokens are short-lived (5–15 min). Without rotation,
+a stolen refresh token can be used indefinitely until it expires.
+
+Refresh Token Rotation:
+  - Every time a refresh token is used to get a new access token,
+    a NEW refresh token is issued and the OLD one is invalidated.
+  - If the old token is used again → detected as token reuse → all tokens
+    for that user are revoked (Reuse Detection).
+
+Standard: RFC 6819, OAuth 2.1 recommendation.
+
+
+2. ACCESS TOKEN vs REFRESH TOKEN
+──────────────────────────────────
+Access Token:
+  - Short-lived (5–15 minutes)
+  - Stateless JWT or opaque
+  - Sent with every API request (Authorization: Bearer <token>)
+  - Not stored on server (if JWT)
+
+Refresh Token:
+  - Long-lived (hours, days, or weeks)
+  - Opaque (random string, stored in DB)
+  - Used only to obtain new access tokens
+  - Stored securely: HttpOnly cookie (web) or secure storage (mobile)
+
+
+3. TOKEN ROTATION FLOW
+───────────────────────
+1. User logs in → server issues:
+     access_token (JWT, 15 min) + refresh_token (opaque, 7 days, stored in DB)
+
+2. Access token expires → client sends refresh_token to /oauth2/token
+
+3. Server validates refresh_token:
+     - Exists in DB?
+     - Not expired?
+     - Not already used (rotation check)?
+
+4. Server:
+     - Invalidates old refresh_token
+     - Issues new access_token + new refresh_token
+     - Stores new refresh_token in DB
+
+5. Client uses new access_token for subsequent requests
+
+Reuse detection:
+   If old (already invalidated) refresh_token is presented:
+     → REVOKE ALL refresh tokens for that user/session
+     → Force re-login
+
+
+4. IMPLEMENTATION WITH SPRING AUTHORIZATION SERVER
+────────────────────────────────────────────────────
+Spring Authorization Server supports rotation via:
+  RegisteredClient.withId(UUID.randomUUID().toString())
+      .clientId("my-client")
+      .tokenSettings(TokenSettings.builder()
+          .accessTokenTimeToLive(Duration.ofMinutes(15))
+          .refreshTokenTimeToLive(Duration.ofDays(7))
+          .reuseRefreshTokens(false)  // KEY: disables reuse = enables rotation
+          .build())
+      .build();
+
+reuseRefreshTokens(false) → rotation enabled
+reuseRefreshTokens(true)  → same refresh token reused (no rotation, less secure)
+
+
+5. CUSTOM REFRESH TOKEN STORE
+──────────────────────────────
+@Entity
+public class RefreshToken {
+    @Id
+    private String tokenId;       // UUID
+    private Long userId;
+    private String familyId;      // all tokens in one login session share a family
+    private LocalDateTime expiresAt;
+    private boolean revoked;
+}
+
+Family-based revocation:
+  - All tokens from the same login share a familyId
+  - On reuse detection: revoke all tokens with same familyId
+  - Forces user to re-authenticate
+
+
+6. SECURE STORAGE OF REFRESH TOKENS
+─────────────────────────────────────
+Web (SPA):
+  - Store refresh_token in HttpOnly + Secure + SameSite=Strict cookie
+  - NOT in localStorage (vulnerable to XSS)
+  - Access token can be in memory (JS variable)
+
+Mobile (iOS/Android):
+  - Use Keychain (iOS) or Keystore (Android)
+  - Never store in SharedPreferences
+
+Backend-for-Frontend (BFF) pattern:
+  - Refresh token stored server-side; browser only gets a session cookie
+  - BFF exchanges session cookie for access token on every request
+
+
+7. SLIDING vs ABSOLUTE EXPIRY
+──────────────────────────────
+Absolute expiry: refresh token expires X days after issuance regardless of use.
+Sliding expiry:  expiry extends with each use (while active, never expires).
+
+Recommendation: Use absolute expiry for security + sliding for UX in trusted apps.
+  - Sliding: update expiresAt = now + 7 days on each successful refresh
+
+
+8. REFRESH TOKEN REVOCATION SCENARIOS
+───────────────────────────────────────
+Scenario                      → Action
+─────────────────────────────────────────────────────────────────────
+Password changed               → Revoke all refresh tokens for user
+User logged out                → Revoke current refresh token family
+Security incident              → Revoke all tokens globally
+Token reuse detected           → Revoke entire token family, alert user
+Account deactivated            → Revoke all tokens
+
+
+9. INTERVIEW QUESTIONS
+──────────────────────
+Q: What is refresh token rotation and why is it important?
+A: Each use of a refresh token generates a new one and invalidates the old.
+   It limits the window of opportunity for a stolen token and enables
+   reuse detection (if old token is presented again, all tokens are revoked).
+
+Q: How do you detect refresh token theft?
+A: Via reuse detection: maintain token families. When a revoked token is
+   presented, revoke the entire family and force re-login.
+
+Q: Where should refresh tokens be stored in a browser-based app?
+A: HttpOnly, Secure, SameSite=Strict cookies — not localStorage.
+   The BFF pattern is preferred for SPAs as it keeps tokens server-side.
+
+Q: What does reuseRefreshTokens(false) do in Spring Authorization Server?
+A: It enables refresh token rotation. Every /oauth2/token call with a
+   refresh_token issues a new refresh token and invalidates the old one.
+
+Q: How do you implement logout that truly invalidates all sessions?
+A: Maintain a refresh token store (Redis or DB). On logout, delete the token
+   record. For JWTs: maintain a short-lived blacklist or use short expiry
+   combined with refresh token revocation. Broadcast invalidation event
+   in distributed systems.

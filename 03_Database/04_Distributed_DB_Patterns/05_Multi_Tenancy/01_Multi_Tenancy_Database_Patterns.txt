@@ -1,0 +1,277 @@
+MULTI-TENANCY DATABASE PATTERNS
+===========================================================================================================
+
+WHAT IS MULTI-TENANCY?
+-----------------------
+A multi-tenant application serves multiple customers (tenants) from a single deployment.
+Each tenant's data must be isolated — Tenant A cannot see Tenant B's data.
+
+Examples: Salesforce, Slack, GitHub, Jira, most SaaS products.
+
+Three fundamental patterns for multi-tenant database design.
+Choice depends on: isolation requirements, scalability, cost, compliance needs.
+
+===========================================================================================================
+PATTERN 1: SEPARATE DATABASE PER TENANT
+===========================================================================================================
+
+Architecture:
+  Tenant A → Database A
+  Tenant B → Database B
+  Tenant C → Database C
+
+Each tenant has a completely separate database instance.
+
+PRO:
+  ✅ Strongest data isolation (physical separation)
+  ✅ Independent scaling per tenant
+  ✅ Independent backup and restore per tenant
+  ✅ Easier to comply with data residency (GDPR: store EU data in EU)
+  ✅ Tenant-specific schema customization possible
+  ✅ Performance isolation — one tenant's load doesn't affect others
+
+CON:
+  ❌ Expensive: 1000 tenants = 1000 database instances
+  ❌ Complex connection management (separate connection pool per tenant)
+  ❌ Schema migrations must be applied to ALL databases
+  ❌ Harder to generate cross-tenant reports/analytics
+
+Spring Boot Implementation:
+  Map tenant ID → DataSource. Use AbstractRoutingDataSource.
+  
+  @Component
+  public class TenantDataSourceRouter extends AbstractRoutingDataSource {
+    
+    private final Map<String, DataSource> tenantDataSources = new ConcurrentHashMap<>();
+    
+    @Override
+    protected Object determineCurrentLookupKey() {
+      return TenantContext.getCurrentTenant();  // ThreadLocal with current tenant ID
+    }
+    
+    public void addTenantDataSource(String tenantId, DataSource ds) {
+      tenantDataSources.put(tenantId, ds);
+      // Update routing map dynamically
+      afterPropertiesSet();
+    }
+  }
+  
+  // Tenant context (set by request filter):
+  public class TenantContext {
+    private static final ThreadLocal<String> currentTenant = new ThreadLocal<>();
+    public static void setCurrentTenant(String tenantId) { currentTenant.set(tenantId); }
+    public static String getCurrentTenant() { return currentTenant.get(); }
+    public static void clear() { currentTenant.remove(); }
+  }
+  
+  // Filter to extract tenant from request:
+  @Component
+  public class TenantResolutionFilter implements Filter {
+    @Override
+    public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain) {
+      String tenantId = extractTenantId((HttpServletRequest) req);
+      TenantContext.setCurrentTenant(tenantId);
+      try {
+        chain.doFilter(req, res);
+      } finally {
+        TenantContext.clear();  // Always clean up ThreadLocal!
+      }
+    }
+    
+    private String extractTenantId(HttpServletRequest req) {
+      // From subdomain: tenant-a.myapp.com → "tenant-a"
+      // From header: X-Tenant-ID: tenant-a
+      // From JWT claim: token.claim("tenant_id")
+      return req.getHeader("X-Tenant-ID");
+    }
+  }
+
+WHEN TO USE:
+  Large enterprise tenants that pay premium.
+  Compliance-heavy industries (healthcare, finance, government).
+  Tenants requiring data residency in specific regions.
+  When tenant customization of schema is required.
+
+===========================================================================================================
+PATTERN 2: SHARED DATABASE, SEPARATE SCHEMA PER TENANT
+===========================================================================================================
+
+Architecture:
+  Single Database → Multiple Schemas:
+    tenant_a schema: users, orders, products tables
+    tenant_b schema: users, orders, products tables
+    tenant_c schema: users, orders, products tables
+
+Each tenant has their own schema (namespace) within the same database.
+Tables have the same structure but exist in different schemas.
+
+PRO:
+  ✅ Better isolation than shared schema (schema-level separation)
+  ✅ Easy to backup per tenant (dump specific schema)
+  ✅ Tenant-specific schema customization still possible
+  ✅ Fewer database instances to manage (lower cost than separate DB)
+  ✅ Can set schema-level permissions
+
+CON:
+  ❌ Schema migrations needed for EVERY tenant schema
+  ❌ Schema count grows with tenant count (100K tenants = 100K schemas → impractical)
+  ❌ Cross-tenant analytics requires cross-schema queries
+  ❌ PostgreSQL: Can have schema proliferation issues
+
+Spring Boot + Hibernate Implementation:
+  Set the schema name per tenant in Hibernate:
+  
+  @Component
+  public class TenantSchemaInterceptor implements CurrentTenantIdentifierResolver,
+                                                   MultiTenantConnectionProvider {
+    
+    @Override
+    public String resolveCurrentTenantIdentifier() {
+      return TenantContext.getCurrentTenant();  // Returns schema name = tenant ID
+    }
+    
+    @Override
+    public Connection getConnection(String tenantId) throws SQLException {
+      Connection conn = dataSource.getConnection();
+      conn.createStatement().execute("SET search_path = " + tenantId);  // PostgreSQL
+      // Or: conn.setSchema(tenantId);
+      return conn;
+    }
+  }
+  
+  # application.yml
+  spring.jpa.properties.hibernate.multiTenancy: SCHEMA
+  spring.jpa.properties.hibernate.tenant-identifier-resolver: com.example.TenantSchemaInterceptor
+  spring.jpa.properties.hibernate.multi-tenant-connection-provider: com.example.TenantSchemaInterceptor
+
+WHEN TO USE:
+  Medium number of tenants (hundreds, not millions).
+  PostgreSQL is your DB (schema support is first-class).
+  Want some isolation without the cost of separate databases.
+
+===========================================================================================================
+PATTERN 3: SHARED DATABASE, SHARED SCHEMA (Discriminator Column)
+===========================================================================================================
+
+Architecture:
+  Single Database → Single Schema → All tenants share tables.
+  tenant_id column in every table.
+
+  Table: orders (id, tenant_id, customer_name, amount, created_at)
+  All tenants' orders are in this one table.
+
+PRO:
+  ✅ Most cost-efficient (single DB, single schema)
+  ✅ Easy to add new tenants (no provisioning)
+  ✅ Cross-tenant analytics is straightforward
+  ✅ Simple schema migration (one schema)
+  ✅ Scales to unlimited tenants
+
+CON:
+  ❌ Weakest isolation — a SQL bug (missing tenant_id filter) leaks ALL tenants' data
+  ❌ One tenant's heavy load can affect others (noisy neighbor problem)
+  ❌ Harder to delete/export one tenant's data (cross-table cascade)
+  ❌ Compliance: Regulated data mixed with unregulated
+  ❌ Tenant-specific schema customization is difficult
+
+Spring Boot Implementation — Hibernate Discriminator:
+
+  @Entity
+  @Table(name = "orders")
+  @FilterDef(name = "tenantFilter", parameters = @ParamDef(name = "tenantId", type = String.class))
+  @Filter(name = "tenantFilter", condition = "tenant_id = :tenantId")
+  public class Order {
+    @Id @GeneratedValue
+    private Long id;
+    
+    @Column(name = "tenant_id", nullable = false)
+    private String tenantId;
+    
+    private String customerName;
+    private BigDecimal amount;
+    // ...
+  }
+  
+  // Enable tenant filter for all queries:
+  @Component
+  public class TenantFilterAspect {
+    @Autowired EntityManager em;
+    
+    @Before("@annotation(org.springframework.web.bind.annotation.RequestMapping)")
+    public void enableTenantFilter() {
+      Session session = em.unwrap(Session.class);
+      session.enableFilter("tenantFilter")
+             .setParameter("tenantId", TenantContext.getCurrentTenant());
+    }
+  }
+
+Row-Level Security (Database-level enforcement):
+  -- PostgreSQL RLS: DB itself enforces tenant isolation
+  ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY tenant_isolation ON orders
+    USING (tenant_id = current_setting('app.tenant_id'));
+  
+  -- Application sets tenant context before queries:
+  entityManager.createNativeQuery(
+      "SET LOCAL app.tenant_id = '" + tenantId + "'").executeUpdate();
+  // Now ALL queries on orders table auto-filter by tenant_id at DB level
+
+WHEN TO USE:
+  Many small tenants (thousands to millions).
+  Cost is a priority.
+  Compliance allows shared data storage.
+  Combined with RLS for safety.
+
+===========================================================================================================
+COMPARISON TABLE
+===========================================================================================================
+
+| Aspect              | Separate DB          | Separate Schema     | Shared Schema      |
+|---------------------|----------------------|---------------------|--------------------|
+| Data Isolation      | Strongest            | Strong              | Weakest            |
+| Cost                | Highest              | Medium              | Lowest             |
+| Tenant Count        | Hundreds             | Hundreds/Thousands  | Unlimited          |
+| Schema Migration    | Per DB (complex)     | Per Schema (complex)| Single (simple)    |
+| Backup/Restore      | Per tenant           | Per schema          | Complex extraction |
+| Customization       | Full                 | Full                | Limited            |
+| Analytics           | Federated queries    | Cross-schema queries| Simple JOIN        |
+| Compliance (GDPR)   | Best                 | Good                | Careful design     |
+| Spring Complexity   | High                 | Medium              | Low                |
+
+===========================================================================================================
+HYBRID APPROACH (Common in Production)
+===========================================================================================================
+
+Many production SaaS apps use a hybrid:
+  - Enterprise/paid tier: Separate database per tenant (isolation + compliance)
+  - SMB/starter tier: Shared schema (cost-efficient)
+
+When a starter tenant upgrades to enterprise → migrate their data to dedicated database.
+
+===========================================================================================================
+INTERVIEW Q&A
+===========================================================================================================
+
+Q: What are the three main multi-tenancy database patterns?
+A: 1. Separate database per tenant: Strongest isolation, highest cost. Best for enterprise/compliance.
+   2. Separate schema per tenant: Good isolation, moderate cost. Good for hundreds of tenants.
+   3. Shared schema with tenant_id column: Weakest isolation, lowest cost. Best for many small tenants.
+
+Q: What is the biggest risk with the shared schema approach?
+A: A missing or incorrect tenant_id WHERE clause in a query leaks data across tenants.
+   Mitigation: Hibernate @Filter for automatic tenant filtering, PostgreSQL Row-Level Security
+   to enforce isolation at the database level, comprehensive test coverage for tenant isolation.
+
+Q: How do you implement tenant-aware connection routing in Spring Boot?
+A: 1. Extract tenant ID from request (header, JWT, subdomain) in a Filter/Interceptor.
+   2. Store in ThreadLocal (TenantContext).
+   3. Use AbstractRoutingDataSource to select the right DataSource/connection based on tenant ID.
+   4. For schema-based: Use Hibernate's MultiTenantConnectionProvider to set the search_path.
+   5. Always clear ThreadLocal in a finally block to prevent tenant data leakage across requests.
+
+Q: How would you handle schema migrations for 1000 tenant schemas?
+A: Use Flyway or Liquibase with multi-schema support.
+   Flyway: Configure multiple schemas in flyway.schemas or run Flyway per schema in a loop.
+   Strategy: On app startup, iterate all tenant schemas and apply pending migrations.
+   Or: Use a migration service that applies migrations to all schemas before deploying new app version.
+   Automation is critical — never manually apply migrations to individual tenant schemas.

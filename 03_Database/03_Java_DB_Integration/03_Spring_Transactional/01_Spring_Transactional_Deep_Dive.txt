@@ -1,0 +1,399 @@
+SPRING @TRANSACTIONAL — DEEP DIVE
+(Propagation, Isolation, Pitfalls, and Real-World Patterns)
+===========================================================================================================
+
+OVERVIEW
+---------
+@Transactional is Spring's declarative transaction management annotation.
+It wraps method execution in a database transaction — the method executes within
+a single logical transaction boundary.
+
+Under the hood: Spring creates a JDK/CGLIB proxy around the bean.
+The proxy intercepts method calls and manages transaction lifecycle using
+PlatformTransactionManager (JPA → JpaTransactionManager).
+
+===========================================================================================================
+1. PROPAGATION — HOW TRANSACTIONS ARE PROPAGATED BETWEEN METHODS
+===========================================================================================================
+
+Propagation defines what happens when a @Transactional method is called
+from WITHIN an existing transaction.
+
+---
+
+REQUIRED (default):
+  Use existing transaction if one exists; otherwise create a new one.
+  Most common. The called method joins the caller's transaction.
+  
+  @Transactional(propagation = Propagation.REQUIRED)
+  public void methodA() {
+    methodB();  // methodB joins methodA's transaction
+  }
+  
+  If methodB throws → entire transaction (including methodA) rolls back.
+
+---
+
+REQUIRES_NEW:
+  ALWAYS creates a NEW transaction. Suspends the existing one.
+  The new transaction commits/rolls back INDEPENDENTLY of the outer transaction.
+  
+  Use case: Audit logging — you want to persist the audit record even if
+            the main transaction rolls back.
+  
+  @Transactional(propagation = Propagation.REQUIRES_NEW)
+  public void saveAuditLog(AuditLog log) {
+    auditRepo.save(log);  // commits independently
+  }
+  
+  @Transactional
+  public void processOrder(Order order) {
+    orderRepo.save(order);
+    auditService.saveAuditLog(...);  // NEW transaction — commits even if order rollbacks
+    // if this throws after audit → order rolls back but audit is committed
+  }
+
+---
+
+NESTED:
+  Runs within a NESTED transaction (uses SAVEPOINT in SQL).
+  Nested transaction can roll back WITHOUT rolling back the outer transaction.
+  Outer transaction rollback DOES roll back nested.
+  
+  Use case: Process batch items — skip failed items but continue outer batch.
+  
+  @Transactional
+  public void processBatch(List<Item> items) {
+    for (Item item : items) {
+      try {
+        processItem(item);  // @Transactional(NESTED)
+      } catch (Exception e) {
+        // Item rolled back via SAVEPOINT, batch continues
+      }
+    }
+    batchRepo.markComplete();  // outer transaction still commits
+  }
+  
+  Note: NESTED requires database SAVEPOINT support and DataSourceTransactionManager.
+        NOT supported with JpaTransactionManager by default.
+
+---
+
+SUPPORTS:
+  Use existing transaction if available; otherwise execute NON-transactionally.
+  Use for read-only methods that work both inside and outside a transaction.
+
+MANDATORY:
+  Must have an existing transaction; throws exception if none exists.
+  Use to enforce that a method is always called within a transaction context.
+
+NOT_SUPPORTED:
+  Always executes NON-transactionally. Suspends existing transaction if any.
+  Rare use case: Calling legacy non-transactional code that conflicts with TX.
+
+NEVER:
+  Must NOT be called within an existing transaction; throws exception if one exists.
+
+---
+
+===========================================================================================================
+2. ISOLATION LEVELS
+===========================================================================================================
+
+@Transactional(isolation = Isolation.READ_COMMITTED)
+
+| Isolation Level    | Dirty Read | Non-Repeatable | Phantom  | Spring Constant              |
+|--------------------|------------|----------------|----------|------------------------------|
+| DEFAULT            | DB default | DB default     | DB default | Isolation.DEFAULT            |
+| READ_UNCOMMITTED   | Allowed    | Allowed        | Allowed  | Isolation.READ_UNCOMMITTED   |
+| READ_COMMITTED     | Prevented  | Allowed        | Allowed  | Isolation.READ_COMMITTED     |
+| REPEATABLE_READ    | Prevented  | Prevented      | Allowed  | Isolation.REPEATABLE_READ    |
+| SERIALIZABLE       | Prevented  | Prevented      | Prevented| Isolation.SERIALIZABLE       |
+
+DEFAULT: Uses the database's configured default isolation level.
+  PostgreSQL default: READ_COMMITTED
+  MySQL InnoDB default: REPEATABLE_READ
+
+Recommendation: Keep DEFAULT unless you have a specific reason to change.
+  Setting SERIALIZABLE has significant performance impact (locks/blocking).
+
+---
+
+===========================================================================================================
+3. READ-ONLY TRANSACTIONS
+===========================================================================================================
+
+@Transactional(readOnly = true)
+
+Benefits:
+  1. Database optimization: DB can use read-only snapshot / MVCC without version tracking.
+  2. Hibernate optimization: Dirty checking is disabled — no overhead scanning entities.
+  3. Read replica routing: Can configure AbstractRoutingDataSource to route read-only
+                            transactions to a read replica automatically.
+
+Always mark read-only transactions:
+  @Transactional(readOnly = true)
+  public List<Product> getAllProducts() {
+    return productRepo.findAll();
+  }
+
+  @Transactional(readOnly = true)
+  public Optional<Product> getById(Long id) {
+    return productRepo.findById(id);
+  }
+
+---
+
+===========================================================================================================
+4. TIMEOUT
+===========================================================================================================
+
+@Transactional(timeout = 30)  // seconds
+
+Prevents long-running transactions from holding DB locks indefinitely.
+If transaction exceeds timeout → rolled back with TransactionTimedOutException.
+
+Use in APIs where you want to fail fast:
+  @Transactional(timeout = 10)
+  public void processPayment(PaymentRequest req) {
+    // If this takes > 10 seconds → auto rollback
+  }
+
+---
+
+===========================================================================================================
+5. ROLLBACK RULES
+===========================================================================================================
+
+Default rollback behavior:
+  - Rolls back on UNCHECKED exceptions (RuntimeException and Error subclasses)
+  - Does NOT roll back on CHECKED exceptions (IOException, SQLException)
+
+Why? Java convention: checked = recoverable, unchecked = programming error.
+
+Customize rollback:
+  // Rollback on a CHECKED exception
+  @Transactional(rollbackFor = IOException.class)
+  public void saveData() throws IOException { ... }
+
+  // Rollback on multiple exception types
+  @Transactional(rollbackFor = {IOException.class, CustomBusinessException.class})
+
+  // Do NOT rollback on a specific unchecked exception
+  @Transactional(noRollbackFor = OptimisticLockException.class)
+  public void update() { ... }
+
+Common mistake:
+  try {
+    // some logic that throws
+  } catch (Exception e) {
+    log.error("error", e);
+    // WRONG: Swallowing the exception prevents rollback!
+    // Spring doesn't know an exception occurred.
+  }
+  
+  // If you catch and need to rollback: rethrow or mark transaction for rollback manually
+  TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+
+---
+
+===========================================================================================================
+6. CRITICAL PITFALLS — THE "GOTCHAS" INTERVIEWERS LOVE
+===========================================================================================================
+
+PITFALL 1: Self-Invocation (Proxy Bypass)
+------------------------------------------
+@Transactional only works when called THROUGH the Spring proxy (from outside the bean).
+Calling @Transactional from within the SAME class bypasses the proxy!
+
+  @Service
+  public class OrderService {
+    
+    public void processOrders(List<Order> orders) {
+      for (Order o : orders) {
+        saveOrder(o);  // ← WRONG! Direct call, no proxy → NO TRANSACTION!
+      }
+    }
+    
+    @Transactional
+    public void saveOrder(Order order) {
+      orderRepo.save(order);
+    }
+  }
+
+Fix options:
+  a) Inject self-reference (hacky but works):
+       @Autowired private OrderService self;
+       self.saveOrder(order);  // Goes through proxy
+  
+  b) Extract to a separate @Service bean:
+       @Autowired private OrderSaveService orderSaveService;
+       orderSaveService.saveOrder(order);  // Clean, preferred
+  
+  c) Use AspectJ mode instead of proxy mode (complex setup):
+       @EnableTransactionManagement(mode = AdviceMode.ASPECTJ)
+
+---
+
+PITFALL 2: @Transactional on private or non-Spring methods
+-----------------------------------------------------------
+Spring proxy can ONLY intercept public methods.
+
+  @Transactional      // ← IGNORED! Spring proxy can't intercept private methods
+  private void saveInternal() { ... }
+
+Fix: Make the method public or protected, or extract to another bean.
+
+---
+
+PITFALL 3: Long Transactions with External I/O
+-----------------------------------------------
+NEVER perform external I/O (HTTP calls, file I/O) inside a @Transactional method.
+
+  @Transactional  // ← WRONG PATTERN
+  public void processPayment(Order order) {
+    orderRepo.save(order);                          // holds DB lock
+    paymentGateway.chargeCard(order.getAmount());   // HTTP call — may take 3 seconds!
+    paymentRepo.savePayment(result);                // still holding lock
+  }
+
+  // CORRECT PATTERN: Keep transaction short
+  public void processPayment(Order order) {
+    Long orderId = orderService.saveOrder(order);               // @Transactional — short
+    PaymentResult result = paymentGateway.chargeCard(amount);   // Outside transaction
+    paymentService.recordPayment(orderId, result);              // @Transactional — short
+  }
+
+---
+
+PITFALL 4: LazyInitializationException (Most Common JPA Issue)
+---------------------------------------------------------------
+Accessing a lazy-loaded association OUTSIDE the transaction context.
+
+  // Service layer - transaction ends here
+  @Transactional(readOnly = true)
+  public Order getOrder(Long id) {
+    return orderRepo.findById(id).get();
+  }
+  
+  // Controller - transaction already closed!
+  Order order = orderService.getOrder(1L);
+  order.getItems().size();  // ← LazyInitializationException! Session is closed.
+
+Fixes:
+  a) Fetch eagerly in the query: @Query("SELECT o FROM Order o JOIN FETCH o.items WHERE o.id = ?1")
+  b) Use @EntityGraph to specify fetch plan
+  c) Use DTOs (project only needed data — no entity returned to controller)
+  d) Open Session in View pattern (ANTI-PATTERN — avoid in production)
+
+---
+
+PITFALL 5: N+1 Queries Inside @Transactional
+---------------------------------------------
+@Transactional keeps the session open, but lazy associations still fire individual queries.
+
+  @Transactional(readOnly = true)
+  public List<Department> getAllDepartmentsWithEmployees() {
+    List<Department> depts = deptRepo.findAll();  // 1 query
+    depts.forEach(d -> d.getEmployees().size());  // N queries (one per dept)!
+    return depts;
+  }
+
+Fix:
+  @Query("SELECT d FROM Department d JOIN FETCH d.employees")
+  List<Department> findAllWithEmployees();
+
+---
+
+PITFALL 6: Transaction Not Rolling Back Due to Checked Exception
+----------------------------------------------------------------
+  @Transactional
+  public void saveFile(String data) throws IOException {
+    fileRepo.save(data);                           // saved
+    fileSystem.write(data);                        // throws IOException
+    // Transaction does NOT rollback! IOException is checked.
+  }
+  
+  Fix: @Transactional(rollbackFor = IOException.class)
+
+---
+
+===========================================================================================================
+7. TRANSACTION TEMPLATE (PROGRAMMATIC TRANSACTIONS)
+===========================================================================================================
+
+Sometimes you need fine-grained control that @Transactional can't provide.
+Use TransactionTemplate for programmatic transactions.
+
+  @Autowired
+  private TransactionTemplate transactionTemplate;
+
+  public void processWithResult() {
+    String result = transactionTemplate.execute(status -> {
+      try {
+        orderRepo.save(order);
+        return "success";
+      } catch (Exception e) {
+        status.setRollbackOnly();  // Mark for rollback
+        return "failed";
+      }
+    });
+  }
+
+Use cases:
+  - Conditional rollback based on business logic
+  - Transactions in lambda/async code
+  - Testing scenarios where you need fine-grained control
+
+---
+
+===========================================================================================================
+8. DISTRIBUTED TRANSACTIONS — @Transactional ACROSS MULTIPLE DATA SOURCES
+===========================================================================================================
+
+@Transactional by default supports SINGLE data source only.
+For two DB sources (e.g., PostgreSQL + MySQL), you need JTA (Java Transaction API).
+
+XA Transactions (Two-Phase Commit):
+  Use Atomikos, Bitronix, or Jakarta EE JTA to coordinate across multiple resources.
+  Configure XADataSource for each DB.
+  Spring supports @Transactional across JTA-managed resources.
+
+  Downside: XA is slow, complex, not cloud-friendly.
+
+Modern alternative: Saga Pattern (choreography or orchestration) — see Distributed_DB_Patterns.
+
+---
+
+===========================================================================================================
+9. INTERVIEW QUESTIONS SUMMARY
+===========================================================================================================
+
+Q: What is the default propagation of @Transactional?
+A: REQUIRED — join existing transaction, or create new if none exists.
+
+Q: What is the difference between REQUIRED and REQUIRES_NEW?
+A: REQUIRED joins the caller's transaction (same TX). 
+   REQUIRES_NEW always creates a new independent transaction (suspends caller's TX).
+
+Q: Why doesn't @Transactional work on private methods?
+A: Spring uses AOP proxies to implement @Transactional. Proxies can only intercept
+   calls that go through the proxy object. Private method calls are direct — no proxy involved.
+
+Q: What happens if a @Transactional method calls another @Transactional method in the same class?
+A: Self-invocation bypasses the proxy → the inner @Transactional is IGNORED.
+   Fix: Extract the inner method to a separate Spring bean.
+
+Q: @Transactional(readOnly = true) — does it prevent writes?
+A: NO. readOnly is a HINT to the underlying infrastructure, not an enforcement.
+   JPA/Hibernate uses it to skip dirty checking (performance). Some databases use it
+   to optimize snapshot handling. But you CAN still execute writes (they'll succeed).
+
+Q: What's the difference between @Transactional(rollbackFor = Exception.class) vs default?
+A: Default rolls back only on RuntimeException (unchecked) and Error.
+   rollbackFor = Exception.class also rolls back on checked exceptions.
+
+Q: How does @Transactional interact with @Async?
+A: @Async creates a new thread — the original transaction context is NOT propagated.
+   @Transactional in an @Async method starts a FRESH, independent transaction.
+   Never rely on the caller's transaction in an async method.

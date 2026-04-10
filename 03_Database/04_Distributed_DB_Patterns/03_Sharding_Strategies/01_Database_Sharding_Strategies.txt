@@ -1,0 +1,276 @@
+DATABASE SHARDING STRATEGIES
+===========================================================================================================
+
+WHAT IS SHARDING?
+-----------------
+Sharding is the technique of HORIZONTALLY PARTITIONING data across multiple databases
+(shards), where each shard holds a SUBSET of the total data.
+
+Vertical scaling (bigger server) has limits. Sharding allows linear horizontal scaling
+by distributing both data and query load across many nodes.
+
+NOT to confuse with:
+  Replication: Copies of same data across nodes (for HA and read scaling)
+   Sharding:   Different data on different nodes (for write scaling and data volume)
+
+===========================================================================================================
+1. SHARDING STRATEGIES
+===========================================================================================================
+
+A. RANGE-BASED SHARDING
+------------------------
+Partition data by value ranges of the shard key.
+
+Example: Shard by user_id ranges:
+  Shard 1: user_id 1 – 1,000,000
+  Shard 2: user_id 1,000,001 – 2,000,000
+  Shard 3: user_id 2,000,001 – 3,000,000
+
+PRO: Range queries are efficient (same shard for consecutive keys).
+PRO: Easy to implement.
+
+CON: HOTSPOT PROBLEM: If recent/new data is always in the last shard → uneven load.
+     Example: Sharding orders by order_date — all new orders go to the latest shard.
+CON: Requires rebalancing as data grows (manual range splits).
+
+Use when: Data access is naturally range-based (time-series, IDs are sequential).
+
+---
+
+B. HASH-BASED SHARDING
+-----------------------
+Apply a hash function to the shard key → modulo number of shards.
+
+  shard_id = hash(shard_key) % number_of_shards
+
+Example: hash(user_id) % 4
+  user_id=100  → hash=7301 → 7301 % 4 = 1 → Shard 1
+  user_id=101  → hash=9823 → 9823 % 4 = 3 → Shard 3
+
+PRO: Even distribution of data (if hash is good).
+PRO: Simple routing logic.
+
+CON: Range queries are terrible — data for adjacent keys is on different shards.
+CON: Adding/removing shards requires re-hashing ALL keys (massive data movement).
+
+Use when: Point lookups only, no range queries. Hash-based KV stores.
+
+---
+
+C. CONSISTENT HASHING (Solves hash-based resharding)
+------------------------------------------------------
+Map both nodes and keys onto a virtual ring (0 to 2^32 positions).
+
+How it works:
+  1. Place each shard node on the ring via hash(node_name).
+  2. For each key: hash(key) → position on ring → walk CLOCKWISE to find the first node.
+
+Adding a new node:
+  New node takes over part of its clockwise neighbor's range.
+  Only ~1/N of all keys need to move (N = number of nodes).
+
+Removing a node:
+  Its keys move to the next clockwise node.
+  Only ~1/N keys move.
+
+Without consistent hashing: Adding one node to 4-shard hash setup → 75% of keys move.
+With consistent hashing: Adding one node → only ~25% of keys move.
+
+Virtual Nodes (Vnodes):
+  Each physical node maps to MULTIPLE positions on the ring.
+  Distributes load more evenly, especially when nodes have different capacities.
+  Used by Cassandra (each node defaults to 256 virtual nodes).
+
+Implementation in Java (conceptual):
+  TreeMap<Long, String> ring = new TreeMap<>();
+  // Place nodes
+  ring.put(hash("node1"), "node1");
+  ring.put(hash("node2"), "node2");
+  ring.put(hash("node3"), "node3");
+  
+  // Route a key
+  String getNode(String key) {
+    long hash = hash(key);
+    SortedMap<Long, String> tail = ring.tailMap(hash);
+    // Walk clockwise (wraps to start of ring if no higher hash)
+    return tail.isEmpty() ? ring.firstEntry().getValue() : tail.firstEntry().getValue();
+  }
+
+Used by: Cassandra, Amazon DynamoDB, Amazon S3, Redis Cluster (uses hash slots instead).
+
+---
+
+D. DIRECTORY-BASED SHARDING (Lookup Table)
+-------------------------------------------
+A central lookup table maps shard keys to shards.
+
+  | shard_key_range  | shard_id |
+  |------------------|----------|
+  | 1 – 50,000       | shard-1  |
+  | 50,001 – 100,000 | shard-2  |
+  | 100,001 – ...    | shard-3  |
+
+PRO: Maximum flexibility — any distribution possible.
+PRO: Easy rebalancing (just update the lookup table).
+CON: Lookup table is a bottleneck and single point of failure.
+CON: Extra hop for every request.
+
+Use when: Need fine-grained control over shard placement.
+
+===========================================================================================================
+2. CHOOSING A SHARD KEY
+===========================================================================================================
+
+The shard key is THE MOST CRITICAL DECISION in sharding.
+
+Good shard key:
+  ✅ HIGH CARDINALITY: Many distinct values for even distribution.
+  ✅ EVENLY DISTRIBUTED ACCESS: Not hot (one value accessed much more than others).
+  ✅ ALIGNS WITH QUERY PATTERNS: Most queries filter on shard key → stay on one shard.
+  ✅ IMMUTABLE: Once data is sharded, changing the shard key requires moving data.
+
+Bad shard key examples:
+  ❌ country code: US has 100x more users than Luxembourg → massive hotspot on US shard.
+  ❌ created_at: All new writes go to today's shard → hot shard.
+  ❌ gender: Only 2 values → only 2 meaningful shards maximum.
+  ❌ is_active: Same problem — very low cardinality.
+
+Good shard key examples:
+  ✅ user_id (UUID or random): High cardinality, even distribution.
+  ✅ tenant_id (for multi-tenant SaaS): All queries are per-tenant, keeps data local.
+  ✅ hash(email): High cardinality, even distribution.
+
+Compound shard key:
+  MongoDB: { "customerId": 1, "orderId": 1 }
+  Allows efficient queries by customer (partial key match).
+
+===========================================================================================================
+3. CROSS-SHARD QUERIES
+===========================================================================================================
+
+The biggest challenge with sharding: queries that span multiple shards.
+
+Problem: "Find all orders with amount > $1000"
+  Must query ALL shards → scatter-gather → slow.
+
+Solutions:
+
+1. Scatter-Gather Query:
+   Send query to all shards in parallel, aggregate results.
+   Works but latency = max(slowest shard). Overhead increases with shard count.
+   
+   Implemented by: MongoDB mongos router, Vitess, ProxySQL, application logic.
+
+2. Denormalize / Duplicate Data:
+   Store copies of data on multiple shards based on different access patterns.
+   Example: Store orders both by user_id shard (for user queries) and date shard (for reports).
+
+3. Secondary Lookup Index:
+   Maintain a separate lookup table: {secondary_key → shard_id}.
+   Route based on this lookup.
+
+4. Query Routing Layer:
+   Application never talks to shards directly.
+   Middleware (Vitess for MySQL, pgBouncer, Citus for PostgreSQL) handles routing.
+
+---
+
+===========================================================================================================
+4. SHARDING IN SPECIFIC DATABASES
+===========================================================================================================
+
+MongoDB Sharding:
+  mongos router: Acts as query router between application and shards.
+  Config servers: Store sharding metadata.
+  Shard: Each shard is a replica set.
+  
+  Enable sharding:
+    sh.enableSharding("mydb");
+    sh.shardCollection("mydb.orders", { customerId: 1 });  -- Ranged sharding
+    sh.shardCollection("mydb.orders", { customerId: "hashed" });  -- Hashed sharding
+
+Cassandra:
+  Built-in sharding via consistent hashing.
+  Partition key is the shard key.
+  Multiple ring positions per node (vnodes).
+  
+  -- Choose partition key carefully:
+  CREATE TABLE orders_by_customer (
+    customer_id UUID,    -- PARTITION KEY → shard key
+    order_date TIMESTAMP,
+    ...
+    PRIMARY KEY (customer_id, order_date)
+  );
+
+PostgreSQL (Citus extension):
+  Turns PostgreSQL into a distributed DB.
+  Horizontal sharding across worker nodes.
+  Coordinator node routes queries.
+  
+  SELECT create_distributed_table('orders', 'customer_id');  -- Shard by customer_id
+
+DynamoDB:
+  Sharding is transparent (managed by AWS).
+  Good partition key design is still critical (avoid hot partitions).
+  Adaptive Capacity: Auto-adjusts for hot partitions.
+  
+MySQL (Vitess):
+  Vitess: YouTube's MySQL sharding solution, now CNCF project.
+  Transparent sharding for MySQL with a query routing layer.
+
+===========================================================================================================
+5. RESHARDING
+===========================================================================================================
+
+Problem: As data grows, you need to add more shards.
+
+Approaches:
+
+1. Double shard count (split shards):
+   Shard A (keys 0-1000) → Shard A (0-500) + Shard A2 (500-1000).
+   Move ~50% of each shard's data to the new shard.
+   
+2. Online migration with dual writes:
+   Start writing to both old and new shards simultaneously.
+   Backfill old data to new sharding scheme.
+   Cut over reads to new shards.
+   Decommission old shards.
+
+3. Consistent Hashing: Minimizes data movement. Only ~1/N data moves per node added.
+
+Key challenge: Zero-downtime resharding with live traffic.
+Real-world: This is a major operational challenge. Plan shard count ahead.
+Pinterest went from 512 shards of MySQL to support scale without resharding.
+
+===========================================================================================================
+6. INTERVIEW Q&A
+===========================================================================================================
+
+Q: What is the difference between sharding and partitioning?
+A: Partitioning splits a table within a SINGLE database instance into smaller physical pieces
+   (by range, list, or hash) — still on one server, managed by one DB engine.
+   Sharding splits data across MULTIPLE database instances (servers/nodes) —
+   requires application or middleware to route queries to the correct shard.
+   Both improve performance for large datasets, but sharding is for true horizontal scaling.
+
+Q: What is a hotspot in sharding and how do you prevent it?
+A: A hotspot occurs when one shard receives disproportionately more traffic than others.
+   Causes: Poor shard key choice (low cardinality, time-based), viral content, popular users.
+   Prevention:
+   1. Choose high-cardinality shard keys with even access patterns.
+   2. Use hashed shard keys for even distribution.
+   3. Use consistent hashing with virtual nodes for load balancing.
+   4. DynamoDB: Adaptive Capacity auto-balances hot partitions.
+   5. Add a random suffix to hot shard keys (write amplification trade-off).
+
+Q: How does consistent hashing solve the resharding problem?
+A: Traditional hash-based sharding (key % N) requires moving nearly all data when N changes.
+   Consistent hashing maps keys and nodes on a ring — only ~1/N keys need to move when
+   a node is added or removed. This minimizes data migration during scaling events.
+
+Q: Why is the shard key immutable (can't be changed after insertion)?
+A: The shard key determines which physical shard stores the document/row.
+   If the shard key changes, the record must MOVE to a different physical shard.
+   This requires: deleting from old shard, inserting to new shard — a complex, risky operation.
+   MongoDB forbids updating shard keys (or requires a special command).
+   Design your shard key to never need to change — use immutable identifiers (user ID, entity ID).

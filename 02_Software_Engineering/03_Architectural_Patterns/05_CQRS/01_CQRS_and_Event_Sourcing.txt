@@ -1,0 +1,255 @@
+================================================================
+  CQRS — COMMAND QUERY RESPONSIBILITY SEGREGATION
+================================================================
+
+  Author:     Greg Young (coined the term, 2010); based on CQS by Bertrand Meyer.
+  Frequency:  High for senior Java developer interviews, especially backend/microservices.
+
+----------------------------------------------------------------
+CORE CONCEPT
+----------------------------------------------------------------
+
+  CQRS separates READ (Query) operations from WRITE (Command) operations
+  using different models for each.
+
+  CQS (Command Query Separation — the principle):
+    A method should EITHER return a value (Query) OR change state (Command),
+    never both. "Asking a question shouldn't change the answer."
+
+  CQRS (the pattern):
+    Takes CQS further: use DIFFERENT MODELS, DIFFERENT SERVICES,
+    and potentially DIFFERENT DATABASES for reads vs writes.
+
+  Key insight: In most applications, the READ model and WRITE model
+  have fundamentally different requirements:
+    WRITE: consistency, validation, business rules, transactions.
+    READ:  performance, projections, denormalized views, caching.
+
+----------------------------------------------------------------
+CQRS LEVELS
+----------------------------------------------------------------
+
+  LEVEL 1: METHOD SEPARATION (Minimal CQRS — most common starting point)
+  -----------------------------------------------------------------------
+    Separate Command and Query methods within the same service:
+
+    // Commands (state-changing):
+    public interface OrderCommandService {
+        OrderId createOrder(CreateOrderCommand command);
+        void confirmOrder(OrderId orderId);
+        void cancelOrder(OrderId orderId, CancellationReason reason);
+    }
+
+    // Queries (read-only):
+    public interface OrderQueryService {
+        OrderDto findById(OrderId orderId);
+        List<OrderSummary> findByCustomer(CustomerId customerId, Pageable page);
+        OrderDashboard getDashboard(CustomerId customerId);
+    }
+
+    Benefits: Clean separation; command side uses domain model; query side can
+    use projections (Spring Data Projections / native queries) optimized for reading.
+
+
+  LEVEL 2: SEPARATE MODELS (Read model vs Write model)
+  -----------------------------------------------------
+    Write side: full domain model (Order aggregate with business logic).
+    Read side:  flat DTOs / projections optimized for display.
+
+    // Write model (domain aggregate — enforces business rules):
+    public class Order {
+        private OrderId id;
+        private List<OrderItem> items;
+        private OrderStatus status;
+        public void confirm() { ... }  // business logic
+    }
+
+    // Read model (flat, denormalized — no business logic):
+    public record OrderSummary(
+        String orderId,
+        String customerName,
+        String statusLabel,
+        BigDecimal totalAmount,
+        int itemCount,
+        LocalDateTime createdAt
+    ) {}
+
+    // Separate Spring Data projections:
+    public interface OrderProjection {
+        String getOrderId();
+        String getCustomerName();
+        BigDecimal getTotalAmount();
+    }
+
+    // Query repository using native SQL for optimized reads:
+    @Query(value = "SELECT o.id, c.name, SUM(oi.price*oi.qty) as total FROM orders o " +
+                   "JOIN customers c ON o.customer_id = c.id " +
+                   "JOIN order_items oi ON oi.order_id = o.id " +
+                   "WHERE o.customer_id = :customerId GROUP BY o.id", nativeQuery = true)
+    List<OrderSummary> findOrderSummaries(@Param("customerId") Long customerId);
+
+
+  LEVEL 3: SEPARATE DATABASES (Full CQRS — advanced)
+  ---------------------------------------------------
+    Write database: normalized relational DB (PostgreSQL) — ensures consistency.
+    Read database: denormalized store (Elasticsearch, Redis, MongoDB, read replicas)
+                   optimized for query patterns.
+
+    Synchronization: domain events published when write-side state changes
+    → event handlers update the read-side projection store.
+
+    Flow:
+      [Client]
+          │
+          ├── Command → Write Service → Write DB (PostgreSQL)
+          │               └── Publishes OrderConfirmedEvent (Kafka)
+          │                           └── Read-side Projector subscribes
+          │                               └── Updates OrderSummary in Elasticsearch
+          │
+          └── Query  → Read Service → Elasticsearch (fast, denormalized)
+
+
+----------------------------------------------------------------
+CQRS IN SPRING BOOT (PRACTICAL)
+----------------------------------------------------------------
+
+  Command handler example:
+    @Service
+    @RequiredArgsConstructor
+    @Transactional
+    public class CreateOrderCommandHandler {
+        private final OrderRepository orderRepository;
+        private final ApplicationEventPublisher eventPublisher;
+
+        public OrderId handle(CreateOrderCommand command) {
+            Order order = Order.create(command.getCustomerId(), command.getItems());
+            orderRepository.save(order);
+            eventPublisher.publishEvent(new OrderCreatedEvent(order.getId(), order.getItems()));
+            return order.getId();
+        }
+    }
+
+  Query handler example (optimized reads — bypasses domain model entirely):
+    @Service
+    @RequiredArgsConstructor
+    @Transactional(readOnly = true)
+    public class OrderQueryHandler {
+        private final OrderReadRepository readRepository; // separate, optimized for reads
+
+        public OrderDashboard handle(GetOrderDashboardQuery query) {
+            return readRepository.getDashboardByCustomer(query.getCustomerId());
+        }
+    }
+
+  Controller wires them together:
+    @RestController
+    @RequiredArgsConstructor
+    public class OrderController {
+        private final CreateOrderCommandHandler createHandler;
+        private final OrderQueryHandler queryHandler;
+
+        @PostMapping("/orders")
+        public ResponseEntity<Void> create(@RequestBody CreateOrderRequest req) {
+            OrderId id = createHandler.handle(OrderMapper.toCommand(req));
+            return ResponseEntity.created(URI.create("/orders/" + id)).build();
+        }
+
+        @GetMapping("/orders/dashboard")
+        public OrderDashboard getDashboard(@RequestParam Long customerId) {
+            return queryHandler.handle(new GetOrderDashboardQuery(customerId));
+        }
+    }
+
+
+----------------------------------------------------------------
+CQRS + EVENT SOURCING
+----------------------------------------------------------------
+
+  CQRS naturally pairs with Event Sourcing (ES):
+    - Write side: instead of storing current state, store a sequence of events
+      (OrderCreated, OrderItemAdded, OrderConfirmed, OrderShipped).
+    - Current state is rebuilt by replaying events.
+    - Event log is immutable — complete audit trail by design.
+    - Read side: event handlers build projections (denormalized views) from events.
+
+  Event Store:
+    Events are appended to an event log (append-only).
+    EventStore.append(orderId, new OrderConfirmedEvent(...));
+    EventStore.load(orderId) → List<DomainEvent> → replay → current Order state.
+
+  Frameworks: Axon Framework is the most popular Java implementation of CQRS + ES.
+
+  Caution: Event Sourcing dramatically increases complexity. Use it when:
+    - Full audit trail is required (finance, healthcare, compliance).
+    - Time-travel queries needed ("what was the state on date X?").
+    - Complex event-driven integration needed.
+    Don't use it for simple CRUD — enormous overhead.
+
+
+----------------------------------------------------------------
+TRADE-OFFS
+----------------------------------------------------------------
+
+  Pros:
+    - Read side optimized independently from write side.
+    - Write side maintains strict domain model integrity.
+    - Scales reads and writes independently.
+    - Enables rich projections without complex joins.
+    - Natural event-driven architecture integration.
+
+  Cons:
+    - Eventual consistency: read model may lag behind write model.
+    - Added complexity: two models, separate repositories, event synchronization.
+    - Debugging harder: "why is the read model stale?" requires event inspection.
+    - Overkill for simple read/write symmetric systems.
+
+  Rule: start with Level 1 (method separation). Introduce Level 2/3 only when
+  read query complexity or performance genuinely demands it.
+
+
+----------------------------------------------------------------
+COMMON INTERVIEW QUESTIONS
+----------------------------------------------------------------
+
+  Q: What is CQRS and when should you use it?
+  A: CQRS separates read (Query) and write (Command) operations into different
+     models and/or services. Use it when reads and writes have very different
+     performance, scalability, or model requirements. For example: writes need
+     strict domain validation and transactions; reads need fast, denormalized
+     projections for dashboards. Overkill for simple CRUD apps.
+
+  Q: What is eventual consistency in CQRS?
+  A: In full CQRS (separate read/write DBs), a write to the command side triggers
+     an event that asynchronously updates the read model. Between the event
+     publication and the read model update, the read side may serve stale data.
+     This "lag" is eventual consistency. It's acceptable when users don't need
+     immediate read-after-write consistency. If they do, use same-DB CQRS or
+     accept the trade-off with client-side compensation (optimistic UI updates).
+
+  Q: How does CQRS relate to Event Sourcing?
+  A: They're separate patterns but pair well. CQRS separates read/write models.
+     Event Sourcing stores state as a sequence of events instead of current state.
+     When combined: write side stores events; event handlers build the read-side
+     projections. They amplify each other but also multiply complexity.
+
+  Q: How is CQRS different from traditional layered architecture?
+  A: In layered architecture, one service and one repository handles both reads
+     and writes using the same domain model. In CQRS, reads and writes use
+     separate models, potentially separate data stores, and separate code paths.
+     CQRS explicitly acknowledges that optimizing for reads and optimizing for
+     writes are fundamentally different concerns.
+
+================================================================
+INTERVIEW TIPS
+================================================================
+
+  - Don't introduce CQRS unless there's a real reason — say "I'd start with
+    Level 1 separation and introduce full CQRS only when read performance
+    becomes a bottleneck."
+  - Mention Axon Framework if asked about Java implementations.
+  - Connect CQRS to Event-Driven: publish domain events from the command side.
+  - Mention @Transactional(readOnly = true) on query services — small but shows depth.
+  - Real story: "We split our reporting queries to a read-only replica using
+    CQRS-style separation — drastically reduced load on the write DB."
+
+================================================================

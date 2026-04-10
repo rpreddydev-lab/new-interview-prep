@@ -1,0 +1,181 @@
+======================================================
+MULTI-TENANCY + SPRING SECURITY
+======================================================
+
+1. WHAT IS MULTI-TENANCY?
+──────────────────────────
+A single application instance serves multiple tenants (clients/organizations).
+Each tenant's data must be completely isolated.
+
+Strategies:
+  a) Database per tenant     → strongest isolation, highest cost
+  b) Schema per tenant       → good isolation, shared DB instance
+  c) Row-level (shared DB)   → lowest cost, requires careful filtering
+
+Spring Security role in multi-tenancy:
+  - Identify the tenant from the incoming request
+  - Enforce tenant-scoped authorization (user can only access own tenant's data)
+
+
+2. EXTRACTING TENANT IDENTITY
+──────────────────────────────
+Sources of tenant info (pick one):
+  - Subdomain:  tenant1.myapp.com
+  - JWT claim:  { "tenantId": "tenant-abc" }
+  - HTTP header: X-Tenant-ID: tenant-abc
+  - Path variable: /api/{tenantId}/resources
+
+JWT-based (most common in microservices):
+  {
+    "sub": "user123",
+    "tenantId": "tenant-abc",
+    "roles": ["ROLE_USER"]
+  }
+
+
+3. TENANT CONTEXT HOLDER
+─────────────────────────
+Thread-local store for current tenant:
+
+  public class TenantContext {
+      private static final ThreadLocal<String> CURRENT_TENANT =
+          new ThreadLocal<>();
+
+      public static void setTenantId(String tenantId) {
+          CURRENT_TENANT.set(tenantId);
+      }
+
+      public static String getTenantId() {
+          return CURRENT_TENANT.get();
+      }
+
+      public static void clear() {
+          CURRENT_TENANT.remove(); // MUST clear after request
+      }
+  }
+
+IMPORTANT: Always clear in a filter's finally block to prevent leaks in thread pools.
+
+
+4. TENANT FILTER (SPRING SECURITY INTEGRATION)
+────────────────────────────────────────────────
+  @Component
+  public class TenantFilter extends OncePerRequestFilter {
+
+      @Override
+      protected void doFilterInternal(HttpServletRequest request,
+              HttpServletResponse response, FilterChain chain)
+              throws ServletException, IOException {
+          try {
+              // Option 1: from header
+              String tenantId = request.getHeader("X-Tenant-ID");
+
+              // Option 2: from JWT claim (after JwtAuthenticationFilter)
+              Authentication auth = SecurityContextHolder.getContext()
+                                                         .getAuthentication();
+              if (auth != null && auth.getPrincipal() instanceof Jwt jwt) {
+                  tenantId = jwt.getClaimAsString("tenantId");
+              }
+
+              TenantContext.setTenantId(tenantId);
+              chain.doFilter(request, response);
+          } finally {
+              TenantContext.clear();
+          }
+      }
+  }
+
+Register in SecurityFilterChain:
+  http.addFilterAfter(tenantFilter, JwtAuthenticationFilter.class);
+
+
+5. DATA ISOLATION STRATEGIES
+─────────────────────────────
+
+a) Row-level (Discriminator column):
+   Entity:
+     @Entity
+     @FilterDef(name = "tenantFilter", parameters =
+         @ParamDef(name = "tenantId", type = String.class))
+     @Filter(name = "tenantFilter", condition = "tenant_id = :tenantId")
+     public class Order {
+         @Column(name = "tenant_id")
+         private String tenantId;
+     }
+
+   Hibernate session setup (in a filter or interceptor):
+     Session session = entityManager.unwrap(Session.class);
+     session.enableFilter("tenantFilter")
+            .setParameter("tenantId", TenantContext.getTenantId());
+
+b) Schema per tenant (Hibernate multi-tenancy):
+   Implement CurrentTenantIdentifierResolver and MultiTenantConnectionProvider
+
+   @Bean
+   public HibernatePropertiesCustomizer hibernatePropertiesCustomizer() {
+       return props -> {
+           props.put(AvailableSettings.MULTI_TENANT_IDENTIFIER_RESOLVER,
+                     tenantIdentifierResolver);
+           props.put(AvailableSettings.MULTI_TENANT_CONNECTION_PROVIDER,
+                     multiTenantConnectionProvider);
+       };
+   }
+
+c) Database per tenant:
+   Use AbstractRoutingDataSource to route to the correct DataSource:
+
+   public class TenantRoutingDataSource extends AbstractRoutingDataSource {
+       @Override
+       protected Object determineCurrentLookupKey() {
+           return TenantContext.getTenantId();
+       }
+   }
+
+
+6. AUTHORIZATION IN MULTI-TENANT CONTEXT
+──────────────────────────────────────────
+Ensure users can only access their own tenant's resources:
+
+  @PreAuthorize("@tenantSecurity.belongsToTenant(authentication, #tenantId)")
+  @GetMapping("/tenants/{tenantId}/orders")
+  public List<Order> getOrders(@PathVariable String tenantId) { ... }
+
+  @Component("tenantSecurity")
+  public class TenantSecurityService {
+      public boolean belongsToTenant(Authentication auth, String tenantId) {
+          Jwt jwt = (Jwt) auth.getPrincipal();
+          return tenantId.equals(jwt.getClaimAsString("tenantId"));
+      }
+  }
+
+
+7. CACHING IN MULTI-TENANT APPS
+────────────────────────────────
+Cache keys MUST include tenantId to prevent cross-tenant data leakage:
+
+  @Cacheable(value = "orders", key = "#tenantId + ':' + #orderId")
+  public Order getOrder(String tenantId, Long orderId) { ... }
+
+With Spring Cache abstraction + Redis: always namespace by tenantId.
+
+
+8. INTERVIEW QUESTIONS
+──────────────────────
+Q: What are the main strategies for multi-tenant data isolation?
+A: Database-per-tenant (strongest, expensive), Schema-per-tenant (balanced),
+   Row-level with discriminator column (cheapest, requires careful filtering).
+
+Q: How do you prevent cross-tenant data leakage?
+A: Use Hibernate @Filter with tenantId, AbstractRoutingDataSource, or schema
+   routing. Always validate tenant in @PreAuthorize. Include tenantId in
+   all cache keys. Test explicitly with multi-tenant integration tests.
+
+Q: Where should tenant resolution happen in a Spring Boot app?
+A: In a dedicated OncePerRequestFilter that runs early in the filter chain,
+   after JWT validation so the tenant claim from the token can be trusted.
+
+Q: What ThreadLocal pitfalls exist with multi-tenancy?
+A: ThreadLocal values must be cleared after each request (in finally block).
+   With async processing (@Async, CompletableFuture, reactive), ThreadLocal
+   is NOT automatically propagated — use InheritableThreadLocal or explicitly
+   pass tenant context, or use task decorators (TaskDecorator in Spring).

@@ -1,0 +1,241 @@
+================================================================
+MULTI-TENANCY DESIGN
+================================================================
+
+WHAT IS MULTI-TENANCY?
+------------------------
+A multi-tenant system serves multiple customers (tenants) from the
+same infrastructure, while keeping each tenant's data isolated and
+invisible to other tenants.
+
+Tenant = an organization, company, or account (not an individual user).
+  SaaS products: Salesforce, Slack, Jira, Stripe are all multi-tenant.
+  Each company using the product = one tenant.
+
+The fundamental challenge: How do you isolate data between tenants
+efficiently while minimizing operational overhead?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+THREE ISOLATION MODELS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MODEL 1: SEPARATE DATABASE PER TENANT
+  Each tenant gets their own dedicated database instance.
+  
+  Tenant A → DB_A (separate PostgreSQL instance)
+  Tenant B → DB_B (separate PostgreSQL instance)
+  Tenant C → DB_C (separate PostgreSQL instance)
+  
+  PROS:
+    ✓ Strongest isolation (blast radius limited to one tenant)
+    ✓ No risk of data leakage between tenants
+    ✓ Independent scaling per tenant
+    ✓ Custom backup/restore per tenant
+    ✓ Different schema versions per tenant (gradual rollout)
+    ✓ Compliance: GDPR "right to erasure" — drop one DB
+  
+  CONS:
+    ✗ Expensive: 1000 tenants = 1000 database instances
+    ✗ Operational overhead: migrations must run on each DB separately
+    ✗ Connection pool: one pool per tenant DB, limits scalability
+    ✗ Inefficient for small tenants (db with 100 rows, full instance)
+  
+  WHEN TO USE:
+    Enterprise B2B SaaS with large, high-value clients
+    Compliance requirements (healthcare HIPAA, finance)
+    Tenants with varying scale needs (one tenant = 10M rows, another = 100)
+    Contractually guaranteed isolation
+
+MODEL 2: SEPARATE SCHEMA PER TENANT (same DB)
+  One database instance, separate PostgreSQL schema per tenant.
+  Schema = namespace with its own tables.
+  
+  DB_shared → schema_tenant_a (has its own users, orders tables)
+           → schema_tenant_b (has its own users, orders tables)
+  
+  PROS:
+    ✓ Better isolation than shared schema
+    ✓ One DB to manage, separate schemas
+    ✓ Easy tenant-level backup (pg_dump specific schema)
+    ✓ Can search within a tenant efficiently (no WHERE tenant_id)
+  
+  CONS:
+    ✗ Schema count limit: Postgres handles thousands of schemas but
+      with migration complexity
+    ✗ Connection pooling: still one pool, shared resources
+    ✗ Migrations more complex (run per schema, not one migration)
+    ✗ Does not scale to millions of tenants
+  
+  WHEN TO USE:
+    Hundreds to low thousands of tenants
+    Per-tenant customization (different columns per tenant schema)
+    Regulatory requirements that don't demand full DB separation
+
+MODEL 3: SHARED SCHEMA (same tables, tenant_id column)
+  One database, one set of tables, every row has a tenant_id column.
+  
+  CREATE TABLE orders (
+    id         BIGSERIAL PRIMARY KEY,
+    tenant_id  UUID NOT NULL,  -- identifies the tenant
+    user_id    UUID NOT NULL,
+    amount     DECIMAL NOT NULL,
+    status     VARCHAR NOT NULL,
+    created_at TIMESTAMP NOT NULL
+  );
+  
+  CREATE INDEX idx_orders_tenant ON orders(tenant_id);
+  
+  PROS:
+    ✓ Most cost-efficient (one DB for all tenants)
+    ✓ Easy to manage (one schema, one migration)
+    ✓ Scales to millions of tenants
+    ✓ Simple operational model
+  
+  CONS:
+    ✗ Weaker isolation (a bug in your WHERE clause exposes all data)
+    ✗ Noisy neighbor: one huge tenant can affect all others (lock contention)
+    ✗ GDPR erasure: must DELETE all rows for one tenant across many tables
+    ✗ Large indexes (tenant_id on every table)
+    ✗ Complex cross-tenant queries in admin tooling
+  
+  WHEN TO USE:
+    High-volume SaaS with many small tenants (startups, SMBs)
+    Cost is a major constraint
+    All tenants have similar small data volumes
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HYBRID APPROACH (TIERED TENANCY)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Real-world SaaS products use a tiered approach based on plan:
+
+  Free / Basic plan: Shared schema (pool all small tenants)
+  Pro plan:          Separate schema (more isolation)
+  Enterprise plan:   Separate DB instance (full isolation, custom SLA)
+
+This balances cost (cheap for small tenants) with isolation (safe for big ones).
+
+Routing logic:
+  Tenant registry service maps tenantId → {isolationModel, DB connection string}
+  Application layer resolves correct connection at request time.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TENANT CONTEXT PROPAGATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The most critical implementation challenge: ensure EVERY query filters by tenant.
+
+APPROACH 1: Application-Level Filter (Shared Schema)
+  Every repository/DAO call must include tenant_id in WHERE clause.
+  Risk: Developer forgets → tenant data leakage.
+  
+  Mitigation: Hibernate Filter / @TenantId annotation
+  Spring Data JPA with @Query includes tenant_id automatically.
+  Code review checklist: every query must include tenant filter.
+
+APPROACH 2: Row-Level Security (PostgreSQL RLS)
+  Database enforces tenant isolation — even if app forgets WHERE clause.
+  
+  ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+  
+  CREATE POLICY tenant_isolation ON orders
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+  
+  Application sets tenant context before each query:
+  SET app.current_tenant_id = 'tenant-uuid-here';
+  SELECT * FROM orders;  -- automatically filtered by RLS policy
+  
+  Even a bug in the app that omits WHERE tenant_id → only returns that tenant's rows.
+  Strong protection against data leakage bugs.
+  
+  Performance: RLS policies add minimal overhead (index on tenant_id used).
+
+APPROACH 3: Hibernate Multi-tenancy
+  Spring Boot + Hibernate supports multi-tenancy natively.
+  
+  Three modes:
+    SCHEMA:   Hibernate switches schema per tenant (requires schema resolver)
+    DATABASE: Hibernate switches connection/datasource per tenant
+    DISCRIMINATOR: Hibernate adds tenant filter to all queries (experimental, EF6+)
+  
+  TenantIdentifierResolver: extracts tenantId from request context (JWT claim)
+  MultiTenantConnectionProvider: returns correct DataSource for tenant
+
+TENANT CONTEXT VIA JWT:
+  JWT payload: { "sub": "userId", "tenantId": "acme-corp", "roles": [...] }
+  Spring interceptor extracts tenantId → stores in ThreadLocal.
+  TenantIdentifierResolver reads from ThreadLocal.
+  Every query automatically uses correct schema/DB.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NOISY NEIGHBOR PROBLEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Problem: One large tenant runs expensive queries → slow for all other tenants.
+
+Mitigations:
+  1. Rate limiting per tenant (API level + DB query level)
+  2. Separate read replicas per tier (Enterprise tenants get dedicated replicas)
+  3. Query timeouts per tenant (kill runaway queries)
+  4. Connection pool limits per tenant (max connections per tenantId)
+  5. Priority queues: route premium tenant requests to dedicated workers
+  6. Monitoring: alert when one tenant uses >X% of shared resources
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ONBOARDING AND OFFBOARDING TENANTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ONBOARDING:
+  1. Create tenant record (tenantId, plan, connectionConfig)
+  2. Provision resources (create schema/DB if needed, apply migrations)
+  3. Create default admin user for tenant
+  4. Register in tenant registry service
+
+OFFBOARDING / DELETION:
+  GDPR "right to erasure" requires deleting all tenant data.
+  Shared schema: DELETE FROM all tables WHERE tenant_id = ?
+  Separate schema: DROP SCHEMA tenant_xyz CASCADE
+  Separate DB: Drop/archive the entire database
+  
+  Soft delete first: mark tenant as "DELETED", schedule hard delete 30 days later.
+  Async deletion: use a background job for large data volumes.
+  Audit: log all deletion events for compliance.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MULTI-TENANCY IN THE FULL STACK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SUBDOMAIN ROUTING:
+  acme.myapp.com → tenantId = "acme"
+  globex.myapp.com → tenantId = "globex"
+  API Gateway / Nginx extracts subdomain → injects X-Tenant-ID header.
+
+STORAGE:
+  S3: separate prefix per tenant: s3://bucket/tenants/acme-corp/files/...
+  Elasticsearch: separate index per tenant OR filter by tenantId field.
+  Redis: key prefix: "tenant:{tenantId}:session:{sessionId}"
+  Kafka: separate topics per tenant (high isolation) OR filter by header.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: How would you design a multi-tenant SaaS with 10,000 tenants?
+A: Tiered model: small tenants (free/basic) → shared schema with RLS
+   enforcement. Large enterprise tenants → separate DB or separate schema.
+   Tenant registry maps tenantId → isolation model + connection config.
+   JWT carries tenantId, resolved at API Gateway, propagated via ThreadLocal.
+   RLS as the last line of defense against data leakage bugs.
+
+Q: What is the noisy neighbor problem and how do you solve it?
+A: One tenant's heavy usage degrades others sharing the same infrastructure.
+   Solutions: rate limiting per tenant, dedicated resources for premium tiers,
+   query timeouts, connection pool limits per tenant, monitoring with
+   per-tenant resource attribution dashboards.
+
+Q: How do you run database migrations across all tenants?
+A: For shared schema: one migration runs once (easy).
+   For separate schemas: migration tool iterates all tenant schemas
+   (e.g., Flyway with custom schema-per-tenant runner).
+   For separate DBs: automation (Terraform, script) applies migration
+   to each DB. Monitor for failures. Can use canary tenant (migrate one first).

@@ -1,0 +1,345 @@
+================================================================
+AWS INTERVIEW QUESTIONS — CI/CD AND DEVELOPER TOOLS
+================================================================
+
+Q1: What are the four core AWS CI/CD services and how do they work together?
+
+A: 
+   CodeCommit:   Git-based source repository (hosted in AWS). 
+                 Alternative to GitHub/GitLab. Integrates natively with other 
+                 Code* services. Note: AWS deprecated new customer onboarding 
+                 for CodeCommit in 2024 — most teams use GitHub/GitLab instead.
+
+   CodeBuild:    Fully managed build service. Runs tests, compiles code, 
+                 produces artifacts. No servers to manage. Defined by buildspec.yml.
+                 Supports Maven, Gradle, npm, Docker builds.
+
+   CodeDeploy:   Automated deployment to EC2, ECS, Lambda, or on-prem servers.
+                 Supports blue/green and rolling deployments.
+
+   CodePipeline: Orchestrates the end-to-end pipeline. Connects source → build 
+                 → test → deploy stages. Triggers automatically on code push.
+
+   FULL PIPELINE FLOW:
+   GitHub push → CodePipeline triggers →
+     Stage 1: Source (GitHub)
+     Stage 2: Build (CodeBuild: mvn package, docker build/push to ECR)
+     Stage 3: Test (CodeBuild: integration tests)
+     Stage 4: Deploy Staging (CodeDeploy to ECS staging)
+     Stage 5: Manual Approval (SNS notification → human approves)
+     Stage 6: Deploy Prod (CodeDeploy to ECS prod)
+
+---
+
+Q2: What is buildspec.yml and how do you structure it for a Java Maven project?
+
+A: buildspec.yml is the CodeBuild build specification — it defines the commands 
+   to run at each phase of the build.
+
+   version: 0.2
+
+   env:
+     variables:
+       JAVA_HOME: /usr/lib/jvm/java-21
+     parameter-store:
+       DB_PASSWORD: /myapp/prod/db-password    # Read from SSM Parameter Store
+     secrets-manager:
+       API_KEY: myapp/prod/api-key             # Read from Secrets Manager
+
+   phases:
+     install:
+       runtime-versions:
+         java: corretto21                      # Amazon Corretto 21
+       commands:
+         - echo "Installing dependencies"
+
+     pre_build:
+       commands:
+         - echo "Logging in to ECR"
+         - aws ecr get-login-password --region $AWS_DEFAULT_REGION | 
+             docker login --username AWS --password-stdin $ECR_REGISTRY
+         - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+         - IMAGE_TAG=${COMMIT_HASH:=latest}
+
+     build:
+       commands:
+         - echo "Running tests"
+         - mvn clean verify -Dmaven.test.failure.ignore=false
+         - echo "Building Docker image"
+         - docker build -t $ECR_REGISTRY/$IMAGE_REPO_NAME:$IMAGE_TAG .
+         - docker push $ECR_REGISTRY/$IMAGE_REPO_NAME:$IMAGE_TAG
+
+     post_build:
+       commands:
+         - echo "Writing image tag to imagedefinitions.json"
+         - printf '[{"name":"app","imageUri":"%s"}]' 
+             "$ECR_REGISTRY/$IMAGE_REPO_NAME:$IMAGE_TAG" > imagedefinitions.json
+         - echo "Build completed"
+
+   artifacts:
+     files:
+       - imagedefinitions.json          # Used by CodeDeploy for ECS update
+       - target/*.jar                   # If deploying JAR directly
+
+   cache:
+     paths:
+       - '/root/.m2/**/*'               # Cache Maven dependencies (faster builds)
+
+   reports:
+     surefire-reports:
+       files:
+         - 'target/surefire-reports/**/*.xml'
+       file-format: JUNITXML            # Publish test results to CodeBuild console
+
+---
+
+Q3: What is CodeDeploy's blue/green deployment and how does it work with ECS?
+
+A: Blue/green deployment creates a NEW set of tasks (green) alongside the 
+   existing production tasks (blue). Traffic is shifted from blue to green.
+
+   HOW IT WORKS FOR ECS:
+   1. CodeDeploy creates a new ECS task set with the new container image.
+   2. The new task set registers with the ALB's second target group (green).
+   3. CodeDeploy shifts traffic: ALB routes % of requests to green target group.
+   4. Traffic shift strategies:
+      - AllAtOnce: 100% to green immediately (fast but risky)
+      - Canary: shift 10% to green, wait X minutes, then 100% (e.g., Canary10Percent5Minutes)
+      - Linear: shift incrementally (e.g., 10% every 5 minutes)
+   5. If green passes health checks: CodeDeploy terminates the blue task set.
+   6. If health check fails (or you trigger a rollback): 100% traffic back to blue.
+
+   APPSPEC.YML (for ECS CodeDeploy):
+   version: 0.0
+   Resources:
+     - TargetService:
+         Type: AWS::ECS::Service
+         Properties:
+           TaskDefinition: <TASK_DEFINITION>      # Replaced by CodePipeline
+           LoadBalancerInfo:
+             ContainerName: "app"
+             ContainerPort: 8080
+   Hooks:
+     - BeforeAllowTraffic: "arn:aws:lambda:...:function:PreDeployValidation"
+     - AfterAllowTraffic:  "arn:aws:lambda:...:function:SmokeTestLambda"
+
+   HOOKS (Java Lambda example — smoke test):
+   public class SmokeTestLambda implements RequestHandler<Map<String, Object>, Void> {
+       @Override
+       public Void handleRequest(Map<String, Object> event, Context context) {
+           String deploymentId = (String) event.get("DeploymentId");
+           String lifecycleEventHookExecutionId = 
+               (String) event.get("LifecycleEventHookExecutionId");
+           
+           try {
+               // Hit health endpoint of new (green) task set
+               String healthUrl = System.getenv("GREEN_HEALTH_URL");
+               HttpResponse<String> response = httpClient.send(
+                   HttpRequest.newBuilder().uri(URI.create(healthUrl)).build(),
+                   HttpResponse.BodyHandlers.ofString());
+               
+               if (response.statusCode() == 200) {
+                   codeDeployClient.putLifecycleEventHookExecutionStatus(
+                       PutLifecycleEventHookExecutionStatusRequest.builder()
+                           .deploymentId(deploymentId)
+                           .lifecycleEventHookExecutionId(lifecycleEventHookExecutionId)
+                           .status(LifecycleEventStatus.SUCCEEDED)
+                           .build());
+               } else {
+                   // Trigger automatic rollback
+                   codeDeployClient.putLifecycleEventHookExecutionStatus(
+                       PutLifecycleEventHookExecutionStatusRequest.builder()
+                           .deploymentId(deploymentId)
+                           .lifecycleEventHookExecutionId(lifecycleEventHookExecutionId)
+                           .status(LifecycleEventStatus.FAILED)
+                           .build());
+               }
+           } catch (Exception e) {
+               // Fail safe — rollback on any error
+           }
+           return null;
+       }
+   }
+
+---
+
+Q4: What is CloudFormation and how does it compare to CDK?
+
+A: CloudFormation:
+   - AWS native Infrastructure as Code (IaC).
+   - Define resources in YAML or JSON templates.
+   - AWS provisions and manages the resource stack.
+   - Drift detection: identify manual changes vs template.
+   - Change sets: preview what will change before applying.
+   
+   CloudFormation is declarative — you describe WHAT you want.
+
+   CDK (Cloud Development Kit):
+   - Write infrastructure in TypeScript, Python, Java, Go, C#.
+   - CDK synthesizes CloudFormation templates — CloudFormation does the actual provisioning.
+   - Higher abstraction: Constructs encapsulate best practices (L1/L2/L3 constructs).
+   - Benefits over raw CloudFormation:
+     * IDE support (autocomplete, type checking)
+     * Reusable constructs (like functions/classes)
+     * Loops, conditionals — no CloudFormation-specific DSL needed
+     * Unit testable (CDK assertions library)
+
+   // Java CDK example:
+   public class OrderServiceStack extends Stack {
+       public OrderServiceStack(Construct scope, String id) {
+           super(scope, id);
+           
+           // L2 Construct — ECS Fargate service with sensible defaults
+           Cluster cluster = Cluster.Builder.create(this, "Cluster")
+               .vpc(vpc).build();
+           
+           ApplicationLoadBalancedFargateService service = 
+               ApplicationLoadBalancedFargateService.Builder.create(this, "Service")
+                   .cluster(cluster)
+                   .cpu(512)
+                   .memoryLimitMiB(1024)
+                   .taskImageOptions(TaskImageOptions.builder()
+                       .image(ContainerImage.fromEcrRepository(repo, imageTag))
+                       .containerPort(8080)
+                       .build())
+                   .desiredCount(2)
+                   .publicLoadBalancer(true)
+                   .build();
+           
+           // Auto-scaling
+           ScalableTaskCount scaling = service.getService().autoScaleTaskCount(
+               EnableScalingProps.builder().minCapacity(2).maxCapacity(20).build());
+           scaling.scaleOnCpuUtilization("CpuScaling", 
+               CpuUtilizationScalingProps.builder().targetUtilizationPercent(70).build());
+       }
+   }
+
+   CHOOSE CDK when: team prefers general-purpose language, need reusable 
+   components, want type safety.
+   CHOOSE CloudFormation directly when: team knows YAML, existing templates, 
+   strict governance requires raw template review.
+
+---
+
+Q5: How do you store and use secrets securely in a CI/CD pipeline?
+
+A: NEVER hardcode secrets (passwords, API keys) in:
+   - Source code (committed to git)
+   - buildspec.yml plain text
+   - Docker images or environment variables in task definitions
+
+   SOLUTIONS:
+
+   1. AWS SECRETS MANAGER in buildspec.yml:
+      env:
+        secrets-manager:
+          DB_PASSWORD: prod/myapp/db:password  # SecretId:jsonKey
+      # CodeBuild fetches at runtime — never stored in git
+
+   2. SSM PARAMETER STORE for non-sensitive config:
+      env:
+        parameter-store:
+          DB_HOST: /myapp/prod/db-host   # SecureString for sensitive values
+      # Cheaper than Secrets Manager, no auto-rotation
+
+   3. ECS SECRETS (task definition):
+      containerDefinitions:
+        - secrets:
+          - name: DB_PASSWORD
+            valueFrom: arn:aws:secretsmanager:us-east-1:123:secret:prod/db:password
+      # ECS fetches at task startup — never in task definition JSON
+
+   4. SPRING BOOT + SECRETS MANAGER (runtime):
+      spring:
+        config:
+          import: aws-secretsmanager:/myapp/prod/secrets
+      # spring-cloud-aws auto-populates Spring properties from Secrets Manager
+
+   5. IAM ROLE FOR CODEBUILD:
+      CodeBuild runs with an IAM service role. Grant that role:
+      secretsmanager:GetSecretValue on the specific secret ARN.
+      Never use access keys in the pipeline — use IAM roles only.
+
+---
+
+Q6: Explain the concept of Infrastructure Drift and how CloudFormation handles it.
+
+A: Drift occurs when the actual state of AWS resources diverges from the 
+   CloudFormation template — usually due to manual changes in the console or CLI.
+
+   DETECTING DRIFT:
+   - CloudFormation Drift Detection: compares current resource state to template
+   - Shows: MODIFIED, DELETED, or IN_SYNC for each resource
+   - Run: aws cloudformation detect-stack-drift --stack-name my-stack
+   - View: aws cloudformation describe-stack-resource-drifts --stack-name my-stack
+
+   PREVENTING DRIFT:
+   - Enforce IaC-only changes: use SCPs (Service Control Policies) to deny 
+     manual console changes to production resources
+   - AWS Config rules: detect and alert on manual resource changes
+   - Treat infrastructure as immutable — never modify, always replace via stack update
+
+   REMEDIATION:
+   - Option 1: Fix template to match actual state, then deploy (accepts drift)
+   - Option 2: Redeploy stack to reset resources to template state (removes manual changes)
+   - Best practice: always go through CodePipeline for infra changes
+
+---
+
+Q7: What is CDK Bootstrapping and why is it required?
+
+A: CDK requires a one-time setup in each AWS account/region before you can deploy:
+   cdk bootstrap aws://ACCOUNT_ID/REGION
+
+   This creates:
+   - S3 bucket: stores CDK assets (CloudFormation templates, Lambda ZIPs, Docker images)
+   - ECR repository: stores Docker images used by CDK apps
+   - IAM roles: CDK uses these roles to deploy (CloudFormation execution role)
+   - CDKToolkit CloudFormation stack: manages all of the above
+
+   WHY: CDK needs a place to store large assets that can't fit in CloudFormation 
+   templates directly (templates have a 51 KB size limit).
+
+   CROSS-ACCOUNT DEPLOY:
+   Bootstrap target account with a trust policy pointing to the pipeline account:
+   cdk bootstrap --trust PIPELINE_ACCOUNT_ID aws://TARGET_ACCOUNT_ID/REGION
+
+---
+
+Q8: How do you implement a GitOps-style deployment pipeline for a Java Spring Boot 
+    app on ECS using AWS tools?
+
+A: GitOps principle: Git is the single source of truth. Any change to 
+   infrastructure or application config goes through a pull request.
+
+   PIPELINE:
+
+   1. Developer opens PR → code review → merge to main
+
+   2. CodePipeline triggers on main branch push:
+      Stage 1: Source — fetch from GitHub
+      Stage 2: Build — CodeBuild runs:
+        mvn clean verify          # Unit + integration tests
+        docker build + push to ECR
+        Generate imagedefinitions.json
+
+   3. Stage 3: Deploy to Staging:
+      CodeDeploy (blue/green) to ECS staging cluster
+      
+   4. Stage 4: Integration Tests — CodeBuild runs e2e test suite against staging
+
+   5. Stage 5: Manual Approval:
+      SNS → email to tech lead
+      Approved → proceed, Rejected → pipeline stops
+
+   6. Stage 6: Deploy to Prod:
+      CodeDeploy (blue/green canary) to ECS prod cluster
+      AfterAllowTraffic hook: smoke test Lambda validates prod health
+
+   7. CloudWatch Alarm → CodeDeploy automatic rollback if error rate spikes 
+      within 10 minutes of deployment
+
+   INFRA CHANGES (GitOps for IaC):
+   - CDK/CloudFormation changes also go through PR
+   - Separate pipeline for infra: CDK diff in PR → CDK deploy after merge
+   - No direct console access to prod — enforced by SCPs

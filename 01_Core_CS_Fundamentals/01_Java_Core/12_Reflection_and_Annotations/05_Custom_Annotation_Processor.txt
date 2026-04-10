@@ -1,0 +1,472 @@
+================================================================================
+05 — CUSTOM ANNOTATION PROCESSORS
+================================================================================
+Target: Senior Java Developer Interview
+Topics: javax.annotation.processing API, APT, AbstractProcessor,
+        RoundEnvironment, generating source files, Lombok/MapStruct internals,
+        compile-time validation, runtime annotation processing
+
+================================================================================
+SECTION 1 — HOW ANNOTATION PROCESSING WORKS
+================================================================================
+
+Q1: What is an annotation processor and when does it run?
+
+A: An annotation processor is a plugin to the Java compiler (javac) that runs
+   DURING COMPILATION — before the compiled classes are written to disk.
+
+   PROCESSING LIFECYCLE:
+   1. javac discovers processor via META-INF/services/javax.annotation.processing.Processor
+   2. Compiler runs processor in rounds (multiple passes if new sources are generated)
+   3. Each round: processor.process(annotations, roundEnv) is called
+   4. Processor can: generate new source files, emit warnings/errors, validate code
+   5. If new files were generated, compiler re-runs processors on them (next round)
+   6. Final round: roundEnv.processingOver() returns true
+
+   WHAT CAN A PROCESSOR DO:
+   ✓ Generate new .java source files (most common use case)
+   ✓ Generate resource files (META-INF/services, JSON, XML)
+   ✓ Emit compiler errors/warnings (for validation)
+   ✓ Inspect AST structure (types, methods, fields, annotations)
+   ✗ CANNOT modify existing source files (read-only access to existing code)
+
+   FAMOUS PROCESSORS:
+   - Lombok:      generates constructors, getters, builders (via AST hacks)
+   - MapStruct:   generates type-safe mapper implementation classes
+   - Dagger 2:    generates dependency injection factories
+   - AutoValue:   generates immutable value classes
+   - AutoService: generates META-INF/services files
+
+──────────────────────────────────────────────────────────────────────────────
+Q2: What is the structure of AbstractProcessor?
+
+A:
+@SupportedAnnotationTypes("com.example.*")   // which annotations to process
+@SupportedSourceVersion(SourceVersion.RELEASE_17)
+public class MyProcessor extends AbstractProcessor {
+
+    private Messager messager;     // emit compiler messages (errors, warnings, notes)
+    private Filer filer;           // create new files
+    private Elements elementUtils; // utility methods for Element hierarchy
+    private Types typeUtils;       // utility methods for TypeMirror hierarchy
+
+    @Override
+    public synchronized void init(ProcessingEnvironment env) {
+        super.init(env);
+        this.messager = env.getMessager();
+        this.filer = env.getFiler();
+        this.elementUtils = env.getElementUtils();
+        this.typeUtils = env.getTypeUtils();
+    }
+
+    @Override
+    public boolean process(Set<? extends TypeElement> annotations,
+                           RoundEnvironment roundEnv) {
+        for (TypeElement annotation : annotations) {
+            for (Element element : roundEnv.getElementsAnnotatedWith(annotation)) {
+                // element is the annotated class/method/field
+                processElement(element);
+            }
+        }
+        return true;  // true = annotation is "claimed" (won't be processed by others)
+    }
+}
+
+   KEY TYPES:
+   - Element:     represents a program element (class, method, field, parameter)
+   - TypeElement: an Element that is a class or interface
+   - ExecutableElement: a method or constructor
+   - VariableElement: a field or parameter
+   - TypeMirror:  the type of an element (equivalent of Class<?> at compile time)
+
+================================================================================
+SECTION 2 — COMPLETE EXAMPLE: @TelecomEntity VALIDATOR
+================================================================================
+
+Q3: Write a custom annotation processor that validates classes annotated with
+    @TelecomEntity must have:
+    - A field named 'id' of type String
+    - A field named 'createdAt' of type java.time.LocalDateTime
+    - Emit a compile error if either is missing
+
+A:
+STEP 1 — Define the annotation:
+
+package com.telecom.annotations;
+
+import java.lang.annotation.*;
+
+@Retention(RetentionPolicy.SOURCE)   // not needed at runtime
+@Target(ElementType.TYPE)
+public @interface TelecomEntity {
+    String tableName() default "";
+}
+
+
+STEP 2 — Write the processor:
+
+package com.telecom.annotations;
+
+import javax.annotation.processing.*;
+import javax.lang.model.*;
+import javax.lang.model.element.*;
+import javax.lang.model.type.*;
+import javax.tools.Diagnostic;
+import java.util.*;
+import java.util.stream.*;
+
+@SupportedAnnotationTypes("com.telecom.annotations.TelecomEntity")
+@SupportedSourceVersion(SourceVersion.RELEASE_17)
+// Also register in META-INF/services/javax.annotation.processing.Processor
+public class TelecomEntityProcessor extends AbstractProcessor {
+
+    private Messager messager;
+    private Types typeUtils;
+    private Elements elementUtils;
+
+    @Override
+    public synchronized void init(ProcessingEnvironment env) {
+        super.init(env);
+        this.messager = env.getMessager();
+        this.typeUtils = env.getTypeUtils();
+        this.elementUtils = env.getElementUtils();
+    }
+
+    @Override
+    public boolean process(Set<? extends TypeElement> annotations, RoundEnvironment roundEnv) {
+        if (roundEnv.processingOver()) return false;
+
+        for (Element element : roundEnv.getElementsAnnotatedWith(TelecomEntity.class)) {
+            if (element.getKind() != ElementKind.CLASS) {
+                error(element, "@TelecomEntity can only be applied to classes");
+                continue;
+            }
+            validateEntity((TypeElement) element);
+        }
+        return true;
+    }
+
+    private void validateEntity(TypeElement classElement) {
+        List<VariableElement> fields = ElementFilter.fieldsIn(classElement.getEnclosedElements());
+        Map<String, String> fieldTypes = fields.stream()
+            .collect(Collectors.toMap(
+                f -> f.getSimpleName().toString(),
+                f -> f.asType().toString()
+            ));
+
+        // Validate 'id' field
+        if (!fieldTypes.containsKey("id")) {
+            error(classElement, "@TelecomEntity class '%s' must have a field named 'id'",
+                classElement.getSimpleName());
+        } else if (!fieldTypes.get("id").equals("java.lang.String")) {
+            error(classElement, "@TelecomEntity class '%s': 'id' field must be of type String",
+                classElement.getSimpleName());
+        }
+
+        // Validate 'createdAt' field
+        if (!fieldTypes.containsKey("createdAt")) {
+            error(classElement, "@TelecomEntity class '%s' must have a field named 'createdAt'",
+                classElement.getSimpleName());
+        } else if (!fieldTypes.get("createdAt").equals("java.time.LocalDateTime")) {
+            error(classElement, "@TelecomEntity class '%s': 'createdAt' must be LocalDateTime",
+                classElement.getSimpleName());
+        }
+
+        // Log note on success
+        if (fieldTypes.containsKey("id") && fieldTypes.containsKey("createdAt")) {
+            note(classElement, "@TelecomEntity '%s' validated OK", classElement.getSimpleName());
+        }
+    }
+
+    private void error(Element e, String msg, Object... args) {
+        messager.printMessage(Diagnostic.Kind.ERROR, String.format(msg, args), e);
+    }
+
+    private void note(Element e, String msg, Object... args) {
+        messager.printMessage(Diagnostic.Kind.NOTE, String.format(msg, args), e);
+    }
+}
+
+
+STEP 3 — Register the processor:
+File: src/main/resources/META-INF/services/javax.annotation.processing.Processor
+Content (one class per line):
+  com.telecom.annotations.TelecomEntityProcessor
+
+OR use Google AutoService to generate this automatically:
+  @AutoService(Processor.class)
+  public class TelecomEntityProcessor extends AbstractProcessor { ... }
+
+
+STEP 4 — Maven configuration (processor in separate module):
+<build>
+  <plugins>
+    <plugin>
+      <groupId>org.apache.maven.plugins</groupId>
+      <artifactId>maven-compiler-plugin</artifactId>
+      <configuration>
+        <annotationProcessorPaths>
+          <path>
+            <groupId>com.telecom</groupId>
+            <artifactId>telecom-annotation-processor</artifactId>
+            <version>1.0.0</version>
+          </path>
+        </annotationProcessorPaths>
+      </configuration>
+    </plugin>
+  </plugins>
+</build>
+
+================================================================================
+SECTION 3 — CODE GENERATION WITH FILER
+================================================================================
+
+Q4: How do you generate source code from an annotation processor?
+
+A: Use processingEnv.getFiler() to create new Java source files.
+
+Example — @BuilderTarget annotation generates a Builder class:
+
+private void generateBuilder(TypeElement classElement) throws IOException {
+    String className = classElement.getSimpleName().toString();
+    String packageName = elementUtils.getPackageOf(classElement).getQualifiedName().toString();
+    String builderClassName = className + "Builder";
+    String qualifiedBuilderName = packageName + "." + builderClassName;
+
+    // Get all fields of the annotated class
+    List<VariableElement> fields = ElementFilter.fieldsIn(classElement.getEnclosedElements());
+
+    // Open a new source file
+    JavaFileObject file = filer.createSourceFile(qualifiedBuilderName, classElement);
+
+    try (PrintWriter writer = new PrintWriter(file.openWriter())) {
+        writer.println("package " + packageName + ";");
+        writer.println();
+        writer.println("public class " + builderClassName + " {");
+
+        // Declare one field per annotated class field
+        for (VariableElement field : fields) {
+            writer.printf("    private %s %s;%n", field.asType(), field.getSimpleName());
+        }
+
+        writer.println();
+
+        // Generate setter-style with methods
+        for (VariableElement field : fields) {
+            String name = field.getSimpleName().toString();
+            String type = field.asType().toString();
+            writer.printf("    public %s %s(%s %s) {%n", builderClassName, name, type, name);
+            writer.printf("        this.%s = %s;%n", name, name);
+            writer.printf("        return this;%n");
+            writer.printf("    }%n%n");
+        }
+
+        // Generate build() method
+        writer.printf("    public %s build() {%n", className);
+        writer.printf("        return new %s(%n", className);
+        String args = fields.stream()
+            .map(f -> "            " + f.getSimpleName())
+            .collect(Collectors.joining(",\n"));
+        writer.println(args);
+        writer.println("        );");
+        writer.println("    }");
+        writer.println("}");
+    }
+}
+
+   MULTI-ROUND PROCESSING:
+   If you generate a class in round 1 that is itself annotated, round 2 will
+   process it. Use roundEnv.processingOver() to avoid processing in the final round.
+
+================================================================================
+SECTION 4 — RUNTIME ANNOTATION PROCESSING (REFLECTION)
+================================================================================
+
+Q5: How do you process annotations at RUNTIME using reflection?
+
+A: Use Class.getAnnotation() / Method.getAnnotation() etc. — works for
+   annotations with @Retention(RetentionPolicy.RUNTIME).
+
+Example — Auto-register all @TelecomRoute-annotated methods:
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface TelecomRoute {
+    String path();
+    String method() default "GET";
+}
+
+public class RouteRegistry {
+
+    private final Map<String, Method> routes = new HashMap<>();
+    private final Object handlerInstance;
+
+    public RouteRegistry(Object handler) {
+        this.handlerInstance = handler;
+        // Scan all methods for @TelecomRoute
+        for (Method method : handler.getClass().getDeclaredMethods()) {
+            TelecomRoute route = method.getAnnotation(TelecomRoute.class);
+            if (route != null) {
+                String key = route.method() + ":" + route.path();
+                routes.put(key, method);
+                method.setAccessible(true);  // allow private methods
+                System.out.println("Registered route: " + key + " → " + method.getName());
+            }
+        }
+    }
+
+    public Object dispatch(String httpMethod, String path, Object... args) throws Exception {
+        String key = httpMethod.toUpperCase() + ":" + path;
+        Method handler = routes.get(key);
+        if (handler == null) throw new IllegalArgumentException("No route: " + key);
+        return handler.invoke(handlerInstance, args);
+    }
+}
+
+// Usage:
+class SubscriberController {
+    @TelecomRoute(path = "/subscribers", method = "GET")
+    public List<Subscriber> list() { ... }
+
+    @TelecomRoute(path = "/subscribers/{id}", method = "DELETE")
+    private void deactivate(String id) { ... }
+}
+
+RouteRegistry registry = new RouteRegistry(new SubscriberController());
+registry.dispatch("GET", "/subscribers");
+
+──────────────────────────────────────────────────────────────────────────────
+Q6: What is the difference between @Retention SOURCE, CLASS, and RUNTIME?
+
+A:
+   @Retention(RetentionPolicy.SOURCE):
+   - Annotation visible to compiler/processor only
+   - Stripped from .class files
+   - Use: @Override, @SuppressWarnings, custom compile-time processors
+   - Accessible via: annotation processor (APT) ONLY
+
+   @Retention(RetentionPolicy.CLASS):
+   - Annotation stored in .class files
+   - Not loaded into JVM at runtime (default if @Retention omitted)
+   - Use: bytecode tools that read .class without loading (JVM agents, byte-buddy)
+   - Accessible via: bytecode libraries (ASM, byte-buddy) at load time
+
+   @Retention(RetentionPolicy.RUNTIME):
+   - Annotation loaded into JVM and accessible via reflection
+   - Use: Spring @Component, @Autowired, @Transactional, JUnit @Test
+   - Accessible via: reflection APIs at runtime
+
+   CHOICE RULE:
+   - No runtime behavior needed → SOURCE (smallest overhead, processed at compile)
+   - Framework reflection needed → RUNTIME (most common in enterprise Java)
+   - Bytecode instrumentation needed → CLASS
+
+================================================================================
+SECTION 5 — INTERVIEW TRICKY QUESTIONS
+================================================================================
+
+Q7: Can an annotation processor modify existing source code?
+
+A: NO. The annotation processing API is intentionally read-only for existing sources.
+   Processors can ONLY generate NEW source files via Filer.
+
+   EXCEPTION: Lombok uses internal javac AST APIs (com.sun.tools.javac.tree.JCTree)
+   to mutate the AST of existing classes. This is not part of the public API and is
+   considered a hack — it breaks with new JDK versions and requires --add-opens flags.
+
+──────────────────────────────────────────────────────────────────────────────
+Q8: How would you test an annotation processor?
+
+A: Use Google's compile-testing library:
+
+   // Maven: com.google.testing.compile:compile-testing
+   @Test
+   void missingIdField_shouldFailCompilation() {
+       JavaFileObject sourceFile = JavaFileObjects.forSourceLines(
+           "com.example.BadEntity",
+           "package com.example;",
+           "import com.telecom.annotations.TelecomEntity;",
+           "@TelecomEntity",
+           "public class BadEntity {",
+           "    // no 'id' field",
+           "    private java.time.LocalDateTime createdAt;",
+           "}"
+       );
+
+       Compilation compilation = javac()
+           .withProcessors(new TelecomEntityProcessor())
+           .compile(sourceFile);
+
+       assertThat(compilation).failed();
+       assertThat(compilation).hadErrorContaining("must have a field named 'id'");
+   }
+
+   @Test
+   void validEntity_shouldCompileSuccessfully() {
+       JavaFileObject sourceFile = JavaFileObjects.forSourceLines(
+           "com.example.GoodEntity",
+           "package com.example;",
+           "import com.telecom.annotations.TelecomEntity;",
+           "import java.time.LocalDateTime;",
+           "@TelecomEntity",
+           "public class GoodEntity {",
+           "    private String id;",
+           "    private LocalDateTime createdAt;",
+           "}"
+       );
+
+       Compilation compilation = javac()
+           .withProcessors(new TelecomEntityProcessor())
+           .compile(sourceFile);
+
+       assertThat(compilation).succeeded();
+   }
+
+──────────────────────────────────────────────────────────────────────────────
+Q9: What are the @SupportedAnnotationTypes options?
+
+A:
+   @SupportedAnnotationTypes("com.example.MyAnnotation")    // exact class name
+   @SupportedAnnotationTypes("com.example.*")               // all in package
+   @SupportedAnnotationTypes("*")                            // ALL annotations (expensive)
+
+   ALTERNATIVE: Override getSupportedAnnotationTypes() for dynamic computation:
+   @Override
+   public Set<String> getSupportedAnnotationTypes() {
+       return Set.of(MyAnnotation.class.getCanonicalName());
+   }
+
+================================================================================
+QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+ANNOTATION PROCESSOR LIFECYCLE:
+  javac → discovers processor → init() → process() round 1 → [generate sources]
+  → process() round 2 (if new sources) → ... → processingOver() = true
+
+KEY INTERFACES:
+  AbstractProcessor     base class; extend this
+  ProcessingEnvironment access to Messager, Filer, Elements, Types
+  RoundEnvironment      which elements annotated this round; processingOver()
+  Element               program element (class, method, field)
+  TypeElement           Element that is a class or interface
+  Filer                 creates new source/resource files
+
+EMIT MESSAGES:
+  messager.printMessage(Kind.ERROR, "msg", element)    → compiler error
+  messager.printMessage(Kind.WARNING, "msg", element)  → compiler warning
+  messager.printMessage(Kind.NOTE, "msg", element)     → informational
+
+GENERATE CODE:
+  JavaFileObject jfo = filer.createSourceFile("pkg.ClassName", originElement)
+  PrintWriter writer = new PrintWriter(jfo.openWriter())
+
+REGISTER PROCESSOR:
+  META-INF/services/javax.annotation.processing.Processor
+  OR @AutoService(Processor.class) [Google AutoService]
+
+RETENTION RULES:
+  SOURCE  → compile time only (APT)
+  CLASS   → in .class, not in JVM (bytecode tools)
+  RUNTIME → in JVM, accessible via reflection (most framework annotations)
+================================================================================

@@ -1,0 +1,300 @@
+================================================================
+AWS INTERVIEW QUESTIONS — MESSAGING AND INTEGRATION
+================================================================
+
+Q1: What is the difference between SQS, SNS, and EventBridge? 
+    When do you use each?
+
+A: All three are AWS messaging services, but with distinct purposes:
+
+   SQS (Simple Queue Service):
+   - Point-to-point queue. One producer, one consumer group.
+   - Messages persist until consumed (up to 14 days).
+   - Consumers PULL messages (polling).
+   - Use for: async task processing, decoupling producer from consumer, 
+     load leveling (buffer traffic spikes for a downstream service).
+   - Example: API receives order → SQS → Order Processing Lambda.
+
+   SNS (Simple Notification Service):
+   - Pub/Sub. One publisher, multiple subscribers (fan-out).
+   - Messages NOT persisted — if subscriber is down, message is lost (unless SQS subscriber).
+   - Consumers PUSHED to (HTTP/Lambda/SQS).
+   - Use for: broadcasting events to multiple consumers simultaneously.
+   - Example: Order placed → SNS → [email Lambda, analytics Lambda, SQS queue].
+
+   EventBridge:
+   - Event bus with content-based routing (rules filter on event content).
+   - Supports cross-account, cross-region event routing.
+   - Integrates with 200+ AWS and SaaS services as sources.
+   - Schema registry for event contracts.
+   - Use for: event-driven microservices, decoupled architecture with 
+     content-based routing, SaaS event integration.
+   - Example: payment.completed event → EventBridge → only routes to 
+     LoyaltyService if amount > 100, to ShippingService always.
+
+   COMBINED PATTERN (most common):
+   SNS → SQS (fan-out pattern):
+   - SNS broadcasts to multiple SQS queues
+   - Each SQS queue has its own consumer (independent scaling, retry, DLQ)
+   - Durable fan-out: SQS provides persistence and retry even if consumer is down
+
+---
+
+Q2: What is a Dead Letter Queue (DLQ) and how do you configure it?
+
+A: A DLQ is an SQS queue where messages are sent when they cannot be 
+   successfully processed after a maximum number of receive attempts.
+
+   WHEN A MESSAGE GOES TO DLQ:
+   - Consumer receives the message, fails (exception thrown), message 
+     becomes visible again after visibility timeout.
+   - After maxReceiveCount deliveries (e.g., 3), moved to DLQ automatically.
+
+   CONFIGURATION (SQS):
+   1. Create a standard SQS queue as DLQ
+   2. On source queue: set Redrive Policy:
+      { "deadLetterTargetArn": "arn:aws:sqs:...:my-dlq", "maxReceiveCount": 3 }
+
+   CONFIGURATION (Lambda event source):
+   - Lambda can also have its own DLQ (for async invocations):
+     Destination: SQS DLQ or SNS topic for failed async invocations
+
+   WHAT TO DO WITH DLQ:
+   - Alarm on DLQ depth > 0 (CloudWatch metric: ApproximateNumberOfMessagesVisible)
+   - Inspect failed messages, fix the bug, then redrive (move back to source queue)
+   - Use SQS Redrive (console or API) to replay DLQ messages after fix
+
+   JAVA (Spring Cloud AWS reading from DLQ for inspection):
+   @SqsListener("${dlq.url}")
+   public void handleDlqMessage(String payload, 
+                                 @Header("ApproximateReceiveCount") String count,
+                                 @Header("SenderId") String senderId) {
+       log.error("DLQ message after {} attempts: {}", count, payload);
+       alertingService.notifyOps(payload);
+   }
+
+---
+
+Q3: What is SQS visibility timeout and how do you tune it?
+
+A: When a consumer receives an SQS message, the message becomes invisible 
+   to other consumers for the visibility timeout duration. This prevents 
+   double processing.
+
+   IF visibility timeout < processing time:
+   → Message becomes visible again before processing completes
+   → Another consumer picks it up → DUPLICATE PROCESSING
+
+   IF visibility timeout >> processing time:
+   → If consumer crashes, message stays invisible for too long
+   → Long delay before retry
+
+   RULE: Set visibility timeout to 6x your Lambda/consumer timeout.
+   For Lambda with 3-minute timeout → set visibility timeout to 18 minutes.
+
+   DYNAMIC EXTENSION (Java SDK):
+   // If you know processing will exceed visibility timeout:
+   sqsClient.changeMessageVisibility(ChangeMessageVisibilityRequest.builder()
+       .queueUrl(queueUrl)
+       .receiptHandle(message.receiptHandle())
+       .visibilityTimeout(600)    // Extend to 10 minutes
+       .build());
+
+   // Better: use a background thread to extend periodically during long processing
+
+---
+
+Q4: Explain SQS Standard vs FIFO queues. When do you use FIFO?
+
+A: SQS Standard Queue:
+   - At-least-once delivery (occasional duplicate messages)
+   - Best-effort ordering (not guaranteed)
+   - Nearly unlimited throughput
+   - Use for: most async workloads where duplicates are handled (idempotent consumers)
+     and order doesn't matter (payment processing, notification sending)
+
+   SQS FIFO Queue:
+   - Exactly-once processing (deduplication within 5-minute window)
+   - Strict ordering within a message group
+   - Up to 3,000 msg/sec with batching, 300/sec without
+   - MessageGroupId: messages with same group ID are processed in order
+   - MessageDeduplicationId: deduplication key (or enable content-based dedup)
+   - Use for: order processing (steps must happen in sequence), 
+     financial ledger (credit before debit), config changes (apply in order)
+
+   JAVA (sending to FIFO — required attributes):
+   sqsClient.sendMessage(SendMessageRequest.builder()
+       .queueUrl(fifoQueueUrl)                           // Must end in .fifo
+       .messageBody(objectMapper.writeValueAsString(order))
+       .messageGroupId(order.getCustomerId())            // Orders per customer are ordered
+       .messageDeduplicationId(order.getOrderId())       // Idempotent send
+       .build());
+
+---
+
+Q5: What is Kinesis Data Streams and how does it differ from SQS?
+
+A: Both are message queuing services but with different models:
+
+   ┌─────────────────────┬──────────────────────────┬──────────────────────────┐
+   │ Aspect              │ SQS                      │ Kinesis Data Streams     │
+   ├─────────────────────┼──────────────────────────┼──────────────────────────┤
+   │ Consumer model      │ Competing consumers       │ Multiple independent     │
+   │                     │ (each message processed   │ consumer groups (each    │
+   │                     │ by ONE consumer)          │ gets ALL records)        │
+   ├─────────────────────┼──────────────────────────┼──────────────────────────┤
+   │ Message retention   │ Up to 14 days            │ 24h default, up to 365d  │
+   ├─────────────────────┼──────────────────────────┼──────────────────────────┤
+   │ Ordering            │ Best-effort (Standard)   │ Guaranteed within shard  │
+   │                     │ Strict (FIFO)            │                          │
+   ├─────────────────────┼──────────────────────────┼──────────────────────────┤
+   │ Replay              │ No (deleted after read)  │ Yes (from any position)  │
+   ├─────────────────────┼──────────────────────────┼──────────────────────────┤
+   │ Throughput          │ Unlimited (standard)     │ 1 MB/s or 1000 rec/s     │
+   │                     │                          │ per shard                │
+   ├─────────────────────┼──────────────────────────┼──────────────────────────┤
+   │ Use for             │ Task queues, async work  │ Real-time analytics,     │
+   │                     │ orders, notifications    │ IoT telemetry, audit log │
+   └─────────────────────┴──────────────────────────┴──────────────────────────┘
+
+   Choose Kinesis when: multiple teams need to independently consume the same 
+   stream, you need ordered processing within a partition, or you need replay 
+   (reprocess historical records after a bug fix).
+
+---
+
+Q6: What is the SNS → SQS fan-out pattern? Why is it preferred over direct SNS?
+
+A: Direct SNS → Lambda/HTTP:
+   - If Lambda is throttled or endpoint is down, the notification is LOST.
+   - No retry beyond SNS's built-in (3 retries for HTTP, then drop).
+
+   SNS → SQS fan-out:
+   - SNS publishes to multiple SQS queues (one per consumer).
+   - SQS provides durability (message persists until consumer processes it).
+   - Each SQS queue has independent retry, DLQ, visibility timeout.
+   - Consumer Lambda reads from SQS — if throttled, message stays in SQS.
+   - Each consumer can scale independently.
+
+   Diagram:
+   OrderPlaced (SNS)
+     ├── SQS → EmailNotificationLambda
+     ├── SQS → InventoryUpdateLambda
+     └── SQS → AnalyticsPipelineLambda
+
+   Each downstream system can fail/scale independently without losing messages.
+
+---
+
+Q7: How does EventBridge differ from SNS for event-driven architecture?
+
+A: SNS: simple fan-out, all subscribers get all messages (no content filtering).
+   Primarily for internal AWS notification fan-out.
+
+   EventBridge: content-based routing using rules (filter on event fields).
+   Example: only route order events with amount > 1000 to FraudDetectionService.
+   
+   Additional EventBridge advantages:
+   - Schema registry: discover and document event contracts across services
+   - Cross-account event bus: publish events from account A, consume in account B
+   - 200+ native integrations (Stripe, Shopify, Zendesk as event sources)
+   - Archive and replay: save all events, replay to new consumers (SQS doesn't support this)
+   - Pipes: point-to-point integration (SQS → Lambda → EventBridge in one construct)
+
+   For Java microservices: EventBridge is preferred for domain events 
+   (OrderPlaced, PaymentProcessed) because it enforces schema contracts and 
+   allows content-based routing without a central event router Lambda.
+
+---
+
+Q8: How do you ensure exactly-once processing with SQS and Java?
+
+A: SQS Standard guarantees at-least-once delivery — duplicates CAN occur.
+   True exactly-once requires IDEMPOTENT consumers:
+
+   1. DATABASE IDEMPOTENCY KEY:
+      INSERT INTO processed_messages (message_id, processed_at) 
+      VALUES (?, NOW())
+      ON CONFLICT (message_id) DO NOTHING
+      
+      If the message_id already exists → skip processing. Safe to receive duplicate.
+
+   2. CONDITIONAL DYNAMODB WRITE:
+      PutItem with condition: attribute_not_exists(pk)
+      If item exists → condition fails → idempotent.
+
+   3. SQS FIFO + MessageDeduplicationId:
+      Exactly-once DELIVERY within 5-minute dedup window.
+      Still need idempotent consumer for longer-running jobs.
+
+   JAVA PATTERN:
+   @SqsListener("${queue.url}")
+   @Transactional
+   public void processOrder(Order order, @Header(SqsHeaders.SQS_MESSAGE_ID_HEADER) String msgId) {
+       if (processedMessageRepository.existsById(msgId)) {
+           log.info("Duplicate message {}, skipping", msgId);
+           return;  // Acknowledge but skip — SQS will delete from queue
+       }
+       orderService.process(order);
+       processedMessageRepository.save(new ProcessedMessage(msgId, Instant.now()));
+   }
+
+---
+
+Q9: How do you implement the Outbox Pattern with SQS/SNS in a Java Spring Boot app?
+
+A: The Outbox Pattern solves the dual-write problem: writing to DB and publishing 
+   to SQS in the same operation must be atomic. If you write to DB then crash 
+   before publishing → event is lost.
+
+   IMPLEMENTATION:
+   1. Write the domain event to an outbox table in the SAME DB transaction as the business data.
+   2. A separate outbox poller (scheduled task) reads unpublished events and sends to SQS/SNS.
+   3. Mark events as published after successful SQS send.
+
+   @Transactional
+   public void placeOrder(OrderRequest req) {
+       Order order = orderRepository.save(new Order(req));
+       // Write event to outbox IN THE SAME TRANSACTION:
+       outboxRepository.save(new OutboxEvent("OrderPlaced", 
+           objectMapper.writeValueAsString(order)));
+       // Transaction commits: both order and outbox event saved atomically
+   }
+   
+   // Scheduler (separate thread/process):
+   @Scheduled(fixedDelay = 5000)
+   @Transactional
+   public void publishOutboxEvents() {
+       List<OutboxEvent> pending = outboxRepository.findByStatus("PENDING");
+       for (OutboxEvent event : pending) {
+           snsClient.publish(PublishRequest.builder()
+               .topicArn(orderTopicArn)
+               .message(event.getPayload())
+               .build());
+           event.setStatus("PUBLISHED");
+           outboxRepository.save(event);
+       }
+   }
+   
+   // Alternative: use Debezium CDC to capture DB changes and publish to Kafka/SQS
+   // without a polling loop
+
+---
+
+Q10: What is SQS Long Polling and how does it reduce cost?
+
+A: By default, SQS uses short polling — it queries a subset of servers and 
+   returns immediately even if no messages. This burns API call quota and costs.
+
+   Long Polling: SQS waits up to 20 seconds for a message before returning empty.
+   - Reduces empty responses (cost savings on API calls)
+   - Reduces latency (message received as soon as it arrives, up to 20s wait)
+   - Set: ReceiveMessageWaitTimeSeconds = 20 on the queue
+
+   Spring Cloud AWS @SqsListener uses long polling by default (20s).
+   Manual SDK:
+   sqsClient.receiveMessage(ReceiveMessageRequest.builder()
+       .queueUrl(queueUrl)
+       .waitTimeSeconds(20)      // Long polling
+       .maxNumberOfMessages(10)
+       .build());

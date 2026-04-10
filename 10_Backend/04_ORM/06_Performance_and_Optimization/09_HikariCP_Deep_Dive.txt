@@ -1,0 +1,188 @@
+======================================================
+HIKARICP CONNECTION POOL — DEEP DIVE & TUNING
+======================================================
+
+1. WHAT IS HIKARICP?
+─────────────────────
+HikariCP is the default JDBC connection pool in Spring Boot (since 2.0).
+Known for: high performance, low latency, minimal overhead, reliability.
+
+Auto-configured via: HikariDataSource when spring-boot-starter-data-jpa (or jdbc) is on classpath.
+
+
+2. KEY CONFIGURATION PROPERTIES
+──────────────────────────────────
+application.yml:
+  spring:
+    datasource:
+      hikari:
+        pool-name: MyPool
+        maximum-pool-size: 20          # Max connections in pool
+        minimum-idle: 5               # Min idle connections maintained
+        idle-timeout: 600000          # 10 min: remove idle connections beyond minimum-idle
+        connection-timeout: 30000     # 30s: max wait for a connection from pool
+        max-lifetime: 1800000         # 30 min: max connection lifetime (rotate before DB closes it)
+        keepalive-time: 30000         # 30s: send keepalive query to prevent connection drops
+        connection-test-query: SELECT 1  # only if JDBC4 validation not available
+        validation-timeout: 5000      # 5s: timeout for connection validation
+        leak-detection-threshold: 60000  # 60s: warn if connection held > this duration
+
+
+3. POOL SIZING — THE FORMULA
+──────────────────────────────
+The most important rule (from HikariCP author):
+  Pool size = (Core_count * 2) + effective_spindle_count
+
+For a database server with:
+  - 4 CPU cores
+  - 1 SSD (spindle count = 0 for SSDs, use 1 as minimum)
+  → Pool size = (4 × 2) + 1 = 9 ≈ 10
+
+Common mistake: setting pool size to 100+ is counterproductive.
+  - DB server has limited CPU; extra connections cause context switching
+  - Connections queue at DB → higher overall latency
+
+Little's Law (for validating):
+  connections_needed = requests_per_second × avg_query_time_seconds
+  Example: 1000 RPS × 0.01s (10ms avg query) = 10 connections
+
+Rules of thumb:
+  - For microservices: 10–20 connections is usually sufficient
+  - For batch jobs: can go higher (parallelism-driven)
+  - Never exceed DB's max_connections limit / number of app instances
+
+PostgreSQL max_connections (default 100):
+  If you have 5 app pods × 20 connections = 100 → at the DB limit!
+  Use PgBouncer connection pooler in front of PostgreSQL for many pods.
+
+
+4. TIMEOUT CONFIGURATION EXPLAINED
+─────────────────────────────────────
+connection-timeout (30s default):
+  Max time a caller waits to get a connection from the pool.
+  If exceeded: SQLTransientConnectionException thrown.
+  Tune: reduce to 5–10s to fail fast; don't let callers wait too long.
+
+max-lifetime (30 min default):
+  Maximum lifetime of a connection. Must be LESS than DB's wait_timeout.
+  MySQL default wait_timeout = 8 hours; max-lifetime = 1800s (30 min) is safe.
+  PostgreSQL: set to less than idle_in_transaction_session_timeout.
+
+idle-timeout (10 min default):
+  Time after which idle connections (beyond minimum-idle) are removed.
+  Set to 0 to disable (connections kept alive indefinitely = not recommended).
+
+keepalive-time (0 by default, recommend 30000–60000ms):
+  Sends a keepalive query to prevent firewall/NAT from dropping idle connections.
+  Essential in cloud environments (AWS RDS, Azure DB) where idle connections
+  are dropped by network infrastructure.
+
+validation-timeout (5s default):
+  Time to validate a connection before handing it to the caller.
+  If validation fails: connection is discarded and new one acquired.
+
+leak-detection-threshold:
+  If a connection is held longer than this duration, HikariCP logs a warning
+  with the stack trace of where it was borrowed.
+  Set to 0 in production (disabled), use in dev/test to find connection leaks.
+
+
+5. LEAK DETECTION
+──────────────────
+Enable in dev/staging only (generates thread stack traces = overhead):
+  spring.datasource.hikari.leak-detection-threshold=30000  # 30 seconds
+
+Log message when leak detected:
+  WARN  HikariPool - Connection leak detection triggered...
+
+Common causes of connection leaks in Spring:
+  - Using EntityManager directly without @Transactional and not closing it
+  - Opening JPA sessions in @Async methods (thread doesn't have transaction context)
+  - Long-running @Scheduled jobs holding connections
+  - Not returning connections in catch/finally blocks in raw JDBC code
+
+
+6. MONITORING HIKARICP METRICS
+────────────────────────────────
+HikariCP integrates with Micrometer out-of-box in Spring Boot.
+
+Metrics exposed:
+  hikaricp.connections.active      → active (in-use) connections
+  hikaricp.connections.idle        → idle connections
+  hikaricp.connections.pending     → threads waiting for a connection
+  hikaricp.connections.max         → maximum pool size
+  hikaricp.connections.timeout.total → total timeouts (pool exhaustion events)
+  hikaricp.connections.acquire     → time to acquire a connection (histogram)
+  hikaricp.connections.creation    → time to create a new connection
+
+Grafana dashboard ID: 6083 (HikariCP Metrics)
+
+Alert on:
+  hikaricp.connections.pending > 0 for > 30s → pool exhaustion
+  hikaricp.connections.timeout.total increasing → callers being rejected
+
+
+7. MULTIPLE DATA SOURCES
+─────────────────────────
+Each data source has its own HikariCP pool:
+  @Primary
+  @Bean
+  @ConfigurationProperties("spring.datasource.primary")
+  public DataSource primaryDataSource() {
+      return DataSourceBuilder.create().type(HikariDataSource.class).build();
+  }
+
+  @Bean
+  @ConfigurationProperties("spring.datasource.secondary")
+  public DataSource secondaryDataSource() {
+      return DataSourceBuilder.create().type(HikariDataSource.class).build();
+  }
+
+application.yml:
+  spring.datasource.primary.hikari.maximum-pool-size: 15
+  spring.datasource.secondary.hikari.maximum-pool-size: 5
+
+
+8. COMMON POOL EXHAUSTION SCENARIO & FIX
+──────────────────────────────────────────
+Symptom:
+  Unable to acquire JDBC Connection after 30000ms
+  HikariPool-1 - Connection is not available, request timed out
+
+Causes & Fixes:
+  Cause                              | Fix
+  ──────────────────────────────────────────────────────────────────
+  Pool size too small                | Increase maximum-pool-size (but see formula)
+  Slow DB queries holding connections | Optimize queries, add indexes
+  Missing @Transactional boundaries  | Long transactions holding connections
+  Connection leak                    | Enable leak-detection, fix code
+  Too many app instances for one DB  | Add PgBouncer / ProxySQL in front of DB
+  N+1 queries opening many sessions  | Fix with JOIN FETCH or @EntityGraph
+
+
+9. INTERVIEW QUESTIONS
+──────────────────────
+Q: What is the recommended pool size formula for HikariCP?
+A: (Core_count × 2) + effective_spindle_count. For a 4-core server with SSD:
+   (4×2)+1 = 9. More connections than CPU can handle causes DB context switching
+   overhead. Start small and increase only based on metrics.
+
+Q: What is the difference between connection-timeout and max-lifetime?
+A: connection-timeout is the wait time for a caller to get a connection from
+   the pool. max-lifetime is how long a connection lives before being retired
+   (to prevent stale connections or DB-side idle timeouts).
+
+Q: How do you detect connection leaks with HikariCP?
+A: Set leak-detection-threshold (e.g., 30000ms). HikariCP logs a warning with
+   the acquisition stack trace if a connection is held beyond the threshold.
+   Disable in production; use only in dev/staging.
+
+Q: How do you handle HikariCP in a microservice with 10 replicas connecting to PostgreSQL?
+A: 10 pods × 20 connections = 200 connections. PostgreSQL default max_connections
+   is 100. Use PgBouncer as a connection pooler in front of PostgreSQL to
+   multiplex application connections, reducing actual DB connections needed.
+
+Q: What happens when all connections in the pool are exhausted?
+A: Callers wait up to connection-timeout (default 30s). After that, HikariCP
+   throws SQLTransientConnectionException. hikaricp.connections.timeout.total
+   metric increments. Should be alerted on immediately.

@@ -1,0 +1,232 @@
+======================================================
+DISTRIBUTED LOCKING IN JAVA / SPRING BOOT
+======================================================
+
+1. WHY DISTRIBUTED LOCKING?
+─────────────────────────────
+In a single JVM: synchronized, ReentrantLock, Semaphore work fine.
+In distributed systems (multiple pods/instances):
+  - Multiple instances can execute the same code simultaneously
+  - JVM-level locks don't span processes
+  - Need: distributed lock that all instances respect
+
+Use cases:
+  - Preventing duplicate payment processing
+  - @Scheduled jobs (only one instance should run)
+  - Inventory reservation (prevent overselling)
+  - Idempotent API operations
+  - Leader election
+
+
+2. REDIS-BASED DISTRIBUTED LOCKING (REDISSON)
+───────────────────────────────────────────────
+
+2a. Redisson — recommended library for Redis distributed locks
+
+Dependency:
+  <dependency>
+    <groupId>org.redisson</groupId>
+    <artifactId>redisson-spring-boot-starter</artifactId>
+    <version>3.27.2</version>
+  </dependency>
+
+Config (application.yml):
+  spring:
+    redis:
+      host: localhost
+      port: 6379
+
+Basic usage — RLock (Reentrant Lock):
+  @Autowired
+  private RedissonClient redissonClient;
+
+  public void processOrder(String orderId) {
+      RLock lock = redissonClient.getLock("order-lock:" + orderId);
+      try {
+          // waitTime: max time to wait for the lock
+          // leaseTime: auto-release after this duration (prevents deadlocks)
+          boolean acquired = lock.tryLock(5, 30, TimeUnit.SECONDS);
+          if (!acquired) {
+              throw new LockAcquisitionException("Could not acquire lock for order " + orderId);
+          }
+          // Critical section
+          processOrderInternal(orderId);
+      } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new RuntimeException("Lock interrupted", e);
+      } finally {
+          if (lock.isHeldByCurrentThread()) {
+              lock.unlock();
+          }
+      }
+  }
+
+IMPORTANT:
+  - Always release in finally block
+  - Check isHeldByCurrentThread() before unlock to avoid IllegalMonitorStateException
+  - leaseTime prevents deadlocks if the JVM crashes before unlock
+
+2b. RedLock (Distributed lock across multiple Redis nodes):
+  // Redisson implements RedLock algorithm automatically with RedissonMultiLock
+  RLock lock1 = redisson1.getLock("myLock");
+  RLock lock2 = redisson2.getLock("myLock");
+  RLock lock3 = redisson3.getLock("myLock");
+
+  RLock multiLock = redissonClient.getMultiLock(lock1, lock2, lock3);
+  multiLock.lock();
+  try { /* ... */ }
+  finally { multiLock.unlock(); }
+
+  RedLock acquires majority (2/3 nodes) — survives single node failure.
+
+
+3. REDIS SETNX (MANUAL APPROACH)
+──────────────────────────────────
+Before Redisson: manual SETNX + EXPIRE (SET NX PX):
+
+  SET lock:order:123 unique-value NX PX 30000
+  # NX = only if not exists, PX = expire in milliseconds
+
+  Spring Data Redis:
+  Boolean acquired = redisTemplate.opsForValue()
+      .setIfAbsent("lock:order:" + orderId, lockValue, 30, TimeUnit.SECONDS);
+
+  // Unlock: use Lua script to ensure atomicity (check + delete)
+  String script = "if redis.call('get',KEYS[1]) == ARGV[1] then " +
+                  "return redis.call('del',KEYS[1]) else return 0 end";
+  redisTemplate.execute(
+      new DefaultRedisScript<>(script, Long.class),
+      Collections.singletonList("lock:order:" + orderId),
+      lockValue);
+
+  Why Lua script for unlock? Prevents releasing another thread's lock:
+  - Check if value == our value (atomic with delete)
+  - Without Lua: check + delete is not atomic
+
+
+4. DATABASE-LEVEL DISTRIBUTED LOCKING
+───────────────────────────────────────
+
+4a. Optimistic Locking (JPA @Version):
+  No explicit lock; detect conflicts at commit time.
+
+  @Entity
+  public class Inventory {
+      @Id
+      private Long id;
+      private int quantity;
+      @Version
+      private Long version;
+  }
+
+  // JPA automatically adds WHERE id=? AND version=? to UPDATE
+  // Throws OptimisticLockException if version changed since read
+
+  Use when: conflicts are rare (read-heavy workflows)
+  Don't use when: high contention → too many retries
+
+4b. Pessimistic Locking (SELECT FOR UPDATE):
+  @Repository
+  public interface InventoryRepository extends JpaRepository<Inventory, Long> {
+      @Lock(LockModeType.PESSIMISTIC_WRITE)
+      @Query("SELECT i FROM Inventory i WHERE i.id = :id")
+      Optional<Inventory> findByIdWithLock(@Param("id") Long id);
+  }
+
+  Generates: SELECT ... FROM inventory WHERE id=? FOR UPDATE
+  Locks the row until the transaction commits or rolls back.
+
+  Use when: conflicts are frequent (write-heavy workflows)
+  Cons: deadlock risk if not careful with lock ordering; performance impact
+
+4c. Advisory Locks (PostgreSQL specific):
+  PostgreSQL supports application-level advisory locks:
+
+  @Query(value = "SELECT pg_try_advisory_lock(:key)", nativeQuery = true)
+  Boolean tryAdvisoryLock(@Param("key") long key);
+
+  @Query(value = "SELECT pg_advisory_unlock(:key)", nativeQuery = true)
+  void advisoryUnlock(@Param("key") long key);
+
+  Pros: session-scoped, don't block table/row, low overhead
+  Cons: PostgreSQL-specific, must explicitly release
+
+
+5. SHEDLOCK — DISTRIBUTED @SCHEDULED JOBS
+──────────────────────────────────────────
+ShedLock prevents @Scheduled methods from running in parallel across instances.
+
+Dependency:
+  <dependency>
+    <groupId>net.javacrumbs.shedlock</groupId>
+    <artifactId>shedlock-spring</artifactId>
+    <version>5.13.0</version>
+  </dependency>
+  <dependency>
+    <groupId>net.javacrumbs.shedlock</groupId>
+    <artifactId>shedlock-provider-redis-spring</artifactId>
+    <version>5.13.0</version>
+  </dependency>
+
+Config:
+  @EnableSchedulerLock(defaultLockAtMostFor = "10m")
+  @Configuration
+  public class ShedLockConfig {
+      @Bean
+      public LockProvider lockProvider(RedisConnectionFactory factory) {
+          return new RedisLockProvider(factory);
+      }
+  }
+
+Usage:
+  @Scheduled(cron = "0 */5 * * * *")
+  @SchedulerLock(name = "dailyReport",
+                 lockAtMostFor = "5m",
+                 lockAtLeastFor = "1m")
+  public void generateDailyReport() {
+      // Only runs on ONE instance at a time
+  }
+
+lockAtMostFor: max time lock is held (prevents deadlock if pod crashes)
+lockAtLeastFor: min time lock is held (prevents fast re-execution on quick finish)
+
+
+6. COMPARISON
+──────────────
+Mechanism            | Granularity  | Failure Safe | Cross-DB | Performance
+─────────────────────────────────────────────────────────────────────────────
+Redisson RLock       | Any key      | Yes (TTL)    | Yes      | High
+Redis SETNX (manual) | Any key      | Yes (TTL)    | Yes      | High
+JPA Optimistic Lock  | Row (@Version)| Yes (retry)  | Yes      | Very high (no lock)
+JPA Pessimistic Lock | Row          | Yes (tx)     | Yes      | Medium
+PostgreSQL Advisory  | Long key     | Session-tied | No       | High
+ShedLock             | Job name     | Yes (TTL)    | Yes      | High
+
+
+7. INTERVIEW QUESTIONS
+──────────────────────
+Q: Why can't you use synchronized or ReentrantLock for distributed locking?
+A: They are JVM-local. In a multi-instance deployment, each JVM has its own
+   lock state — two instances can both enter the critical section simultaneously.
+
+Q: What is the RedLock algorithm?
+A: Proposed by Redis author for distributed locks across multiple Redis masters.
+   Lock is acquired by sending SETNX to N Redis instances. Lock is considered
+   acquired if majority (N/2+1) succeed within a time window. Provides safety
+   even if some Redis nodes fail. Redisson implements it via MultiLock.
+
+Q: What is the difference between optimistic and pessimistic locking?
+A: Optimistic: no lock held; conflict detected at commit via @Version check.
+   Good for low-contention scenarios. Pessimistic: acquires a SELECT FOR UPDATE
+   lock, blocking other transactions. Good for high-contention scenarios.
+   Optimistic is non-blocking but fails under contention; pessimistic is blocking
+   but consistent.
+
+Q: How does Redisson prevent deadlocks?
+A: Via leaseTime — the lock auto-expires after the specified duration even if
+   the lock holder crashes. The Redisson client also uses Watchdog (auto-extends
+   lease while the lock holder is alive) to prevent premature expiry.
+
+Q: How would you prevent a @Scheduled job from running on all pods simultaneously?
+A: Use ShedLock. It creates a lock in Redis (or DB) with a TTL. Only the first
+   pod to acquire the lock runs the job. Others see the lock and skip.

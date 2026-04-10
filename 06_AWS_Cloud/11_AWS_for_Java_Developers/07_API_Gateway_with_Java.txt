@@ -1,0 +1,357 @@
+================================================================
+AWS FOR JAVA DEVELOPERS — API GATEWAY WITH JAVA
+Complete Interview Preparation Guide
+================================================================
+
+1. API GATEWAY — OVERVIEW
+================================================================
+
+  Amazon API Gateway is a fully managed service to create, publish,
+  maintain, monitor, and secure REST, HTTP, and WebSocket APIs.
+
+  THREE TYPES:
+  ┌─────────────────┬──────────────────────────────────────────────────────────┐
+  │ Type            │ Description                                              │
+  ├─────────────────┼──────────────────────────────────────────────────────────┤
+  │ REST API        │ Full-featured: usage plans, API keys, caching, request   │
+  │                 │ transformation, WAF integration. Most configurable.      │
+  ├─────────────────┼──────────────────────────────────────────────────────────┤
+  │ HTTP API        │ Lower latency, lower cost (~70% cheaper than REST API).  │
+  │                 │ OIDC/JWT auth built-in. Best for Lambda + OIDC.          │
+  ├─────────────────┼──────────────────────────────────────────────────────────┤
+  │ WebSocket API   │ Persistent connections. Real-time apps (chat, trading).  │
+  └─────────────────┴──────────────────────────────────────────────────────────┘
+
+  KEY INTERVIEW POINT: HTTP API vs REST API
+    - Use HTTP API when: simple Lambda proxy, JWT auth, low cost needed
+    - Use REST API when: request/response transformation, API keys, usage 
+      plans, caching, AWS service proxy integrations needed
+
+================================================================
+2. LAMBDA PROXY INTEGRATION (Java)
+================================================================
+
+  PROXY INTEGRATION — API Gateway passes the entire HTTP request to Lambda
+  as a single JSON event. Lambda returns a structured JSON response.
+
+  ── REQUEST EVENT STRUCTURE ──────────────────────────────────
+  
+  {
+    "resource": "/orders/{orderId}",
+    "path": "/orders/123",
+    "httpMethod": "GET",
+    "headers": { "Authorization": "Bearer eyJ...", "Content-Type": "application/json" },
+    "queryStringParameters": { "include": "items" },
+    "pathParameters": { "orderId": "123" },
+    "body": null,                          // For POST: JSON string (needs deserialization)
+    "isBase64Encoded": false,
+    "requestContext": {
+      "authorizer": { "claims": { "sub": "user-uuid" } }   // If Cognito authorizer used
+    }
+  }
+
+  ── RESPONSE STRUCTURE REQUIRED ─────────────────────────────
+
+  Lambda MUST return:
+  {
+    "statusCode": 200,
+    "headers": { "Content-Type": "application/json" },
+    "body": "{\"orderId\":\"123\",\"status\":\"ACTIVE\"}",    // Always a STRING
+    "isBase64Encoded": false
+  }
+
+  ── JAVA HANDLER USING AWS EVENTS LIBRARY ────────────────────
+
+  <dependency>
+    <groupId>com.amazonaws</groupId>
+    <artifactId>aws-lambda-java-events</artifactId>
+    <version>3.11.4</version>
+  </dependency>
+
+  import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyRequestEvent;
+  import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyResponseEvent;
+
+  public class OrderHandler implements 
+      RequestHandler<APIGatewayProxyRequestEvent, APIGatewayProxyResponseEvent> {
+
+      private static final ObjectMapper MAPPER = new ObjectMapper();
+
+      @Override
+      public APIGatewayProxyResponseEvent handleRequest(
+              APIGatewayProxyRequestEvent request, Context context) {
+
+          String orderId = request.getPathParameters().get("orderId");
+          String userId = request.getRequestContext()
+              .getAuthorizer().getClaims().get("sub");   // From Cognito JWT
+
+          try {
+              Order order = orderService.getOrder(orderId, userId);
+              return new APIGatewayProxyResponseEvent()
+                  .withStatusCode(200)
+                  .withHeaders(Map.of("Content-Type", "application/json"))
+                  .withBody(MAPPER.writeValueAsString(order));
+
+          } catch (OrderNotFoundException e) {
+              return new APIGatewayProxyResponseEvent()
+                  .withStatusCode(404)
+                  .withBody("{\"error\":\"Order not found\"}");
+          } catch (Exception e) {
+              context.getLogger().log("Error: " + e.getMessage());
+              return new APIGatewayProxyResponseEvent()
+                  .withStatusCode(500)
+                  .withBody("{\"error\":\"Internal server error\"}");
+          }
+      }
+  }
+
+================================================================
+3. AUTHORIZERS
+================================================================
+
+  THREE TYPES OF AUTHORIZERS:
+
+  1. COGNITO USER POOL AUTHORIZER (REST API only)
+     - API Gateway validates JWT token against Cognito User Pool
+     - No Lambda required — purely AWS-native
+     - Extracts claims automatically into requestContext.authorizer.claims
+     - Setup: Configure in API Gateway → Authorizers → Cognito
+     - Java side: read claims from requestContext (see above)
+
+  2. LAMBDA AUTHORIZER — TOKEN type
+     - API Gateway calls your Lambda with the Authorization header
+     - Your Lambda returns an IAM policy (Allow/Deny)
+     - Result is cached (TTL configurable, default 300s)
+     
+     public class TokenAuthorizerHandler 
+         implements RequestHandler<APIGatewayCustomAuthorizerRequestContext, 
+                                   APIGatewayCustomAuthorizerResponse> {
+
+         @Override
+         public APIGatewayCustomAuthorizerResponse handleRequest(
+                 APIGatewayCustomAuthorizerRequestContext input, Context context) {
+
+             String token = input.getAuthorizationToken();    // "Bearer eyJ..."
+             String methodArn = input.getMethodArn();
+
+             try {
+                 String principalId = jwtService.validateAndExtractSubject(token);
+                 return buildPolicy(principalId, "Allow", methodArn);
+             } catch (InvalidTokenException e) {
+                 throw new RuntimeException("Unauthorized");  // Returns 401
+             }
+         }
+
+         private APIGatewayCustomAuthorizerResponse buildPolicy(
+                 String principal, String effect, String arn) {
+             return APIGatewayCustomAuthorizerResponse.builder()
+                 .withPrincipalId(principal)
+                 .withPolicyDocument(PolicyDocument.builder()
+                     .withStatements(Collections.singletonList(
+                         Statement.builder()
+                             .withEffect(effect)
+                             .withActions(Collections.singletonList("execute-api:Invoke"))
+                             .withResources(Collections.singletonList(arn))
+                             .build()))
+                     .build())
+                 .build();
+         }
+     }
+
+  3. LAMBDA AUTHORIZER — REQUEST type
+     - Receives full request (headers, query params, stage vars)
+     - Useful when auth depends on multiple headers or query parameters
+     - Same response structure (IAM policy) as token type
+
+  4. JWT AUTHORIZER (HTTP API only)
+     - API Gateway validates JWT natively (OIDC/OAuth2)
+     - Configure issuer URL + audience
+     - No Lambda needed — lowest latency authorizer option
+
+================================================================
+4. INTEGRATION TYPES (REST API)
+================================================================
+
+  ┌─────────────────────────┬───────────────────────────────────────────────────┐
+  │ Type                    │ Description                                       │
+  ├─────────────────────────┼───────────────────────────────────────────────────┤
+  │ Lambda Proxy            │ Full request to Lambda, structured response back  │
+  │ Lambda (non-proxy)      │ Request/response transformation via mapping        │
+  │ HTTP Proxy              │ Forward to backend HTTP endpoint as-is            │
+  │ HTTP (non-proxy)        │ Forward with transformation                       │
+  │ AWS Service             │ Direct call to AWS service (SQS, DynamoDB, SNS)  │
+  │ Mock                    │ Return static response (testing)                  │
+  └─────────────────────────┴───────────────────────────────────────────────────┘
+
+  IMPORTANT: AWS Service integration (SQS example):
+    - API Gateway → SQS (without Lambda!) — reduces cold start risk
+    - Configure IAM role for API Gateway to put messages to SQS
+    - Useful for fire-and-forget APIs (async processing)
+    
+    // Request template (Velocity) mapping POST body to SQS message:
+    Action=SendMessage&MessageBody=$util.urlEncode($input.body)
+
+================================================================
+5. STAGES, DEPLOYMENT, AND VERSIONING
+================================================================
+
+  STAGES:
+    - A stage is a named reference to a deployment (dev, staging, prod)
+    - Each stage can have different: throttling, caching, logging settings
+    - Stage variables work like environment variables for that stage
+    
+    // Stage variable usage in integration URI:
+    arn:aws:lambda:${stageVariables.region}:account:function:${stageVariables.lambdaAlias}
+    
+    // In Java Lambda — read stage variables via the request context:
+    String env = request.getRequestContext().getStage();  // "dev", "prod"
+
+  CANARY DEPLOYMENTS:
+    - Split traffic between two versions (e.g., 90% old → 10% canary)
+    - Promote canary after validation
+
+  LAMBDA ALIASES + API GATEWAY:
+    - Best practice: API Gateway stage → Lambda alias (not $LATEST)
+    - "prod" stage → Lambda:prod alias → specific version
+    - Enables blue/green: update alias weight, no API Gateway change needed
+
+================================================================
+6. THROTTLING AND RATE LIMITING
+================================================================
+
+  TWO LEVELS:
+  
+  1. ACCOUNT LEVEL (default): 10,000 requests/second, burst 5,000
+  2. STAGE / METHOD LEVEL: Configure per-stage or per-method overrides
+  
+  USAGE PLANS (REST API only):
+    - Associate API keys with usage plans
+    - Set request quotas (e.g., 1000 req/day) and throttle rates
+    - Java client must send: x-api-key header
+
+  429 Too Many Requests → client should implement exponential backoff
+
+================================================================
+7. CACHING (REST API)
+================================================================
+
+  - Enable per-stage (0.5 GB to 237 GB cache)
+  - TTL: default 300s, configurable per method (0–3600s)
+  - Cache key: path + query params (configurable)
+  - Invalidate: Cache-Control: max-age=0 header (if allowed)
+  
+  When to use: GET endpoints with stable data, expensive Lambda calls
+
+================================================================
+8. CORS CONFIGURATION
+================================================================
+
+  For REST API:
+  - Must enable CORS per resource (adds OPTIONS method + headers)
+  - Common issue: Lambda must ALSO return CORS headers in response
+  
+  Java Lambda always return:
+  .withHeaders(Map.of(
+      "Access-Control-Allow-Origin", "*",
+      "Access-Control-Allow-Headers", "Content-Type,Authorization",
+      "Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS"
+  ))
+
+  For HTTP API:
+  - Configure CORS at API level (much simpler, no per-resource setup)
+
+================================================================
+9. COMMON ARCHITECTURE PATTERNS (INTERVIEW FAVORITES)
+================================================================
+
+  PATTERN 1: REST API → Lambda → DynamoDB
+  ──────────────────────────────────────
+  Client → API Gateway (Cognito Auth) → Lambda (Java) → DynamoDB
+  
+  - Cognito authorizer validates JWT; Lambda reads user claims
+  - Lambda uses DynamoDB Enhanced Client for CRUD
+  - Lambda response: structured APIGatewayProxyResponseEvent
+
+  PATTERN 2: API Gateway → SQS → Lambda (async processing)
+  ─────────────────────────────────────────────────────────
+  Client → API Gateway → SQS (direct AWS integration, no Lambda)
+            ↓ async
+          Lambda (Java) reads from SQS and processes
+
+  - API Gateway returns 200/202 immediately
+  - Lambda processes asynchronously (decoupled)
+  - Use for: order placement, email sending, notifications
+
+  PATTERN 3: HTTP API + JWT + Lambda (low-cost, low-latency)
+  ──────────────────────────────────────────────────────────
+  Client → HTTP API (JWT Authorizer, OIDC) → Lambda (Java)
+  
+  - ~70% cheaper than REST API
+  - JWT validated natively — no extra Lambda authorizer
+  - Best for microservice-to-microservice or mobile backends
+
+  PATTERN 4: API Gateway + VPC Link → Private ALB → ECS (Spring Boot)
+  ────────────────────────────────────────────────────────────────────
+  Internet → API Gateway → VPC Link → ALB (private) → ECS (Spring Boot Java)
+  
+  - API Gateway handles public TLS termination, throttling, auth
+  - Spring Boot stays fully private in VPC
+  - No Lambda involved — for long-running or stateful workloads
+
+================================================================
+10. INTERVIEW QUESTIONS
+================================================================
+
+Q: What is the difference between REST API and HTTP API in API Gateway?
+
+A: HTTP API is newer, ~70% cheaper, lower latency, supports JWT/OIDC auth 
+   natively and CORS at API level. REST API supports advanced features: 
+   request/response transformation (mapping templates), usage plans, API keys, 
+   response caching, direct AWS service integrations (SQS, DynamoDB), and WAF. 
+   Use HTTP API for simple Lambda proxies; REST API when you need transformation 
+   or fine-grained control.
+
+---
+
+Q: How does API Gateway handle authentication for Java Lambda functions?
+
+A: Three approaches:
+   1. Cognito User Pool Authorizer: validates JWT, injects claims into 
+      requestContext.authorizer.claims. Java reads via getRequestContext().
+   2. Lambda Authorizer: custom Lambda validates token, returns IAM Allow/Deny 
+      policy. Result is cached (TTL 300s default).
+   3. JWT Authorizer (HTTP API): OIDC-native, API Gateway validates the token 
+      without Lambda — lowest latency option.
+
+---
+
+Q: What happens when API Gateway Lambda integration gets a 500 vs 502 error?
+
+A: 
+   502 Bad Gateway: Lambda returned a malformed response (wrong structure — 
+   missing statusCode, body not a string). Fix: ensure Java returns a properly 
+   structured APIGatewayProxyResponseEvent.
+   
+   500 Internal Server Error: Uncaught exception in Lambda or Lambda integration 
+   configuration issue. Fix: catch all exceptions in Java handler and return 
+   proper 500 response with structured body.
+
+---
+
+Q: How do you pass environment-specific config to Java Lambda via API Gateway?
+
+A: Use stage variables in API Gateway → read in Lambda via 
+   requestContext.getStage() or configure Lambda environment variables per alias. 
+   Best practice: use Lambda aliases (prod/staging) mapped to API Gateway stages. 
+   For config values: use SSM Parameter Store (namespaced by env prefix) rather 
+   than stage variables for secrets.
+
+---
+
+Q: Explain the VPC Link pattern and when to use it.
+
+A: VPC Link lets API Gateway route traffic to resources inside a private VPC 
+   (NLB for REST API, ALB for HTTP API). Use it when your backend (Spring Boot 
+   on ECS, EC2) must not be publicly accessible. The pattern is:
+   Internet → API Gateway → VPC Link → private NLB/ALB → Spring Boot.
+   This gives you the public API management features of API Gateway while 
+   keeping backends fully private.

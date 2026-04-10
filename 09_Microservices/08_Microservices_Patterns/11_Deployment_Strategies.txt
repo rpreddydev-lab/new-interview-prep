@@ -1,0 +1,399 @@
+================================================================================
+DEPLOYMENT STRATEGIES FOR MICROSERVICES
+================================================================================
+
+WHY DEPLOYMENT STRATEGY MATTERS
+----------------------------------
+Every microservice deployment risks:
+  - Downtime (service unavailable during update)
+  - Bugs in new version reaching all users at once
+  - Rollback complexity if something goes wrong
+
+A good deployment strategy achieves:
+  ✓ Zero (or minimal) downtime
+  ✓ Fast rollback capability
+  ✓ Controlled risk (test with subset of users/traffic)
+  ✓ Confidence through gradual validation
+
+────────────────────────────────────────────────────────────────────────────────
+
+1. ROLLING DEPLOYMENT (DEFAULT IN KUBERNETES)
+==============================================
+
+What: Gradually replaces old pods with new pods, one (or few) at a time.
+      Old version and new version run simultaneously during the update.
+
+Flow:
+  Before: [v1] [v1] [v1] [v1] [v1]   (5 replicas)
+  Step 1: [v2] [v1] [v1] [v1] [v1]   (1 new pod added, 1 old removed)
+  Step 2: [v2] [v2] [v1] [v1] [v1]
+  Step 3: [v2] [v2] [v2] [v1] [v1]
+  Step 4: [v2] [v2] [v2] [v2] [v1]
+  After:  [v2] [v2] [v2] [v2] [v2]
+
+Kubernetes configuration:
+  spec:
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxSurge: 1          # Max extra pods allowed during update
+        maxUnavailable: 0    # Min pods that must be available (0 = zero-downtime)
+
+PROS:
+  ✓ Zero downtime (with maxUnavailable=0)
+  ✓ No extra infrastructure needed
+  ✓ Built-in to Kubernetes
+
+CONS:
+  ✗ Both versions run simultaneously → must be backward compatible
+    (DB schema changes must be compatible with both versions)
+  ✗ No traffic control — all users may hit v2 before validation
+  ✗ Slow rollback (re-roll to v1 pod by pod)
+  ✗ Hard to test with a subset of users
+
+BACKWARD COMPATIBILITY WITH ROLLING DEPLOYMENTS:
+  Expand and Contract pattern for DB migrations:
+    Deploy 1: Add new column (nullable) — old and new code both work
+    Deploy 2: New code writes/reads new column; old code ignores it
+    Deploy 3: Remove old code path; set NOT NULL constraint if needed
+
+────────────────────────────────────────────────────────────────────────────────
+
+2. BLUE-GREEN DEPLOYMENT
+=========================
+
+What: Maintain two identical environments (Blue = current, Green = new version).
+      Switch all traffic from Blue to Green at once. Blue stays as instant rollback.
+
+Flow:
+  [Load Balancer] ──→ [Blue: v1]     (production traffic)
+                       [Green: v2]   (idle, being deployed and tested)
+
+  After switch:
+  [Load Balancer] ──→ [Green: v2]   (production traffic)
+                       [Blue: v1]   (idle, available for rollback)
+
+IMPLEMENTATION IN KUBERNETES:
+  Use two Deployments (blue and green) + one Service that switches selectors.
+
+  # blue-deployment.yaml
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: order-service-blue
+  spec:
+    replicas: 5
+    selector:
+      matchLabels:
+        app: order-service
+        slot: blue
+    template:
+      metadata:
+        labels:
+          app: order-service
+          slot: blue
+          version: v1
+      spec:
+        containers:
+          - name: order-service
+            image: my-registry/order-service:1.0.0
+
+  # green-deployment.yaml (same structure, slot: green, version: v2)
+
+  # service.yaml (single service — switch selector to switch traffic)
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: order-service
+  spec:
+    selector:
+      app: order-service
+      slot: blue           # ← Change to "green" to switch traffic
+    ports:
+      - port: 80
+        targetPort: 8080
+
+  # Switch traffic to green (instant, atomic):
+  kubectl patch service order-service -p '{"spec":{"selector":{"slot":"green"}}}'
+
+  # Rollback (instant):
+  kubectl patch service order-service -p '{"spec":{"selector":{"slot":"blue"}}}'
+
+WITH SPRING CLOUD GATEWAY (Canary + Blue-Green):
+  routes:
+    - id: order-service-green
+      uri: lb://order-service-green
+      predicates:
+        - Path=/api/v1/orders/**
+        - Header=X-Slot, green    # Internal QA traffic only
+
+SMOKE TESTING BEFORE SWITCH:
+  1. Deploy Green
+  2. Run smoke tests against Green directly (bypass LB)
+  3. Run performance tests
+  4. Switch traffic
+  5. Monitor for 30 minutes
+  6. Decommission Blue (or keep for rollback period)
+
+PROS:
+  ✓ Instant rollback (switch selector back)
+  ✓ No mixed version traffic during deployment (atomic switch)
+  ✓ Full pre-production testing environment
+  ✓ Zero downtime
+
+CONS:
+  ✗ 2x infrastructure cost during deployment
+  ✗ Database migrations are complex (both versions share same DB)
+  ✗ Stateful services (session, cache) need careful handling
+  ✗ More complex setup than rolling
+
+────────────────────────────────────────────────────────────────────────────────
+
+3. CANARY DEPLOYMENT
+=====================
+
+What: Route a small percentage of production traffic to the new version.
+      Monitor metrics (errors, latency). Gradually increase if healthy.
+
+Flow:
+  All traffic:    [v1: 100%]
+  Canary start:   [v1: 90%] [v2: 10%]   ← only 10% of users see new version
+  Expand:         [v1: 70%] [v2: 30%]
+  Expand:         [v1: 30%] [v2: 70%]
+  Complete:       [v1: 0%]  [v2: 100%]
+  If problem:     [v1: 100%] ← rollback immediately
+
+IMPLEMENTATION IN KUBERNETES (Weight predicate in Spring Cloud Gateway):
+  routes:
+    - id: order-service-stable
+      uri: lb://order-service-v1
+      predicates:
+        - Path=/api/v1/orders/**
+        - Weight=order-group, 90
+    - id: order-service-canary
+      uri: lb://order-service-v2
+      predicates:
+        - Path=/api/v1/orders/**
+        - Weight=order-group, 10
+
+IMPLEMENTATION WITH ARGO ROLLOUTS (K8s operator):
+  apiVersion: argoproj.io/v1alpha1
+  kind: Rollout
+  metadata:
+    name: order-service
+  spec:
+    replicas: 10
+    strategy:
+      canary:
+        canaryService: order-service-canary
+        stableService: order-service-stable
+        steps:
+          - setWeight: 10         # 10% to canary
+          - pause: {duration: 10m}  # Wait 10 minutes, check metrics
+          - setWeight: 30
+          - pause: {duration: 10m}
+          - setWeight: 50
+          - pause: {}             # Manual approval required
+          - setWeight: 80
+          - pause: {duration: 5m}
+          - setWeight: 100
+        analysis:
+          templates:
+            - templateName: success-rate-check
+          args:
+            - name: service-name
+              value: order-service-canary
+
+AUTOMATED CANARY ANALYSIS (Argo Rollouts + Prometheus):
+  apiVersion: argoproj.io/v1alpha1
+  kind: AnalysisTemplate
+  metadata:
+    name: success-rate-check
+  spec:
+    metrics:
+      - name: success-rate
+        interval: 1m
+        successCondition: result[0] >= 0.95   # Must have 95%+ success rate
+        failureLimit: 3
+        provider:
+          prometheus:
+            address: http://prometheus:9090
+            query: |
+              sum(rate(http_server_requests_seconds_count{
+                status!~"5..",
+                service="{{args.service-name}}"
+              }[2m])) /
+              sum(rate(http_server_requests_seconds_count{
+                service="{{args.service-name}}"
+              }[2m]))
+
+  If success rate drops below 95% for 3 consecutive minutes → auto rollback.
+
+CANARY TARGETING (route specific users):
+  # Route beta users to canary (by cookie):
+  - Header=X-Beta-User, true
+
+  # Route internal employees to canary (by IP range):
+  # (custom predicate)
+
+PROS:
+  ✓ Lowest risk — only small subset affected if bug
+  ✓ Real production traffic testing
+  ✓ Automated metrics-based rollout/rollback
+  ✓ Fast rollback (remove canary replicas or set weight to 0)
+
+CONS:
+  ✗ Complex to implement correctly
+  ✗ Both versions run simultaneously (backward compatibility required)
+  ✗ Need robust monitoring to detect problems
+  ✗ Database compatibility same challenge as rolling
+
+────────────────────────────────────────────────────────────────────────────────
+
+4. FEATURE FLAGS (COMPLEMENTARY STRATEGY)
+==========================================
+
+What: Deploy code to production but hide new functionality behind a flag.
+      Enable for specific users/percentage without redeployment.
+
+Libraries:
+  - Unleash (open source, Java SDK)
+  - LaunchDarkly (commercial)
+  - Spring Cloud Config (basic flags via config)
+  - Flagsmith
+
+  // Unleash example
+  @Service
+  @RequiredArgsConstructor
+  public class OrderService {
+
+    private final Unleash unleash;
+
+    public OrderResponse createOrder(CreateOrderRequest request) {
+      if (unleash.isEnabled("express-shipping", new UnleashContext()
+              .userId(request.getCustomerId()))) {
+        return createOrderWithExpressShipping(request);
+      }
+      return createOrderStandard(request);
+    }
+  }
+
+  // Control from Unleash dashboard:
+  // Enable for 10% of users → gradual rollout without redeployment
+
+COMBINATION: Canary + Feature Flag:
+  - Deploy v2 to 10% of pods (canary)
+  - Feature flag: enable new payment flow for 5% of users ON canary pods
+  - Very granular control, very low risk
+
+────────────────────────────────────────────────────────────────────────────────
+
+5. DARK LAUNCH / SHADOW DEPLOYMENT
+=====================================
+
+What: Route a copy of production traffic to the new version in parallel.
+      New version's responses are discarded (not sent to users).
+      Used to test new version under real load without user impact.
+
+  User Request ──→ Production (v1) ──→ Response to user
+             ↓ (copy)
+             → Shadow (v2) ──→ Response discarded (compare with v1)
+
+IMPLEMENTATION with Istio:
+  apiVersion: networking.istio.io/v1alpha3
+  kind: VirtualService
+  spec:
+    http:
+      - route:
+          - destination: { host: order-service, subset: v1 }
+            weight: 100
+        mirror:
+          host: order-service
+          subset: v2           # Shadow copy to v2 (no user impact)
+        mirrorPercentage:
+          value: 100.0
+
+USE CASE: Testing a new ML recommendation engine or search algorithm under
+          real production load before exposing to users.
+
+────────────────────────────────────────────────────────────────────────────────
+
+COMPARISON TABLE
+==================
+
+Strategy        │ Downtime   │ Rollback Speed │ Risk    │ Infrastructure Cost
+────────────────┼────────────┼────────────────┼─────────┼────────────────────
+Rolling         │ None       │ Slow (pods)    │ Medium  │ +20% (surge)
+Blue-Green      │ None       │ Instant        │ Low     │ 2x
+Canary          │ None       │ Fast           │ Lowest  │ +10-20%
+Feature Flags   │ None       │ Instant        │ Lowest  │ None
+Shadow          │ None       │ N/A            │ None    │ 2x
+
+DATABASE MIGRATION STRATEGIES (often the hardest part):
+
+EXPAND-CONTRACT (for all zero-downtime strategies):
+  Phase 1 (Expand):   Add new column as nullable. Old code works (ignores it).
+                      New code writes new column.
+  Phase 2 (Migrate):  Backfill old rows with new column data.
+  Phase 3 (Contract): Add NOT NULL constraint. Remove old column references.
+                      Old code is gone.
+
+Tools:
+  Flyway / Liquibase: Schema migration with versioned scripts.
+  Only run ADDITIVE changes before deployment.
+  Never DROP columns while old version pods still run.
+
+────────────────────────────────────────────────────────────────────────────────
+
+CI/CD PIPELINE INTEGRATION
+============================
+
+  Typical pipeline with canary:
+
+  [Push] → [Build + Unit Test] → [Integration Test] → [Build Docker Image]
+         → [Push to Registry] → [Deploy to Staging] → [Smoke Test Staging]
+         → [Deploy Canary 10%] → [Monitor 30 min] → [Automated Analysis]
+         → [Expand to 50%] → [Manual Approval] → [Full Rollout 100%]
+
+  Tools: Argo CD (GitOps), Argo Rollouts (canary), GitHub Actions / Jenkins / GitLab CI
+
+GITOPS WITH ARGO CD:
+  Git is the single source of truth for desired state.
+  Argo CD continuously syncs K8s cluster state to match Git repository.
+  Deployment = pull request → merge → Argo CD detects diff → applies.
+  Rollback = revert PR → Argo CD reverts cluster state.
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS — DEPLOYMENT STRATEGIES
+=============================================
+
+Q: What is the difference between blue-green and canary deployment?
+A: Blue-green maintains two full environments and switches ALL traffic instantly
+   — either 100% on old or 100% on new. No mixed versions in production at once.
+   Canary gradually shifts traffic — 10% → 30% → 50% → 100% — letting you validate
+   with real users at each stage before full rollout. Canary has lower risk but
+   requires more complex monitoring; blue-green has simpler traffic model but
+   higher infrastructure cost (2x resources).
+
+Q: How do you achieve zero-downtime deployments with Kubernetes?
+A: Configure RollingUpdate with maxUnavailable=0 and maxSurge=1. Add readiness
+   probes so K8s only sends traffic to ready pods. Configure graceful shutdown
+   (server.shutdown=graceful). Add a preStop sleep to let the load balancer
+   deregister the pod before Spring starts refusing traffic. Ensure DB changes are
+   backward-compatible (expand-contract pattern) so old and new pods coexist.
+
+Q: What is the expand-contract pattern for database migrations?
+A: For zero-downtime deployments, database changes must be backward-compatible.
+   Expand: Add new columns as nullable — both old and new app versions work.
+   Contract: After old version is fully replaced, remove old columns/paths.
+   Never drop columns while old pods still run. Tools like Flyway/Liquibase manage
+   versioned migrations; only run additive migrations (add columns/tables) pre-deploy.
+
+Q: When would you use feature flags over canary deployments?
+A: Feature flags are better when you want to decouple deployment from feature
+   release — deploy code to all pods but enable the feature for a controlled
+   percentage of users without redeployment. Canary controls which pods run which
+   version. Feature flags control which users see which feature on the same pods.
+   They're complementary: deploy with canary, control feature exposure with flags.
+================================================================================

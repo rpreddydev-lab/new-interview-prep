@@ -1,0 +1,444 @@
+============================================================
+API BEST PRACTICES — DEEP DIVE
+Idempotency, HATEOAS, REST Maturity Model, API Contract Testing
+============================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. RICHARDSON MATURITY MODEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The Richardson Maturity Model defines 4 levels of REST API maturity:
+
+LEVEL 0 — The Swamp of POX (Plain Old XML/JSON)
+  - Single endpoint, one HTTP method (usually POST)
+  - Action in the request body
+  - Example: POST /api { "action": "getOrder", "orderId": "123" }
+  - Essentially RPC over HTTP
+
+LEVEL 1 — Resources
+  - Multiple endpoints representing resources
+  - Still uses only one HTTP method (often POST or GET for everything)
+  - Example: POST /orders/123 with action in body
+
+LEVEL 2 — HTTP Verbs (Most REST APIs are here)
+  - Proper use of HTTP methods:
+      GET    → retrieve (idempotent, safe)
+      POST   → create (not idempotent)
+      PUT    → replace entirely (idempotent)
+      PATCH  → partial update (should be idempotent)
+      DELETE → delete (idempotent)
+  - Proper HTTP status codes (200, 201, 404, 409, etc.)
+  - Example: GET /orders/123, POST /orders, DELETE /orders/123
+
+LEVEL 3 — Hypermedia Controls (HATEOAS) ← The "true" REST
+  - Responses include links to related actions
+  - Client navigates the API by following links (not hardcoding URLs)
+  - Example response:
+    {
+      "orderId": "123",
+      "status": "PENDING",
+      "_links": {
+        "self":   { "href": "/orders/123" },
+        "cancel": { "href": "/orders/123/cancel", "method": "DELETE" },
+        "pay":    { "href": "/orders/123/payment", "method": "POST" }
+      }
+    }
+
+REALITY: Most production APIs operate at Level 2. Level 3 is rarely fully
+adopted due to complexity, but knowing it is expected in interviews.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. HATEOAS IN SPRING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Spring HATEOAS library provides support for building hypermedia-driven APIs.
+
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-hateoas</artifactId>
+</dependency>
+
+// Resource model with links
+@GetMapping("/orders/{id}")
+public EntityModel<OrderDTO> getOrder(@PathVariable Long id) {
+    OrderDTO order = orderService.findById(id);
+
+    return EntityModel.of(order,
+        linkTo(methodOn(OrderController.class).getOrder(id)).withSelfRel(),
+        linkTo(methodOn(OrderController.class).cancelOrder(id)).withRel("cancel"),
+        linkTo(methodOn(PaymentController.class).pay(id)).withRel("pay")
+    );
+}
+
+// Collection response
+@GetMapping("/orders")
+public CollectionModel<EntityModel<OrderDTO>> getAllOrders() {
+    List<EntityModel<OrderDTO>> orders = orderService.findAll().stream()
+        .map(o -> EntityModel.of(o,
+            linkTo(methodOn(OrderController.class).getOrder(o.getId())).withSelfRel()))
+        .collect(Collectors.toList());
+
+    return CollectionModel.of(orders,
+        linkTo(methodOn(OrderController.class).getAllOrders()).withSelfRel());
+}
+
+// Response JSON (HAL format):
+// {
+//   "orderId": 123,
+//   "_links": {
+//     "self": { "href": "http://api.example.com/orders/123" },
+//     "cancel": { "href": "http://api.example.com/orders/123/cancel" }
+//   }
+// }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. IDEMPOTENCY — THE MOST IMPORTANT API PROPERTY FOR FINANCIAL SYSTEMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+An operation is IDEMPOTENT if calling it multiple times produces the same result
+as calling it once.
+
+  GET, PUT, DELETE → idempotent by HTTP spec
+  POST             → NOT idempotent by default (creates a new resource each time)
+  PATCH            → should be designed idempotent
+
+WHY IT MATTERS:
+  Network failures → client retries → without idempotency → duplicate payments!
+
+Scenario:
+  1. Client sends POST /payments (charge $100)
+  2. Server processes payment successfully
+  3. Network drops before response
+  4. Client retries → Server charges AGAIN → double charge!
+
+SOLUTION: Idempotency Keys
+
+─────────────────────────────────────────
+IDEMPOTENCY KEY PATTERN
+─────────────────────────────────────────
+
+Client generates a unique Idempotency-Key for each logical operation.
+Server stores the result keyed by this value. On retry, returns cached result.
+
+// Client sends:
+POST /payments
+Headers:
+  Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
+Body:
+  { "amount": 100.00, "currency": "USD", "accountId": "ACC-123" }
+
+// Server logic:
+@PostMapping("/payments")
+public ResponseEntity<PaymentResponse> createPayment(
+        @RequestHeader("Idempotency-Key") String idempotencyKey,
+        @RequestBody PaymentRequest request) {
+
+    // 1. Check if we've seen this key before
+    Optional<PaymentResponse> cached = idempotencyStore.get(idempotencyKey);
+    if (cached.isPresent()) {
+        return ResponseEntity.ok(cached.get()); // return exact same response
+    }
+
+    // 2. Process payment (only happens once per key)
+    PaymentResponse response = paymentService.process(request);
+
+    // 3. Store result with TTL (e.g., 24 hours)
+    idempotencyStore.save(idempotencyKey, response, Duration.ofHours(24));
+
+    return ResponseEntity.status(HttpStatus.CREATED).body(response);
+}
+
+// Storage: Redis with TTL
+@Service
+public class IdempotencyStore {
+    private final RedisTemplate<String, PaymentResponse> redis;
+
+    public Optional<PaymentResponse> get(String key) {
+        return Optional.ofNullable(redis.opsForValue().get("idempotency:" + key));
+    }
+
+    public void save(String key, PaymentResponse response, Duration ttl) {
+        redis.opsForValue().set("idempotency:" + key, response, ttl);
+    }
+}
+
+IMPORTANT DETAILS:
+  - Same key + different request body → should return 422 Unprocessable Entity
+    (key mismatch — client error, not a retry)
+  - Key scope: usually per API key/client + per operation type
+  - TTL: match retry window (24-48 hours typical)
+  - Idempotency key is client-generated (UUID v4)
+  - Return IDENTICAL response on retry (including same HTTP status code)
+
+─────────────────────────────────────────
+DATABASE-LEVEL IDEMPOTENCY
+─────────────────────────────────────────
+
+// Use unique constraint on external reference ID
+CREATE TABLE payments (
+    id              BIGSERIAL PRIMARY KEY,
+    idempotency_key VARCHAR(100) UNIQUE NOT NULL,  ← DB-level enforcement
+    amount          DECIMAL,
+    status          VARCHAR(20),
+    created_at      TIMESTAMP
+);
+
+// INSERT ... ON CONFLICT DO NOTHING (PostgreSQL)
+INSERT INTO payments (idempotency_key, amount, status)
+VALUES ('550e8400...', 100.00, 'PENDING')
+ON CONFLICT (idempotency_key) DO NOTHING
+RETURNING *;
+
+This provides idempotency even if Redis is down.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. HTTP STATUS CODES — PROPER USAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+2xx — Success:
+  200 OK          → GET, PATCH (resource returned or updated)
+  201 Created     → POST (new resource created); include Location header
+  202 Accepted    → async operation accepted, not yet complete
+  204 No Content  → DELETE (success, no body); PUT (updated, no body needed)
+
+3xx — Redirection:
+  301 Moved Permanently → resource URL changed permanently
+  304 Not Modified      → ETag/Last-Modified unchanged; use cached version
+
+4xx — Client Error:
+  400 Bad Request        → invalid request format/syntax
+  401 Unauthorized       → authentication required (missing/invalid token)
+  403 Forbidden          → authenticated but no permission
+  404 Not Found          → resource doesn't exist
+  405 Method Not Allowed → HTTP method not supported on this endpoint
+  409 Conflict           → resource state conflict (e.g., duplicate creation)
+  410 Gone               → resource permanently deleted
+  422 Unprocessable Entity → valid format, but business validation failed
+  429 Too Many Requests  → rate limit exceeded (include Retry-After header)
+
+5xx — Server Error:
+  500 Internal Server Error → unexpected server failure
+  502 Bad Gateway           → upstream service failure
+  503 Service Unavailable   → server overloaded or down for maintenance
+  504 Gateway Timeout       → upstream service timeout
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. API VERSIONING STRATEGIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+─────────────────────────────
+URL Path Versioning (Most Common)
+─────────────────────────────
+  GET /api/v1/orders
+  GET /api/v2/orders
+  
+  Pros: Explicit, easy to route, cache-friendly, easy to test
+  Cons: Not "pure REST" (version is not a resource property)
+  Used by: Twitter, Stripe, GitHub
+
+─────────────────────────────
+Header Versioning
+─────────────────────────────
+  GET /api/orders
+  Accept-Version: v2
+  OR
+  API-Version: 2026-04
+
+  Pros: Clean URLs, supports content negotiation
+  Cons: Not visible in URL, harder to test in browser, less cacheable
+
+─────────────────────────────
+Query Parameter Versioning
+─────────────────────────────
+  GET /api/orders?version=2
+  
+  Pros: Easy to add, no URL change
+  Cons: Ugly, caching issues, easy to forget
+
+─────────────────────────────
+Media Type Versioning (Content Negotiation)
+─────────────────────────────
+  Accept: application/vnd.example.orders.v2+json
+  
+  Most "REST-pure" but most complex. Rare in practice.
+
+RECOMMENDATION: URL path versioning for most APIs.
+                Date-based versioning (2026-04) for Stripe-style APIs.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. BACKWARD COMPATIBILITY RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+NEVER break existing clients:
+  ✅ Adding new optional fields to response → backward compatible
+  ✅ Adding new endpoints → backward compatible
+  ✅ Adding new optional request parameters → backward compatible
+  ✅ Relaxing validation rules → backward compatible
+
+  ❌ Removing existing fields → BREAKING CHANGE
+  ❌ Renaming fields → BREAKING CHANGE
+  ❌ Changing field type (string → int) → BREAKING CHANGE
+  ❌ Making optional field required → BREAKING CHANGE
+  ❌ Changing error codes/structure → BREAKING CHANGE
+
+Strategy for breaking changes:
+  1. Add new field alongside old field
+  2. Deprecate old field (document, log usage, set header: Deprecation: true)
+  3. After migration period → remove old field in new major version
+  4. Maintain old API version for 6-12 months after new version launch
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. API CONTRACT TESTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Contract testing verifies that consumer and provider agree on the API contract.
+Catches breaking changes BEFORE deployment.
+
+─────────────────────────────
+Consumer-Driven Contract Testing (Pact)
+─────────────────────────────
+
+Consumer writes the contract (what they expect from the provider).
+Provider verifies it satisfies the consumer's contract.
+
+// Consumer test (Order Service consuming Payment Service)
+@ExtendWith(PactConsumerTestExt.class)
+@PactTestFor(providerName = "PaymentService")
+public class PaymentServiceContractTest {
+
+    @Pact(consumer = "OrderService")
+    public RequestResponsePact createPact(PactDslWithProvider builder) {
+        return builder
+            .given("payment 123 exists")
+            .uponReceiving("get payment by id")
+            .path("/payments/123")
+            .method("GET")
+            .willRespondWith()
+            .status(200)
+            .body(new PactDslJsonBody()
+                .stringType("paymentId", "123")
+                .decimalType("amount", 100.00)
+                .stringMatcher("status", "COMPLETED|PENDING|FAILED", "COMPLETED"))
+            .toPact();
+    }
+
+    @Test
+    @PactTestFor(pactMethod = "createPact")
+    void testGetPayment(MockServer mockServer) {
+        PaymentClient client = new PaymentClient(mockServer.getUrl());
+        PaymentDTO payment = client.getPayment("123");
+        assertThat(payment.getPaymentId()).isEqualTo("123");
+    }
+}
+
+// Provider verification test (Payment Service)
+@Provider("PaymentService")
+@PactBroker(url = "https://pact-broker.company.com")
+public class PaymentProviderTest {
+    @BeforeEach
+    void setUp(PactVerificationContext context) {
+        context.setTarget(new HttpTestTarget("localhost", 8080));
+    }
+
+    @TestTemplate
+    @ExtendWith(PactVerificationInvocationContextProvider.class)
+    void verifyPact(PactVerificationContext context) {
+        context.verifyInteraction();
+    }
+}
+
+─────────────────────────────
+OpenAPI / JSON Schema Validation
+─────────────────────────────
+
+// Validate responses against OpenAPI spec in tests
+@Test
+void apiResponseConformsToSpec() {
+    // Uses swagger-request-validator or similar
+    given()
+        .get("/orders/123")
+        .then()
+        .assertThat()
+        .spec(ResponseSpecBuilder.withResponseBodyCompliantWithJsonSchema(schema));
+}
+
+─────────────────────────────
+Spring MVC / MockMVC as Contract Tests
+─────────────────────────────
+
+Spring Cloud Contract generates stubs from contract files.
+Consumer uses stubs; provider verifies against same contracts.
+
+// contracts/OrderService.groovy
+Contract.make {
+    request {
+        method GET()
+        url '/orders/123'
+    }
+    response {
+        status 200
+        body([orderId: "123", status: "PENDING"])
+        headers { contentType applicationJson() }
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. PAGINATION PATTERNS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Offset-based:
+  GET /orders?page=2&size=20
+  Pros: Random access to any page, simple
+  Cons: Inconsistent results if data changes; slow for large offsets (DB scans all rows up to offset)
+
+Cursor-based (Keyset pagination):
+  GET /orders?cursor=eyJpZCI6MTIzfQ==&size=20  (Base64 encoded cursor)
+  Response: { "data": [...], "nextCursor": "eyJpZCI6MTQzfQ==" }
+  Pros: Consistent, fast (uses indexed column), no missing/duplicate results
+  Cons: No random access to arbitrary page
+  Best for: Feeds, real-time data, large datasets
+
+Time-based:
+  GET /orders?since=2026-04-01T00:00:00Z&until=2026-04-09T00:00:00Z
+  Best for: Event logs, audit trails
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is idempotency and why is it critical in payment APIs?
+A: An idempotent operation produces the same result when called multiple times.
+   Without idempotency, a network failure causing a retry could double-charge
+   a customer. Solution: client provides an Idempotency-Key; server stores
+   result and returns it on duplicate requests.
+
+Q: What is the difference between PUT and PATCH?
+A: PUT replaces the entire resource (must send complete representation).
+   PATCH applies partial update (only send changed fields). Both should be
+   idempotent. PATCH with a JSON Patch document (RFC 6902) is most precise.
+
+Q: What is HATEOAS? Do you use it in practice?
+A: Hypermedia As The Engine Of Application State — responses include links
+   to related actions. In practice: Level 3 REST is rarely fully implemented
+   due to complexity. Most APIs are Level 2 (proper verbs + status codes).
+   Spring HATEOAS can add links when needed (e.g., for public APIs).
+
+Q: What is the difference between 401 and 403?
+A: 401 Unauthorized: you are not authenticated (missing/invalid token).
+   403 Forbidden: you ARE authenticated, but lack permission for this resource.
+
+Q: How do you design an API for backwards compatibility?
+A: Never remove or rename fields; only add new optional fields. Use versioning
+   for breaking changes. Deprecate old fields with notices before removal.
+   Use Expand/Sparse Fieldsets to let clients opt into additional data.
+
+Q: What is consumer-driven contract testing?
+A: The consumer (client) defines the contract (what they expect from the API).
+   The provider (server) verifies it satisfies the consumer's contract.
+   Tools: Pact, Spring Cloud Contract. Catches breaking changes before deployment.
+
+Q: Why is cursor-based pagination better than offset-based for large datasets?
+A: Offset pagination becomes slow for large offsets (DB must scan all rows up to offset).
+   It also produces inconsistent results if data is inserted/deleted between pages.
+   Cursor pagination uses an indexed column (like id or timestamp) for efficient seeks,
+   and results are stable even if data changes.

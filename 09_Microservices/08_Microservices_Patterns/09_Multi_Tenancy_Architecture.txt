@@ -1,0 +1,330 @@
+============================================================
+MULTI-TENANCY ARCHITECTURE PATTERNS
+============================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHAT IS MULTI-TENANCY?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Multi-tenancy means a single application instance serves multiple customers
+(tenants) with their data kept logically isolated from each other.
+
+Tenants: Separate companies/organizations using the same SaaS product.
+         Example: Salesforce serves thousands of companies on one platform.
+
+Key requirements:
+  - Data isolation: Tenant A cannot see Tenant B's data
+  - Customization: Tenants may have different configs, feature sets
+  - Performance isolation: one tenant's heavy load doesn't affect others
+  - Scalability: add tenants without re-architecture
+  - Security and compliance (GDPR, HIPAA data residency requirements)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. THREE MAIN PATTERNS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+─────────────────────────────────────────────────────────
+PATTERN 1: SHARED DATABASE, SHARED SCHEMA (Discriminator Column)
+─────────────────────────────────────────────────────────
+
+All tenants share the same database AND same tables.
+Every table has a tenant_id column (discriminator).
+
+Example:
+  CREATE TABLE orders (
+    id          BIGINT PRIMARY KEY,
+    tenant_id   VARCHAR(50) NOT NULL,  ← discriminator
+    order_date  TIMESTAMP,
+    total       DECIMAL,
+    ...
+    INDEX idx_tenant_id (tenant_id)
+  );
+
+  SELECT * FROM orders WHERE tenant_id = 'acme-corp' AND ...;
+
+PROS:
+  ✅ Lowest cost (single DB instance)
+  ✅ Easiest to manage and deploy
+  ✅ Cross-tenant analytics are easy
+  ✅ Adding tenants requires no infrastructure change
+
+CONS:
+  ❌ Weakest isolation — one bug could expose all tenants' data
+  ❌ One tenant's heavy query can slow all tenants (noisy neighbor)
+  ❌ Hard to comply with data residency laws (GDPR, tenant-specific regions)
+  ❌ Cannot easily delete all tenant data (must WHERE on all tables)
+  ❌ Schema customization per tenant is difficult
+
+BEST FOR: Small-to-medium SaaS, low compliance requirements, 1000s of tenants.
+
+─────────────────────────────────────────────────────────
+PATTERN 2: SHARED DATABASE, SEPARATE SCHEMA (Schema-per-Tenant)
+─────────────────────────────────────────────────────────
+
+All tenants share the same database server but each has their own schema
+(namespace) with identical table structures.
+
+  Database: saas_db
+    Schema: acme_corp → orders, customers, products
+    Schema: globex    → orders, customers, products
+    Schema: initech   → orders, customers, products
+
+Connection switching:
+  SET search_path = acme_corp;  (PostgreSQL)
+  USE acme_corp;               (MySQL)
+
+PROS:
+  ✅ Stronger isolation than shared schema (schema-level access control)
+  ✅ Easy to delete all tenant data (DROP SCHEMA)
+  ✅ Per-tenant schema customization possible
+  ✅ Tenant-specific backups and restores
+
+CONS:
+  ❌ More complex schema migration (run Flyway per schema)
+  ❌ Cross-tenant queries are harder
+  ❌ PostgreSQL: ~1000 schema limit practical ceiling
+  ❌ Connection pooling complexity (must route connection to correct schema)
+
+BEST FOR: Medium SaaS, compliance-sensitive, hundreds to low thousands of tenants.
+
+─────────────────────────────────────────────────────────
+PATTERN 3: SEPARATE DATABASE PER TENANT
+─────────────────────────────────────────────────────────
+
+Each tenant gets their own completely separate database instance.
+
+  Tenant acme-corp  → PostgreSQL instance at db-acme.internal:5432
+  Tenant globex     → PostgreSQL instance at db-globex.internal:5432
+
+PROS:
+  ✅ Strongest isolation — complete blast radius containment
+  ✅ Per-tenant performance SLAs (dedicated resources)
+  ✅ Data residency compliance (host DB in tenant's region/country)
+  ✅ Custom DB configuration per tenant (e.g., different extensions)
+  ✅ Independent backup, restore, scaling per tenant
+
+CONS:
+  ❌ Highest cost (N database instances for N tenants)
+  ❌ Operational complexity (provisioning, patching, monitoring N DBs)
+  ❌ Schema migrations must be applied to all databases
+  ❌ Cross-tenant reporting is very difficult
+
+BEST FOR: Enterprise SaaS with strict compliance (HIPAA, banking), high-value tenants.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. HYBRID APPROACH (Tiered Multi-Tenancy)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Real-world SaaS often combines approaches based on tenant tier:
+
+  Free/Starter   → Shared DB, Shared Schema (cheapest, large number)
+  Professional   → Shared DB, Separate Schema (better isolation)
+  Enterprise     → Separate DB per tenant (full isolation, compliance)
+
+Salesforce, HubSpot, and many B2B SaaS products use this model.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. IMPLEMENTING MULTI-TENANCY IN SPRING BOOT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+─────────────────────────────────────────
+APPROACH 1: Column Discriminator (Shared Schema)
+─────────────────────────────────────────
+
+Step 1: Resolve tenant from incoming request
+// From JWT claim, subdomain, HTTP header, or path variable
+
+@Component
+public class TenantResolver implements Filter {
+    @Override
+    public void doFilter(ServletRequest req, ...) {
+        HttpServletRequest httpReq = (HttpServletRequest) req;
+        String tenantId = httpReq.getHeader("X-Tenant-ID");
+        // or: extract from JWT: jwtToken.getClaim("tenant_id")
+        // or: extract from subdomain: "acme" from "acme.myapp.com"
+        TenantContext.setCurrentTenant(tenantId);
+        try {
+            chain.doFilter(req, resp);
+        } finally {
+            TenantContext.clear(); // always clear!
+        }
+    }
+}
+
+// ThreadLocal holder
+public class TenantContext {
+    private static final ThreadLocal<String> TENANT = new ThreadLocal<>();
+    public static void setCurrentTenant(String tenant) { TENANT.set(tenant); }
+    public static String getCurrentTenant() { return TENANT.get(); }
+    public static void clear() { TENANT.remove(); }
+}
+
+Step 2: All queries automatically filter by tenant
+// Option A: Add tenant_id to @Where (Hibernate filter)
+@Entity
+@Where(clause = "tenant_id = :tenantId")  // Hibernate @Where
+public class Order { ... }
+
+// Option B: Spring Data Specifications
+public class OrderSpecs {
+    public static Specification<Order> byTenant() {
+        return (root, query, cb) ->
+            cb.equal(root.get("tenantId"), TenantContext.getCurrentTenant());
+    }
+}
+
+// Option C: Spring Data JPA default methods in repository
+interface OrderRepository extends JpaRepository<Order, Long> {
+    default List<Order> findAllForCurrentTenant() {
+        return findByTenantId(TenantContext.getCurrentTenant());
+    }
+    List<Order> findByTenantId(String tenantId);
+}
+
+─────────────────────────────────────────
+APPROACH 2: Schema Switching (Schema-per-Tenant)
+─────────────────────────────────────────
+
+Use Hibernate's MultiTenancyStrategy or Spring's AbstractRoutingDataSource.
+
+// Dynamic DataSource routing
+@Configuration
+public class MultiTenantDataSourceConfig {
+
+    @Bean
+    public DataSource dataSource() {
+        return new AbstractRoutingDataSource() {
+            @Override
+            protected Object determineCurrentLookupKey() {
+                return TenantContext.getCurrentTenant(); // returns schema name
+            }
+        };
+    }
+}
+
+// Hibernate approach — implement CurrentTenantIdentifierResolver
+@Component
+public class TenantIdentifierResolver implements CurrentTenantIdentifierResolver {
+    @Override
+    public String resolveCurrentTenantIdentifier() {
+        return TenantContext.getCurrentTenant();
+    }
+    @Override
+    public boolean validateExistingCurrentSessions() { return true; }
+}
+
+// application.properties
+spring.jpa.properties.hibernate.multiTenancy=SCHEMA
+spring.jpa.properties.hibernate.tenant_identifier_resolver=com.example.TenantIdentifierResolver
+spring.jpa.properties.hibernate.multi_tenant_connection_provider=com.example.TenantConnectionProvider
+
+─────────────────────────────────────────
+APPROACH 3: Separate DataSource per Tenant
+─────────────────────────────────────────
+
+// Map each tenant to its own DataSource
+@Component
+public class TenantDataSourceRouter extends AbstractRoutingDataSource {
+
+    private final Map<String, DataSource> tenantDataSources;
+
+    public TenantDataSourceRouter(TenantRepository tenantRepo) {
+        this.tenantDataSources = tenantRepo.findAll().stream()
+            .collect(Collectors.toMap(
+                Tenant::getId,
+                t -> buildDataSource(t.getDbUrl(), t.getDbUser(), t.getDbPass())));
+        setTargetDataSources(new HashMap<>(tenantDataSources));
+        afterPropertiesSet();
+    }
+
+    @Override
+    protected Object determineCurrentLookupKey() {
+        return TenantContext.getCurrentTenant();
+    }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. SCHEMA MIGRATIONS WITH MULTIPLE TENANTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Challenge: With 1000 tenants, you can't run Flyway manually for each.
+
+Solutions:
+  A. On-demand migration: run migration when a tenant's request arrives,
+     if their schema version is behind. (risky: delays user request)
+
+  B. Background job: At startup or scheduled, iterate all tenants and
+     apply pending migrations to each.
+
+  C. Flyway Teams / multi-schema support:
+     for each tenant_schema in tenants:
+         flyway.setSchemas(tenant_schema)
+         flyway.migrate()
+
+  D. Liquibase with contexts: Apply changesets to specific tenant schemas.
+
+KEY: ALL schema changes must be backward-compatible during rolling deployment.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. TENANT ISOLATION CHECKLIST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ✅ Every DB query filtered by tenant_id (never query without filter)
+  ✅ Tenant ID always comes from authenticated context (JWT/session), NEVER from request body
+  ✅ File storage: per-tenant prefix in S3 (s3://bucket/tenant-id/files/)
+  ✅ Caching: cache keys always prefixed with tenant_id (e.g., "acme:user:123")
+  ✅ Background jobs: tenant context propagated to async threads
+  ✅ Audit logs: always include tenant_id
+  ✅ Row-level security (PostgreSQL RLS): DB-level enforcement as safety net
+  ✅ Rate limiting: per tenant (not per IP to prevent one tenant starving others)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. COMPARISON TABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────┬──────────────┬──────────────┬──────────────┐
+│                 │ Shared DB    │ Schema-per-  │ DB-per-      │
+│                 │ Shared Schema│ Tenant       │ Tenant       │
+├─────────────────┼──────────────┼──────────────┼──────────────┤
+│ Cost            │ ✅ Low       │ 🟡 Medium    │ ❌ High      │
+│ Isolation       │ ❌ Weak      │ 🟡 Good      │ ✅ Excellent │
+│ Compliance      │ ❌ Hard      │ 🟡 Moderate  │ ✅ Easy      │
+│ # Tenants       │ ✅ Millions  │ 🟡 Thousands │ ❌ Hundreds  │
+│ Ops Complexity  │ ✅ Simple    │ 🟡 Medium    │ ❌ High      │
+│ Migration       │ ✅ Once      │ ❌ Per schema│ ❌ Per DB    │
+│ Noisy Neighbor  │ ❌ High risk │ 🟡 Moderate  │ ✅ Isolated  │
+│ Data Residency  │ ❌ Hard      │ 🟡 Possible  │ ✅ Easy      │
+└─────────────────┴──────────────┴──────────────┴──────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: What is multi-tenancy? Which pattern would you recommend for a B2B SaaS?
+A: Multi-tenancy is serving multiple customers from a single application.
+   For B2B SaaS: start with shared schema (column discriminator) for cost
+   efficiency. Offer schema-per-tenant or DB-per-tenant for enterprise
+   customers with compliance requirements.
+
+Q: How do you prevent one tenant's data from leaking to another?
+A: (1) Always filter queries by tenant_id from authenticated context.
+   (2) Use PostgreSQL Row-Level Security as a database-level safety net.
+   (3) Prefix all cache keys with tenant_id.
+   (4) Automated tests that verify cross-tenant isolation.
+
+Q: How would you propagate tenant context to async threads?
+A: TenantContext uses ThreadLocal which is not automatically inherited
+   by child threads. Solutions: (a) Use InheritableThreadLocal.
+   (b) Wrap Runnable/Callable to copy and clear tenant context.
+   (c) Use Spring Security's DelegatingSecurityContextExecutor.
+   (d) With Virtual Threads (Java 21): use ScopedValue instead of ThreadLocal.
+
+Q: How do you handle schema migrations with 1000 tenant schemas?
+A: Run migrations as a background job at startup or via a scheduled task.
+   Iterate all tenants, apply Flyway migrations per schema. Ensure all
+   changes are backward-compatible for zero-downtime deploys.
+
+Q: How does SaaS rate limiting work in multi-tenant systems?
+A: Rate limit per tenant_id (not per IP). Use Redis with keys like
+   "rate_limit:tenant_id:endpoint". This ensures one heavy tenant
+   doesn't exhaust shared rate limit quotas for other tenants.

@@ -1,0 +1,229 @@
+======================================================
+TRANSACTIONAL MESSAGING — OUTBOX PATTERN IN SPRING
+======================================================
+
+1. THE PROBLEM: DUAL-WRITE CONSISTENCY
+────────────────────────────────────────
+Classic failure scenario:
+  1. Save Order to DB → SUCCESS
+  2. Publish "OrderCreated" event to Kafka → FAILS (network outage)
+  Result: DB has order, Kafka has no event → data inconsistency
+
+OR:
+  1. Publish event to Kafka → SUCCESS
+  2. Save Order to DB → FAILS
+  Result: Kafka has event, DB has no order → ghost event
+
+There is no distributed transaction across DB + Kafka/RabbitMQ.
+Solution: Outbox Pattern (Transactional Outbox)
+
+
+2. OUTBOX PATTERN
+──────────────────
+Core idea: Write the event to the same DB as the business entity in the SAME
+local transaction. A separate process (relay) reads from the outbox and publishes.
+
+Tables:
+  orders (id, status, amount, ...)
+  outbox (id, aggregate_type, aggregate_id, event_type, payload, created_at, published)
+
+Transaction:
+  BEGIN;
+    INSERT INTO orders (...) VALUES (...);
+    INSERT INTO outbox (event_type, payload) VALUES ('OrderCreated', '{}');
+  COMMIT;
+
+  → Atomic: both succeed or both fail. No dual-write inconsistency.
+
+Relay (Outbox Publisher):
+  - Polls outbox table for unpublished events
+  - Publishes to Kafka/RabbitMQ
+  - Marks as published (or deletes)
+
+
+3. SPRING IMPLEMENTATION — DB POLLING RELAY
+────────────────────────────────────────────
+
+Entity:
+  @Entity
+  @Table(name = "outbox")
+  public class OutboxEvent {
+      @Id
+      @GeneratedValue
+      private UUID id;
+      private String aggregateType;
+      private String aggregateId;
+      private String eventType;
+      @Column(columnDefinition = "jsonb")
+      private String payload;
+      private LocalDateTime createdAt;
+      private boolean published;
+  }
+
+Service — atomic write:
+  @Transactional
+  public Order createOrder(CreateOrderRequest request) {
+      Order order = orderRepository.save(new Order(request));
+
+      OutboxEvent event = OutboxEvent.builder()
+          .aggregateType("Order")
+          .aggregateId(order.getId().toString())
+          .eventType("OrderCreated")
+          .payload(objectMapper.writeValueAsString(order))
+          .createdAt(LocalDateTime.now())
+          .published(false)
+          .build();
+      outboxRepository.save(event);
+
+      return order;
+  }
+
+Relay — scheduled publisher:
+  @Scheduled(fixedDelay = 1000)  // every 1 second
+  @Transactional
+  public void publishOutboxEvents() {
+      List<OutboxEvent> events = outboxRepository
+          .findTop100ByPublishedFalseOrderByCreatedAtAsc();
+
+      for (OutboxEvent event : events) {
+          kafkaTemplate.send(event.getEventType(), event.getAggregateId(),
+                             event.getPayload());
+          event.setPublished(true);
+      }
+      outboxRepository.saveAll(events);
+  }
+
+  // Use ShedLock to prevent multiple pods from processing same events
+  @SchedulerLock(name = "outboxRelay", lockAtMostFor = "30s")
+
+
+4. DEBEZIUM — CDC-BASED OUTBOX RELAY
+──────────────────────────────────────
+Production-grade: use Debezium (Change Data Capture) instead of polling.
+
+Debezium reads the DB WAL (Write-Ahead Log) and publishes changes to Kafka.
+  - No polling overhead
+  - Sub-second latency
+  - Transactionally consistent with DB
+
+Debezium Outbox SMT (Single Message Transform):
+  Transforms outbox table records into domain events in Kafka.
+
+Stack:
+  PostgreSQL → Debezium Connector → Kafka → Consumers
+
+Debezium connector config (simplified):
+  {
+    "name": "outbox-connector",
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "localhost",
+    "database.dbname": "mydb",
+    "table.include.list": "public.outbox",
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter"
+  }
+
+
+5. INBOX PATTERN (CONSUMER SIDE IDEMPOTENCY)
+──────────────────────────────────────────────
+At-least-once delivery from Kafka/RabbitMQ means a consumer may receive
+the same event multiple times. The Inbox Pattern handles this:
+
+  CREATE TABLE inbox (
+      event_id UUID PRIMARY KEY,
+      event_type VARCHAR,
+      processed_at TIMESTAMP
+  );
+
+Consumer:
+  @KafkaListener(topics = "OrderCreated")
+  @Transactional
+  public void handleOrderCreated(OrderCreatedEvent event) {
+      // Check if already processed
+      if (inboxRepository.existsById(event.getEventId())) {
+          log.info("Duplicate event, skipping: {}", event.getEventId());
+          return;
+      }
+
+      // Process the event
+      fulfillOrder(event);
+
+      // Mark as processed (same transaction)
+      inboxRepository.save(new InboxRecord(event.getEventId(),
+          event.getEventType(), LocalDateTime.now()));
+  }
+
+
+6. SPRING INTEGRATION WITH SPRING MESSAGING
+─────────────────────────────────────────────
+Spring AMQP (@RabbitListener) + transactional DB:
+  @RabbitListener(queues = "payment.queue")
+  @Transactional
+  public void handlePayment(PaymentMessage message) {
+      // DB write and Inbox check in same transaction
+      processPayment(message);
+  }
+
+Spring Kafka transactional producer:
+  @Bean
+  public KafkaTemplate<String, String> kafkaTemplate(
+          ProducerFactory<String, String> pf) {
+      return new KafkaTemplate<>(pf);
+  }
+
+  // Enable Kafka transactions (different from DB transactions):
+  spring.kafka.producer.transaction-id-prefix=tx-
+
+  @Transactional("kafkaTransactionManager")
+  public void publishEvent(String topic, String message) {
+      kafkaTemplate.send(topic, message);
+  }
+
+  Note: Kafka transactions (exactly-once between Kafka topics) ≠ DB transactions.
+  Outbox pattern is still needed for DB + Kafka consistency.
+
+
+7. AT-LEAST-ONCE vs EXACTLY-ONCE DELIVERY
+───────────────────────────────────────────
+At-least-once: message delivered at least once; duplicates possible.
+  → Requires consumer-side idempotency (Inbox pattern)
+  → Standard for most systems (Kafka default)
+
+Exactly-once: message delivered exactly once; no duplicates.
+  → Kafka supports EOS (Exactly Once Semantics) within Kafka → Kafka flows
+  → Does NOT solve DB + Kafka dual-write problem
+  → Implementation: idempotent producer + transactional API
+
+At-most-once: message delivered 0 or 1 times; no duplicates but possible loss.
+  → Not suitable for financial systems
+
+
+8. INTERVIEW QUESTIONS
+──────────────────────
+Q: What is the Outbox pattern and what problem does it solve?
+A: It solves the dual-write problem: you can't atomically write to a DB and
+   publish to a message broker. The Outbox pattern writes the event to the
+   DB in the same local transaction as the business entity. A separate relay
+   publishes the event from the outbox, guaranteeing at-least-once delivery.
+
+Q: What is the difference between Outbox polling and Debezium CDC?
+A: Polling: a scheduled job queries the outbox table for unpublished events.
+   Simple but adds polling overhead and latency.
+   Debezium CDC: reads the database WAL (change log) in real-time. Lower
+   latency, no polling overhead, but requires more infrastructure (Kafka Connect).
+
+Q: How do you prevent multiple service instances from processing the same outbox event?
+A: Use ShedLock with a distributed lock (Redis or DB-backed) on the scheduled
+   relay. Or use Kafka partitions: each partition is consumed by one instance.
+   Debezium handles this natively as there's one connector.
+
+Q: What is the Inbox pattern?
+A: Consumer-side deduplication. Store processed event IDs in an inbox table.
+   Before processing, check if the event ID already exists. If yes, skip.
+   Write to inbox in the same transaction as business logic for atomicity.
+
+Q: Can Kafka transactions replace the Outbox pattern?
+A: No. Kafka transactions (EOS) guarantee exactly-once between Kafka topics
+   (producer → Kafka → consumer). They don't solve the DB + Kafka dual-write
+   problem. If you need DB consistency + Kafka publishing, you still need
+   the Outbox pattern.

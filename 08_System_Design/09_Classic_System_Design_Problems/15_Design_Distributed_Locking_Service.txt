@@ -1,0 +1,241 @@
+============================================================
+SYSTEM DESIGN: DISTRIBUTED LOCKING SERVICE
+============================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. PROBLEM STATEMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Design a distributed locking service that allows multiple processes
+across different machines to coordinate access to shared resources.
+
+Real-world use cases:
+  - Only one instance processes a scheduled job (cron deduplication)
+  - Leader election for master/replica pattern
+  - Preventing double payments in financial transactions
+  - Rate limiting at the service level
+  - Ensuring only one writer to a resource at a time
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. FUNCTIONAL REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - acquire(lockName, ttl): try to acquire a lock; return success/failure
+  - release(lockName, lockToken): release the lock (only by the owner)
+  - tryAcquireWithTimeout(lockName, ttl, waitTimeout): block until acquired or timeout
+  - isLocked(lockName): check if lock is currently held
+  - Automatic expiry: locks auto-release if holder crashes (TTL-based)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. NON-FUNCTIONAL REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - Mutual Exclusion: only one holder at a time
+  - Deadlock-free: locks must auto-expire (TTL)
+  - Fault-tolerant: survives node failures
+  - Low latency: lock operations < 10ms p99
+  - High availability: 99.99% uptime
+  - No starvation: fair locking or retry with backoff
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. APPROACHES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+─────────────────────────────────────────
+APPROACH 1: Redis (Single Node) — Redlock Lite
+─────────────────────────────────────────
+
+SET lock:resource1 <unique_token> NX PX 30000
+
+  NX  → only set if not exists (atomic acquisition)
+  PX  → TTL in milliseconds (auto-expiry if holder crashes)
+
+Release (Lua script — atomic check-and-delete):
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+      return redis.call("del", KEYS[1])
+  else
+      return 0
+  end
+
+Why Lua? → check + delete must be ATOMIC.
+           Without Lua: get returns value → TTL expires → another acquires
+           → your delete removes their lock. Race condition!
+
+Problem with single Redis: node failure loses lock state.
+
+─────────────────────────────────────────
+APPROACH 2: Redlock Algorithm (Multi-node Redis)
+─────────────────────────────────────────
+
+Martin Kleppmann's critique vs Antirez debate — know both sides.
+
+Algorithm (N = 5 Redis nodes):
+  1. Record start time T1
+  2. Try to SET lock on ALL N nodes (with same TTL, unique token)
+  3. Count successes; compute elapsed time: drift = T2 - T1
+  4. Lock is acquired IF:
+       - Success count >= (N/2 + 1) = 3 nodes
+       - Remaining TTL = originalTTL - drift > 0
+  5. To release: DELETE on ALL nodes (even ones that failed)
+
+Failure scenario:
+  - If < quorum acquired → release all and retry with backoff
+  - If node fails after lock: quorum still holds on remaining nodes
+
+Criticism (Martin Kleppmann):
+  - Clock drift can cause two clients to both think they hold the lock
+  - GC pauses (Stop-the-World) can expire locks mid-operation
+  - Fencing tokens (monotonically increasing IDs) needed for true safety
+
+─────────────────────────────────────────
+APPROACH 3: ZooKeeper (Recommended for Strong Guarantees)
+─────────────────────────────────────────
+
+ZooKeeper provides linearizable reads/writes (via ZAB consensus protocol).
+
+Lock using ephemeral sequential znodes:
+  1. Create ephemeral sequential node: /locks/resource-0000000001
+  2. Get all children of /locks/resource
+  3. If your node has the LOWEST sequence number → you hold the lock
+  4. Otherwise → watch the node with the NEXT LOWER sequence number
+  5. When that node is deleted → re-check (avoid herd effect)
+  6. Releasing: delete your ephemeral znode (also auto-deleted on disconnect)
+
+Benefits:
+  - Ephemeral nodes auto-delete when client session expires → deadlock-free
+  - Sequential nodes → natural queue (fair locking, no starvation)
+  - Linearizable → true mutual exclusion
+  - Watch mechanism → efficient notification (no polling)
+
+Downside: higher operational complexity, write latency ~10-20ms.
+
+─────────────────────────────────────────
+APPROACH 4: etcd (Kubernetes-style)
+─────────────────────────────────────────
+
+etcd uses Raft consensus. Similar to ZooKeeper but with:
+  - gRPC API instead of binary Zab protocol
+  - Lease-based TTL (create a lease, attach keys to lease)
+  - Revision-based fencing tokens (every write increments a global revision)
+
+// Create a lease (TTL-based expiry)
+PUT /v3/leases/grant { "TTL": 30 }
+→ { "ID": 7587845940498951139 }
+
+// Acquire lock atomically (txn: only if key doesn't exist)
+TXN:
+  compare: version("/locks/resource") == 0
+  success: PUT /locks/resource <token> with leaseID
+  failure: return current value
+
+// Fencing token: use the revision number from the PUT response
+// Storage systems should reject writes with lower revision numbers
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. RECOMMENDED ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For a general-purpose distributed lock service:
+
+  Client Library (SDK)
+       │
+       ▼
+  Lock Service API (gRPC / REST)
+  ┌─────────────────────────────┐
+  │   Lock Manager              │
+  │   - acquire / release       │
+  │   - TTL management          │
+  │   - Fencing token issuance  │
+  └────────────┬────────────────┘
+               │
+  ┌────────────▼────────────────┐
+  │   etcd Cluster (3 or 5     │
+  │   nodes, Raft consensus)   │
+  └─────────────────────────────┘
+
+Client SDK responsibilities:
+  - Auto-retry with exponential backoff + jitter
+  - Heartbeat/renew TTL while holding lock (keepalive)
+  - Cleanup on process exit (try/finally pattern)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. THE FENCING TOKEN PROBLEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Scenario:
+  T1: Client A acquires lock (token=33), starts long operation
+  T2: GC pause on Client A for 30 seconds
+  T3: Lock expires; Client B acquires lock (token=34)
+  T4: Client A resumes, still thinks it holds the lock
+  T5: Both A and B write to the shared resource → CORRUPTION
+
+Solution — Fencing Tokens:
+  - Lock service issues monotonically increasing token on each acquisition
+  - Client A gets token=33, Client B gets token=34
+  - Storage layer REJECTS writes with token < current max seen
+  - Client A's write with token=33 is rejected → safe
+
+Implementation:
+  - etcd: use the ModRevision from PUT response as fencing token
+  - ZooKeeper: use the sequential znode ID as fencing token
+  - Redis: NO built-in fencing token → implement counter separately
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. JAVA IMPLEMENTATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Redis:
+  - Redisson (most popular): RLock lock = redissonClient.getLock("myLock");
+  - Lettuce + Lua scripts
+
+ZooKeeper:
+  - Apache Curator: InterProcessMutex, InterProcessSemaphoreMutex
+
+etcd:
+  - jetcd (official Java client): io.etcd:jetcd-core
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. KEY TRADE-OFFS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────┬──────────┬────────────┬──────────┬──────────────┐
+│             │ Redis    │ Redlock    │ ZooKeeper│ etcd         │
+├─────────────┼──────────┼────────────┼──────────┼──────────────┤
+│ Consistency │ Eventual │ Near-linear│ Linear   │ Linear       │
+│ Latency     │ <1ms     │ 5-10ms     │ 10-20ms  │ 5-15ms       │
+│ Fencing     │ ❌ No    │ ❌ No      │ ✅ Yes   │ ✅ Yes       │
+│ Complexity  │ Low      │ Medium     │ High     │ Medium       │
+│ Use case    │ Best     │ Better     │ Strong   │ Strong +     │
+│             │ effort   │ effort     │ guarantee│ modern API   │
+└─────────────┴──────────┴────────────┴──────────┴──────────────┘
+
+RECOMMENDATION:
+  - High throughput, tolerate rare race: Redis single-node Redlock
+  - Financial transactions, leader election: ZooKeeper or etcd
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: Why can't you use a single Redis SET NX for distributed locking?
+A: Single Redis node is a single point of failure. If it fails, the lock
+   is lost and no client can acquire it. Redlock uses N nodes for fault tolerance.
+
+Q: Why must lock release in Redis use a Lua script?
+A: The check (GET) and delete (DEL) must be atomic. Without atomicity,
+   between GET and DEL the TTL can expire and another client can acquire —
+   you'd then delete their lock instead of yours.
+
+Q: What is a fencing token and why is it important?
+A: A monotonically increasing ID issued with each lock acquisition. Protects
+   against GC pauses and clock skew causing a stale lock holder to overwrite
+   a newer holder's work. The storage layer rejects writes with lower tokens.
+
+Q: How does ZooKeeper implement distributed locks without polling?
+A: Using ephemeral sequential znodes + watch mechanism. Each client watches
+   only the next-lower node (not all), avoiding herd effect on release.
+
+Q: How does Redisson handle lock renewal?
+A: Redisson uses a background "watchdog" thread that automatically extends
+   the lock TTL every 10 seconds (default) while the lock is held, preventing
+   expiry during long operations.

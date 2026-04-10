@@ -1,0 +1,367 @@
+================================================================
+  JAVA 21 CONCURRENCY: VIRTUAL THREADS, STRUCTURED CONCURRENCY
+  & COMPLETABLEFUTURE PATTERNS
+================================================================
+
+  Java Version: Java 19 (preview) → Java 21 (GA — LTS)
+  Frequency:    HIGH for 7+ YOE interviews — Java 21 is the current LTS.
+                Interviewers expect senior devs to know new concurrency models.
+
+================================================================
+SECTION 1: VIRTUAL THREADS (PROJECT LOOM)
+================================================================
+
+----------------------------------------------------------------
+PROBLEM WITH TRADITIONAL THREADS (PLATFORM THREADS)
+----------------------------------------------------------------
+
+  Platform threads map 1:1 to OS threads.
+  OS thread stack: ~1MB of memory.
+  Typical server: 200–1000 concurrent OS threads practical limit.
+  With blocking I/O (DB calls, HTTP calls): thread blocks and sits idle
+  — wasting OS thread while waiting. This limits throughput.
+
+  Traditional fix: Reactive programming (WebFlux, RxJava) — non-blocking I/O.
+  Cost: complex, callback/chain style code; hard to debug; steep learning curve.
+
+----------------------------------------------------------------
+VIRTUAL THREADS — THE SOLUTION
+----------------------------------------------------------------
+
+  Virtual threads are lightweight, JVM-managed threads.
+  Many virtual threads are multiplexed onto a small pool of platform (carrier) threads.
+
+  When a virtual thread blocks (waiting for DB, HTTP, file I/O):
+    - JVM UNMOUNTS it from the carrier thread.
+    - Carrier thread is freed to run another virtual thread.
+    - When the blocking operation completes, the virtual thread is REMOUNTED.
+
+  Result:
+    - Millions of virtual threads possible (not thousands).
+    - Blocking I/O code reads naturally (no callbacks, no reactive chains).
+    - Same simple thread-per-request model as traditional blocking, but scalable.
+
+  Memory: virtual thread stack starts small (~few KB), grows dynamically.
+  OS threads: only N carrier threads needed (typically = number of CPU cores).
+
+----------------------------------------------------------------
+CREATING VIRTUAL THREADS
+----------------------------------------------------------------
+
+  // Method 1: Thread.ofVirtual()
+  Thread vt = Thread.ofVirtual().start(() -> {
+      System.out.println("Running on: " + Thread.currentThread());
+  });
+
+  // Method 2: Virtual thread executor (recommended for applications)
+  try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+      executor.submit(() -> fetchDataFromDatabase());
+      executor.submit(() -> callExternalApi());
+  } // auto-closed: awaits task completion
+
+  // Method 3: Thread.startVirtualThread() shortcut
+  Thread.startVirtualThread(() -> processRequest(request));
+
+  // Checking if a thread is virtual:
+  Thread.currentThread().isVirtual(); // true for virtual threads
+
+----------------------------------------------------------------
+VIRTUAL THREADS IN SPRING BOOT (Java 21 + Spring Boot 3.2+)
+----------------------------------------------------------------
+
+  // application.properties — enable virtual threads for all @Async and Tomcat threads:
+  spring.threads.virtual.enabled=true
+
+  // OR configure programmatically:
+  @Configuration
+  public class ThreadConfig {
+      @Bean
+      public TomcatProtocolHandlerCustomizer<?> virtualThreadsForTomcat() {
+          return protocolHandler -> {
+              protocolHandler.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+          };
+      }
+  }
+
+  Effect: every incoming HTTP request handled on a virtual thread.
+  Blocking DB calls, RestTemplate calls, etc., no longer block platform threads.
+  Throughput increases dramatically for I/O-bound workloads.
+
+  IMPORTANT: Virtual threads work best with:
+    ✅ Blocking I/O (JDBC, RestTemplate, HTTP clients).
+    ✅ Simple synchronous code.
+    ❌ CPU-intensive tasks (virtual threads don't help — still CPU-bound).
+    ❌ ThreadLocal misuse (each virtual thread has its own ThreadLocal — storage may be high).
+
+----------------------------------------------------------------
+PINNING — AVOID THIS
+----------------------------------------------------------------
+
+  A virtual thread gets PINNED to a carrier thread and cannot be unmounted when:
+    1. Executing a synchronized block or method.
+    2. Calling native code.
+
+  Pinned virtual threads waste carrier threads (reverts to platform thread behavior).
+
+  Fix: replace synchronized with java.util.concurrent.locks.ReentrantLock:
+
+    // BAD (causes pinning):
+    public synchronized void update() {
+        callDatabase();  // virtual thread pins here
+    }
+
+    // GOOD (no pinning):
+    private final ReentrantLock lock = new ReentrantLock();
+    public void update() {
+        lock.lock();
+        try {
+            callDatabase();  // virtual thread can be unmounted
+        } finally {
+            lock.unlock();
+        }
+    }
+
+  Spring Boot: Hibernate JDBC uses synchronized internally — in-flight fix.
+  Monitor with JVM flags: -Djdk.tracePinnedThreads=full
+
+================================================================
+SECTION 2: STRUCTURED CONCURRENCY (Java 21 Preview → Java 23 GA)
+================================================================
+
+  StructuredTaskScope is the API for structured concurrency.
+
+  Traditional problem with unstructured concurrency:
+    // Hard to reason about: if one fails, the other might keep running
+    Future<User> userFuture = executor.submit(() -> fetchUser(id));
+    Future<Order> orderFuture = executor.submit(() -> fetchOrders(id));
+    User user = userFuture.get();    // blocks
+    Order order = orderFuture.get(); // blocks separately — error handling complex
+
+  Structured Concurrency principle:
+    "A task's lifetime should be bounded by the scope that created it."
+    When the scope closes, all tasks are either done or cancelled.
+    No orphaned tasks. Clear error propagation.
+
+----------------------------------------------------------------
+STRUCTURED CONCURRENCY API
+----------------------------------------------------------------
+
+  // ShutdownOnFailure: if any subtask fails, cancel remaining and fail the scope
+  try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+      Subtask<User> userTask = scope.fork(() -> fetchUser(userId));
+      Subtask<List<Order>> ordersTask = scope.fork(() -> fetchOrders(userId));
+
+      scope.join()           // wait for all tasks to complete (or fail)
+           .throwIfFailed(); // propagate exception if any task failed
+
+      // Both completed successfully
+      User user = userTask.get();
+      List<Order> orders = ordersTask.get();
+      return new UserDashboard(user, orders);
+  }
+
+  // ShutdownOnSuccess: cancel remaining as soon as ONE succeeds (racing)
+  try (var scope = new StructuredTaskScope.ShutdownOnSuccess<Response>()) {
+      scope.fork(() -> callPrimaryService());
+      scope.fork(() -> callFallbackService());
+
+      scope.join();
+      return scope.result(); // returns first successful result
+  }
+
+  Benefits:
+    - Clear task lifecycle — scope boundary = task lifetime.
+    - Automatic cancellation of sibling tasks on failure.
+    - No orphaned threads. No resource leaks.
+    - Stack traces are meaningful (task context preserved).
+
+================================================================
+SECTION 3: COMPLETABLEFUTURE PATTERNS
+================================================================
+
+  CompletableFuture (Java 8+) enables asynchronous programming with platform threads.
+  Still relevant and widely used — virtual threads complement, not replace it.
+
+----------------------------------------------------------------
+CORE OPERATIONS
+----------------------------------------------------------------
+
+  // Creating:
+  CompletableFuture<User> future = CompletableFuture.supplyAsync(() -> fetchUser(id));
+  CompletableFuture<Void> future = CompletableFuture.runAsync(() -> sendEmail());
+
+  // Transforming (non-blocking chain):
+  CompletableFuture<String> result = CompletableFuture
+      .supplyAsync(() -> fetchUser(id))       // runs async
+      .thenApply(user -> user.getName())      // sync transform (same thread)
+      .thenApplyAsync(name -> name.toUpperCase(), customExecutor); // async on custom pool
+
+  // Consuming:
+  future.thenAccept(user -> log.info("Got user: {}", user));
+
+  // Combining two futures (both must complete):
+  CompletableFuture<UserDashboard> dashboard = CompletableFuture
+      .supplyAsync(() -> fetchUser(id))
+      .thenCombine(
+          CompletableFuture.supplyAsync(() -> fetchOrders(id)),
+          (user, orders) -> new UserDashboard(user, orders)
+      );
+
+  // Running after both complete (no result):
+  future1.thenAcceptBoth(future2, (r1, r2) -> process(r1, r2));
+
+  // Chaining futures that return futures (flatMap equivalent):
+  CompletableFuture<Order> order = CompletableFuture
+      .supplyAsync(() -> fetchUser(id))
+      .thenCompose(user -> fetchOrder(user.getActiveOrderId())); // avoids nesting
+
+  // First to complete wins:
+  CompletableFuture<Response> response = primaryCall.applyToEither(fallbackCall, r -> r);
+
+  // All must complete:
+  CompletableFuture.allOf(future1, future2, future3)
+      .thenRun(() -> System.out.println("All done"));
+
+  // Any completes:
+  CompletableFuture.anyOf(future1, future2, future3)
+      .thenAccept(result -> System.out.println("First: " + result));
+
+----------------------------------------------------------------
+ERROR HANDLING
+----------------------------------------------------------------
+
+  // Handle errors gracefully:
+  future
+      .exceptionally(ex -> {
+          log.error("Failed: {}", ex.getMessage());
+          return defaultUser(); // fallback value
+      });
+
+  // Handle both success and failure:
+  future.handle((result, ex) -> {
+      if (ex != null) return handleError(ex);
+      return process(result);
+  });
+
+  // Recover on specific exception type:
+  future.exceptionallyCompose(ex -> {
+      if (ex.getCause() instanceof UserNotFoundException) {
+          return CompletableFuture.supplyAsync(() -> createGuestUser());
+      }
+      return CompletableFuture.failedFuture(ex);
+  });
+
+----------------------------------------------------------------
+COMPLETABLEFUTURE WITH VIRTUAL THREADS (Java 21)
+----------------------------------------------------------------
+
+  // Before Java 21: supplyAsync uses ForkJoinPool.commonPool() — platform threads
+  CompletableFuture.supplyAsync(() -> fetchData());  // platform thread pool
+
+  // Java 21: supply to virtual thread executor
+  ExecutorService virtualExecutor = Executors.newVirtualThreadPerTaskExecutor();
+  CompletableFuture
+      .supplyAsync(() -> fetchUser(id), virtualExecutor)
+      .thenCombine(
+          CompletableFuture.supplyAsync(() -> fetchOrders(id), virtualExecutor),
+          UserDashboard::new
+      )
+      .join();
+
+  Best practice in Java 21+: for I/O-bound parallel work, prefer
+  StructuredTaskScope over CompletableFuture — cleaner error handling, no orphaned tasks.
+  Use CompletableFuture for complex async chains with transformations.
+
+----------------------------------------------------------------
+COMMON PITFALLS
+----------------------------------------------------------------
+
+  1. Blocking in a CompletableFuture chain:
+     // BAD: blocks the thread executing this stage
+     future.thenApply(user -> {
+         return orderRepo.findAll().get(); // .get() blocks!
+     });
+     // Use thenCompose with another supplyAsync instead.
+
+  2. Not providing a custom executor for blocking operations:
+     // BAD: uses ForkJoinPool for blocking I/O (starves the pool)
+     CompletableFuture.supplyAsync(() -> dbCall());
+     // GOOD: use a dedicated executor (or virtual threads)
+     CompletableFuture.supplyAsync(() -> dbCall(), ioExecutor);
+
+  3. Swallowing exceptions:
+     // BAD:
+     future.exceptionally(ex -> null); // silently returns null on error
+     // GOOD: log + return meaningful fallback or rethrow.
+
+  4. Calling .join() / .get() on the main thread:
+     // This defeats the purpose of async — blocks main thread.
+     // Only call at the top-level entry point after all chaining is set up.
+
+================================================================
+SECTION 4: INTERVIEW QUESTIONS
+================================================================
+
+  Q: What are virtual threads and how do they differ from platform threads?
+  -------------------------------------------------------------------------
+  A: Virtual threads (Project Loom, Java 21) are lightweight JVM-managed threads
+     that multiplex onto platform (OS) threads. When a virtual thread blocks on I/O,
+     the JVM unmounts it from the carrier thread — freeing the carrier to run other
+     virtual threads. This allows millions of concurrent virtual threads (vs thousands
+     of platform threads). Code remains simple synchronous blocking style — no reactive
+     programming needed. Best for I/O-bound workloads. No benefit for CPU-bound tasks.
+
+  Q: What is thread pinning in virtual threads?
+  -----------------------------------------------
+  A: A virtual thread becomes "pinned" (unable to unmount from its carrier thread)
+     when executing a synchronized block or native method. Pinned virtual threads
+     behave like platform threads — blocking the carrier. Fix: replace synchronized
+     with ReentrantLock, which allows the virtual thread to unmount during blocking.
+
+  Q: How do you enable virtual threads in Spring Boot?
+  -----------------------------------------------------
+  A: In Spring Boot 3.2+ with Java 21:
+     Set spring.threads.virtual.enabled=true in application.properties.
+     This makes Spring's async task executor and Tomcat use virtual threads.
+     This means every HTTP request handler runs on a virtual thread — blocking
+     JDBC/RestTemplate calls no longer starve platform threads.
+
+  Q: What is Structured Concurrency?
+  ------------------------------------
+  A: Structured Concurrency (Java 21+) ensures that subtasks don't outlive the
+     scope that created them. Using StructuredTaskScope, you fork tasks, join the
+     scope (which waits for all), and handle errors centrally. If one subtask fails,
+     sibling tasks are cancelled (ShutdownOnFailure policy). This prevents orphaned
+     threads, simplifies error handling, and makes concurrent code behave like
+     structured sequential code at the macro level.
+
+  Q: When would you use CompletableFuture vs StructuredTaskScope?
+  ---------------------------------------------------------------
+  A: CompletableFuture: for complex async chains with transformations, combining
+     multiple async results, building reactive-style pipelines. Works across Java
+     versions. Best for CPU-bound or long async transformation pipelines.
+
+     StructuredTaskScope (Java 21): for concurrent I/O fan-out where you need
+     all results (or first result), with simple, correct error handling and
+     automatic task lifetime management. Cleaner and safer than CompletableFuture
+     for parallel I/O calls where you need all results.
+
+     Rule of thumb: if I need two DB calls in parallel and combine results → 
+     StructuredTaskScope in Java 21. For complex transformations or compatibility
+     with Java 8+ → CompletableFuture.
+
+================================================================
+INTERVIEW TIPS
+================================================================
+
+  - Virtual threads are a HOT topic in 2024–2025 Java interviews. Know the
+    "unmount on block" mechanism and the pinning problem.
+  - Mention spring.threads.virtual.enabled=true for Spring Boot — shows
+    you know how to actually USE virtual threads in practice.
+  - CompletableFuture knowledge is still expected — know thenApply,
+    thenCompose, thenCombine, allOf, anyOf, exceptionally.
+  - Show you understand WHEN to use each: "I'd use virtual threads for
+    any I/O-bound service; I'd still use CompletableFuture for complex
+    async pipelines."
+
+================================================================

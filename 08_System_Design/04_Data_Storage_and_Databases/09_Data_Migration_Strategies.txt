@@ -1,0 +1,203 @@
+================================================================
+DATA MIGRATION STRATEGIES — ZERO-DOWNTIME SCHEMA CHANGES
+================================================================
+
+THE PROBLEM
+------------
+Your service has millions of rows. You need to change the database schema.
+Naive approach: take the app offline, run ALTER TABLE, bring app back up.
+
+At scale, this is NOT acceptable:
+  - ALTER TABLE on 100M rows can take hours (table lock held the entire time)
+  - Zero downtime is a business requirement
+  - "Deployment causes 2-hour outage" is a P0 incident
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EXPAND/CONTRACT PATTERN (PARALLEL CHANGE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The industry standard for zero-downtime schema migrations.
+Also known as "Parallel Change" or "Strangler Migration."
+
+SCENARIO: Rename column `full_name` → split into `first_name` + `last_name`
+
+PHASE 1 — EXPAND (Add new, keep old):
+  Database change:
+    ALTER TABLE users ADD COLUMN first_name VARCHAR(100);
+    ALTER TABLE users ADD COLUMN last_name VARCHAR(100);
+    (Add new columns — fast, non-blocking, old column still exists)
+  
+  Application v1 (deployed before DB change or same deploy):
+    - Write: writes to BOTH old column (full_name) AND new columns (first_name, last_name)
+    - Read: reads from OLD column (full_name) — new columns may be null
+  
+  Background migration (async job):
+    Run in small batches:
+    UPDATE users
+    SET first_name = split_part(full_name, ' ', 1),
+        last_name  = split_part(full_name, ' ', 2)
+    WHERE first_name IS NULL
+    LIMIT 1000;
+    [Sleep 100ms between batches — rate limit to avoid overloading DB]
+  
+  Monitor: track progress (rows remaining). Takes hours/days for large tables.
+
+PHASE 2 — SWITCH (Read from new):
+  Application v2:
+    - Write: writes to BOTH columns
+    - Read: reads from NEW columns (first_name, last_name)
+    - First_name/last_name now populated for all rows (migration complete)
+  
+  Both app versions can run simultaneously (rolling deployment is safe).
+
+PHASE 3 — CONTRACT (Remove old):
+  After all instances are on v2:
+  Application v3:
+    - Write: writes to ONLY new columns
+    - Read: reads from ONLY new columns
+  
+  Database cleanup (after v3 fully deployed):
+    ALTER TABLE users DROP COLUMN full_name;
+    (Now fast — just metadata change, no row scan)
+
+RULE: Deploy application changes BEFORE schema drops.
+      Never drop a column/table that still has running application code reading it.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ONLINE SCHEMA CHANGE TOOLS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Some ALTER TABLE operations lock the table for the duration.
+Online schema change tools perform changes without blocking reads/writes.
+
+PT-ONLINE-SCHEMA-CHANGE (Percona Toolkit — MySQL):
+  1. Creates a new table with the desired schema.
+  2. Copies data in small chunks from old to new.
+  3. Applies ongoing changes (DML) to new table via triggers.
+  4. When copy complete: atomic rename old ↔ new.
+  5. App never sees a lock.
+
+GITHUB'S gh-ost (MySQL):
+  Similar to pt-osc but uses binary log instead of triggers.
+  No triggers = less write overhead.
+  Used by GitHub for all MySQL schema changes.
+
+PostgreSQL:
+  Most operations (ADD COLUMN with default NULL, ADD INDEX CONCURRENTLY)
+  are non-blocking natively.
+  
+  CREATE INDEX CONCURRENTLY idx_users_email ON users(email);
+  -- Builds index without locking writes (slower but non-blocking)
+  
+  CREATE INDEX (without CONCURRENTLY) → TABLE LOCK for duration. Never in prod.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MIGRATION TOOLS — FLYWAY AND LIQUIBASE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FLYWAY (simpler, widely used with Spring Boot):
+  SQL migration files named: V1__create_users.sql, V2__add_email_index.sql
+  Flyway tracks applied migrations in flyway_schema_history table.
+  On startup: applies pending migrations in version order.
+  
+  Spring Boot integration: spring.flyway.enabled=true
+  auto-runs on startup before application is ready.
+  
+  BEST PRACTICES:
+  - Never modify applied migration scripts (Flyway detects and fails)
+  - Use checksums — Flyway validates files haven't changed
+  - Name migrations descriptively: V20260410__add_tenant_id_to_orders.sql
+  - Test migrations on staging with production data volume first
+
+LIQUIBASE:
+  XML/YAML/JSON changesets (also supports SQL).
+  More features: rollback support, diff generation, multiple formats.
+  More complex than Flyway.
+  
+  Spring Boot: spring.liquibase.change-log=classpath:db/changelog/db.changelog-master.yaml
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LARGE TABLE BACKFILL STRATEGIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Adding a new NOT NULL column to a 100M row table:
+  Cannot do: ALTER TABLE orders ADD COLUMN tenant_id UUID NOT NULL;
+  Fails immediately (existing rows violate NOT NULL).
+  
+  STRATEGY:
+  1. ALTER TABLE orders ADD COLUMN tenant_id UUID;  (nullable first)
+  2. Backfill in batches (background job):
+     UPDATE orders SET tenant_id = lookup_tenant(user_id)
+     WHERE tenant_id IS NULL AND id > ? ORDER BY id LIMIT 1000;
+  3. Once all rows populated: ALTER TABLE orders ALTER COLUMN tenant_id SET NOT NULL;
+  4. Add index: CREATE INDEX CONCURRENTLY idx_orders_tenant ON orders(tenant_id);
+
+BATCH UPDATE TIPS:
+  - Use keyset pagination (WHERE id > last_processed_id) not OFFSET
+    (OFFSET on 100M rows is slow and gets slower as offset increases)
+  - Rate limit: 1000 rows per batch, sleep 50-100ms between batches
+  - Monitor DB CPU and replication lag during backfill
+  - Ensure the job is restartable (idempotent update: SET field WHERE field IS NULL)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BLUE-GREEN DATABASE MIGRATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For major data model overhauls (not column-level changes):
+
+BLUE-GREEN APPROACH:
+  Blue DB: current production database.
+  Green DB: new database with new schema.
+  
+  1. Provision Green DB with new schema.
+  2. Set up replication: Blue (source) → Green (target), with transformation.
+     Tool: AWS DMS (Database Migration Service), Debezium, custom ETL.
+  3. Let Green DB catch up to Blue DB (replication lag → near zero).
+  4. Application migration: some writes go to Blue, replicated to Green.
+  5. Traffic cutover: atomic switch → all new traffic goes to Green.
+     Old Blue → read-only → for rollback.
+  6. Decommission Blue after confidence period (1–7 days).
+  
+  Used for: migrating DB engines (MySQL → Postgres), region migrations,
+  major schema restructuring.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ROLLBACK STRATEGY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Always have a rollback plan before running any migration.
+
+Rollback options:
+  1. Code rollback (deploy previous version) — fast, no DB change.
+     Only works if DB change is backward compatible.
+     This is why EXPAND phase keeps old column running.
+  
+  2. DB rollback script: manually reverse the change.
+     Must be tested in advance (on staging).
+     Drops added columns → can lose data if writes already happened.
+  
+  3. Point-in-time restore: restore from backup to pre-migration state.
+     Last resort. Means accepting data loss for the migration window.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: How would you rename a column in production with zero downtime?
+A: Expand/contract pattern. Phase 1: add new column, write to both,
+   read from old. Phase 2: backfill new column from old. Phase 3: switch
+   reads to new column. Phase 4: stop writing to old. Phase 5: drop old column.
+   Each phase is a separate deployment. May take days for 100M+ row tables.
+
+Q: You need to add an index on a 500M row table in production. What do you do?
+A: CREATE INDEX CONCURRENTLY idx_name ON table(column);
+   CONCURRENTLY means no table lock — reads/writes continue normally.
+   Takes longer than normal index creation but doesn't block production traffic.
+   Monitor: check progress in pg_stat_progress_create_index.
+   Run during off-peak hours even with CONCURRENTLY (still adds write overhead).
+
+Q: What can go wrong with Flyway in production?
+A: Developer modifies a previously applied migration script → Flyway checksum
+   fails → application won't start. Fix: revert the change (or use
+   flyway.repair in emergencies). Mitigation: enforce no-edit policy on
+   applied migrations via CI checks.

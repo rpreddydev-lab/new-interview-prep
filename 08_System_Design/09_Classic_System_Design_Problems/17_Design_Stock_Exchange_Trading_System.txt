@@ -1,0 +1,235 @@
+============================================================
+SYSTEM DESIGN: STOCK EXCHANGE / TRADING PLATFORM
+============================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. PROBLEM STATEMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Design a stock exchange / trading platform that:
+  - Accepts buy and sell orders from traders/brokers
+  - Matches orders (price-time priority)
+  - Executes trades and notifies participants
+  - Maintains order books per security
+  - Broadcasts real-time market data feeds
+
+Scale: 10,000+ orders/sec, < 1ms matching latency, 10,000 securities
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. FUNCTIONAL REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - Place order: Market, Limit, Stop-Loss order types
+  - Cancel/modify order
+  - Order matching engine (price-time priority)
+  - Trade execution and settlement notification
+  - Real-time order book (Level 1: best bid/ask; Level 2: full depth)
+  - Market data feed: last price, volume, OHLCV candlesticks
+  - Portfolio and position tracking
+  - Account / balance management
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. ORDER TYPES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Market Order:  Execute immediately at best available price
+  Limit Order:   Execute only at specified price or better; rests in order book
+  Stop Order:    Becomes market order when price hits trigger
+  Stop-Limit:    Becomes limit order when price hits trigger
+  IOC:           Immediate Or Cancel — fill whatever you can, cancel rest
+  FOK:           Fill Or Kill — fill entirely or cancel entirely
+  GTC:           Good Till Cancelled — stays in book until matched or cancelled
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. ORDER BOOK STRUCTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+An order book maintains all outstanding LIMIT orders for a security.
+
+  BUY ORDERS (BIDS)         │  SELL ORDERS (ASKS)
+  Sorted: highest → lowest  │  Sorted: lowest → highest
+  ──────────────────────────│───────────────────────────
+  Price    Qty   Orders     │  Price    Qty   Orders
+  $150.50  500   [ord1,ord2]│  $150.75  200   [ord5]
+  $150.25  300   [ord3]     │  $151.00  800   [ord6,ord7]
+  $150.00  1000  [ord4]     │  $151.50  400   [ord8]
+
+  Best Bid: $150.50  │  Best Ask: $150.75
+  Spread: $0.25
+
+Data structure for order book:
+  - TreeMap<Price, Queue<Order>> bids (descending)
+  - TreeMap<Price, Queue<Order>> asks (ascending)
+  - HashMap<OrderId, Order> for O(1) cancellation lookup
+
+  Time complexity:
+    - Add order:    O(log N) — TreeMap insertion
+    - Cancel order: O(1) HashMap lookup + O(1) Queue removal
+    - Match:        O(log N) — access best price level
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. MATCHING ENGINE (CORE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The matching engine is the HEART of the exchange. It must be:
+  - Single-threaded per symbol (no locking overhead, deterministic)
+  - In-memory (no database calls on the critical path)
+  - Ultra-low latency (< 1ms)
+
+Price-Time Priority (FIFO):
+  1. Orders matched at the BEST PRICE first
+  2. Among orders at same price → EARLIEST submitted wins
+
+Matching Algorithm for incoming BUY LIMIT order (price P, qty Q):
+  while Q > 0 and asks.bestPrice <= P:
+    topAsk = asks.peek()         // best ask
+    fillQty = min(Q, topAsk.qty)
+    executeTrade(buyOrder, topAsk, topAsk.price, fillQty)
+    Q -= fillQty
+    if topAsk.qty == 0: asks.remove()
+  if Q > 0: place remainder in bids at price P
+
+Matching for MARKET order:
+  - No price constraint; match against best available asks/bids
+  - Risk: slippage if order book is thin
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. HIGH-LEVEL ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌─────────────────────────────────────────────────────────┐
+  │  CLIENT (Broker, Trader, Algo Bot)                      │
+  │  FIX protocol / REST / WebSocket                        │
+  └────────────────────┬────────────────────────────────────┘
+                       │
+  ┌────────────────────▼────────────────────────────────────┐
+  │  ORDER GATEWAY (API Layer)                              │
+  │  - Rate limiting per client                             │
+  │  - Authentication / authorization                       │
+  │  - Order validation (format, limits)                    │
+  │  - Risk pre-check (buying power, position limits)       │
+  └────────────────────┬────────────────────────────────────┘
+                       │ (publish to Kafka)
+  ┌────────────────────▼────────────────────────────────────┐
+  │  ORDER QUEUE — Kafka                                    │
+  │  Topic: orders (partitioned by symbol)                  │
+  │  Guarantees: same symbol → same partition → ordered     │
+  └────────────────────┬────────────────────────────────────┘
+                       │
+  ┌────────────────────▼────────────────────────────────────┐
+  │  MATCHING ENGINE (one instance per symbol shard)        │
+  │  Single-threaded per partition                          │
+  │  In-memory order book (TreeMap + HashMap)               │
+  │  Produces: Trade Events, OrderBook updates              │
+  └──────────┬─────────────────────────┬───────────────────┘
+             │                         │
+  ┌──────────▼──────────┐   ┌──────────▼──────────────────┐
+  │  TRADE PROCESSOR    │   │  MARKET DATA PUBLISHER       │
+  │  - Update positions │   │  - Broadcast order book      │
+  │  - Notify clients   │   │    changes in real-time      │
+  │  - T+2 settlement   │   │  - Candlestick aggregation   │
+  │  - Persist trades   │   │  - WebSocket fan-out         │
+  └──────────┬──────────┘   └─────────────────────────────┘
+             │
+  ┌──────────▼──────────────────────────────────────────────┐
+  │  DATABASES                                              │
+  │  - PostgreSQL: accounts, positions, trade history       │
+  │  - Redis: real-time portfolio state, caching            │
+  │  - TimescaleDB / InfluxDB: market data (OHLCV)          │
+  └─────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. CRITICAL DESIGN DECISIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+─────────────────────────────────
+Why single-threaded matching engine?
+─────────────────────────────────
+  - Multi-threaded matching requires locks → latency spikes
+  - Single-threaded = deterministic, reproducible order of events
+  - Scale horizontally: one thread per symbol (or symbol shard)
+  - Real exchanges (NYSE, NASDAQ, LMAX Exchange) use this model
+
+─────────────────────────────────
+Why partition Kafka by symbol?
+─────────────────────────────────
+  - All orders for AAPL go to the same partition
+  - Single consumer (matching engine) per partition
+  - Maintains strict time ordering per symbol
+  - Easy horizontal scaling: add partitions for more symbols
+
+─────────────────────────────────
+Order Book Recovery (restart/crash)
+─────────────────────────────────
+  - Kafka consumer stores offset; replay from last committed offset
+  - Rebuild in-memory order book by replaying all unmatched orders
+  - OR: take periodic snapshots + replay delta from Kafka
+  - Log all state changes as events (Event Sourcing pattern)
+
+─────────────────────────────────
+Pre-trade Risk Checks
+─────────────────────────────────
+  - Buying power check: cash balance ≥ order value
+  - Position limits: max shares per symbol per account
+  - Fat finger protection: order price not > 20% from last traded price
+  - Circuit breakers: halt trading if price moves > X% in Y minutes
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. MARKET DATA FEED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Two types:
+  Level 1 (Top of Book): Best bid price, best ask price, last trade
+  Level 2 (Market Depth): Full order book (all price levels, qty)
+
+Distribution:
+  - WebSocket for retail clients (bi-directional streaming)
+  - FIX/FAST protocol for institutional (ultra-low latency)
+  - Multicast UDP for market data broadcast (exchange-level)
+
+Aggregation for candlesticks (OHLCV):
+  - Kafka Streams: tumbling 1-min window → compute open/high/low/close/volume
+  - Store in TimescaleDB / InfluxDB for time-series queries
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. SCALE ESTIMATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Orders/sec:         10,000 (peak: 50,000 during market open/close)
+  Symbols:            10,000
+  Orders per symbol:  1 order/sec average
+  Trades/day:         5 million
+  Market data msgs/s: 500,000 (order book updates)
+
+Matching Engines:
+  - 1 thread per symbol = 10,000 threads? No!
+  - Group into 1,000 partitions × 10 symbols each
+  - 1,000 matching engine threads across N machines
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: Why is the matching engine single-threaded?
+A: Locks cause latency and priority inversion. Single-threaded matching
+   is deterministic, faster, and easier to audit. Scale by partitioning
+   symbols across multiple single-threaded engines.
+
+Q: How do you ensure no orders are lost if the matching engine crashes?
+A: Orders are durably stored in Kafka before the matching engine processes them.
+   On restart, replay from the last committed Kafka offset. Optionally use
+   periodic snapshotting to avoid replaying the entire history.
+
+Q: What is price-time priority?
+A: Orders at the best price are matched first. Among orders at the same
+   price, the earliest received order is matched first (FIFO).
+
+Q: How do you prevent a "fat finger" error (accidentally large order)?
+A: Pre-trade checks: validate order price vs last traded price (e.g., reject
+   if price > 20% from current), validate quantity against position limits,
+   enforce per-client daily order limits.
+
+Q: How do you scale the market data feed to millions of subscribers?
+A: Use a tiered fan-out: matching engine → Kafka topic → regional
+   WebSocket servers → clients. WebSocket servers subscribe to Kafka and
+   fan out to local clients. Use CDN/edge for Level 1 data.

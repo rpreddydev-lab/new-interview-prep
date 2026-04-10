@@ -1,0 +1,520 @@
+================================================================================
+KAFKA AS INTER-SERVICE COMMUNICATION — MICROSERVICES
+================================================================================
+
+WHY KAFKA FOR SERVICE COMMUNICATION?
+--------------------------------------
+In microservices, services need to notify each other of state changes.
+Options:
+  REST call (synchronous) → temporal coupling, cascading failures
+  RabbitMQ queue (point-to-point) → limited replay, no log compaction
+  Kafka (distributed log) → decoupled, replay, at-least-once, exactly-once,
+                             consumer groups, multiple consumers per topic
+
+Kafka is not a message queue — it is a DISTRIBUTED COMMIT LOG.
+Messages (events) are persisted and can be replayed by any number of consumers.
+
+────────────────────────────────────────────────────────────────────────────────
+
+KAFKA CORE CONCEPTS (MICROSERVICES LENS)
+==========================================
+
+Topic:        Named log of events. Services publish to and consume from topics.
+              Example: order-events, payment-events, inventory-events
+
+Partition:    A topic is split into partitions for parallelism.
+              Ordering is guaranteed WITHIN a partition (not across).
+              Keys determine which partition a message goes to.
+
+Consumer Group: A set of consumers that collectively process a topic.
+              Each partition is assigned to exactly ONE consumer in the group.
+              Multiple services = multiple consumer groups → independent processing.
+
+Offset:       Position of a message in a partition. Consumers commit offsets
+              to track progress. Reset offset → replay from beginning.
+
+Retention:    Messages are kept for a configured duration (default: 7 days).
+              Allows replay of past events by new consumers.
+
+────────────────────────────────────────────────────────────────────────────────
+
+EVENT-DRIVEN COMMUNICATION PATTERN
+=====================================
+
+  Order Service         Kafka Broker            Inventory Service
+  ──────────────        ─────────────           ─────────────────
+  [ PLACE ORDER ]  →   order-events topic   →   [ RESERVE INVENTORY ]
+                                            →   Notification Service: [ SEND EMAIL ]
+                                            →   Analytics Service: [ LOG EVENT ]
+
+Key insight: Order Service doesn't know or care who consumes its events.
+New consumers can be added without touching the producer.
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING BOOT + KAFKA SETUP
+============================
+
+pom.xml:
+  <dependency>
+    <groupId>org.springframework.kafka</groupId>
+    <artifactId>spring-kafka</artifactId>
+  </dependency>
+  <!-- For JSON serialization -->
+  <dependency>
+    <groupId>com.fasterxml.jackson.core</groupId>
+    <artifactId>jackson-databind</artifactId>
+  </dependency>
+
+application.yml (Producer Service — Order Service):
+  spring:
+    kafka:
+      bootstrap-servers: localhost:9092
+      producer:
+        key-serializer: org.apache.kafka.common.serialization.StringSerializer
+        value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+        acks: all                    # Wait for all replicas to acknowledge
+        retries: 3
+        properties:
+          enable.idempotence: true   # Exactly-once producer semantics
+          max.in.flight.requests.per.connection: 1
+
+application.yml (Consumer Service — Inventory Service):
+  spring:
+    kafka:
+      bootstrap-servers: localhost:9092
+      consumer:
+        group-id: inventory-service
+        auto-offset-reset: earliest
+        key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+        value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+        properties:
+          spring.json.trusted.packages: "com.example.events"
+          isolation.level: read_committed   # Only read committed (transactional) messages
+      listener:
+        ack-mode: MANUAL_IMMEDIATE    # Manual offset commit for at-least-once safety
+
+────────────────────────────────────────────────────────────────────────────────
+
+EVENT CLASSES — SHARED OR SEPARATE?
+======================================
+
+Best practice: Keep event classes in a SHARED LIBRARY or use CloudEvents/Avro schema.
+
+  // shared-events library
+  public record OrderCreatedEvent(
+      String eventId,          // UUID — for idempotency checking
+      String eventType,        // "ORDER_CREATED"
+      String orderId,
+      String customerId,
+      List<OrderItemDto> items,
+      BigDecimal totalAmount,
+      Instant occurredAt
+  ) {}
+
+  public record OrderCancelledEvent(
+      String eventId,
+      String orderId,
+      String reason,
+      Instant occurredAt
+  ) {}
+
+Alternative: Event envelope pattern (single topic, multiple event types):
+  public record DomainEvent(
+      String eventId,
+      String eventType,       // discriminator field
+      String aggregateId,
+      Map<String, Object> payload,
+      Instant occurredAt
+  ) {}
+
+────────────────────────────────────────────────────────────────────────────────
+
+KAFKA PRODUCER — SPRING BOOT
+==============================
+
+  @Service
+  @RequiredArgsConstructor
+  @Slf4j
+  public class OrderEventPublisher {
+
+    private final KafkaTemplate<String, Object> kafkaTemplate;
+
+    private static final String ORDER_EVENTS_TOPIC = "order-events";
+
+    // Basic publish
+    public void publishOrderCreated(Order order) {
+      OrderCreatedEvent event = new OrderCreatedEvent(
+          UUID.randomUUID().toString(),
+          "ORDER_CREATED",
+          order.getId().toString(),
+          order.getCustomerId(),
+          mapItems(order.getItems()),
+          order.getTotalAmount(),
+          Instant.now()
+      );
+
+      // Key = orderId ensures all events for the same order go to the same partition
+      // → preserves ordering of events per order
+      kafkaTemplate.send(ORDER_EVENTS_TOPIC, order.getId().toString(), event)
+          .whenComplete((result, ex) -> {
+            if (ex != null) {
+              log.error("Failed to publish OrderCreatedEvent for order {}",
+                        order.getId(), ex);
+              // In production: dead letter queue or retry via outbox pattern
+            } else {
+              log.info("Published OrderCreatedEvent: topic={}, partition={}, offset={}",
+                  result.getRecordMetadata().topic(),
+                  result.getRecordMetadata().partition(),
+                  result.getRecordMetadata().offset());
+            }
+          });
+    }
+
+    // Transactional publish (atomic with DB write — use Outbox pattern for true atomicity)
+    @Transactional
+    public void publishWithTransaction(Order order) {
+      kafkaTemplate.executeInTransaction(kt -> {
+        kt.send(ORDER_EVENTS_TOPIC, order.getId().toString(),
+                new OrderCreatedEvent(/* ... */));
+        kt.send("audit-events", order.getId().toString(),
+                new AuditEvent("ORDER_CREATED", order.getId()));
+        return null;
+      });
+    }
+  }
+
+  // KafkaTemplate Bean configuration
+  @Configuration
+  public class KafkaProducerConfig {
+
+    @Bean
+    public KafkaTemplate<String, Object> kafkaTemplate(ProducerFactory<String, Object> pf) {
+      KafkaTemplate<String, Object> template = new KafkaTemplate<>(pf);
+      template.setObservationEnabled(true);  // OpenTelemetry tracing
+      return template;
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+KAFKA CONSUMER — SPRING BOOT
+==============================
+
+  @Component
+  @RequiredArgsConstructor
+  @Slf4j
+  public class InventoryEventConsumer {
+
+    private final InventoryService inventoryService;
+    private final ProcessedEventRepository processedEventRepository;
+
+    @KafkaListener(
+        topics = "order-events",
+        groupId = "inventory-service",
+        containerFactory = "kafkaListenerContainerFactory"
+    )
+    public void onOrderEvent(
+        @Payload OrderCreatedEvent event,
+        @Header(KafkaHeaders.RECEIVED_TOPIC) String topic,
+        @Header(KafkaHeaders.RECEIVED_PARTITION) int partition,
+        @Header(KafkaHeaders.OFFSET) long offset,
+        Acknowledgment acknowledgment) {
+
+      log.info("Received event: type={}, orderId={}, topic={}, partition={}, offset={}",
+          event.eventType(), event.orderId(), topic, partition, offset);
+
+      try {
+        // IDEMPOTENCY CHECK — process each event exactly once
+        if (processedEventRepository.existsByEventId(event.eventId())) {
+          log.warn("Duplicate event detected, skipping: {}", event.eventId());
+          acknowledgment.acknowledge();
+          return;
+        }
+
+        // Process the event
+        inventoryService.reserveInventory(event.orderId(), event.items());
+
+        // Mark as processed (in the same DB transaction as the inventory update)
+        processedEventRepository.save(new ProcessedEvent(event.eventId(), Instant.now()));
+
+        // Manually commit offset AFTER successful processing
+        acknowledgment.acknowledge();
+
+      } catch (InventoryInsufficientException e) {
+        log.warn("Insufficient inventory for order {}", event.orderId(), e);
+        // Publish compensating event
+        publishInventoryReservationFailed(event.orderId(), e.getMessage());
+        acknowledgment.acknowledge();  // Don't retry — compensation handles it
+
+      } catch (Exception e) {
+        log.error("Failed to process event {}, will retry", event.eventId(), e);
+        // Don't acknowledge — message will be redelivered
+        // After max retries, Spring sends to Dead Letter Topic
+      }
+    }
+
+    // Listen to multiple event types on same topic
+    @KafkaListener(topics = "order-events", groupId = "notification-service")
+    public void onAnyOrderEvent(@Payload String rawPayload,
+                                @Header("eventType") String eventType) {
+      switch (eventType) {
+        case "ORDER_CREATED"    -> sendOrderConfirmationEmail(rawPayload);
+        case "ORDER_CANCELLED"  -> sendCancellationEmail(rawPayload);
+        case "ORDER_SHIPPED"    -> sendShippingNotification(rawPayload);
+      }
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+KAFKA CONSUMER CONFIGURATION
+===============================
+
+  @Configuration
+  public class KafkaConsumerConfig {
+
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, Object>
+        kafkaListenerContainerFactory(ConsumerFactory<String, Object> cf) {
+
+      ConcurrentKafkaListenerContainerFactory<String, Object> factory =
+          new ConcurrentKafkaListenerContainerFactory<>();
+      factory.setConsumerFactory(cf);
+      factory.setConcurrency(3);   // 3 consumer threads (≤ number of partitions)
+      factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
+      factory.setObservationEnabled(true);  // Micrometer/OTel tracing
+
+      // Dead Letter Publishing (after max retries)
+      factory.setCommonErrorHandler(new DefaultErrorHandler(
+          new DeadLetterPublishingRecoverer(kafkaTemplate),
+          new FixedBackOff(1000L, 3)  // 3 retries, 1s interval
+      ));
+
+      return factory;
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+DEAD LETTER TOPIC (DLT)
+=========================
+
+When a consumer exhausts retries, Spring Kafka automatically publishes the
+failed message to a Dead Letter Topic (DLT).
+
+  Default DLT name: {original-topic}.DLT
+  Example: order-events.DLT
+
+  @KafkaListener(topics = "order-events.DLT", groupId = "dlt-handler")
+  public void handleDeadLetter(
+      @Payload byte[] payload,
+      @Header(KafkaHeaders.RECEIVED_TOPIC) String topic,
+      @Header(KafkaHeaders.EXCEPTION_MESSAGE) String exceptionMessage) {
+
+    log.error("Dead letter received from topic {}: {}", topic, exceptionMessage);
+    // Alert, store for manual reprocessing, or trigger compensation
+    deadLetterRepository.save(new DeadLetterEntry(
+        new String(payload), topic, exceptionMessage, Instant.now()));
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+KAFKA TOPIC DESIGN FOR MICROSERVICES
+=======================================
+
+TOPIC NAMING CONVENTIONS:
+  {domain}.{entity}.{event-type}     → orders.order.created
+  {service}.events                   → order-service.events
+  {aggregate}.events                 → order-events
+
+PARTITION STRATEGY:
+  - Number of partitions = max consumer parallelism
+  - Partition key = entity ID (orderId, customerId) for ordering
+  - Default (no key) → round-robin distribution
+  - Too few partitions: bottleneck; Too many: overhead
+
+TOPIC CONFIGURATION (important settings):
+  retention.ms=604800000      # 7 days retention
+  cleanup.policy=delete       # Delete old segments (vs compact for CDC)
+  replication.factor=3        # 3 replicas for HA (≤ broker count)
+  min.insync.replicas=2       # acks=all needs 2 ISRs
+
+TOPIC TYPES:
+  Event Topics:       Regular events, short retention (7-30 days)
+                      order-events, payment-events
+  Compacted Topics:   Latest value per key kept forever (like a table)
+                      customer-profiles (key=customerId, value=latest profile)
+  Audit/Log Topics:   Long retention (1 year+) for compliance
+                      audit-log
+
+────────────────────────────────────────────────────────────────────────────────
+
+ORDERING GUARANTEES
+====================
+
+Kafka guarantees ordering WITHIN a partition only.
+
+  ORDER EVENTS FOR ORDER-123 (same key → same partition → ordered):
+  partition-0: [ORDER_CREATED] → [PAYMENT_PROCESSED] → [ORDER_SHIPPED] → [DELIVERED]
+
+  If different orders go to different partitions, their events are unordered
+  relative to each other — but that's usually fine.
+
+WHEN YOU NEED GLOBAL ORDERING:
+  - Use a single partition topic (sacrifices parallelism)
+  - Or use sequence numbers in events and consumer handles reordering
+
+COMMON ORDERING PITFALLS:
+  - Don't use null as message key → round-robin → same order's events can land
+    in different partitions → out-of-order processing
+  - With multiple consumer threads, processing of the same partition is
+    still sequential; parallelism is across partitions only
+
+────────────────────────────────────────────────────────────────────────────────
+
+EXACTLY-ONCE SEMANTICS IN KAFKA
+==================================
+
+Delivery semantics:
+  At-most-once:   Message may be lost, never duplicated (auto commit before process)
+  At-least-once:  Message never lost, may be duplicated (manual commit after process)
+  Exactly-once:   Message processed exactly once (Kafka transactions + idempotency)
+
+EXACTLY-ONCE PRODUCER (idempotent + transactional):
+  spring.kafka.producer.properties.enable.idempotence=true
+  spring.kafka.producer.properties.transactional.id=order-service-tx-${random}
+
+  // Transactional producer
+  kafkaTemplate.executeInTransaction(kt -> {
+    kt.send("order-events", orderId, orderCreatedEvent);
+    kt.send("inventory-commands", orderId, reserveInventoryCommand);
+    return null;
+  });
+
+EXACTLY-ONCE CONSUMER (read committed + idempotent processing):
+  isolation.level=read_committed
+  + Idempotency check in consumer (processedEventRepository)
+
+Full exactly-once end-to-end (Kafka Streams):
+  - Kafka Streams with processing.guarantee=exactly_once_v2
+  - Complex to set up; most microservices use at-least-once + idempotency
+
+────────────────────────────────────────────────────────────────────────────────
+
+KAFKA vs RabbitMQ FOR MICROSERVICES
+=====================================
+
+Feature              │ Kafka                          │ RabbitMQ
+─────────────────────┼────────────────────────────────┼──────────────────────
+Model                │ Distributed log (pull)         │ Message broker (push)
+Message retention    │ Configurable (days/forever)    │ Until consumed
+Replay               │ Yes — reset offset             │ No — deleted on consume
+Throughput           │ Very high (millions/sec)       │ High (thousands/sec)
+Message ordering     │ Per-partition                  │ Per-queue (FIFO)
+Multiple consumers   │ Same message → many groups     │ Competing consumers only
+Routing              │ Topic + partition key          │ Exchanges + routing keys
+Complex routing      │ Limited                        │ Rich (topic, fanout, etc.)
+Use case             │ Event streaming, audit, replay │ Task queues, RPC, routing
+Spring integration   │ spring-kafka                   │ spring-amqp / spring-rabbit
+
+Choose Kafka:  Event streaming, audit logs, replay, high-throughput, many consumers
+Choose RabbitMQ: Task queues, complex routing, lower volume, point-to-point work
+
+────────────────────────────────────────────────────────────────────────────────
+
+TESTING KAFKA IN MICROSERVICES
+================================
+
+Unit test (mock KafkaTemplate):
+  @ExtendWith(MockitoExtension.class)
+  class OrderEventPublisherTest {
+    @Mock KafkaTemplate<String, Object> kafkaTemplate;
+    @InjectMocks OrderEventPublisher publisher;
+
+    @Test
+    void publishOrderCreated_sendsToCorrectTopic() {
+      when(kafkaTemplate.send(any(), any(), any()))
+          .thenReturn(CompletableFuture.completedFuture(mock(SendResult.class)));
+
+      publisher.publishOrderCreated(sampleOrder());
+
+      verify(kafkaTemplate).send(eq("order-events"),
+          eq(sampleOrder().getId().toString()), any(OrderCreatedEvent.class));
+    }
+  }
+
+Integration test with EmbeddedKafka:
+  @SpringBootTest
+  @EmbeddedKafka(partitions = 1, topics = {"order-events"})
+  class KafkaIntegrationTest {
+
+    @Autowired KafkaTemplate<String, Object> kafkaTemplate;
+    @Autowired InventoryEventConsumer consumer;
+
+    @Test
+    void whenOrderCreated_inventoryIsReserved() throws InterruptedException {
+      OrderCreatedEvent event = new OrderCreatedEvent(/* ... */);
+      kafkaTemplate.send("order-events", "ord-123", event);
+
+      // Wait for consumer to process
+      await().atMost(5, SECONDS).until(() ->
+          inventoryService.isReserved("ord-123"));
+    }
+  }
+
+Integration test with TestContainers (preferred — real Kafka):
+  @Testcontainers
+  @SpringBootTest
+  class KafkaTestContainersTest {
+
+    @Container
+    static KafkaContainer kafka = new KafkaContainer(
+        DockerImageName.parse("confluentinc/cp-kafka:7.6.0"));
+
+    @DynamicPropertySource
+    static void kafkaProps(DynamicPropertyRegistry registry) {
+      registry.add("spring.kafka.bootstrap-servers", kafka::getBootstrapServers);
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS — KAFKA IN MICROSERVICES
+=============================================
+
+Q: How does Kafka decouple microservices compared to REST?
+A: With REST, both services must be up simultaneously (temporal coupling). With
+   Kafka, the producer publishes to a topic and continues — the consumer processes
+   independently, even hours later. The producer doesn't know or depend on who
+   consumes. New consumers can be added without changing the producer.
+
+Q: How do you guarantee exactly-once processing in a Kafka consumer?
+A: True exactly-once requires: (1) idempotent Kafka producer (enable.idempotence=true),
+   (2) Kafka transactions if producing from a consumer, (3) idempotency check in the
+   consumer (store processed event IDs in DB and check before processing). Most
+   production systems use at-least-once delivery + idempotent consumers.
+
+Q: How do you ensure ordering of events for the same order?
+A: Use the order ID as the Kafka message key. Kafka routes messages with the same
+   key to the same partition. Since consumers process a partition sequentially,
+   all events for the same order are processed in order.
+
+Q: What happens when a consumer fails to process a message?
+A: With manual acknowledgment (AckMode.MANUAL), the offset is not committed.
+   On restart, the consumer reprocesses from the last committed offset.
+   After exhausting retries (DefaultErrorHandler with FixedBackOff), Spring Kafka
+   sends the message to the Dead Letter Topic (DLT) for manual inspection.
+
+Q: What is the difference between consumer group and partition in Kafka?
+A: A partition is a unit of parallelism in a topic. A consumer group is a set of
+   consumers that collectively process all partitions of a topic — each partition
+   is assigned to exactly one consumer in the group. Multiple services each have
+   their own consumer group → each receives ALL events independently.
+
+Q: When would you use log compaction on a Kafka topic?
+A: Log compaction keeps only the latest value per key, removing older versions.
+   Use it for topics that represent the current state of an entity — e.g.,
+   a customer-profiles topic where only the latest profile matters. Event topics
+   use regular delete retention; state/entity topics use compaction.
+================================================================================

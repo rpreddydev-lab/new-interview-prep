@@ -1,0 +1,253 @@
+PAGINATION STRATEGIES IN JAVA & SPRING
+===========================================================================================================
+
+WHY PAGINATION?
+---------------
+Never return unbounded result sets from an API.
+10 million rows cannot fit in memory or be useful to a client.
+Pagination breaks results into manageable pages.
+
+Two main approaches:
+  1. OFFSET-based pagination  — simple but has serious limitations at scale
+  2. Keyset (Cursor-based) pagination — production-grade for large datasets
+
+===========================================================================================================
+1. OFFSET-BASED PAGINATION
+===========================================================================================================
+
+SQL:
+  SELECT * FROM products ORDER BY id LIMIT 20 OFFSET 200;
+
+How it works:
+  The DB scans and discards the first OFFSET rows, then returns the next LIMIT rows.
+
+Spring Data JPA:
+  Page<Product> findAll(Pageable pageable);
+  
+  // In controller:
+  Pageable pageable = PageRequest.of(page, 20, Sort.by("id").ascending());
+  Page<Product> result = productRepo.findAll(pageable);
+
+  // Page object has:
+  result.getContent()         // current page data
+  result.getTotalElements()   // total record count (requires COUNT(*) query)
+  result.getTotalPages()      // total pages
+  result.hasNext()            // whether next page exists
+  result.getNumber()          // current page number (0-indexed)
+
+Generated SQL (two queries):
+  SELECT * FROM products ORDER BY id LIMIT 20 OFFSET 200;
+  SELECT COUNT(*) FROM products;  -- expensive COUNT for total pages!
+
+---
+
+PROBLEMS WITH OFFSET PAGINATION
+---------------------------------
+
+Problem 1: Performance degrades with large offsets.
+  OFFSET 200 → scan 220 rows, discard 200, return 20.
+  OFFSET 1,000,000 → scan 1,000,020 rows, discard 1M, return 20.
+  The more you paginate, the SLOWER it gets.
+
+Problem 2: Data inconsistency between pages.
+  Page 1 at T1: returns rows 1–20 (newest first)
+  A new row is inserted.
+  Page 2 at T2: OFFSET 20 now skips what was previously row 20 (now row 21).
+  Result: Duplicate row appears on page 2 / row missed entirely.
+
+Problem 3: Expensive COUNT(*) for total pages.
+  Page<T> in Spring Data always fires a separate COUNT query.
+  On tables with millions of rows — this is slow.
+  Fix: Use Slice<T> instead of Page<T> (no COUNT, just hasNext check).
+
+---
+
+WHEN OFFSET IS ACCEPTABLE:
+  - Small datasets (< 100K rows)
+  - Admin interfaces where performance is not critical
+  - Reports where user expects exact page numbers
+
+===========================================================================================================
+2. KEYSET (CURSOR-BASED) PAGINATION
+===========================================================================================================
+
+Instead of OFFSET, use the LAST VALUE from previous page as a filter anchor.
+
+SQL:
+  -- Page 1:
+  SELECT * FROM products ORDER BY id LIMIT 20;
+  -- Last id returned: 520
+  
+  -- Page 2 (using last id as cursor):
+  SELECT * FROM products WHERE id > 520 ORDER BY id LIMIT 20;
+  -- Last id returned: 540
+  
+  -- Page 3:
+  SELECT * FROM products WHERE id > 540 ORDER BY id LIMIT 20;
+
+Why it's efficient:
+  Uses the index on `id` → O(log N) seek directly to position.
+  No full scan of skipped rows.
+  Performance is CONSTANT regardless of page depth.
+
+---
+
+COMPOSITE CURSOR (for multi-column sort):
+  Sort by (created_at DESC, id ASC) — stable sort with tiebreaker.
+  
+  SELECT * FROM products
+  WHERE (created_at < :lastCreatedAt)
+     OR (created_at = :lastCreatedAt AND id > :lastId)
+  ORDER BY created_at DESC, id ASC
+  LIMIT 20;
+
+Always include a unique column (like id) as the final tiebreaker to ensure stable ordering.
+
+---
+
+SPRING DATA IMPLEMENTATION — Slice<T>
+--------------------------------------
+Slice<T> is like Page<T> but WITHOUT the COUNT query.
+
+  public interface ProductRepository extends JpaRepository<Product, Long> {
+    Slice<Product> findByIdGreaterThanOrderById(Long lastId, Pageable pageable);
+  }
+
+  // Service:
+  Pageable pageable = PageRequest.of(0, 20);  // page 0 always — offset is in WHERE clause
+  Slice<Product> slice = productRepo.findByIdGreaterThanOrderById(lastId, pageable);
+  
+  List<Product> items = slice.getContent();
+  boolean hasMore = slice.hasNext();
+  Long newCursor = items.isEmpty() ? null : items.get(items.size() - 1).getId();
+
+---
+
+CUSTOM KEYSET QUERY WITH JPQL:
+  @Query("SELECT p FROM Product p WHERE p.id > :lastId ORDER BY p.id ASC")
+  List<Product> findNextPage(@Param("lastId") Long lastId, Pageable pageable);
+  
+  // Use:
+  List<Product> page = productRepo.findNextPage(lastId, PageRequest.of(0, 20));
+
+---
+
+API DESIGN FOR CURSOR-BASED PAGINATION
+---------------------------------------
+Request:  GET /api/products?cursor=<opaque-cursor>&limit=20
+Response: {
+            "items": [...],
+            "nextCursor": "eyJpZCI6NTQwfQ==",   // Base64 encoded cursor
+            "hasMore": true
+          }
+
+Cursor encoding:
+  - Opaque to client (Base64 encode JSON: {"id": 540})
+  - Allows changing cursor structure without breaking API contract
+  - Contains all fields needed to anchor the next query
+
+  String cursor = Base64.getEncoder().encodeToString(
+      objectMapper.writeValueAsBytes(Map.of("id", lastId)));
+
+---
+
+SPRING DATA WINDOW / KEYSET WITH Spring 3+
+--------------------------------------------
+Spring Data 3.x introduced Window<T> with KeysetScrollPosition.
+
+  Window<Product> page = productRepo.findBy(
+      Example.of(product),
+      q -> q.sortBy(Sort.by("id").ascending()).limit(20).scroll(scrollPosition)
+  );
+  
+  KeysetScrollPosition nextPosition = (KeysetScrollPosition) page.positionAt(page.size() - 1);
+
+This is the most native Spring Data way to implement keyset pagination.
+
+---
+
+===========================================================================================================
+3. COMPARISON TABLE
+===========================================================================================================
+
+| Feature                    | OFFSET Pagination    | Keyset Pagination         |
+|----------------------------|----------------------|---------------------------|
+| Performance at deep pages  | O(n) — degrades      | O(log n) — constant       |
+| Total count (# pages)      | Yes (COUNT query)    | No (only hasNext)         |
+| Random page access         | Yes (go to page 50)  | No (must traverse forward)|
+| Data consistency           | Unstable (inserts    | Stable (cursor anchored)  |
+|                            | shift pages)         |                           |
+| Spring Data class          | Page<T>              | Slice<T>, Window<T>       |
+| Good for                   | Small data, admin    | Large data, infinite      |
+|                            | pages, reports       | scroll, feeds, APIs       |
+| Implementation complexity  | Very simple          | Moderate                  |
+
+===========================================================================================================
+4. SEEK METHOD / JOOQ KEYSET
+===========================================================================================================
+
+JOOQ (alternative to JPA) has first-class keyset pagination support:
+
+  Result<Record> page = dsl
+      .selectFrom(PRODUCTS)
+      .orderBy(PRODUCTS.CREATED_AT.desc(), PRODUCTS.ID.asc())
+      .seek(lastCreatedAt, lastId)  // seek() does the WHERE clause magic
+      .limit(20)
+      .fetch();
+
+JOOQ generates the correct multi-column keyset WHERE clause automatically.
+
+===========================================================================================================
+5. INFINITE SCROLL VS TRADITIONAL PAGINATION
+===========================================================================================================
+
+Infinite Scroll (Mobile/Social Feed):
+  - Use keyset pagination (cursor-based)
+  - Client sends cursor from last item
+  - Server returns next N items + new cursor
+  - No page numbers needed
+  - Very efficient
+
+Traditional Pagination (Admin, Reports):
+  - Use OFFSET with Page<T>
+  - Acceptable because dataset is smaller + user needs page numbers
+  - Cache COUNT result if expensive
+
+===========================================================================================================
+6. DATABASE-LEVEL CONSIDERATIONS
+===========================================================================================================
+
+For keyset pagination to be efficient:
+  1. The sort column(s) MUST be indexed.
+  2. Sort order must be STABLE (deterministic). Always add a unique tiebreaker.
+  3. NULL handling: Be explicit about NULLS FIRST / NULLS LAST in ORDER BY.
+
+Index for common sort patterns:
+  -- For created_at DESC, id ASC pagination:
+  CREATE INDEX idx_products_pagination ON products (created_at DESC, id ASC);
+
+===========================================================================================================
+7. INTERVIEW Q&A
+===========================================================================================================
+
+Q: What is the performance problem with OFFSET pagination?
+A: OFFSET causes the database to scan and discard the first N rows before returning results.
+   At large offsets (page 50000), this means scanning millions of rows — O(n) complexity.
+   Keyset pagination avoids this by using an indexed WHERE condition — O(log n).
+
+Q: What is the difference between Page<T> and Slice<T> in Spring Data?
+A: Page<T>:  Fires a COUNT(*) query to calculate total pages/elements. More expensive.
+   Slice<T>: No COUNT query. Only checks if there are more results (hasNext). Faster.
+   Use Slice<T> for cursor-based pagination and infinite scroll.
+
+Q: How would you implement cursor-based pagination where results are sorted by created_at (non-unique)?
+A: Use a composite cursor: (created_at, id) where id is the tiebreaker.
+   WHERE clause: (created_at < :lastCreatedAt) OR (created_at = :lastCreatedAt AND id > :lastId)
+   ORDER BY created_at DESC, id ASC
+   This ensures stable pagination even with identical timestamps.
+
+Q: Why can't you use keyset pagination to jump to page 50?
+A: Keyset pagination requires knowing the cursor value (last item of previous page).
+   To reach page 50, you'd need the cursor from page 49, which requires traversing pages 1–49.
+   There's no way to compute the cursor for an arbitrary page without reading prior pages.
+   For use cases requiring page number jumps → use OFFSET (accepting its limitations).

@@ -1,0 +1,251 @@
+================================================================
+  ARCHITECTURAL PATTERNS — INTERVIEW QUESTIONS & ANSWERS
+================================================================
+
+  Level:    Senior (7–10+ YOE)
+  Frequency: High for architect-track, tech lead, and senior backend roles.
+
+================================================================
+SECTION 1: GENERAL ARCHITECTURE
+================================================================
+
+  Q1: How do you decide which architectural pattern to use for a new service?
+  ---------------------------------------------------------------------------
+  A: I evaluate along these dimensions:
+     1. Domain complexity: is the business logic rich and complex (DDD, Hexagonal)
+        or mostly CRUD (simple Layered MVC)?
+     2. Team size: large teams benefit from explicit bounded contexts (DDD).
+     3. Testability requirements: high test quality demands → Hexagonal/Clean.
+     4. Read/write asymmetry: heavy analytics/reporting → CQRS.
+     5. Integration footprint: multiple I/O adapters (REST + gRPC + batch + messaging)
+        → Hexagonal Ports & Adapters.
+     6. Long-term lifespan: long-lived app that will outlast current frameworks
+        → Clean Architecture for framework independence.
+
+     I typically start with a clean layered MVC (Controller → Service → Repository)
+     and introduce Hexagonal structure when the service grows beyond a handful of
+     use cases or when multiple adapters appear.
+
+
+  Q2: What are the most common architectural mistakes in Java Spring Boot projects?
+  ----------------------------------------------------------------------------------
+  A:
+     1. Business logic in Controllers: controllers bloated with validation, business
+        rules, and DB calls. Violates SRP. Fix: move to @Service.
+
+     2. JPA entities returned from REST controllers: exposes DB structure, triggers
+        lazy loading issues (N+1), and couples API contract to DB schema.
+        Fix: always map to DTOs at the controller boundary.
+
+     3. No domain model (Anemic Domain Model): @Service does everything; entities
+        are pure data holders. Fix: push behavior into domain objects.
+
+     4. @Transactional on everything: including read methods without readOnly=true;
+        or too-large transaction boundaries causing DB lock contention.
+
+     5. @Autowired field injection: hides dependencies, breaks testability.
+        Fix: constructor injection (Lombok @RequiredArgsConstructor).
+
+     6. One monolithic service class: e.g., UserService with 60+ methods.
+        Fix: split by sub-domain or use case (UserRegistrationService,
+        UserProfileService, UserAuthenticationService).
+
+
+================================================================
+SECTION 2: MVC
+================================================================
+
+  Q3: Walk me through what happens when a Spring Boot REST request is received.
+  -----------------------------------------------------------------------------
+  A:
+     1. HTTP request hits the embedded Tomcat/Netty server.
+     2. DispatcherServlet (Front Controller) receives all requests.
+     3. HandlerMapping identifies the matching @RequestMapping method.
+     4. HandlerAdapter invokes the controller method.
+     5. @RequestBody deserialized by HttpMessageConverter (Jackson by default).
+     6. @Valid triggers Bean Validation (JSR 380) if present.
+     7. Controller calls the @Service method.
+     8. Service executes business logic, calls @Repository.
+     9. @Transactional proxy wraps the service call in a DB transaction.
+     10. Result mapped to DTO; Jackson serializes to JSON.
+     11. ResponseEntity or @ResponseBody sends HTTP response.
+     12. If exception thrown: @ExceptionHandler / @RestControllerAdvice intercepts.
+
+
+  Q4: How do you keep controllers thin?
+  -------------------------------------
+  A: A controller should only:
+     1. Parse and validate HTTP input (@RequestBody, @PathVariable, @Valid).
+     2. Call exactly ONE service method.
+     3. Map the result to an HTTP response (status code, body, headers).
+     4. Handle HTTP-level exceptions.
+     No business logic, no DB calls, no if-else on business conditions.
+     If my controller method exceeds ~15 lines, I extract to the service layer.
+
+
+================================================================
+SECTION 3: HEXAGONAL / CLEAN ARCHITECTURE
+================================================================
+
+  Q5: What's the main benefit of Hexagonal Architecture over layered?
+  -------------------------------------------------------------------
+  A: The domain is testable without any infrastructure. In layered arch, the
+     domain Service imports @Repository (JPA), which means testing it requires
+     a DB or complex mocking. In Hexagonal, the domain defines Repository as an
+     interface (port). Unit tests inject a simple in-memory FakeRepository — no
+     Spring context, no DB, milliseconds to run.
+     Additionally: adding a new adapter (e.g., a gRPC adapter alongside REST)
+     requires zero changes to business logic — just a new primary adapter class.
+
+  Q6: How do you handle the mapping between domain objects and JPA entities?
+  --------------------------------------------------------------------------
+  A: In Hexagonal/Clean Architecture, I maintain separate domain model and JPA
+     persistence model. A Mapper (using MapStruct or manual code) translates:
+       - On read: JpaOrderEntity → Order domain object.
+       - On write: Order domain object → JpaOrderEntity.
+
+     This keeps the domain free of @Entity, @Column, @GeneratedValue annotations.
+     The JPA entity is purely an infrastructure concern.
+
+     Trade-off: more mapping code. Justified for complex domains; possibly
+     over-engineering for simple CRUD services.
+
+
+================================================================
+SECTION 4: DDD
+================================================================
+
+  Q7: How do you determine Aggregate boundaries?
+  -----------------------------------------------
+  A: Key rules for aggregate design:
+     1. Invariant rule: all data that must be consistent together belongs in one aggregate.
+        e.g., Order and its OrderItems — you can't have an Order with invalid items.
+     2. One transaction = one aggregate: never modify two aggregates in one transaction.
+        If you do, use eventual consistency via domain events.
+     3. Reference other aggregates by ID only, never by object reference.
+        Order has CustomerId (value object), not a reference to Customer object.
+     4. Small aggregates: the smaller the aggregate, the less lock contention.
+        Split large aggregates into smaller ones connected by domain events.
+
+  Q8: How do you handle cross-aggregate operations?
+  --------------------------------------------------
+  A: Two approaches:
+     1. Application Service orchestration: the application service loads both aggregates,
+        calls methods on each, saves both (in one transaction — only OK if in the same DB
+        and you accept the coupling).
+     2. Domain Events + eventual consistency: Aggregate A publishes a domain event.
+        An event handler (or saga) reacts and updates Aggregate B asynchronously.
+        This is preferred for microservices or when strict decoupling is needed.
+
+     Example: placing an order should reserve inventory.
+     Option 2: OrderService.placeOrder() publishes OrderPlacedEvent.
+     InventoryService listens and reserves stock.
+     If reservation fails, a compensating event (OrderCancelled) is published.
+
+
+  Q9: What is a Saga pattern and when do you use it?
+  ---------------------------------------------------
+  A: A Saga manages a long-running, multi-step business process that spans multiple
+     aggregates or services, maintaining consistency through compensating transactions
+     instead of distributed ACID transactions.
+
+     Two types:
+       Choreography: each service publishes events and reacts to others' events.
+         Pros: simple. Cons: hard to track overall flow.
+       Orchestration: a central saga orchestrator (state machine) sends commands
+         and reacts to replies.
+         Pros: explicit flow. Cons: single point of coordination.
+
+     Example: Order placement saga:
+       1. OrderService: create order (PENDING).
+       2. PaymentService: process payment.
+       3. InventoryService: reserve items.
+       4. ShippingService: create shipment.
+       If step 3 fails: compensate step 2 (refund), step 1 (cancel order).
+
+
+================================================================
+SECTION 5: CQRS
+================================================================
+
+  Q10: When would you introduce CQRS in a project?
+  -------------------------------------------------
+  A: I'd introduce CQRS when:
+     1. Read queries require complex denormalized views that are hard to express
+        with the write-side domain model (e.g., analytics dashboards with aggregated data).
+     2. Read load far exceeds write load — need to scale reads independently.
+     3. The domain is complex enough to warrant strict separation of state-changing
+        operations from queries.
+
+     I'd START with Level 1 (separate interfaces for commands and queries).
+     Introduce separate data stores only when there's a measurable performance need.
+
+     I'd AVOID CQRS for simple CRUD apps — the added complexity of two models,
+     event synchronization, and eventual consistency far outweighs the benefit.
+
+  Q11: How do you keep the read model synchronized in full CQRS?
+  --------------------------------------------------------------
+  A: The command side publishes domain events (via Kafka, Spring Events, or Outbox pattern)
+     whenever state changes. Event handlers (projectors) consume these events and
+     update the read model (Elasticsearch index, Redis cache, denormalized SQL view).
+
+     Key challenge: what if the projector fails after the command commits?
+     Use the Outbox Pattern: write the event to an outbox table in the SAME transaction
+     as the state change. A separate process reads the outbox and publishes to Kafka.
+     This ensures at-least-once delivery without distributed transactions.
+
+
+================================================================
+SECTION 6: TRADE-OFF QUESTIONS
+================================================================
+
+  Q12: Microservices vs Monolith — what's your take?
+  ---------------------------------------------------
+  A: Monolith first, microservices when justified. Reasons:
+     - Monoliths are simpler to build, test, and deploy initially.
+     - Microservices introduce: network latency, distributed transactions, service
+       discovery, independent deployments, polyglot complexity.
+     - Microservices scale team complexity: each service = autonomous team.
+
+     Extract to microservices when:
+       - A specific component needs to scale independently (e.g., image processing).
+       - A component needs different technology (Python ML model alongside Java backend).
+       - Team size makes the monolith a coordination bottleneck.
+       - Different release cadences per component.
+
+     Modular Monolith: a middle ground — single deployable, but modules have strict
+     boundaries (separate packages, no cross-module direct calls). Easier to extract later.
+
+  Q13: How do you ensure backward compatibility in distributed systems?
+  --------------------------------------------------------------------
+  A:
+     API versioning:
+       - URL versioning (/api/v1/orders) — clear, visible.
+       - Header versioning (Accept: application/vnd.company.v2+json) — cleaner URLs.
+       - Add fields before removing; deprecate before breaking changes.
+
+     Event schema evolution (Kafka, etc.):
+       - Use a schema registry (Confluent Schema Registry + Avro/Protobuf).
+       - Schema evolution rules: add optional fields, never remove or rename.
+       - Consumer-driven contract testing (Pact) to detect breaking changes before deploy.
+
+     Database migrations:
+       - Expand-Contract (Blue-Green): add new column → backfill → switch code → remove old.
+       - Never drop a column the current version still reads.
+       - Flyway/Liquibase for versioned, repeatable migrations.
+
+================================================================
+INTERVIEW TIPS
+================================================================
+
+  - For architectural questions: ALWAYS mention trade-offs. "This pattern gives
+    us X benefit but at the cost of Y complexity."
+  - Draw architecture diagrams if given a whiteboard — visual communication
+    of architectural understanding is highly valued at senior level.
+  - Frame your answers around real decisions you've made: "On my last project,
+    we chose Hexagonal Architecture because we had to support both REST and
+    a batch job consuming the same business logic..."
+  - Know the continuum: Layered → Hexagonal → Clean → DDD — each adds rigor
+    and complexity. Know when each step is justified.
+
+================================================================

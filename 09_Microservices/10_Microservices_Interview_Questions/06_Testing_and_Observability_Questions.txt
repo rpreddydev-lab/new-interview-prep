@@ -1,0 +1,511 @@
+================================================================================
+TESTING AND OBSERVABILITY INTERVIEW QUESTIONS
+MICROSERVICES — SENIOR LEVEL (7+ YOE)
+================================================================================
+
+FORMAT: Each question lists what the interviewer is really testing,
+        followed by the ideal senior-level answer.
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 1 — TESTING STRATEGY AND PHILOSOPHY
+────────────────────────────────────────────────────────────────────────────────
+
+Q1: What is the Testing Pyramid and how does it apply to microservices?
+──────────────────────────────────────────────────────────────────────
+Tests for: Understanding of test design philosophy and cost-benefit tradeoffs.
+
+A: The Testing Pyramid has three layers:
+   Bottom (Unit tests — most): Fast, cheap, isolated. Test a single class with
+   mocked dependencies. Should make up ~70% of tests. Example: testing business
+   logic in an OrderService with a mocked repository.
+
+   Middle (Integration tests): Test interactions between components — Spring
+   context, database queries, REST layer. Slower and more expensive. Use
+   @SpringBootTest for Spring context, TestContainers for real PostgreSQL/Kafka.
+   ~20% of tests.
+
+   Top (E2E / Contract tests): Fewest, slowest, most brittle. Test the full
+   system across service boundaries. In microservices, E2E tests are often
+   replaced with Consumer-Driven Contract Tests (Pact) which verify service
+   boundaries without deploying the full stack.
+
+   Anti-pattern to avoid: The "Ice Cream Cone" — heavy E2E tests at the top,
+   few unit tests. This leads to slow, flaky CI pipelines.
+
+Q2: How do you test microservices in isolation without starting the entire system?
+──────────────────────────────────────────────────────────────────────────────────
+Tests for: Practical knowledge of test doubles and tools.
+
+A: Several techniques:
+   1. WireMock: Stub HTTP dependencies. Service A tests can stub Service B's
+      HTTP responses without deploying Service B.
+      WireMockServer mock = new WireMockServer(8089);
+      mock.stubFor(get("/api/inventory/123")
+          .willReturn(aResponse().withBody("{\"stock\": 10}")));
+
+   2. TestContainers: Run real dependencies (PostgreSQL, Redis, Kafka) in Docker
+      containers during tests. No mocking database behavior — use real DB queries.
+      @Container PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16");
+
+   3. Spring @MockBean: Replace Spring beans with Mockito mocks in integration tests.
+      @MockBean InventoryClient inventoryClient; // Feign client mocked in Spring context
+
+   4. In-process gRPC testing: grpc-inprocess-server for testing gRPC services
+      without network.
+      InProcessServerBuilder.forName("test").addService(new OrderGrpcService()).build().start()
+
+   5. Pact contract tests: Consumer side tests generate a pact file, defining
+      what the consumer expects. Provider side verifies its implementation against
+      the pact — no integration needed between the two.
+
+Q3: What is Consumer-Driven Contract Testing and why is it preferred over
+    integration testing across microservices?
+──────────────────────────────────────────────────────────────────────────────
+Tests for: Understanding of the problem space and the Pact/CDC pattern.
+
+A: In microservices, integration tests between services require both services
+   to be deployed simultaneously, making them slow, environment-dependent, and
+   hard to maintain (who owns the test?).
+
+   Consumer-Driven Contract Testing (CDC) solves this:
+   - Consumer (Service A) defines a "contract" — what endpoints it calls and
+     what response structure it expects.
+   - The contract (Pact file) is published to a Pact Broker.
+   - Provider (Service B) runs its own tests against the pact, verifying its
+     implementation matches the consumer's expectations.
+   - Neither service needs the other deployed during tests.
+
+   This shifts the communication from "did you break my integration test?" to
+   "did you break the published contract your consumer depends on?".
+
+   Tools: Pact (most popular), Spring Cloud Contract.
+
+   Key difference from OpenAPI: OpenAPI describes what a service CAN do.
+   Pact describes what consumers ACTUALLY use — much tighter and relevant.
+
+Q4: What is TestContainers and what problems does it solve?
+────────────────────────────────────────────────────────────
+Tests for: Hands-on experience with realistic integration testing.
+
+A: TestContainers is a Java library that programmatically starts Docker containers
+   during tests and tears them down after.
+
+   Problems it solves:
+   - "Works on my machine" — tests use the same Docker images as production.
+   - In-memory H2 vs real PostgreSQL behavioral differences (different SQL dialects,
+     constraint handling, JSON support). TestContainers runs real PostgreSQL.
+   - Kafka EmbeddedKafka has quirks; TestContainers runs real Kafka (Confluent image).
+   - Tests are self-contained — no shared database state between test runs.
+
+   Common usage:
+   @Testcontainers
+   @SpringBootTest
+   class OrderRepositoryTest {
+     @Container
+     static PostgreSQLContainer<?> postgres =
+         new PostgreSQLContainer<>("postgres:16").withDatabaseName("orders_test");
+
+     @DynamicPropertySource
+     static void properties(DynamicPropertyRegistry registry) {
+       registry.add("spring.datasource.url", postgres::getJdbcUrl);
+       registry.add("spring.datasource.username", postgres::getUsername);
+     }
+   }
+
+   @DynamicPropertySource overrides Spring datasource config to point to the
+   container URL, which is assigned dynamically (random port).
+
+Q5: How do you test Kafka producers and consumers in Spring Boot?
+──────────────────────────────────────────────────────────────────
+Tests for: Practical Kafka testing experience.
+
+A: Two approaches:
+
+   1. EmbeddedKafka (@EmbeddedKafka annotation):
+      - Spins up an in-memory Kafka broker within the JVM.
+      - Fast, no Docker needed.
+      - @EmbeddedKafka(partitions = 1, topics = {"order-placed"})
+      - Limitation: Not a real Kafka — may hide production quirks.
+
+   2. TestContainers with Kafka:
+      - Runs real Confluent Kafka image.
+      - Slower but realistic.
+      @Container
+      static KafkaContainer kafka =
+          new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.5.0"));
+
+   Testing pattern (consumer test):
+   1. Publish a test message via KafkaTemplate.
+   2. Use CountDownLatch or Awaitility to wait for consumer to process.
+   3. Assert the side effect (DB record created, downstream call made).
+
+   @Test
+   void whenOrderPlaced_thenInventoryReserved() throws InterruptedException {
+     kafkaTemplate.send("order-placed", new OrderPlacedEvent("ORD-001", "P-100", 2));
+     assertTrue(latch.await(10, TimeUnit.SECONDS));
+     verify(inventoryService).reserve("P-100", 2);
+   }
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 2 — DISTRIBUTED TRACING AND OBSERVABILITY
+────────────────────────────────────────────────────────────────────────────────
+
+Q6: What changed with Spring Boot 3 regarding distributed tracing?
+──────────────────────────────────────────────────────────────────
+Tests for: Up-to-date knowledge of Spring Boot 3 tracing ecosystem.
+
+A: Spring Cloud Sleuth (used in Spring Boot 2) was deprecated and is no longer
+   supported with Spring Boot 3. Spring Boot 3 uses Micrometer Tracing as the
+   new abstraction layer.
+
+   Key differences:
+   - Spring Boot 2: spring-cloud-sleuth-zipkin auto-configured tracing
+   - Spring Boot 3: micrometer-tracing-bridge-otel + opentelemetry-exporter-zipkin
+   - MDC is still auto-populated with traceId/spanId but via Micrometer
+   - New annotations: @NewSpan / @ContinueSpan on methods
+
+   Setup (Spring Boot 3):
+   <dependency>
+     <groupId>io.micrometer</groupId>
+     <artifactId>micrometer-tracing-bridge-otel</artifactId>
+   </dependency>
+   <dependency>
+     <groupId>io.opentelemetry</groupId>
+     <artifactId>opentelemetry-exporter-zipkin</artifactId>
+   </dependency>
+
+   management.tracing.sampling.probability=0.1  # 10% in production
+
+Q7: How do you propagate trace context across asynchronous boundaries
+    (Kafka, async methods, thread pools)?
+──────────────────────────────────────────────────────────────────────
+Tests for: Deep understanding of trace propagation challenges.
+
+A: In synchronous HTTP calls, Micrometer/OpenTelemetry automatically injects
+   trace context (traceparent header via W3C TraceContext). The problem is
+   async boundaries where context can be lost.
+
+   Kafka (automatic in Spring Boot 3):
+   - spring-kafka with Micrometer automatically injects trace headers into
+     Kafka message headers when producing.
+   - On the consumer side, Spring extracts headers and restores the trace context.
+   - Result: Kafka consumer spans are children of the producer span — full trace.
+
+   @Async methods (Java thread pool):
+   - Spring's @Async loses MDC context by default.
+   - Solution: Use a custom TaskDecorator that copies the Observation context:
+     @Bean
+     public ThreadPoolTaskExecutor asyncExecutor(ObservationRegistry registry) {
+       ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+       executor.setTaskDecorator(task -> {
+         Observation parent = registry.getCurrentObservation();
+         return () -> {
+           try (Observation.Scope ignored = parent.openScope()) {
+             task.run();
+           }
+         };
+       });
+       return executor;
+     }
+
+   CompletableFuture:
+   - Wrap with context-preserving wrappers or use virtual threads (Java 21+)
+     where Micrometer tracing support is improving.
+
+Q8: What is the difference between metrics, logs, and traces?
+     How do they complement each other?
+──────────────────────────────────────────────────────────────
+Tests for: Observability fundamentals understanding.
+
+A: The three pillars of observability:
+
+   METRICS: Aggregated numerical data over time.
+   - What: Count of requests, error rate, p99 latency, JVM heap, CPU
+   - Tool: Prometheus (scraping) + Micrometer (Spring Boot adapter)
+   - Use for: Alerting ("error rate > 5% for 5 minutes"), dashboards, capacity planning
+   - Limitation: No context about WHY a metric is anomalous
+
+   LOGS: Timestamped event records.
+   - What: Individual request logs, exception stack traces, business events
+   - Tool: Logback/Log4j2 → Loki / Elasticsearch / CloudWatch Logs
+   - Use for: Debugging a specific failure, audit trail
+   - Limitation: High volume, hard to correlate across services without traceId
+
+   TRACES: Records of a request's journey across services.
+   - What: Span trees showing which services were called, how long each took
+   - Tool: OpenTelemetry → Jaeger / Zipkin / Grafana Tempo
+   - Use for: Finding which service introduced latency, pinpointing bottleneck
+
+   In practice they work together:
+   1. Metric alert fires (p99 latency spike)
+   2. Navigate to Grafana dashboard → see spikes on payment-service
+   3. Click trace link → see a slow Tempo trace
+   4. Trace shows DB span took 3s → navigate to Loki logs with that traceId
+   5. Log shows "Connection pool exhausted" → root cause found
+
+Q9: How do you implement custom metrics in Spring Boot with Micrometer?
+────────────────────────────────────────────────────────────────────────
+Tests for: Hands-on Micrometer experience beyond default metrics.
+
+A: Spring Boot auto-configures Micrometer with many default metrics (JVM, HTTP,
+   DB connection pool). For custom business metrics:
+
+   @Service
+   @RequiredArgsConstructor
+   public class OrderService {
+     private final MeterRegistry registry;
+
+     // Counter: how many orders were placed
+     private final Counter orderCounter;
+     // Timer: how long order processing takes
+     private final Timer orderTimer;
+
+     @PostConstruct
+     void initMetrics() {
+       orderCounter = Counter.builder("orders.placed.total")
+           .description("Total orders placed")
+           .tag("region", "us-east-1")
+           .register(registry);
+
+       orderTimer = Timer.builder("orders.processing.duration")
+           .description("Time to process an order")
+           .percentiles(0.5, 0.95, 0.99)  // Expose p50, p95, p99
+           .register(registry);
+     }
+
+     public Order placeOrder(CreateOrderRequest req) {
+       return orderTimer.record(() -> {
+         Order order = processOrder(req);
+         orderCounter.increment();
+         return order;
+       });
+     }
+   }
+
+   Gauge (current value, e.g., queue depth):
+   Gauge.builder("orders.pending.queue", orderQueue, Queue::size)
+       .register(registry);
+
+   These metrics are exposed at /actuator/prometheus and scraped by Prometheus.
+   Alert rule example: alert if orders.placed.total rate drops to 0 for 5 minutes.
+
+Q10: What is sampling in distributed tracing and how do you configure it?
+──────────────────────────────────────────────────────────────────────────
+Tests for: Production tracing experience and cost awareness.
+
+A: Sampling determines what percentage of requests generate traces. 100% sampling
+   is prohibitively expensive in high-traffic production systems.
+
+   Types:
+   HEAD-BASED SAMPLING (decision at start of request):
+   - Simple, low overhead.
+   - Configured per-rate: management.tracing.sampling.probability=0.1 (10%)
+   - Problem: Randomly excludes traces — you might miss the 1-in-1000 error.
+
+   TAIL-BASED SAMPLING (decision after request completes):
+   - OpenTelemetry Collector can see the full trace before deciding to keep it.
+   - Keep all error traces (status 5xx), slow traces (>2s), and 1% of healthy ones.
+   - Best for catching important traces while reducing volume.
+
+   OTel Collector tail sampling config:
+   processors:
+     tail_sampling:
+       policies:
+         - name: errors, type: status_code, status_code: {status_codes: [ERROR]}
+         - name: slow, type: latency, latency: {threshold_ms: 2000}
+         - name: probabilistic, type: probabilistic, probabilistic: {sampling_percentage: 1}
+
+   Production recommendation:
+   - 10% head-based sampling as baseline.
+   - OTel Collector with tail-based rules: always keep errors and slow traces.
+   - Or: Use Jaeger's adaptive sampling to auto-adjust rate per service.
+
+Q11: How would you debug a latency spike in a microservice system?
+──────────────────────────────────────────────────────────────────
+Tests for: Systematic debugging methodology using observability tools.
+
+A: Structured approach:
+   1. Identify the symptom: Which service's SLI (p99 latency) crossed the SLO?
+      (Prometheus/Grafana alert tells you this)
+
+   2. Narrow to time window: When did it start? Correlate with deployments,
+      traffic spikes, or infrastructure events (use Grafana time ranges).
+
+   3. Check resource metrics: CPU, memory, JVM heap, GC pauses, thread pool
+      exhaustion, DB connection pool. Micrometer exposes all of these.
+
+   4. Look at traces: Filter slow traces (>2s) in Tempo/Jaeger for the affected
+      service. Identify which span is slow — HTTP call to dependency, DB query,
+      external API?
+
+   5. Examine logs: Use the traceId from the slow trace to find corresponding
+      logs in Loki/CloudWatch. Look for warnings, retry logs, circuit breaker opens.
+
+   6. Check downstream services: If the slow span is a downstream HTTP call,
+      look at that service's metrics — maybe it's CPU-bound or its DB is slow.
+
+   Common culprits:
+   - N+1 queries (check DB span count in trace — should be 1-2, not 100)
+   - Missing DB index (slow DB spans without N+1)
+   - Thread pool starvation (all threads busy → queuing delay)
+   - GC pressure (JVM GC metric shows frequent GC pauses)
+   - External dependency degradation (circuit breaker should catch this)
+
+Q12: How do you implement health checks in Spring Boot for Kubernetes?
+──────────────────────────────────────────────────────────────────────
+Tests for: Production K8s readiness and health check implementation.
+
+A: Spring Boot Actuator provides three types of probes for K8s:
+
+   application.yml:
+     management:
+       endpoint:
+         health:
+           probes:
+             enabled: true    # Enables /actuator/health/liveness and /readiness
+           show-details: always
+       health:
+         livenessState.enabled: true
+         readinessState.enabled: true
+
+   LIVENESS (/actuator/health/liveness):
+   - "Is the application alive (not deadlocked/crashed)?"
+   - Kubernetes restarts the pod if this fails.
+   - Should only fail if the app is in an unrecoverable state.
+   - DO NOT include external dependency (DB/Kafka) checks here — a DB outage
+     would cause K8s to restart all pods, which doesn't fix the DB.
+
+   READINESS (/actuator/health/readiness):
+   - "Can this pod accept traffic?"
+   - K8s removes pod from load balancer if this fails (no restart).
+   - Include external dependency checks here — DB, Redis, Kafka.
+   - If DB is unavailable, mark readiness DOWN → traffic routed to healthy pods.
+
+   STARTUP (/actuator/health/startup):
+   - Used for slow-starting apps (initial data loading, etc.).
+   - K8s won't start liveness checks until startup probe succeeds.
+
+   Custom health indicator:
+   @Component
+   public class KafkaHealthIndicator implements HealthIndicator {
+     @Override
+     public Health health() {
+       // Check Kafka connectivity
+       return isKafkaReachable()
+           ? Health.up().withDetail("broker", "connected").build()
+           : Health.down().withDetail("broker", "unreachable").build();
+     }
+   }
+
+Q13: What is an SLI, SLO, and SLA? How do you implement them?
+──────────────────────────────────────────────────────────────
+Tests for: Site Reliability Engineering (SRE) knowledge.
+
+A:
+  SLI (Service Level Indicator): A metric that measures service behavior.
+  Examples: request success rate, p99 latency, availability (uptime %).
+
+  SLO (Service Level Objective): Internal target for an SLI.
+  Examples: "99.9% of requests succeed", "p99 latency < 500ms".
+  This is the engineering team's commitment to themselves.
+
+  SLA (Service Level Agreement): External contract with customers.
+  Usually less strict than SLO (leave an error budget for recovery).
+  Example: SLO = 99.9%, SLA = 99.5%.
+
+  Error Budget: How much "unreliability" you're allowed before breaching SLO.
+  99.9% availability = 8.7 hours/year of allowed downtime.
+
+  Implementation with Prometheus:
+  # SLI: HTTP success rate
+  sum(rate(http_server_requests_seconds_count{status!~"5.."}[5m])) /
+  sum(rate(http_server_requests_seconds_count[5m]))
+
+  # Alert when SLO threshold breached for 5 minutes:
+  - alert: HighErrorRate
+    expr: (sum(rate(http_server_requests_seconds_count{status=~"5.."}[5m])) /
+           sum(rate(http_server_requests_seconds_count[5m]))) > 0.001
+    for: 5m
+    labels:
+      severity: critical
+
+Q14: How do you design alerting to minimize alert fatigue?
+───────────────────────────────────────────────────────────
+Tests for: Operational maturity and SRE thinking.
+
+A: Alert fatigue happens when teams get too many alerts, especially false positives,
+   causing them to ignore or acknowledge-and-dismiss real incidents.
+
+   Principles to minimize fatigue:
+   1. Alert on SYMPTOMS not CAUSES:
+      Bad: "CPU > 80%" (cause — doesn't mean users are affected)
+      Good: "Error rate > 1%" (symptom — users seeing errors)
+
+   2. Alert on SLO burn rate (not momentary spikes):
+      "SLO burned at 14x normal rate for 1 hour" is more actionable than
+      "error rate briefly hit 2% for 1 minute".
+      Multi-window alerting (fast burn: 1h window, slow burn: 6h window).
+
+   3. Group related alerts: Don't alert 50 services individually when the
+      shared database is down — alert on the root cause.
+
+   4. Severity tiers:
+      P0/Page: User-facing outage, revenue impact → wake on-call
+      P1/Notify: Degraded performance → Slack notification
+      P2/Ticket: Trending bad, no immediate user impact → create Jira ticket
+
+   5. Regular alert review: Monthly review — which alerts never fire?
+      Which fire and get immediately silenced? Remove or tune them.
+
+   6. Silence during deployments: Suppress known transient alerts during
+      planned maintenance/deployments to reduce noise.
+
+Q15: How do you correlate logs across multiple services using traceId?
+───────────────────────────────────────────────────────────────────────
+Tests for: Practical log correlation experience.
+
+A: In a distributed system, a single user request may touch 5 services.
+   To correlate logs across all 5:
+
+   1. Generate a traceId at the entry point (API Gateway or first service).
+      Spring Boot 3 Micrometer Tracing does this automatically.
+
+   2. Propagate traceId via HTTP headers (W3C traceparent standard):
+      traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+      Feign clients and WebClient propagate this header automatically with
+      Micrometer Tracing on the classpath.
+
+   3. Include traceId in log output via MDC:
+      Logback pattern:
+      %d{ISO8601} [%X{traceId},%X{spanId}] %-5level %logger{36} - %msg%n
+      MDC is automatically populated by Micrometer Tracing.
+
+   4. Send logs to centralized store (Loki, Elasticsearch, CloudWatch).
+
+   5. Query by traceId:
+      Grafana Loki: {app="order-service"} | traceId="4bf92f3577b34da6a"
+      All log lines across all services with that traceId appear.
+
+   Grafana's correlation feature: Click a traceId in a Tempo trace →
+   auto-navigate to Loki logs for that traceId. And vice versa.
+   Also link Prometheus metrics time ranges to matching traces.
+
+================================================================================
+QUICK REFERENCE — TOOLS AND FRAMEWORKS
+================================================================================
+
+Category              │ Tool                         │ Spring Boot Integration
+──────────────────────┼──────────────────────────────┼──────────────────────────
+Unit Testing          │ JUnit 5 + Mockito             │ spring-boot-starter-test
+Integration Testing   │ @SpringBootTest               │ Built-in
+Real DB in Tests      │ TestContainers                │ @Container, @DynamicPropertySource
+HTTP Stubbing         │ WireMock                      │ wiremock-spring-boot
+Contract Testing      │ Pact / Spring Cloud Contract  │ JUnit 5 runner
+Kafka Testing         │ EmbeddedKafka / TC Kafka      │ @EmbeddedKafka annotation
+Metrics               │ Micrometer + Prometheus        │ spring-boot-actuator, prometheus
+Distributed Tracing   │ Micrometer Tracing + OTel     │ micrometer-tracing-bridge-otel
+Trace Storage         │ Jaeger / Zipkin / Tempo        │ OTel Exporter
+Log Aggregation       │ Loki / ELK / CloudWatch       │ LogstashEncoder
+Alerting              │ Prometheus Alertmanager        │ Grafana alerts
+APM                   │ Datadog / New Relic / Dynatrace│ Agent-based, zero code changes
+================================================================================

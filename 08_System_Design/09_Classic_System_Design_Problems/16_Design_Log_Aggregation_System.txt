@@ -1,0 +1,274 @@
+============================================================
+SYSTEM DESIGN: LOG AGGREGATION SYSTEM
+(Similar to ELK Stack / Datadog Logs / Splunk)
+============================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. PROBLEM STATEMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Design a centralized log aggregation system that:
+  - Collects logs from thousands of microservices/servers
+  - Stores them durably and efficiently
+  - Enables fast full-text search and filtering
+  - Supports real-time alerting on log patterns
+  - Provides dashboards and analytics
+
+Scale: 1 million log events/second, 100TB+ retention
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. FUNCTIONAL REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - Ingest logs from any service (structured JSON or unstructured text)
+  - Tag/enrich logs with metadata (service name, host, env, trace ID)
+  - Search logs by keyword, time range, log level, service name
+  - Stream live tail (like `tail -f` in real-time)
+  - Set alerts on error rate spikes or specific patterns
+  - Retain logs for 30 days hot, 1 year cold
+  - Support multiple tenants (different teams)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. NON-FUNCTIONAL REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - Ingestion: handle 1M events/sec with < 1s end-to-end latency
+  - Search: p99 query latency < 3s for most queries
+  - High availability: 99.9% for ingestion; 99.5% for search
+  - Fault tolerance: no log loss (at-least-once delivery)
+  - Cost-efficient: compress and tier storage
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. SYSTEM ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  SOURCES                                                         │
+  │  Microservices, VMs, Containers, Lambda Functions                │
+  └──────────────┬───────────────────────────────────────────────────┘
+                 │ (Log Agents: Filebeat, Fluent Bit, Vector)
+                 ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  LOG COLLECTORS (Load Balanced)                                  │
+  │  Logstash / Fluentd / OpenTelemetry Collector                   │
+  │  - Parse, filter, enrich, normalize                              │
+  │  - Add: service_name, hostname, env, trace_id, timestamp         │
+  └──────────────┬───────────────────────────────────────────────────┘
+                 │ (publish)
+                 ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  MESSAGE QUEUE — Kafka                                           │
+  │  Topic: logs-raw (partitioned by service or log level)          │
+  │  - Decouples ingestion from storage                              │
+  │  - Handles burst traffic (buffering)                             │
+  │  - Replay logs if indexing fails                                 │
+  └─────┬────────────────────────────────────┬────────────────────────┘
+        │                                    │
+        ▼                                    ▼
+  ┌──────────────┐                   ┌──────────────────┐
+  │  Indexing    │                   │  Archival        │
+  │  Service     │                   │  Service         │
+  │  (Consumers) │                   │                  │
+  └──────┬───────┘                   └────────┬─────────┘
+         │                                    │
+         ▼                                    ▼
+  ┌──────────────────┐               ┌──────────────────┐
+  │  Elasticsearch / │               │  Object Storage  │
+  │  OpenSearch      │               │  (S3 / GCS)      │
+  │  (Hot: 30 days)  │               │  (Cold: 1 year)  │
+  │  - Inverted index│               │  Parquet / ZSTD  │
+  │  - Full-text search              │  Query via Athena│
+  └──────────────────┘               └──────────────────┘
+         │
+         ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  QUERY SERVICE                                                   │
+  │  - REST API for search queries                                   │
+  │  - Fan-out to hot (Elasticsearch) + cold (S3/Athena) if needed  │
+  │  - Result merging, pagination                                    │
+  └──────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  UI / API LAYER                                                  │
+  │  Kibana / Grafana / Custom dashboard                             │
+  │  - Search, filter, live tail, dashboards, alerts                 │
+  └──────────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. LOG AGENT (COLLECTION TIER)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Runs as a sidecar or DaemonSet in Kubernetes.
+
+Options:
+  - Filebeat      → lightweight, reads file tails, ships to Logstash/Kafka
+  - Fluent Bit    → very lightweight (C, <1MB), native K8s support
+  - Vector        → Rust-based, high performance, unified logs/metrics/traces
+  - OTEL Collector → vendor-neutral, can route to multiple backends
+
+Agent responsibilities:
+  - Read from stdout/stderr, log files, systemd journal
+  - Parse multiline logs (e.g., Java stack traces)
+  - Add metadata: pod_name, namespace, node, container_id
+  - Buffer locally if collector is down (disk-backed queue)
+  - Ship to collector or directly to Kafka
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. LOG FORMAT — STRUCTURED LOGGING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Always use structured (JSON) logging for machine-parseable logs:
+
+{
+  "timestamp": "2026-04-09T10:15:32.456Z",
+  "level": "ERROR",
+  "service": "order-service",
+  "version": "2.3.1",
+  "env": "production",
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "span_id": "00f067aa0ba902b7",
+  "host": "pod-order-7d9f8b-xkp2q",
+  "message": "Payment processing failed",
+  "exception": "PaymentGatewayException: Connection timeout",
+  "order_id": "ORD-98765",
+  "user_id": "usr-12345",
+  "duration_ms": 5001
+}
+
+Java: Use Logback + logstash-logback-encoder for automatic JSON formatting.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. KAFKA DESIGN FOR LOG INGESTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Topics:
+  logs-raw         → all raw logs (broad topic)
+  logs-error       → ERROR level only (for alerting)
+  logs-<service>   → per-service topics for isolation
+
+Partitioning strategy:
+  - By service_name → keeps service logs in order, good locality
+  - By trace_id     → keeps correlated logs together
+  - Round-robin     → max throughput, no ordering guarantee
+
+Retention:
+  - Kafka: 24h retention (buffer only; Elasticsearch is source of truth)
+
+Replication: RF=3 for durability.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. ELASTICSEARCH INDEXING DESIGN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Index Strategy: Time-based indices
+  logs-2026.04.09, logs-2026.04.10, ...
+
+  Benefits:
+    - Easy deletion of old indices (just delete old date index)
+    - Hot/warm/cold node tiering per index age
+    - Parallelizable writes to today's index
+
+Index Lifecycle Management (ILM):
+  - Hot    (0-7 days):  SSD nodes, full replica
+  - Warm   (7-30 days): HDD nodes, read-only, 1 replica
+  - Cold   (30+ days):  Frozen / moved to S3 Snapshots
+
+Mapping (schema):
+  - timestamp → date (sorted)
+  - level     → keyword (exact match)
+  - message   → text (full-text search, analyzed)
+  - service   → keyword
+  - trace_id  → keyword (exact match for correlation)
+
+Sharding:
+  - 1 primary shard per ~30GB data
+  - Number of shards = (daily_volume_GB / 30) * retention_days
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. COLD STORAGE AND QUERY (S3 + Athena)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For logs older than 30 days:
+  - Store as Parquet files in S3 (columnar, compressed with ZSTD)
+  - Partitioned by: year/month/day/service
+  - Query with AWS Athena (serverless SQL on S3)
+
+s3://logs-archive/
+  year=2026/month=01/day=15/service=order-service/part-00001.parquet
+
+Athena query example:
+  SELECT * FROM logs
+  WHERE year=2026 AND month=01 AND service='order-service'
+    AND level='ERROR'
+  ORDER BY timestamp DESC
+  LIMIT 100;
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. ALERTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Two approaches:
+  1. Kafka Streams / Flink: real-time stream processing on logs-raw topic
+     - Count ERROR events in a 1-minute tumbling window
+     - Alert if count > threshold
+     - Near real-time (seconds latency)
+
+  2. Elasticsearch Alerting (Kibana/OpenSearch Dashboards):
+     - Scheduled queries every N minutes
+     - Alert if query result exceeds threshold
+     - Simpler but slightly delayed
+
+Alert routing:
+  - PagerDuty / OpsGenie for on-call incidents
+  - Slack for lower-severity notifications
+  - Email for daily summaries
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+11. SCALE ESTIMATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Events/sec:       1,000,000
+  Avg event size:   500 bytes (JSON structured)
+  Ingestion rate:   500 MB/s = 43 TB/day
+  Compressed (5:1): ~8.6 TB/day stored in Elasticsearch
+  30-day hot store: ~258 TB
+  1-year cold (S3): ~3.15 PB (uncompressed), ~630 TB compressed
+
+Kafka:
+  - 500 MB/s throughput → 50 partitions @ 10 MB/s each
+  - 3 brokers minimum for HA
+
+Elasticsearch:
+  - Data nodes: 258 TB / 4 TB per node ≈ 65 data nodes
+  - Master nodes: 3 dedicated (odd number for quorum)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+12. INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: Why put Kafka between collectors and Elasticsearch?
+A: Kafka decouples ingestion rate from indexing throughput. If Elasticsearch
+   is slow or down, Kafka buffers events without loss. Agents never back-pressure.
+   Also enables multiple consumers (indexing + alerting + archival) simultaneously.
+
+Q: How do you handle log loss if an agent crashes?
+A: Agents use disk-backed buffers and track file offsets (like Filebeat's registry).
+   Kafka provides at-least-once delivery. Elasticsearch indexing is idempotent
+   if we use a unique document ID (e.g., trace_id + timestamp hash).
+
+Q: How would you implement live log tailing?
+A: Client opens a WebSocket or SSE connection. Server subscribes to Kafka
+   topic for that service and streams new events directly to the client.
+   Alternatively, Elasticsearch provides a real-time search with polling.
+
+Q: Why use Parquet for cold storage instead of raw JSON?
+A: Parquet is columnar — queries that filter by a few columns (level, service)
+   read only those columns, not entire rows. Parquet + ZSTD compression
+   achieves 5-10x compression. Athena charges per byte scanned, so less data
+   scanned = lower cost.
+
+Q: How do you correlate logs across microservices?
+A: Distributed tracing with trace_id propagated via HTTP headers (W3C Trace Context
+   or B3 format). Every service includes the same trace_id in its log lines.
+   Search by trace_id in the log system to see all correlated logs.

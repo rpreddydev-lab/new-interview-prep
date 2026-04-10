@@ -1,0 +1,298 @@
+======================================================
+VIRTUAL THREADS & @ASYNC PITFALLS IN SPRING BOOT
+======================================================
+
+1. VIRTUAL THREADS (JAVA 21 + SPRING BOOT 3.2+)
+─────────────────────────────────────────────────
+
+1a. What are Virtual Threads?
+  - Java 21 feature (JEP 444 — finalized, previously preview in 19/20)
+  - Lightweight threads managed by the JVM (not OS threads)
+  - Thousands to millions of virtual threads can exist simultaneously
+  - Map many-to-many onto a small pool of carrier (OS) threads
+  - When a virtual thread blocks (I/O, sleep), the carrier thread is freed
+    to execute another virtual thread — no OS thread wasting
+
+Traditional platform threads:
+  - 1 OS thread per Java thread
+  - ~1MB stack per thread
+  - OS limited to ~thousands of threads per machine
+
+Virtual threads:
+  - Tiny stack (grows/shrinks dynamically)
+  - JVM schedules them on a ForkJoinPool of carrier threads
+  - Can create millions: new Thread(runnable).start() vs Thread.ofVirtual().start(runnable)
+
+
+1b. Enable in Spring Boot 3.2+:
+  application.yml:
+    spring:
+      threads:
+        virtual:
+          enabled: true    # replaces Tomcat thread pool with virtual threads
+
+  This single property:
+  - Replaces Tomcat's thread pool with virtual threads
+  - Replaces @Async thread pool with virtual threads
+  - Replaces Spring MVC request handling threads with virtual threads
+
+  No more thread pool sizing: each request gets its own virtual thread.
+
+
+1c. When Virtual Threads shine:
+  - High-concurrency I/O-bound workloads (DB calls, HTTP calls, Redis)
+  - Replacing reactive (WebFlux) for simpler code with similar throughput
+  - Blocking code that was previously throttled by thread pool size
+
+  Example — before (blocks 200 platform threads):
+    @GetMapping("/orders")
+    public List<Order> getOrders() {
+        return orderService.getAll(); // blocks JDBC thread for 50ms
+    }
+    // With Tomcat max 200 threads → max 4000 RPS (200/0.050)
+
+  After (virtual threads — millions of threads):
+    // Same code, but spring.threads.virtual.enabled=true
+    // Carrier threads freed during JDBC blocking → massive concurrency
+
+
+1d. What NOT to do with Virtual Threads:
+  - Avoid synchronized on shared resources (pins virtual thread to carrier)
+    Use java.util.concurrent.locks.ReentrantLock instead
+  - Avoid CPU-bound work in virtual threads (no benefit; use platform threads)
+  - Avoid ThreadLocal if many virtual threads share state (memory issue)
+  - Not a replacement for reactive streams for backpressure scenarios
+
+
+1e. Pinning problem (common gotcha):
+  If virtual thread executes synchronized block or native method:
+    → Virtual thread is "pinned" to carrier thread
+    → Carrier thread cannot serve other virtual threads
+    → Performance degradation back to platform thread model
+
+  JVM flag to detect pinning:
+    -Djdk.tracePinnedThreads=full
+
+  Fix: replace synchronized with ReentrantLock or use @ReentrantLock-based code
+
+  Spring Boot 3.2 fixes many internal synchronized usages (e.g., Tomcat, JDBC)
+
+
+1f. Check compatibility:
+  Libraries that use synchronized (may pin):
+    - Older JDBC drivers (PostgreSQL 42.6+ is fixed)
+    - Some Jedis/Lettuce internals (Lettuce is better for virtual threads)
+    - Some Hibernate internals (check version)
+
+
+2. @ASYNC PITFALLS
+───────────────────
+
+2a. Basic @Async usage:
+  @EnableAsync  // on @Configuration
+  @Service
+  public class EmailService {
+      @Async
+      public CompletableFuture<Void> sendEmail(String to, String message) {
+          // Runs in a separate thread from the thread pool
+          emailClient.send(to, message);
+          return CompletableFuture.completedFuture(null);
+      }
+  }
+
+
+2b. PITFALL 1: Self-invocation (most common bug)
+  BROKEN:
+    @Service
+    public class OrderService {
+        public void createOrder(Order order) {
+            saveOrder(order);
+            sendConfirmation(order);  // ← called on 'this', NOT on Spring proxy!
+        }
+
+        @Async
+        public void sendConfirmation(Order order) { ... }  // ← NEVER runs async!
+    }
+
+  WHY: @Async uses Spring AOP proxy. Calling method on 'this' bypasses the proxy.
+
+  FIX 1: Inject self via ApplicationContext:
+    @Autowired
+    private ApplicationContext context;
+
+    public void createOrder(Order order) {
+        saveOrder(order);
+        context.getBean(OrderService.class).sendConfirmation(order);  // ← goes through proxy
+    }
+
+  FIX 2: Extract to separate bean:
+    @Service
+    public class OrderService {
+        @Autowired private NotificationService notificationService;
+
+        public void createOrder(Order order) {
+            saveOrder(order);
+            notificationService.sendConfirmation(order);  // ← separate bean = works
+        }
+    }
+
+  FIX 3: @Async on the caller (make the whole call async)
+
+
+2c. PITFALL 2: Exception handling
+  BROKEN:
+    @Async
+    public void processAsync() {
+        throw new RuntimeException("Async failure");
+        // This exception is SWALLOWED! Caller never sees it.
+    }
+
+  WHY: @Async runs in a separate thread. Uncaught exceptions are lost
+       unless the return type is CompletableFuture.
+
+  FIX 1: Return CompletableFuture and handle:
+    @Async
+    public CompletableFuture<Void> processAsync() {
+        try {
+            doWork();
+            return CompletableFuture.completedFuture(null);
+        } catch (Exception e) {
+            return CompletableFuture.failedFuture(e);
+        }
+    }
+
+    // Caller:
+    processAsync().exceptionally(ex -> {
+        log.error("Async failed", ex);
+        return null;
+    });
+
+  FIX 2: AsyncUncaughtExceptionHandler:
+    @Configuration
+    @EnableAsync
+    public class AsyncConfig implements AsyncConfigurer {
+        @Override
+        public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+            return (ex, method, params) ->
+                log.error("Async exception in {}: {}", method.getName(), ex.getMessage(), ex);
+        }
+    }
+
+
+2d. PITFALL 3: No custom thread pool configured (uses SimpleAsyncTaskExecutor by default)
+  Default executor: creates a NEW thread for every @Async call — no pooling!
+  Under load: thread explosion, OOM.
+
+  FIX: Configure a proper thread pool:
+    @Bean(name = "taskExecutor")
+    public Executor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(50);
+        executor.setQueueCapacity(100);
+        executor.setThreadNamePrefix("async-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.initialize();
+        return executor;
+    }
+
+    // Use specific executor:
+    @Async("taskExecutor")
+    public void doAsyncWork() { ... }
+
+  With virtual threads enabled (Spring Boot 3.2+):
+    → SimpleAsyncTaskExecutor is automatically configured with virtual threads
+    → Thread explosion is no longer an issue
+    → But: still configure named executor for observability/monitoring
+
+
+2e. PITFALL 4: @Transactional + @Async = new transaction context
+  BROKEN:
+    @Transactional
+    public void doWork() {
+        save(entity);
+        asyncService.doAsyncUpdate(entity.getId());  // runs in separate thread
+        // async update runs OUTSIDE this transaction!
+    }
+
+  WHY: @Async spawns a new thread with no transaction context from the caller.
+
+  FIX: Don't rely on caller's transaction in async methods.
+       Each @Async method that needs a transaction should have its own @Transactional.
+    @Async
+    @Transactional
+    public void doAsyncUpdate(Long id) { ... }  // own transaction
+
+
+2f. PITFALL 5: SecurityContext not propagated
+  Security context is stored in ThreadLocal. @Async runs in a different thread.
+
+  FIX: Use DelegatingSecurityContextAsyncTaskExecutor:
+    @Bean(name = "securityAwareExecutor")
+    public Executor securityAwareExecutor() {
+        return new DelegatingSecurityContextAsyncTaskExecutor(taskExecutor());
+    }
+
+  Or propagate manually:
+    SecurityContext context = SecurityContextHolder.getContext();
+    CompletableFuture.runAsync(() -> {
+        SecurityContextHolder.setContext(context);
+        doWork();
+        SecurityContextHolder.clearContext();
+    }, executor);
+
+
+2g. PITFALL 6: Shutdown order — tasks not completed
+  If the app shuts down before async tasks complete:
+    → Tasks may be interrupted mid-execution
+
+  FIX:
+    executor.setWaitForTasksToCompleteOnShutdown(true);
+    executor.setAwaitTerminationSeconds(30);
+
+
+3. VIRTUAL THREADS VS @ASYNC
+──────────────────────────────
+  @Async with thread pool   | Virtual threads (Spring Boot 3.2)
+  ───────────────────────────────────────────────────────────────
+  Fixed pool size           | Unbounded (JVM manages)
+  Thread pool tuning needed | No tuning needed
+  Blocking I/O wastes pool  | Blocking I/O frees carrier thread
+  Good for fire-and-forget  | Good for all I/O-bound work
+  Explicit async opt-in     | Implicit for all requests (when enabled)
+
+Recommendation:
+  Java 21 + Spring Boot 3.2: Enable virtual threads globally.
+  Use @Async for explicit background tasks (fire-and-forget, batch).
+  For low-latency sequential pipelines: consider Reactor/WebFlux.
+
+
+4. INTERVIEW QUESTIONS
+──────────────────────
+Q: What are virtual threads and how do they differ from platform threads?
+A: Virtual threads are JVM-managed lightweight threads (Java 21). They map
+   many-to-few onto OS carrier threads. When a virtual thread blocks on I/O,
+   the carrier thread is released to run other virtual threads. Platform
+   threads map 1:1 to OS threads with ~1MB stack. Virtual threads allow
+   millions of concurrent threads with minimal memory.
+
+Q: How do you enable virtual threads in Spring Boot 3.2?
+A: Set spring.threads.virtual.enabled=true in application.yml.
+   This replaces Tomcat's thread pool, @Async executor, and Spring MVC
+   request handling with virtual threads automatically.
+
+Q: Why doesn't @Async work when called from within the same class?
+A: @Async relies on Spring AOP proxy. Calling a method on 'this' bypasses
+   the proxy, so the async interceptor never runs. Fix: inject self via
+   ApplicationContext.getBean() or move the async method to a separate bean.
+
+Q: How do you handle exceptions in @Async methods?
+A: Return CompletableFuture<T> and use .exceptionally() to handle errors.
+   For void methods: implement AsyncUncaughtExceptionHandler in AsyncConfigurer.
+   Without this, exceptions from @Async void methods are silently swallowed.
+
+Q: What is the "pinning" problem with virtual threads?
+A: If a virtual thread enters a synchronized block or calls a native method,
+   it becomes pinned to its carrier OS thread. The carrier cannot serve other
+   virtual threads during this time, losing the scalability benefit.
+   Fix: replace synchronized with ReentrantLock.

@@ -1,0 +1,1153 @@
+================================================================================
+MULTI-ENVIRONMENT PIPELINE PATTERNS — DEV → STAGING → PROD
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1.  Why Multi-Environment Pipelines Matter
+2.  Core Principles: Immutable Artifacts and Environment Parity
+3.  Environment Architecture Patterns
+4.  Promotion Strategies (How Code Moves Across Environments)
+5.  Approval Gates and Manual Validation
+6.  Secrets Management Per Environment
+7.  GitOps-Based Promotion with ArgoCD
+8.  Helm-Based Environment Configuration
+9.  Jenkins Multi-Environment Pipeline
+10. GitHub Actions Multi-Environment Workflow
+11. Database Migration in Multi-Env Pipelines
+12. Feature Flags as Environment Promotion Alternative
+13. Rollback Across Environments
+14. Common Interview Questions & Answers
+15. Quick Reference Cheat Sheet
+
+================================================================================
+1. WHY MULTI-ENVIRONMENT PIPELINES MATTER
+================================================================================
+
+Without multi-environment pipelines:
+  - Developers deploy untested code directly to production
+  - No validation step before real users are impacted
+  - Different configs per environment are manually managed (drift)
+  - Rollback is manual and error-prone
+
+With multi-environment pipelines:
+  - Code flows through gates: dev → staging → prod
+  - Each environment validates a different concern
+  - SAME artifact, different configs
+  - Rollback is automated and traceable
+
+Standard Environment Chain:
+
+  ┌──────┐   ┌────────┐   ┌─────────┐   ┌──────┐
+  │ DEV  │──▶│  QA /  │──▶│ STAGING │──▶│ PROD │
+  │      │   │ TEST   │   │         │   │      │
+  └──────┘   └────────┘   └─────────┘   └──────┘
+  
+  Dev:     Developer testing, frequent deploys, unstable
+  QA:      QA team testing, automated regression suites
+  Staging: Production mirror, UAT, performance/load tests
+  Prod:    Live users, strict change management
+
+What Each Environment Validates:
+
+  Dev:      Does the code compile? Do unit tests pass?
+  QA:       Does feature work end-to-end? No regression?
+  Staging:  Does it perform under load? Is config correct?
+  Prod:     Is it working for real users? Monitor carefully.
+
+================================================================================
+2. CORE PRINCIPLES: IMMUTABLE ARTIFACTS AND ENVIRONMENT PARITY
+================================================================================
+
+Immutable Artifact Principle:
+
+  BUILD ONCE in CI → promote THE SAME BINARY across all environments.
+  
+  What "same artifact" means:
+  ✓ Docker image: my-registry/order-service:sha-abc123
+    - The SAME image runs in dev, staging, prod
+    - Environment-specific config injected at runtime (env vars, ConfigMaps)
+  
+  ✗ WRONG approach: Build a separate image for each environment
+    → Different build = different binary → "worked in staging" ≠ "works in prod"
+
+  Image Tag Strategy:
+    Build: sha-abc1234 (Git SHA, immutable)
+    Staging promotion: tag the same image as "staging"
+    Prod promotion: tag as "v1.2.3" (semantic version) AND "stable"
+    
+    # Retag without rebuild:
+    docker pull my-registry/order-service:sha-abc1234
+    docker tag my-registry/order-service:sha-abc1234 \
+               my-registry/order-service:v1.2.3
+    docker push my-registry/order-service:v1.2.3
+
+Environment Parity:
+
+  Staging must mirror production as closely as possible:
+  
+  ✓ Same Kubernetes resource requests/limits
+  ✓ Same number of replicas (or proportional)
+  ✓ Same database engine version (PostgreSQL 16 in both)
+  ✓ Same JVM flags and heap settings
+  ✓ Same Spring Boot profiles and feature flags
+  ✓ Same external service integrations (not mocked)
+  ✗ NOT OK: Staging uses H2, prod uses PostgreSQL
+  ✗ NOT OK: Staging has 1 replica, prod has 20 (can't test HPA)
+
+Configuration Differs; Binary Does NOT:
+
+  Environment-specific things (ALL injected externally):
+  - Database URLs (different DB per env, same engine)
+  - API keys and secrets
+  - Log levels (DEBUG in dev, INFO in prod)
+  - Feature flags (some features enabled only in prod)
+  - Resource limits (prod gets more CPU/memory)
+  - Replica counts
+
+================================================================================
+3. ENVIRONMENT ARCHITECTURE PATTERNS
+================================================================================
+
+Pattern 1: Multiple Namespaces in Same Cluster (Small Teams):
+
+  ┌─────────────────────────────────────────────┐
+  │              Kubernetes Cluster              │
+  │                                              │
+  │  ┌───────────┐ ┌───────────┐ ┌────────────┐ │
+  │  │ Namespace │ │ Namespace │ │ Namespace  │ │
+  │  │   dev     │ │  staging  │ │   prod     │ │
+  │  └───────────┘ └───────────┘ └────────────┘ │
+  └──────────────────────────────────────────────┘
+  
+  Pros: Simple, cost-effective, shared infrastructure
+  Cons: Blast radius (cluster failure = all envs down)
+       Noisy neighbor (dev load affects prod)
+       Harder to enforce strict isolation
+
+Pattern 2: Separate Clusters Per Environment (Enterprise):
+
+  ┌────────────────────────────────────────────────────────┐
+  │ Dev Cluster     │ Staging Cluster   │ Prod Cluster      │
+  │ (cheap, small)  │ (medium, prod-like│ (large, HA, multi-│
+  │                 │ )                 │ AZ)               │
+  └────────────────────────────────────────────────────────┘
+  
+  Pros: True isolation, can tune each cluster independently
+       Prod incidents don't affect dev/staging
+  Cons: Higher cost, more clusters to manage
+
+Pattern 3: Hybrid (Dev namespace, staging + prod clusters):
+
+  Most common in medium-sized companies:
+  - Dev: namespace in a shared cluster (cheap)
+  - Staging: dedicated cluster (production-like)
+  - Prod: dedicated multi-AZ cluster (HA)
+
+Kubernetes Namespace Isolation:
+
+  # Each namespace has own:
+  kubectl create namespace dev
+  kubectl create namespace staging
+  kubectl create namespace prod
+  
+  # Different resource quotas per namespace:
+  apiVersion: v1
+  kind: ResourceQuota
+  metadata:
+    name: prod-quota
+    namespace: prod
+  spec:
+    hard:
+      requests.cpu: "20"
+      requests.memory: 40Gi
+      limits.cpu: "40"
+      limits.memory: 80Gi
+      pods: "50"
+
+================================================================================
+4. PROMOTION STRATEGIES (HOW CODE MOVES ACROSS ENVIRONMENTS)
+================================================================================
+
+Strategy 1: Automatic Promotion (Dev → Staging):
+
+  After CI passes (tests green, image built):
+  Automatically deploy to dev.
+  After dev smoke tests pass: automatically deploy to staging.
+  
+  Staging → Prod: ALWAYS manual approval (human gate).
+  
+  Implementation:
+    CI pipeline triggers:
+    1. Update values-dev.yaml (image tag) → ArgoCD syncs dev
+    2. Dev health check passes (kubectl rollout status) → 
+    3. Update values-staging.yaml → ArgoCD syncs staging
+
+Strategy 2: Manual All the Way (Enterprise/Regulated):
+
+  CI builds image → notifies release team → manual promotion at each stage.
+  
+  Pros: Maximum control, audit trail
+  Cons: Slow (hours to days per promotion)
+  Use case: Healthcare, finance, regulated industries
+
+Strategy 3: GitOps-Based Promotion:
+
+  Git is the source of truth for what's deployed:
+  
+  Repository structure:
+    config-repo/
+    ├── envs/
+    │   ├── dev/
+    │   │   └── values.yaml  (image: order-service:sha-abc)
+    │   ├── staging/
+    │   │   └── values.yaml  (image: order-service:sha-xyz)
+    │   └── prod/
+    │       └── values.yaml  (image: order-service:v1.2.3)
+  
+  Promotion = Update the values.yaml and merge PR.
+  ArgoCD watches each directory and syncs automatically.
+  Git history = complete audit log of promotions.
+
+Artifact Promotion (JAR to Nexus):
+
+  # For traditional JAR artifacts (non-Docker):
+  # Promote SNAPSHOT → RELEASE:
+  
+  Dev: deploys order-service-2.1.0-SNAPSHOT.jar (from Nexus snapshots repo)
+  Staging: promotes to order-service-2.1.0.jar (Nexus releases repo)
+  Prod: deploys the same 2.1.0.jar from releases repo
+  
+  # Maven release:
+  ./mvnw release:prepare release:perform
+  # Creates tag, changes version SNAPSHOT→RELEASE, deploys to Nexus releases
+
+================================================================================
+5. APPROVAL GATES AND MANUAL VALIDATION
+================================================================================
+
+Approval Gate Types:
+
+  1. Automated gate: Pipeline checks metrics/tests before proceeding
+  2. Manual gate: Human must explicitly approve the deployment
+  3. Timed gate: Deployment pauses for N hours (bake time / soak period)
+
+GitHub Actions Manual Approval:
+
+  # Create an "environment" with required reviewers in GitHub:
+  # Settings → Environments → prod → Required reviewers: [john, jane]
+  
+  jobs:
+    deploy-staging:
+      environment: staging    # Automatic (no reviewers)
+      runs-on: ubuntu-latest
+      steps:
+        - name: Deploy to Staging
+          run: ./deploy.sh staging
+    
+    deploy-prod:
+      environment: production  # Requires manual approval!
+      needs: deploy-staging
+      runs-on: ubuntu-latest
+      steps:
+        - name: Deploy to Production
+          run: ./deploy.sh production
+
+  # GitHub will PAUSE the workflow and notify required reviewers.
+  # They must visit GitHub and click "Approve" to continue.
+
+Jenkins Manual Approval:
+
+  pipeline {
+    stages {
+      stage('Deploy to Staging') {
+        steps {
+          sh './deploy.sh staging'
+        }
+      }
+      
+      stage('Approval — Prod Deploy') {
+        steps {
+          // Pause pipeline; email/Slack notification sent:
+          input {
+            message "Deploy to Production?"
+            submitter "release-managers"   // Only this group can approve
+            parameters {
+              string(
+                name: 'DEPLOY_REASON',
+                description: 'Reason for deployment'
+              )
+            }
+          }
+        }
+        timeout(time: 24, unit: 'HOURS')    // Auto-abort if no response
+      }
+      
+      stage('Deploy to Production') {
+        steps {
+          sh "./deploy.sh prod ${env.DEPLOY_REASON}"
+        }
+      }
+    }
+  }
+
+Argo Workflows Suspend Template (Manual Gate):
+
+  templates:
+    - name: staging-to-prod-gate
+      steps:
+        - - name: deploy-staging
+            template: deploy
+            arguments:
+              parameters:
+                - name: env
+                  value: staging
+        
+        - - name: manual-approval
+            template: approval-gate     # Suspends workflow here
+        
+        - - name: deploy-prod
+            template: deploy
+            arguments:
+              parameters:
+                - name: env
+                  value: prod
+    
+    - name: approval-gate
+      suspend: {}   # Workflow pauses; resume via Argo UI or CLI:
+                    # argo resume workflow-name
+
+Automated Quality Gate (Prometheus/Datadog metrics):
+
+  # Argo Rollouts (Canary with metric-based gates):
+  analysis:
+    - name: success-rate
+      templateRef:
+        name: success-rate
+      args:
+        - name: service-name
+          value: order-service
+      # Only promote to next step if:
+      # HTTP 5xx rate < 5% for 10 minutes
+  
+  # GitHub Actions: Query Datadog/Prometheus before promoting:
+  - name: Check Error Rate
+    run: |
+      ERROR_RATE=$(curl -s "$PROMETHEUS_URL/api/v1/query?query=..." | \
+        jq '.data.result[0].value[1]' | tr -d '"')
+      if (( $(echo "$ERROR_RATE > 0.05" | bc -l) )); then
+        echo "Error rate too high: $ERROR_RATE"
+        exit 1
+      fi
+
+================================================================================
+6. SECRETS MANAGEMENT PER ENVIRONMENT
+================================================================================
+
+Key Problem:
+
+  Different environments need different secrets.
+  Dev: Dev database password
+  Staging: Staging database password
+  Prod: Prod database password
+  
+  Secret must NOT be in source code or Docker image.
+  Secret must NOT be the same across all environments.
+
+Pattern 1: Kubernetes Secrets Per Namespace:
+
+  # Create secrets in each namespace separately:
+  kubectl create secret generic db-credentials \
+    --namespace dev \
+    --from-literal=url=jdbc:postgresql://dev-db:5432/devdb \
+    --from-literal=password=devpassword123
+  
+  kubectl create secret generic db-credentials \
+    --namespace prod \
+    --from-literal=url=jdbc:postgresql://prod-db.internal:5432/proddb \
+    --from-literal=password="$(cat /vault/prod-db-pass)"
+  
+  # Application reads from K8s Secret (same Secret name, different content):
+  # Spring Boot:
+  # spring.datasource.url=${DB_URL}    ← from Secret
+  # spring.datasource.password=${DB_PASSWORD}  ← from Secret
+
+Pattern 2: External Secrets Operator (Recommended):
+
+  # Sync secrets from AWS Secrets Manager / HashiCorp Vault to K8s Secrets.
+  # One secret path per environment.
+  
+  apiVersion: external-secrets.io/v1beta1
+  kind: ExternalSecret
+  metadata:
+    name: db-credentials
+    namespace: prod
+  spec:
+    refreshInterval: 1h
+    secretStoreRef:
+      name: aws-secrets-manager
+      kind: ClusterSecretStore
+    target:
+      name: db-credentials    # K8s Secret to create/update
+    data:
+      - secretKey: url         # Key in K8s Secret
+        remoteRef:
+          key: prod/order-service/db   # Path in AWS Secrets Manager
+          property: url
+      - secretKey: password
+        remoteRef:
+          key: prod/order-service/db
+          property: password
+
+Pattern 3: HashiCorp Vault with K8s Auth:
+
+  # Vault has paths per environment:
+  # secret/dev/order-service/...
+  # secret/staging/order-service/...
+  # secret/prod/order-service/...
+  
+  # Spring Boot Vault integration:
+  spring:
+    cloud:
+      vault:
+        uri: https://vault.internal:8200
+        authentication: kubernetes
+        kubernetes:
+          role: order-service-${spring.profiles.active}   # Role per env
+        kv:
+          enabled: true
+          default-context: ${spring.application.name}
+          profiles:
+            path: ${spring.profiles.active}
+
+Pattern 4: Environment-Specific Secrets in CI (GitHub Actions):
+
+  # GitHub repository secrets can be scoped to environments:
+  # Settings → Environments → prod → Secrets → DB_PASSWORD (prod value)
+  # Settings → Environments → staging → Secrets → DB_PASSWORD (staging value)
+  
+  jobs:
+    deploy:
+      environment: prod   # Uses prod environment's DB_PASSWORD
+      env:
+        DB_PASSWORD: ${{ secrets.DB_PASSWORD }}   # Environment-scoped!
+
+================================================================================
+7. GITOPS-BASED PROMOTION WITH ARGOCD
+================================================================================
+
+GitOps Multi-Environment Setup:
+
+  Two-repository pattern (recommended):
+  
+  Repo 1: app-source (application code)
+  ├── src/
+  ├── Dockerfile
+  └── pom.xml
+
+  Repo 2: app-config (Kubernetes manifests)
+  ├── base/                     (common Kubernetes YAML)
+  │   ├── deployment.yaml
+  │   ├── service.yaml
+  │   └── kustomization.yaml
+  └── overlays/
+      ├── dev/
+      │   ├── kustomization.yaml
+      │   └── values.yaml       (dev-specific overrides)
+      ├── staging/
+      │   ├── kustomization.yaml
+      │   └── values.yaml
+      └── prod/
+          ├── kustomization.yaml
+          └── values.yaml
+
+ArgoCD Application Per Environment:
+
+  # ArgoCD Application for dev:
+  apiVersion: argoproj.io/v1alpha1
+  kind: Application
+  metadata:
+    name: order-service-dev
+    namespace: argocd
+  spec:
+    project: default
+    source:
+      repoURL: https://github.com/my-org/app-config.git
+      targetRevision: HEAD
+      path: overlays/dev             # Points to dev overlay
+    destination:
+      server: https://dev-cluster.internal
+      namespace: dev
+    syncPolicy:
+      automated:
+        prune: true
+        selfHeal: true             # Auto-sync if drift detected
+      syncOptions:
+        - CreateNamespace=true
+  
+  ---
+  
+  # ArgoCD Application for prod (manual sync only):
+  apiVersion: argoproj.io/v1alpha1
+  kind: Application
+  metadata:
+    name: order-service-prod
+    namespace: argocd
+  spec:
+    source:
+      path: overlays/prod
+    syncPolicy:
+      automated: null              # NO auto-sync for production!
+      # Prod requires manual sync: argocd app sync order-service-prod
+
+Kustomize Overlays (Environment-Specific Config):
+
+  # base/deployment.yaml:
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: order-service
+  spec:
+    replicas: 1                    # Base: 1 replica
+    template:
+      spec:
+        containers:
+          - name: order-service
+            image: my-registry/order-service:latest   # Updated by CI
+            resources:
+              requests:
+                memory: "256Mi"
+                cpu: "250m"
+  
+  # overlays/prod/kustomization.yaml:
+  apiVersion: kustomize.config.k8s.io/v1beta1
+  kind: Kustomization
+  bases:
+    - ../../base
+  
+  replicas:
+    - name: order-service
+      count: 5                     # Prod: 5 replicas
+  
+  patches:
+    - target:
+        kind: Deployment
+        name: order-service
+      patch: |
+        - op: replace
+          path: /spec/template/spec/containers/0/resources/requests/memory
+          value: "512Mi"
+        - op: replace
+          path: /spec/template/spec/containers/0/resources/limits/memory
+          value: "1Gi"
+  
+  images:
+    - name: my-registry/order-service
+      newTag: sha-abc1234          # CI updates this tag in prod overlay
+
+CI Updates Image Tag (Git Push to Config Repo):
+
+  # In CI pipeline (after building Docker image):
+  - name: Update image tag in config repo
+    run: |
+      git clone https://github.com/my-org/app-config.git config-repo
+      cd config-repo
+      
+      # Update dev overlay first:
+      cd overlays/dev
+      kustomize edit set image \
+        my-registry/order-service=my-registry/order-service:sha-${{ github.sha }}
+      
+      git config user.email "ci@mycompany.com"
+      git config user.name "CI Bot"
+      git add -A
+      git commit -m "ci: update order-service image to sha-${{ github.sha }}"
+      git push
+      # ArgoCD detects the change → syncs dev automatically
+
+Staging Promotion (Separate PR):
+
+  # After dev is stable, create PR to update staging overlay:
+  cd config-repo/overlays/staging
+  kustomize edit set image \
+    my-registry/order-service=my-registry/order-service:sha-${{ env.PROMOTE_SHA }}
+  
+  # Create PR programmatically (GitHub CLI):
+  gh pr create \
+    --title "Promote order-service sha-${PROMOTE_SHA} to staging" \
+    --body "Deploying sha-${PROMOTE_SHA} which has been stable in dev for 24h"
+
+================================================================================
+8. HELM-BASED ENVIRONMENT CONFIGURATION
+================================================================================
+
+Helm Values Per Environment:
+
+  helm-chart/
+  ├── Chart.yaml
+  ├── values.yaml           (defaults)
+  ├── values-dev.yaml       (dev overrides)
+  ├── values-staging.yaml   (staging overrides)
+  └── values-prod.yaml      (prod overrides)
+
+values.yaml (defaults):
+
+  replicaCount: 1
+  
+  image:
+    repository: my-registry/order-service
+    tag: latest
+    pullPolicy: IfNotPresent
+  
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+  
+  env:
+    LOG_LEVEL: INFO
+    SPRING_PROFILES_ACTIVE: default
+  
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 5
+  
+  postgresql:
+    host: localhost
+    port: 5432
+    database: orderdb
+
+values-prod.yaml (prod overrides):
+
+  replicaCount: 5
+  
+  image:
+    tag: "v1.2.3"              # Specific version in prod
+  
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "500m"
+    limits:
+      memory: "1Gi"
+      cpu: "1"
+  
+  env:
+    LOG_LEVEL: WARN            # Less verbose in prod
+    SPRING_PROFILES_ACTIVE: production
+  
+  autoscaling:
+    enabled: true
+    minReplicas: 5
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 70
+  
+  postgresql:
+    host: prod-postgres.internal
+    port: 5432
+    database: orders_prod
+
+Helm Deploy Commands Per Environment:
+
+  # Dev (auto from CI):
+  helm upgrade --install order-service ./helm-chart \
+    --namespace dev \
+    -f values.yaml -f values-dev.yaml \
+    --set image.tag=sha-${GIT_SHA}
+  
+  # Staging (auto after dev passes):
+  helm upgrade --install order-service ./helm-chart \
+    --namespace staging \
+    -f values.yaml -f values-staging.yaml \
+    --set image.tag=sha-${GIT_SHA}
+  
+  # Prod (manual approval required first):
+  helm upgrade --install order-service ./helm-chart \
+    --namespace prod \
+    -f values.yaml -f values-prod.yaml \
+    --set image.tag=v1.2.3 \
+    --atomic \                    # Roll back if deployment fails
+    --timeout 5m
+
+================================================================================
+9. JENKINS MULTI-ENVIRONMENT PIPELINE
+================================================================================
+
+  pipeline {
+    agent any
+    
+    parameters {
+      choice(
+        name: 'TARGET_ENV',
+        choices: ['dev', 'staging', 'prod'],
+        description: 'Target deployment environment'
+      )
+      string(
+        name: 'IMAGE_TAG',
+        description: 'Docker image tag to deploy'
+      )
+    }
+    
+    environment {
+      REGISTRY = 'my-registry.io'
+      APP = 'order-service'
+      K8S_CLUSTER_DEV = credentials('k8s-kubeconfig-dev')
+      K8S_CLUSTER_STAGING = credentials('k8s-kubeconfig-staging')
+      K8S_CLUSTER_PROD = credentials('k8s-kubeconfig-prod')
+    }
+    
+    stages {
+      stage('Validate') {
+        steps {
+          script {
+            if (!params.IMAGE_TAG) {
+              error("IMAGE_TAG parameter is required!")
+            }
+            echo "Deploying ${REGISTRY}/${APP}:${params.IMAGE_TAG} to ${params.TARGET_ENV}"
+          }
+        }
+      }
+      
+      stage('Deploy to Dev') {
+        when { expression { params.TARGET_ENV == 'dev' } }
+        steps {
+          withKubeConfig([credentialsId: 'k8s-kubeconfig-dev']) {
+            sh """
+              helm upgrade --install ${APP} ./helm-chart \
+                --namespace dev \
+                -f values.yaml -f values-dev.yaml \
+                --set image.tag=${params.IMAGE_TAG}
+            """
+            sh "kubectl rollout status deployment/${APP} -n dev --timeout=5m"
+          }
+        }
+      }
+      
+      stage('Deploy to Staging') {
+        when { expression { params.TARGET_ENV == 'staging' } }
+        steps {
+          withKubeConfig([credentialsId: 'k8s-kubeconfig-staging']) {
+            sh """
+              helm upgrade --install ${APP} ./helm-chart \
+                --namespace staging \
+                -f values.yaml -f values-staging.yaml \
+                --set image.tag=${params.IMAGE_TAG}
+            """
+            sh "kubectl rollout status deployment/${APP} -n staging --timeout=5m"
+          }
+        }
+      }
+      
+      stage('Manual Approval for Prod') {
+        when { expression { params.TARGET_ENV == 'prod' } }
+        steps {
+          timeout(time: 24, unit: 'HOURS') {
+            input(
+              message: "Deploy ${APP}:${params.IMAGE_TAG} to PRODUCTION?",
+              submitter: 'release-managers',
+              ok: 'Approve Production Deployment'
+            )
+          }
+        }
+      }
+      
+      stage('Deploy to Production') {
+        when { expression { params.TARGET_ENV == 'prod' } }
+        steps {
+          withKubeConfig([credentialsId: 'k8s-kubeconfig-prod']) {
+            sh """
+              helm upgrade --install ${APP} ./helm-chart \
+                --namespace prod \
+                -f values.yaml -f values-prod.yaml \
+                --set image.tag=${params.IMAGE_TAG} \
+                --atomic \
+                --timeout 10m
+            """
+            sh "kubectl rollout status deployment/${APP} -n prod --timeout=10m"
+          }
+        }
+      }
+    }
+    
+    post {
+      success {
+        slackSend(message: "✅ Deployed ${APP}:${params.IMAGE_TAG} to ${params.TARGET_ENV}")
+      }
+      failure {
+        slackSend(
+          color: 'danger',
+          message: "❌ FAILED deployment of ${APP}:${params.IMAGE_TAG} to ${params.TARGET_ENV}"
+        )
+      }
+    }
+  }
+
+================================================================================
+10. GITHUB ACTIONS MULTI-ENVIRONMENT WORKFLOW
+================================================================================
+
+  name: Promote Deployment
+  
+  on:
+    workflow_dispatch:
+      inputs:
+        image-tag:
+          description: 'Docker image tag to promote'
+          required: true
+        environment:
+          description: 'Target environment'
+          required: true
+          type: choice
+          options:
+            - dev
+            - staging
+            - prod
+  
+  jobs:
+    validate:
+      name: Validate Image Tag
+      runs-on: ubuntu-latest
+      steps:
+        - name: Verify image exists in registry
+          run: |
+            docker manifest inspect \
+              my-registry.io/order-service:${{ inputs.image-tag }}
+    
+    deploy-dev:
+      name: Deploy to Dev
+      runs-on: ubuntu-latest
+      if: inputs.environment == 'dev'
+      needs: validate
+      environment:
+        name: dev
+        url: https://dev.myapp.com
+      steps:
+        - uses: actions/checkout@v4
+        - name: Deploy to Dev
+          uses: azure/k8s-deploy@v4
+          with:
+            namespace: dev
+            manifests: |
+              k8s/deployment.yaml
+              k8s/service.yaml
+            images: |
+              my-registry.io/order-service:${{ inputs.image-tag }}
+    
+    deploy-staging:
+      name: Deploy to Staging
+      runs-on: ubuntu-latest
+      if: inputs.environment == 'staging'
+      needs: validate
+      environment:
+        name: staging              # No required reviewers (auto)
+        url: https://staging.myapp.com
+      steps:
+        - uses: actions/checkout@v4
+        - name: Update staging values
+          run: |
+            # Update Helm values for staging:
+            helm upgrade --install order-service ./helm-chart \
+              --kube-context staging \
+              -f values-staging.yaml \
+              --set image.tag=${{ inputs.image-tag }}
+    
+    deploy-prod:
+      name: Deploy to Production
+      runs-on: ubuntu-latest
+      if: inputs.environment == 'prod'
+      needs: validate
+      environment:
+        name: production            # REQUIRES APPROVAL (configured in GitHub)
+        url: https://myapp.com
+      steps:
+        - uses: actions/checkout@v4
+        - name: Deploy to Production
+          run: |
+            helm upgrade --install order-service ./helm-chart \
+              --kube-context prod \
+              -f values-prod.yaml \
+              --set image.tag=${{ inputs.image-tag }} \
+              --atomic \
+              --timeout 10m
+        
+        - name: Verify deployment health
+          run: |
+            kubectl rollout status deployment/order-service \
+              --namespace prod \
+              --timeout=10m \
+              --context prod
+        
+        - name: Notify team
+          uses: slackapi/slack-github-action@v1.26.0
+          with:
+            payload: |
+              {
+                "text": "🚀 Deployed order-service:${{ inputs.image-tag }} to production by ${{ github.actor }}"
+              }
+          env:
+            SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+================================================================================
+11. DATABASE MIGRATION IN MULTI-ENVIRONMENT PIPELINES
+================================================================================
+
+The Problem:
+
+  Application update often requires database schema change.
+  Schema migration must happen BEFORE new app version starts.
+  But it must also be BACKWARD COMPATIBLE (for rollback).
+
+Solution: Flyway or Liquibase (Migrations as Code):
+
+  # Flyway migration files:
+  src/main/resources/db/migration/
+  ├── V1__Create_orders_table.sql
+  ├── V2__Add_status_column.sql
+  └── V3__Add_customer_id_index.sql
+  
+  # Flyway runs automatically on Spring Boot startup:
+  spring.flyway.enabled=true
+  spring.flyway.locations=classpath:db/migration
+  
+  # Flyway tracks which migrations have run in flyway_schema_history table.
+  # Only new migrations are applied on each startup.
+
+Expand-Contract Pattern (Safe Migrations):
+
+  Step 1 — EXPAND (add, don't remove):
+    V3__Add_new_column_nullable.sql:
+      ALTER TABLE orders ADD COLUMN customer_email VARCHAR(255);
+      # Add nullable column → old code works (ignores it), new code uses it
+  
+  Deploy v2 (new code reading new column) while v1 still runs.
+  
+  Step 2 — MIGRATE DATA:
+    V4__Populate_customer_email.sql:
+      UPDATE orders SET customer_email = customers.email
+      FROM customers WHERE orders.customer_id = customers.id;
+  
+  Step 3 — CONTRACT (make non-nullable, remove old):
+    V5__Make_email_not_null.sql:
+      ALTER TABLE orders ALTER COLUMN customer_email SET NOT NULL;
+    # Only after ALL old code instances are gone
+
+Migration Pipeline Stages:
+
+  # In CI pipeline, run migrations BEFORE deploying new app:
+  
+  # Stage 1: Apply migrations to dev:
+  ./mvnw flyway:migrate -Dflyway.url=jdbc:postgresql://dev-db/orders
+  
+  # Stage 2: Run integration tests against migrated schema
+  ./mvnw failsafe:integration-test
+  
+  # Stage 3: Deploy new app version (schema already updated)
+  helm upgrade --install order-service ./helm-chart --set image.tag=...
+
+================================================================================
+12. FEATURE FLAGS AS ENVIRONMENT PROMOTION ALTERNATIVE
+================================================================================
+
+Using Feature Flags Instead of Environments:
+
+  Traditional: Code lives in staging until approved → promote to prod.
+  Feature flags: Deploy code to prod, but feature is OFF until enabled.
+  
+  Benefits:
+  - Deploy continuously without "environment gates"
+  - Enable/disable features per user, per region, per %
+  - Instant rollback: turn off flag (no redeploy)
+  
+  Example with LaunchDarkly / Unleash / Spring Cloud Feature Flags:
+  
+  @RestController
+  public class OrderController {
+    
+    @Autowired
+    private FeatureFlagService featureFlags;
+    
+    @PostMapping("/orders")
+    public ResponseEntity<Order> createOrder(
+            @RequestBody OrderRequest request) {
+      
+      if (featureFlags.isEnabled("new-order-processing-v2", request.getUserId())) {
+        // New implementation (deployed but hidden behind flag)
+        return newOrderService.createOrder(request);
+      } else {
+        // Old implementation (safe fallback)
+        return legacyOrderService.createOrder(request);
+      }
+    }
+  }
+  
+  # Gradual rollout:
+  # Day 1: Enable for 1% of users → monitor error rate
+  # Day 2: Enable for 10% → still monitoring
+  # Day 3: Enable for 100% → full rollout
+
+Feature Flags + Multi-Environment:
+
+  Best practice: Use BOTH.
+  - Multi-environment for infrastructure validation (staging ≈ prod)
+  - Feature flags for business feature control
+  
+  Staging: Feature flag ON (to test full feature in staging)
+  Prod: Feature flag OFF initially → gradual rollout after deploy
+
+================================================================================
+13. ROLLBACK ACROSS ENVIRONMENTS
+================================================================================
+
+Rollback Strategies:
+
+  1. Kubernetes rollback:
+     kubectl rollout undo deployment/order-service -n prod
+     # Reverts to previous ReplicaSet (previous image tag)
+  
+  2. Helm rollback:
+     helm rollback order-service 2 --namespace prod
+     # 2 = specific revision number; 0 = previous revision
+     helm history order-service --namespace prod   # View history
+  
+  3. GitOps rollback (preferred):
+     # Revert the commit that changed the image tag in config repo:
+     git revert abc1234
+     git push
+     # ArgoCD detects revert → re-syncs previous image tag
+     # FULL AUDIT TRAIL in Git history!
+  
+  4. Argo Rollouts:
+     kubectl argo rollouts abort order-service -n prod
+     kubectl argo rollouts undo order-service -n prod
+
+Database Rollback Complexity:
+
+  Schema changes are the hardest part of rollback:
+  - Forward-only schema changes (Flyway): Can't auto-rollback
+  - Use expand-contract pattern to make rollback safe
+  - Always keep old code working with new schema (backward compatibility)
+  - Emergency rollback: deploy old code (schema is fine if expand-contract)
+
+Production Rollback Checklist:
+
+  1. Alert team in Slack/PagerDuty: "Rolling back order-service to v1.2.2"
+  2. kubectl rollout undo or helm rollback (immediate)
+  3. Verify rollback: kubectl rollout status / monitor error rate in Grafana
+  4. Create incident ticket with timeline
+  5. Post-mortem: why did deploy fail? How to prevent?
+
+================================================================================
+14. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: How do you manage different configurations (database URLs, secrets, feature flags)
+    across dev, staging, and production environments in a Kubernetes-based pipeline?
+
+A: Layered approach — NO config in Docker image:
+   
+   Layer 1 — Application defaults (application.yml):
+   spring.datasource.url=jdbc:postgresql://localhost:5432/orderdb
+   (Only used if env var not set — for local dev convenience)
+   
+   Layer 2 — Kubernetes Secrets per namespace:
+   db-credentials secret in "dev" namespace has dev DB URL.
+   db-credentials secret in "prod" namespace has prod DB URL.
+   Spring Boot reads: spring.datasource.url=${SPRING_DATASOURCE_URL}
+   from environment variable injected from K8s Secret.
+   
+   Layer 3 — Spring Profiles + ConfigMaps:
+   SPRING_PROFILES_ACTIVE=production set per namespace.
+   application-production.yml in ConfigMap (logging, timeouts, feature flags).
+   
+   Layer 4 — External secrets (AWS Secrets Manager / Vault):
+   External Secrets Operator syncs from AWS SM → K8s Secret.
+   Secrets rotate automatically without redeployment.
+   
+   Result:
+   Same Docker image runs everywhere.
+   All environment-specific data is injected at runtime.
+   Dev team never sees prod secrets (K8s RBAC + AWS IAM restrict access).
+
+---
+
+Q2: What is GitOps-based promotion and how does it give you an audit trail?
+
+A: GitOps promotion means Git is the single source of truth for
+   what version is deployed in each environment.
+   
+   Structure:
+   app-config repo:
+     overlays/dev/values.yaml    → image: order-service:sha-abc
+     overlays/staging/values.yaml → image: order-service:sha-xyz
+     overlays/prod/values.yaml   → image: order-service:v1.2.3
+   
+   ArgoCD watches each overlay directory and syncs to the corresponding
+   cluster/namespace when changes are detected.
+   
+   Promotion process:
+   - CI builds sha-def and updates overlays/dev/values.yaml → commit
+   - ArgoCD detects → deploys sha-def to dev
+   - After dev validation: PR to update overlays/staging → team reviews PR
+   - PR merged → ArgoCD deploys to staging
+   - After staging validation: PR to update overlays/prod → release manager approves
+   - PR merged → ArgoCD deploys to prod
+   
+   Audit trail:
+   Every deployment = a Git commit with:
+   - WHO: git blame shows who updated the config
+   - WHAT: diff shows which image tag changed
+   - WHY: PR description / commit message
+   - WHEN: git log timestamp
+   Emergency rollback = git revert the commit → ArgoCD auto-syncs.
+   
+   This is infinitely better than "who ran helm upgrade manually on what date?"
+
+================================================================================
+15. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+ENVIRONMENT CHAIN:
+  dev → staging → prod (sometimes: dev → QA → staging → prod)
+
+PROMOTION CHECKLIST:
+  Dev → Staging:   Automatic after CI passes
+  Staging → Prod:  Manual approval + change ticket
+
+HELM PER-ENV DEPLOY:
+  helm upgrade --install app ./chart -f values.yaml -f values-${ENV}.yaml \
+    --set image.tag=${TAG} --atomic --timeout 5m
+
+KUSTOMIZE PER-ENV:
+  kubectl apply -k overlays/${ENV}/
+  kustomize edit set image registry/app:${TAG}   # In overlay dir
+
+KUBECTL ROLLBACK:
+  kubectl rollout undo deployment/app -n prod
+  kubectl rollout status deployment/app -n prod
+
+HELM ROLLBACK:
+  helm history app -n prod      # List revisions
+  helm rollback app 3 -n prod   # Rollback to revision 3
+
+GITOPS ROLLBACK:
+  git revert <commit-that-changed-image-tag>
+  git push   → ArgoCD syncs old version
+
+GITHUB ACTIONS ENVIRONMENTS:
+  environment: production   # Triggers approval gate (if reviewers configured)
+
+SECRETS PATTERN:
+  Same Secret NAME in each namespace, different content.
+  External Secrets Operator: AWS SM / Vault → K8s Secret (auto-rotated)
+
+FLYWAY MIGRATION SAFETY:
+  Expand-contract: Add nullable column first → fill data → make NOT NULL.
+  Never: drop column while old code still runs.
+
+================================================================================
+END OF MULTI-ENVIRONMENT PIPELINE PATTERNS GUIDE
+================================================================================

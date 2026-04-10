@@ -1,0 +1,396 @@
+================================================================================
+DISTRIBUTED TRACING — SPRING BOOT 3 + MICROMETER + ZIPKIN / TEMPO
+================================================================================
+
+WHAT IS DISTRIBUTED TRACING?
+------------------------------
+In microservices, a single user request touches multiple services.
+Without tracing: "Why is the checkout slow?" → impossible to pinpoint which service.
+With distributed tracing: every request gets a Trace ID propagated across all services.
+You can see the full call chain, duration of each span, and where latency lives.
+
+Terminology:
+  Trace:    Represents a complete request journey across all services.
+            Identified by a unique Trace ID.
+  Span:     A unit of work within a trace (one service call, one DB query).
+            Has: Span ID, parent Span ID, start time, duration, tags, events.
+  Context:  The Trace ID + Span ID passed between services via HTTP headers.
+
+Example Trace:
+  [Trace ID: abc-123]
+  ├─ [Span: gateway → order-service] 450ms
+  │   ├─ [Span: DB query - find customer] 5ms
+  │   ├─ [Span: feign → inventory-service] 120ms
+  │   │   └─ [Span: DB query - check inventory] 8ms
+  │   └─ [Span: kafka publish - order-events] 3ms
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING BOOT 3 TRACING STACK
+==============================
+
+Spring Boot 3 uses MICROMETER TRACING (replaces Spring Cloud Sleuth).
+
+Components:
+  Micrometer Tracing API:  Common facade (like SLF4J for logging)
+  Bridge:                  Implementation (OpenTelemetry or Brave/Zipkin)
+  Exporter:                Where traces go (Zipkin, Tempo, Jaeger, Datadog)
+
+Most common setups:
+  1. Micrometer + OTel Bridge → Zipkin (simple, self-hosted)
+  2. Micrometer + OTel Bridge → Tempo + Grafana (production, modern)
+  3. OTel Java Agent → Any backend (zero-code, enterprise)
+
+────────────────────────────────────────────────────────────────────────────────
+
+SETUP — MICROMETER + OPENTELEMETRY → ZIPKIN
+=============================================
+
+pom.xml (all services):
+  <!-- Micrometer Tracing with OTel bridge -->
+  <dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-tracing-bridge-otel</artifactId>
+  </dependency>
+  <!-- Zipkin exporter (sends spans to Zipkin) -->
+  <dependency>
+    <groupId>io.opentelemetry</groupId>
+    <artifactId>opentelemetry-exporter-zipkin</artifactId>
+  </dependency>
+  <!-- Micrometer Prometheus metrics (separate from tracing) -->
+  <dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-registry-prometheus</artifactId>
+  </dependency>
+  <!-- Actuator (required for tracing integration) -->
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
+  </dependency>
+
+Spring Boot auto-instruments:
+  ✓ HTTP requests (incoming and outgoing via RestTemplate, WebClient, Feign)
+  ✓ JDBC queries (with p6spy or datasource-proxy)
+  ✓ Kafka producers and consumers
+  ✓ gRPC (with micrometer-tracing-bridge-otel)
+  ✓ Spring Cache
+
+application.yml (all services):
+  management:
+    tracing:
+      sampling:
+        probability: 1.0      # 100% in dev; 0.1 (10%) in production
+    zipkin:
+      tracing:
+        endpoint: http://zipkin:9411/api/v2/spans
+
+  logging:
+    pattern:
+      level: "%5p [${spring.application.name:},%X{traceId:-},%X{spanId:-}]"
+      # Output: INFO  [order-service,abc123def456,abc123def456]
+
+────────────────────────────────────────────────────────────────────────────────
+
+SETUP — MICROMETER + OTel → GRAFANA TEMPO (PRODUCTION)
+=========================================================
+
+pom.xml:
+  <dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-tracing-bridge-otel</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>io.opentelemetry</groupId>
+    <artifactId>opentelemetry-exporter-otlp</artifactId>
+  </dependency>
+
+application.yml:
+  management:
+    tracing:
+      sampling:
+        probability: 0.1       # 10% sampling in production (cost control)
+    otlp:
+      tracing:
+        endpoint: http://otel-collector:4318/v1/traces
+
+  spring:
+    application:
+      name: order-service      # Shows as service name in Grafana
+
+Tempo stack:
+  OTel Collector → Grafana Tempo (trace storage)
+  Prometheus → Grafana (metrics)
+  Loki → Grafana (logs)
+  All three linked in Grafana via Trace ID correlation
+
+────────────────────────────────────────────────────────────────────────────────
+
+TRACE CONTEXT PROPAGATION — HOW IT WORKS
+==========================================
+
+W3C TraceContext standard (supported by OTel):
+  traceparent: 00-{traceId}-{spanId}-{flags}
+  Example:
+  traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+
+Spring Boot auto-propagates via:
+  - HTTP: Adds traceparent / b3 headers to outgoing RestTemplate/Feign/WebClient calls
+  - Kafka: Adds trace headers to Kafka message headers
+  - gRPC: Uses metadata headers via interceptors
+
+WHAT HAPPENS WITHOUT PROPAGATION:
+  Gateway creates Trace ID: abc-123
+  Gateway calls Order Service (passes traceparent header)
+  Order Service calls Inventory Service → if it doesn't forward headers → NEW trace starts
+  Result: two disconnected traces instead of one
+
+VERIFY PROPAGATION WORKS:
+  In Zipkin/Grafana, search by Trace ID → should see ALL services in one trace.
+  If a service is missing → check that HTTP client (Feign/WebClient) auto-instrumentation
+  is on the classpath.
+
+────────────────────────────────────────────────────────────────────────────────
+
+CREATING CUSTOM SPANS
+=======================
+
+  @Service
+  @RequiredArgsConstructor
+  @Slf4j
+  public class OrderService {
+
+    private final Tracer tracer;               // Micrometer Tracer (injected)
+    private final OrderRepository orderRepository;
+
+    public Order processOrder(CreateOrderCommand command) {
+
+      // Create a child span for a specific business operation
+      Span span = tracer.nextSpan()
+          .name("order.validation")
+          .tag("order.customerId", command.customerId())
+          .tag("order.itemCount", String.valueOf(command.items().size()));
+
+      try (Tracer.SpanInScope ws = tracer.withSpan(span.start())) {
+        validateOrder(command);
+        log.info("Order validated for customer {}", command.customerId());
+        // Span automatically gets traceId/spanId from current context
+
+      } catch (Exception e) {
+        span.error(e);
+        throw e;
+      } finally {
+        span.end();
+      }
+
+      // Create another span for DB operation
+      Span dbSpan = tracer.nextSpan().name("order.save");
+      try (Tracer.SpanInScope ws = tracer.withSpan(dbSpan.start())) {
+        Order order = Order.create(command);
+        return orderRepository.save(order);
+      } finally {
+        dbSpan.end();
+      }
+    }
+  }
+
+  // Or using @NewSpan annotation (AOP-based, simpler):
+  @Service
+  public class InventoryService {
+
+    @NewSpan("inventory.check")   // Creates new child span
+    @SpanTag("productId")         // Adds tag from method argument
+    public InventoryResult checkInventory(String productId) {
+      // ...
+    }
+
+    @ContinueSpan                 // Adds tag to CURRENT span (doesn't create new one)
+    public void reserveInventory(String productId, int quantity) {
+      // ...
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+ADDING TRACE ID TO LOGS
+==========================
+
+Spring Boot 3 with Micrometer Tracing automatically adds traceId and spanId
+to the MDC (Mapped Diagnostic Context) — so they appear in logs automatically.
+
+application.yml:
+  logging:
+    pattern:
+      level: "%5p [${spring.application.name},%X{traceId:-},%X{spanId:-}]"
+
+Log output:
+  INFO  [order-service,4bf92f3577b34da6,00f067aa0ba902b7] Received create order request
+  INFO  [order-service,4bf92f3577b34da6,1234567890abcdef] DB query executed in 5ms
+  INFO  [inventory-service,4bf92f3577b34da6,fedcba0987654321] Inventory reserved
+
+Same Trace ID across services → correlate logs in Kibana/Grafana Loki.
+
+STRUCTURED LOGGING (JSON for centralized log systems):
+  <dependency>
+    <groupId>net.logstash.logback</groupId>
+    <artifactId>logstash-logback-encoder</artifactId>
+    <version>7.4</version>
+  </dependency>
+
+  logback-spring.xml:
+  <appender name="json" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+      <includeMdcKeyName>traceId</includeMdcKeyName>
+      <includeMdcKeyName>spanId</includeMdcKeyName>
+    </encoder>
+  </appender>
+
+  Output:
+  {"timestamp":"2024-01-15T10:30:00.123Z",
+   "level":"INFO",
+   "service":"order-service",
+   "traceId":"4bf92f3577b34da6",
+   "spanId":"00f067aa0ba902b7",
+   "message":"Order created successfully",
+   "orderId":"ord-123"}
+
+────────────────────────────────────────────────────────────────────────────────
+
+SAMPLING STRATEGIES
+====================
+
+100% sampling = every request traced = high cost in production.
+10% sampling = 10% of requests traced = good for high-volume services.
+
+SAMPLING STRATEGIES:
+  Constant (Probabilistic):  Sample X% of all traces uniformly.
+  Rate Limiting:             Sample at most N traces per second.
+  Adaptive:                  Adjust rate based on traffic volume.
+  Priority (Head-based):     Client can force trace with special header.
+  Tail-based:                Sample based on outcome (always sample errors and slow traces).
+
+application.yml:
+  management:
+    tracing:
+      sampling:
+        probability: 0.1      # 10% in production
+
+TAIL-BASED SAMPLING (via OTel Collector):
+  # Sample 100% of traces with errors or duration > 500ms
+  # otel-collector.yaml
+  processors:
+    tail_sampling:
+      decision_wait: 10s
+      policies:
+        - name: errors-policy
+          type: status_code
+          status_code: { status_codes: [ERROR] }
+        - name: slow-traces
+          type: latency
+          latency: { threshold_ms: 500 }
+        - name: probabilistic-sample
+          type: probabilistic
+          probabilistic: { sampling_percentage: 10 }
+
+────────────────────────────────────────────────────────────────────────────────
+
+ZIPKIN UI — WHAT TO LOOK FOR
+===============================
+
+Search by:
+  Service name: order-service
+  Trace ID: abc-123
+  Duration > 1000ms (slow requests)
+  Error: true
+
+In a trace view:
+  ✓ Identify which service has the largest span (latency bottleneck)
+  ✓ Look for sequential calls that could be parallelized
+  ✓ Check DB spans (N+1 queries show as many small consecutive spans)
+  ✓ Network latency between services (gap between spans)
+  ✓ Error spans (red highlights)
+
+────────────────────────────────────────────────────────────────────────────────
+
+GRAFANA TEMPO + LOKI CORRELATION
+===================================
+
+Tempo + Loki integration allows: Click on a trace → view correlated logs.
+
+Setup in Grafana:
+  1. Add Tempo datasource (http://tempo:3200)
+  2. Add Loki datasource (http://loki:3100)
+  3. In Tempo datasource: configure Logs integration → Loki
+     "traceId" label maps to {traceId="${__span.traceId}"}
+
+Now in Grafana:
+  - Open any Tempo trace
+  - Click "Logs for this span" → opens Loki with the same traceId filter
+  - See the exact log lines from all services for this trace
+
+This is "observability golden path": Metrics → Traces → Logs, all correlated.
+
+────────────────────────────────────────────────────────────────────────────────
+
+OTel JAVA AGENT (ZERO-CODE ALTERNATIVE)
+==========================================
+
+Attach OTel Java Agent for automatic instrumentation (no code changes):
+
+  Dockerfile:
+  FROM eclipse-temurin:21-jre
+  ADD https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/latest/download/opentelemetry-javaagent.jar /app/otel-agent.jar
+  COPY target/order-service.jar /app/order-service.jar
+  ENTRYPOINT ["java",
+    "-javaagent:/app/otel-agent.jar",
+    "-Dotel.service.name=order-service",
+    "-Dotel.exporter.otlp.endpoint=http://otel-collector:4317",
+    "-Dotel.exporter.otlp.protocol=grpc",
+    "-Dotel.traces.sampler=parentbased_traceidratio",
+    "-Dotel.traces.sampler.arg=0.1",
+    "-jar", "/app/order-service.jar"]
+
+Instruments automatically: HTTP, JDBC, Kafka, Redis, gRPC, Spring MVC, Spring WebFlux.
+No pom.xml changes needed. Best for polyglot environments.
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS — DISTRIBUTED TRACING
+==========================================
+
+Q: What is the difference between a Trace and a Span?
+A: A Trace represents the entire journey of a request across all services,
+   identified by a single Trace ID. A Span represents a single unit of work
+   within that trace (one service handling the request, one DB call, one Kafka
+   publish). Spans have a parent-child relationship forming a tree. All spans
+   in a trace share the same Trace ID.
+
+Q: How does distributed tracing work across microservices?
+A: The entry point (gateway/first service) creates a Trace ID and the first Span.
+   Every outgoing HTTP call (via Feign, RestTemplate, WebClient) includes the
+   traceparent header (W3C TraceContext standard). The receiving service extracts
+   this header, creates a child Span under the same Trace, and continues the chain.
+   At the end, all spans (from all services) are sent to the tracing backend (Zipkin/
+   Tempo) where they're assembled into a full trace tree.
+
+Q: What is tail-based sampling and why is it better than head-based?
+A: Head-based sampling decides at the start of a request whether to sample — it
+   can't know if the request will be slow or fail. Tail-based sampling makes the
+   decision AFTER the trace completes — it can ensure 100% of error traces and
+   slow traces are sampled, while sampling only 10% of successful fast traces.
+   This dramatically improves observability for the requests that matter most.
+
+Q: How do you add the Trace ID to your log output in Spring Boot 3?
+A: Micrometer Tracing automatically adds traceId and spanId to MDC. Configure the
+   logging pattern: "%5p [${spring.application.name},%X{traceId:-},%X{spanId:-}]".
+   For JSON structured logging with Logback, use LogstashEncoder and include the MDC
+   keys. All logs from a single request across all services will share the same
+   traceId, enabling correlation in Kibana or Grafana Loki.
+
+Q: What changed with Spring Boot 3 regarding distributed tracing?
+A: Spring Cloud Sleuth (Spring Boot 2) was deprecated. Spring Boot 3 uses
+   Micrometer Tracing as the new abstraction layer. Key differences: Micrometer
+   Tracing uses standard OTel bridges (brave or otel), Spring Boot 3 auto-
+   configures tracing from the classpath, and the configuration is under
+   management.tracing instead of spring.sleuth. Functionality is similar but
+   the API and configuration keys changed.
+================================================================================

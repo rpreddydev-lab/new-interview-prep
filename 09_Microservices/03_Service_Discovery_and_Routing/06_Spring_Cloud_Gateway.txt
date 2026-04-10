@@ -1,0 +1,532 @@
+================================================================================
+SPRING CLOUD GATEWAY — DEEP DIVE
+================================================================================
+
+WHAT IS SPRING CLOUD GATEWAY?
+-------------------------------
+Spring Cloud Gateway is the modern, reactive API gateway for Spring Boot
+microservices. It replaces Zuul (Netflix, blocking) with a non-blocking,
+reactive gateway built on Spring WebFlux and Project Reactor.
+
+Role in microservices:
+  - Single entry point for all client requests
+  - Routes requests to appropriate downstream microservices
+  - Cross-cutting concerns: auth, rate limiting, logging, CORS, circuit breaking
+  - Offloads concerns from individual services
+
+  Client → [Spring Cloud Gateway] → Order Service
+                                  → Inventory Service
+                                  → Payment Service
+                                  → Notification Service
+
+────────────────────────────────────────────────────────────────────────────────
+
+SETUP
+======
+
+pom.xml:
+  <dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-gateway</artifactId>
+  </dependency>
+  <!-- For JWT authentication -->
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+  </dependency>
+  <!-- For circuit breaking -->
+  <dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-circuitbreaker-reactor-resilience4j</artifactId>
+  </dependency>
+  <!-- For rate limiting with Redis -->
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis-reactive</artifactId>
+  </dependency>
+
+⚠️ IMPORTANT: Gateway uses Spring WebFlux (reactive). Do NOT add spring-boot-starter-web.
+
+────────────────────────────────────────────────────────────────────────────────
+
+ROUTING — YAML CONFIGURATION
+================================
+
+application.yml:
+  spring:
+    cloud:
+      gateway:
+        default-filters:
+          - DedupeResponseHeader=Access-Control-Allow-Credentials Access-Control-Allow-Origin
+
+        routes:
+          # ── Order Service ──────────────────────────────────────────────────
+          - id: order-service
+            uri: lb://order-service           # lb:// = load balanced via discovery
+            predicates:
+              - Path=/api/v1/orders/**
+            filters:
+              - StripPrefix=0                 # Don't strip prefix (pass as-is)
+              - name: CircuitBreaker
+                args:
+                  name: order-service-cb
+                  fallbackUri: forward:/fallback/order-service
+              - name: RequestRateLimiter
+                args:
+                  redis-rate-limiter.replenishRate: 100   # 100 req/sec
+                  redis-rate-limiter.burstCapacity: 200
+                  redis-rate-limiter.requestedTokens: 1
+                  key-resolver: "#{@userKeyResolver}"
+
+          # ── Inventory Service ──────────────────────────────────────────────
+          - id: inventory-service
+            uri: lb://inventory-service
+            predicates:
+              - Path=/api/v1/inventory/**
+              - Method=GET,POST
+            filters:
+              - AddRequestHeader=X-Gateway-Source, spring-cloud-gateway
+              - AddResponseHeader=X-Response-Time, "{@responseTimeFilter}"
+
+          # ── Payment Service (with rewrite path) ────────────────────────────
+          - id: payment-service
+            uri: lb://payment-service
+            predicates:
+              - Path=/api/payments/**        # External path
+            filters:
+              - RewritePath=/api/payments/(?<segment>.*), /api/v1/payments/$\{segment}
+
+          # ── User Service (with version routing) ────────────────────────────
+          - id: user-service-v2
+            uri: lb://user-service-v2
+            predicates:
+              - Path=/api/v1/users/**
+              - Header=X-API-Version, 2       # Route v2 header to v2 service
+            filters:
+              - StripPrefix=0
+
+          - id: user-service-v1
+            uri: lb://user-service-v1
+            predicates:
+              - Path=/api/v1/users/**         # Fallback to v1
+            filters:
+              - StripPrefix=0
+
+          # ── Static / Health ────────────────────────────────────────────────
+          - id: actuator
+            uri: http://localhost:${server.port}
+            predicates:
+              - Path=/actuator/**
+            filters:
+              - RemoveRequestHeader=Authorization  # Don't forward auth to actuator
+
+────────────────────────────────────────────────────────────────────────────────
+
+ROUTING — JAVA DSL (programmatic)
+====================================
+
+  @Configuration
+  public class GatewayConfig {
+
+    @Bean
+    public RouteLocator routes(RouteLocatorBuilder builder,
+                               JwtAuthFilter jwtAuthFilter,
+                               LoggingFilter loggingFilter) {
+      return builder.routes()
+          .route("order-service", r -> r
+              .path("/api/v1/orders/**")
+              .filters(f -> f
+                  .filter(loggingFilter)
+                  .circuitBreaker(config -> config
+                      .setName("order-cb")
+                      .setFallbackUri("forward:/fallback/orders"))
+                  .requestRateLimiter(config -> config
+                      .setRateLimiter(redisRateLimiter())
+                      .setKeyResolver(userKeyResolver())))
+              .uri("lb://order-service"))
+
+          .route("inventory-service", r -> r
+              .path("/api/v1/inventory/**")
+              .and()
+              .method(HttpMethod.GET, HttpMethod.POST)
+              .filters(f -> f
+                  .addRequestHeader("X-Internal-Service", "gateway")
+                  .retry(config -> config
+                      .setRetries(3)
+                      .setStatuses(HttpStatus.BAD_GATEWAY, HttpStatus.SERVICE_UNAVAILABLE)
+                      .setBackoff(Duration.ofMillis(100), Duration.ofMillis(1000), 2, true)))
+              .uri("lb://inventory-service"))
+          .build();
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+PREDICATES — ROUTING CONDITIONS
+==================================
+
+  Path:        - Path=/api/v1/orders/**
+  Method:      - Method=GET,POST
+  Header:      - Header=X-Request-Id, \d+       (regex match on header value)
+  Query:       - Query=color, gre.             (query param color matches regex gre.)
+  Cookie:      - Cookie=session, abc\d+
+  Host:        - Host=**.example.com            (wildcard host matching)
+  After:       - After=2024-01-01T00:00:00+00:00[UTC]  (time-based routing)
+  Before:      - Before=2024-12-31T23:59:59+00:00[UTC]
+  Weight:      - Weight=group1, 80             (canary: 80% to this route)
+
+CANARY DEPLOYMENT WITH WEIGHT:
+  routes:
+    - id: order-service-stable
+      uri: lb://order-service-v1
+      predicates:
+        - Path=/api/v1/orders/**
+        - Weight=order-group, 90             # 90% to stable
+    - id: order-service-canary
+      uri: lb://order-service-v2
+      predicates:
+        - Path=/api/v1/orders/**
+        - Weight=order-group, 10             # 10% to new version
+
+────────────────────────────────────────────────────────────────────────────────
+
+GATEWAY FILTERS
+=================
+
+BUILT-IN FILTERS:
+  AddRequestHeader     → Add header to downstream request
+  AddResponseHeader    → Add header to client response
+  RemoveRequestHeader  → Remove header before forwarding
+  RewritePath          → Rewrite URL path (regex replacement)
+  StripPrefix          → Remove path prefix (StripPrefix=1 removes /api)
+  RedirectTo           → HTTP redirect (301/302)
+  Retry                → Retry on failure (with backoff)
+  RequestRateLimiter   → Rate limiting (Redis-backed token bucket)
+  CircuitBreaker       → Resilience4j circuit breaker
+  RequestSize          → Reject requests over size limit
+  SecureHeaders        → Add security headers (HSTS, X-XSS-Protection, etc.)
+  SaveSession          → Save WebSession before forwarding
+
+────────────────────────────────────────────────────────────────────────────────
+
+CUSTOM GLOBAL FILTER — JWT AUTHENTICATION
+==========================================
+
+  @Component
+  @Order(-1)                        // Run before all other filters
+  @RequiredArgsConstructor
+  @Slf4j
+  public class JwtAuthGatewayFilter implements GlobalFilter {
+
+    private final JwtDecoder jwtDecoder;
+
+    private static final List<String> PUBLIC_PATHS = List.of(
+        "/api/v1/auth/", "/api/v1/public/", "/actuator/health");
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+      String path = exchange.getRequest().getPath().value();
+
+      // Skip auth for public paths
+      if (PUBLIC_PATHS.stream().anyMatch(path::startsWith)) {
+        return chain.filter(exchange);
+      }
+
+      String authHeader = exchange.getRequest().getHeaders()
+          .getFirst(HttpHeaders.AUTHORIZATION);
+
+      if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+        return unauthorizedResponse(exchange, "Missing or invalid Authorization header");
+      }
+
+      String token = authHeader.substring(7);
+
+      try {
+        Jwt jwt = jwtDecoder.decode(token);
+
+        // Forward user info to downstream services as headers
+        ServerHttpRequest mutatedRequest = exchange.getRequest().mutate()
+            .header("X-User-Id", jwt.getSubject())
+            .header("X-User-Roles", String.join(",", jwt.getClaimAsStringList("roles")))
+            .header("X-User-Email", jwt.getClaimAsString("email"))
+            .build();
+
+        log.debug("Authenticated request: user={}, path={}", jwt.getSubject(), path);
+        return chain.filter(exchange.mutate().request(mutatedRequest).build());
+
+      } catch (JwtException e) {
+        log.warn("Invalid JWT token: {}", e.getMessage());
+        return unauthorizedResponse(exchange, "Invalid or expired token");
+      }
+    }
+
+    private Mono<Void> unauthorizedResponse(ServerWebExchange exchange, String message) {
+      exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+      exchange.getResponse().getHeaders().add(
+          HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE);
+      byte[] body = ("{\"error\":\"" + message + "\"}").getBytes(StandardCharsets.UTF_8);
+      DataBuffer buffer = exchange.getResponse().bufferFactory().wrap(body);
+      return exchange.getResponse().writeWith(Mono.just(buffer));
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+CUSTOM GLOBAL FILTER — REQUEST LOGGING
+========================================
+
+  @Component
+  @Order(-2)    // Run first, before auth filter
+  @Slf4j
+  public class LoggingGlobalFilter implements GlobalFilter {
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+      String requestId = UUID.randomUUID().toString();
+      long startTime = System.currentTimeMillis();
+
+      // Add correlation ID for distributed tracing
+      ServerHttpRequest mutatedRequest = exchange.getRequest().mutate()
+          .header("X-Correlation-Id", requestId)
+          .build();
+
+      return chain.filter(exchange.mutate().request(mutatedRequest).build())
+          .doFinally(signalType -> {
+            long duration = System.currentTimeMillis() - startTime;
+            log.info("REQUEST id={} method={} path={} status={} duration={}ms",
+                requestId,
+                exchange.getRequest().getMethod(),
+                exchange.getRequest().getPath(),
+                exchange.getResponse().getStatusCode(),
+                duration);
+          });
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+RATE LIMITING WITH REDIS
+==========================
+
+  @Configuration
+  public class RateLimiterConfig {
+
+    // Rate limit per user (extracts user from JWT sub claim)
+    @Bean
+    public KeyResolver userKeyResolver() {
+      return exchange -> exchange.getPrincipal()
+          .map(Principal::getName)
+          .defaultIfEmpty("anonymous");  // Rate limit anonymous by IP
+    }
+
+    // Rate limit per IP address
+    @Bean
+    public KeyResolver ipKeyResolver() {
+      return exchange -> Mono.just(
+          Objects.requireNonNull(exchange.getRequest().getRemoteAddress())
+              .getAddress().getHostAddress());
+    }
+
+    @Bean
+    public RedisRateLimiter redisRateLimiter() {
+      return new RedisRateLimiter(
+          100,   // replenishRate: tokens added per second
+          200,   // burstCapacity: max tokens (burst allowance)
+          1      // requestedTokens: tokens per request
+      );
+    }
+  }
+
+  application.yml rate limiter config:
+    spring:
+      redis:
+        host: redis
+        port: 6379
+
+  Per-route rate limiting:
+    filters:
+      - name: RequestRateLimiter
+        args:
+          redis-rate-limiter.replenishRate: 10       # 10 req/sec per user
+          redis-rate-limiter.burstCapacity: 20
+          redis-rate-limiter.requestedTokens: 1
+          key-resolver: "#{@userKeyResolver}"
+
+────────────────────────────────────────────────────────────────────────────────
+
+CIRCUIT BREAKER + FALLBACK
+============================
+
+  application.yml:
+    spring:
+      cloud:
+        gateway:
+          routes:
+            - id: order-service
+              uri: lb://order-service
+              predicates:
+                - Path=/api/v1/orders/**
+              filters:
+                - name: CircuitBreaker
+                  args:
+                    name: orderServiceCB
+                    fallbackUri: forward:/fallback/order-service
+                    statusCodes:
+                      - 500
+                      - 502
+                      - 503
+
+    resilience4j:
+      circuitbreaker:
+        instances:
+          orderServiceCB:
+            sliding-window-size: 10
+            failure-rate-threshold: 50
+            wait-duration-in-open-state: 10s
+            permitted-number-of-calls-in-half-open-state: 3
+
+  // Fallback controller
+  @RestController
+  @RequestMapping("/fallback")
+  public class FallbackController {
+
+    @GetMapping("/order-service")
+    public ResponseEntity<Map<String, String>> orderServiceFallback(
+        ServerWebExchange exchange) {
+      log.warn("Order service fallback triggered");
+      return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+          .body(Map.of(
+              "status", "SERVICE_UNAVAILABLE",
+              "message", "Order service is temporarily unavailable. Please try again.",
+              "timestamp", Instant.now().toString()
+          ));
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+CORS CONFIGURATION
+====================
+
+  @Configuration
+  public class CorsGatewayConfig {
+
+    @Bean
+    public CorsWebFilter corsFilter() {
+      CorsConfiguration corsConfig = new CorsConfiguration();
+      corsConfig.setAllowedOriginPatterns(List.of(
+          "https://*.example.com",
+          "http://localhost:3000"    // Dev frontend
+      ));
+      corsConfig.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+      corsConfig.setAllowedHeaders(List.of("*"));
+      corsConfig.setAllowCredentials(true);
+      corsConfig.setMaxAge(3600L);
+
+      UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+      source.registerCorsConfiguration("/**", corsConfig);
+      return new CorsWebFilter(source);
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+PATH REWRITING — EXAMPLES
+===========================
+
+  # External: /api/v1/orders/123
+  # Internal: /orders/123 (strip /api/v1)
+  - StripPrefix=2
+
+  # External: /api/payments/123
+  # Internal: /api/v1/payments/123
+  - RewritePath=/api/payments/(?<segment>.*), /api/v1/payments/$\{segment}
+
+  # External: /orders (legacy)
+  # Internal: /api/v1/orders
+  - RewritePath=/orders/(?<rest>.*), /api/v1/orders/$\{rest}
+
+  # Redirect old path to new:
+  - RedirectTo=301, /api/v1/orders
+
+────────────────────────────────────────────────────────────────────────────────
+
+GATEWAY SECURITY — BEST PRACTICES
+=====================================
+
+  1. JWT validation at gateway (prevent unauthenticated requests reaching services)
+  2. Downstream services still validate JWT (defense in depth)
+  3. Remove sensitive headers before forwarding (X-Admin-Secret)
+  4. Add correlation ID for tracing
+  5. Rate limit at gateway (prevent abuse)
+  6. Use HTTPS only (TLS termination at gateway)
+  7. Disable actuator endpoints externally:
+     management.server.port=8081
+     (separate internal management port)
+
+  # Don't expose management endpoints through gateway:
+    - id: block-actuator
+      uri: no://op
+      predicates:
+        - Path=/actuator/**
+      filters:
+        - SetStatus=404
+
+────────────────────────────────────────────────────────────────────────────────
+
+GATEWAY vs LOAD BALANCER vs SERVICE MESH
+==========================================
+
+Feature            │ API Gateway (SCG)    │ Load Balancer (ALB) │ Service Mesh (Istio)
+───────────────────┼─────────────────────┼─────────────────────┼──────────────────────
+Layer              │ Application (L7)    │ L4/L7               │ L7 (sidecar)
+Auth/JWT           │ Yes                 │ Limited             │ Yes (mTLS + authz)
+Rate limiting      │ Yes                 │ Limited             │ Yes
+Request rewriting  │ Yes                 │ Limited             │ Yes
+Circuit breaking   │ Yes                 │ No                  │ Yes
+Traffic splitting  │ Yes (weight)        │ Yes                 │ Yes (canary)
+Scope              │ North-south traffic │ North-south         │ East-west + north-south
+Programming        │ Code/YAML           │ Cloud console       │ K8s YAML
+
+North-South: Client → Service (external → internal)
+East-West:   Service → Service (internal → internal)
+
+Common pattern: API Gateway (SCG) for north-south + Istio for east-west
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS — SPRING CLOUD GATEWAY
+============================================
+
+Q: What is Spring Cloud Gateway and how is it different from Zuul?
+A: Spring Cloud Gateway is a reactive, non-blocking API gateway built on WebFlux
+   and Project Reactor. Zuul 1 (Netflix) is blocking and thread-per-request.
+   SCG handles more concurrent connections with fewer threads, making it better
+   for high-traffic environments. Zuul 1 is effectively deprecated for new projects.
+
+Q: How do you implement authentication in Spring Cloud Gateway?
+A: Implement a GlobalFilter that intercepts every request. Extract the JWT from
+   the Authorization header, validate it (JwtDecoder), and either forward the
+   request with added user-info headers (X-User-Id, X-User-Roles) or return 401.
+   Public paths are whitelisted. Downstream services also validate the JWT as a
+   second defense layer.
+
+Q: How do you implement rate limiting in Spring Cloud Gateway?
+A: Use the RequestRateLimiter filter backed by Redis (token bucket algorithm).
+   Configure replenishRate (tokens/sec), burstCapacity, and a KeyResolver that
+   determines the key per rate limit bucket (e.g., by userId from JWT or by IP).
+   Redis ensures rate limits are shared across all gateway instances.
+
+Q: How do you do canary deployments with Spring Cloud Gateway?
+A: Use the Weight predicate with two routes for the same path pointing to different
+   service versions. Example: 90% to order-service-v1, 10% to order-service-v2.
+   Gradually shift traffic to the new version as confidence grows. Combine with
+   monitoring to auto-rollback if error rate spikes.
+
+Q: What is the difference between a GlobalFilter and a GatewayFilter?
+A: GlobalFilter applies to ALL routes — used for cross-cutting concerns like auth,
+   logging, rate limiting, CORS. GatewayFilter applies to specific routes — used
+   for route-specific behavior like StripPrefix, RewritePath, AddRequestHeader.
+   GlobalFilters implement GlobalFilter interface; GatewayFilters are configured
+   per route in the routes[].filters section.
+================================================================================

@@ -1,0 +1,199 @@
+======================================================
+THREAD DUMP & HEAP DUMP ANALYSIS FOR SPRING BOOT
+======================================================
+
+1. THREAD DUMPS
+────────────────
+
+What is a thread dump?
+  A snapshot of all threads running in the JVM at a point in time.
+  Shows: thread name, state, stack trace, lock information.
+
+When to take a thread dump:
+  - Application appears frozen / unresponsive
+  - High CPU with no apparent cause
+  - Deadlock suspected
+  - Thread pool exhaustion
+
+How to generate:
+  Option 1: kill signal
+    kill -3 <pid>          # prints to stdout
+    kill -QUIT <pid>       # same on Unix
+
+  Option 2: jstack (JDK tool)
+    jstack <pid> > thread-dump.txt
+    jstack -l <pid>        # includes lock information
+
+  Option 3: Spring Boot Actuator
+    GET /actuator/threaddump
+    # Returns JSON thread dump
+
+  Option 4: VisualVM / JConsole (GUI)
+
+  Option 5: JFR (Java Flight Recorder) — low-overhead, continuous:
+    -XX:+FlightRecorder
+    jcmd <pid> JFR.start duration=60s filename=recording.jfr
+
+
+Thread states:
+  RUNNABLE        → running or ready to run (check for CPU hog)
+  BLOCKED         → waiting to acquire a monitor lock
+  WAITING         → waiting indefinitely (Object.wait, LockSupport.park)
+  TIMED_WAITING   → waiting for a timeout (Thread.sleep, wait(timeout))
+  TERMINATED      → finished
+
+
+2. READING A THREAD DUMP
+─────────────────────────
+Sample thread dump entry:
+  "http-nio-8080-exec-1" #25 daemon prio=5 os_prio=0 tid=0x... nid=0x... waiting on condition
+     java.lang.Thread.State: WAITING (parking)
+          at sun.misc.Unsafe.park(Native Method)
+          - parking to wait for <0x...> (a java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject)
+          at java.util.concurrent.locks.LockSupport.park(LockSupport.java:175)
+          at org.springframework.data.redis.connection.jedis.JedisConnectionFactory...
+
+Interpretation: Tomcat thread waiting on Redis connection pool — pool may be exhausted.
+
+Key patterns to look for:
+  "BLOCKED" on same lock → deadlock or contention
+  All threads "WAITING" for DB/Redis connection → pool exhaustion
+  Same stack trace many times → thread pool stuck
+  High CPU + RUNNABLE in tight loop → busy-wait or infinite loop
+
+
+3. DEADLOCK DETECTION
+──────────────────────
+jstack automatically detects deadlocks:
+  Found one Java-level deadlock:
+  =============================
+  "Thread-A": waiting to lock monitor 0x... (object 0x..., a java.lang.Object),
+    which is held by "Thread-B"
+  "Thread-B": waiting to lock monitor 0x... (object 0x..., a java.lang.Object),
+    which is held by "Thread-A"
+
+Fix: use consistent lock ordering, or prefer java.util.concurrent.locks.Lock
+     with tryLock(timeout) instead of synchronized blocks.
+
+
+4. HEAP DUMPS
+──────────────
+
+What is a heap dump?
+  A snapshot of all objects in the JVM heap at a point in time.
+  Used to diagnose: OutOfMemoryError, memory leaks, excessive object retention.
+
+When to take a heap dump:
+  - OutOfMemoryError
+  - Memory usage growing continuously (suspected leak)
+  - Investigating large memory footprint
+
+How to generate:
+  Option 1: Automatic on OOM (recommended in production):
+    -XX:+HeapDumpOnOutOfMemoryError
+    -XX:HeapDumpPath=/var/log/app/heap-$(date +%F-%H%M%S).hprof
+
+  Option 2: jmap (JDK tool):
+    jmap -dump:format=b,file=heap.hprof <pid>
+    jmap -dump:live,format=b,file=heap.hprof <pid>  # only live objects
+
+  Option 3: jcmd (preferred over jmap):
+    jcmd <pid> GC.heap_dump /var/log/app/heap.hprof
+
+  Option 4: Spring Boot Actuator:
+    POST /actuator/heapdump
+    # Downloads .hprof file
+
+  Option 5: VisualVM → Heap Dump button
+
+
+5. ANALYZING HEAP DUMPS
+─────────────────────────
+Tools:
+  Eclipse MAT (Memory Analyzer Tool) — most powerful
+  VisualVM → Heap Dump tab
+  JProfiler, YourKit (commercial)
+  IntelliJ IDEA built-in heap analyzer
+
+Eclipse MAT key reports:
+  a) Leak Suspects Report → identifies objects likely causing leaks
+  b) Dominator Tree → shows which objects retain the most heap
+  c) Histogram → counts of instances per class
+  d) OQL (Object Query Language) → SQL-like queries on heap
+
+Common leak patterns in Spring Boot:
+  Pattern                       | Cause
+  ───────────────────────────────────────────────────────────────────────
+  ThreadLocal not cleared        | Values held in thread pool threads
+  Spring ApplicationContext leak | Multiple contexts created (in tests)
+  Cache growing unbounded        | No eviction policy set
+  Hibernate session not closed   | Open session in view anti-pattern
+  Static collections             | Adding to static Map/List without removal
+  Listeners not deregistered     | ApplicationEvent listeners holding refs
+
+
+6. JAVA FLIGHT RECORDER (JFR) — PRODUCTION SAFE
+─────────────────────────────────────────────────
+JFR is the preferred low-overhead profiling tool for production (< 1% overhead).
+
+Enable and dump:
+  # Start recording
+  jcmd <pid> JFR.start duration=120s filename=/tmp/recording.jfr
+
+  # Or with JVM flag on start
+  java -XX:+FlightRecorder \
+       -XX:StartFlightRecording=duration=120s,filename=/tmp/app.jfr \
+       -jar app.jar
+
+Analyze with JDK Mission Control (JMC):
+  - CPU profiling
+  - Memory allocation profiling
+  - Lock analysis
+  - GC events
+  - Thread activity
+
+
+7. SPRING BOOT ACTUATOR FOR DIAGNOSTICS
+─────────────────────────────────────────
+application.yml:
+  management:
+    endpoints:
+      web:
+        exposure:
+          include: health,threaddump,heapdump,metrics,info,env
+
+Useful endpoints:
+  GET /actuator/threaddump     → JSON thread dump
+  POST /actuator/heapdump     → download .hprof
+  GET /actuator/metrics        → Micrometer metrics
+  GET /actuator/metrics/jvm.memory.used → current heap usage
+
+
+8. INTERVIEW QUESTIONS
+──────────────────────
+Q: How would you diagnose high CPU usage in a Spring Boot application?
+A: Take a thread dump (jstack or /actuator/threaddump). Look for RUNNABLE threads
+   in a tight loop. Use JFR or async-profiler to identify hot methods.
+   Check for regex backtracking, infinite loops, or GC overhead (check GC logs).
+
+Q: How do you diagnose an OutOfMemoryError?
+A: Enable -XX:+HeapDumpOnOutOfMemoryError. Analyze with Eclipse MAT.
+   Check Leak Suspects report. Look for unbounded caches, ThreadLocal leaks,
+   large Hibernate first-level caches, or static collections.
+
+Q: What's the difference between jmap and jcmd for heap dumps?
+A: Both produce .hprof files. jcmd is preferred as it's safer —
+   it attaches to the process without risk of crashing it.
+   jmap can cause issues on some JVMs when the process is under heavy load.
+
+Q: What is a ThreadLocal leak and how does it occur in Spring Boot?
+A: If a ThreadLocal value is set in a request but not cleared in a finally block,
+   the value remains in Tomcat's thread pool thread indefinitely. This causes
+   memory leaks and stale data in subsequent requests. Always clear in finally
+   block or use RequestContextHolder patterns.
+
+Q: When would you prefer JFR over a heap dump?
+A: JFR is low-overhead (<1%), safe for production, and captures continuous
+   events (CPU, memory, GC, locks) over time. Heap dumps are point-in-time
+   snapshots of all objects — too large and risky to take frequently in production.
+   Use JFR for profiling; heap dump only for OOM/leak investigation.

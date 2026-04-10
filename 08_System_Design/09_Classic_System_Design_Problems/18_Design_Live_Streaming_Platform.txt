@@ -1,0 +1,265 @@
+============================================================
+SYSTEM DESIGN: LIVE STREAMING PLATFORM
+(Similar to Twitch / YouTube Live / Instagram Live)
+============================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. PROBLEM STATEMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Design a live video streaming platform where:
+  - Creators can broadcast live video to viewers
+  - Viewers watch with low latency (5-10 seconds behind live)
+  - Supports 1 to millions of concurrent viewers per stream
+  - Real-time chat alongside the stream
+  - Stream recording for VOD (video on demand) replay
+
+Scale: 100,000 concurrent streamers, 10 million concurrent viewers
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. FUNCTIONAL REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - Streamer starts/stops a live stream from OBS or mobile
+  - Stream is available to viewers globally within seconds of starting
+  - Adaptive bitrate streaming (quality adapts to viewer's bandwidth)
+  - Live chat with 10,000+ messages/sec during popular streams
+  - Stream recording and VOD storage
+  - Stream discovery (trending, categories, following)
+  - Viewer count in real-time
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. VIDEO STREAMING FUNDAMENTALS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+VIDEO CODECS:
+  H.264 (AVC) → universal browser support, medium compression
+  H.265 (HEVC) → 2x better compression, less device support
+  VP9 / AV1   → open source, better compression, growing support
+
+STREAMING PROTOCOLS:
+  RTMP  → Real-Time Messaging Protocol
+          Streamer → Ingest server (low latency, < 1s)
+          Flash-based; widely supported by OBS, cameras
+          NOT browser-native
+
+  HLS   → HTTP Live Streaming (Apple)
+          Ingest server → viewers via CDN
+          Breaks video into small .ts segments (2-6 seconds)
+          Playlist (.m3u8) lists segments; client downloads sequentially
+          Latency: 15-30s (standard) → 2-4s (Low-Latency HLS / LL-HLS)
+          Universal browser support
+
+  DASH  → Dynamic Adaptive Streaming over HTTP (MPEG)
+          Similar to HLS but codec-agnostic
+          Used by YouTube, Netflix
+
+  WebRTC → Peer-to-peer, ultra-low latency (< 500ms)
+           Used for 1:1 or small group; hard to scale to millions of viewers
+
+  SRT   → Secure Reliable Transport (for contribution, replacing RTMP)
+
+ADAPTIVE BITRATE (ABR):
+  Multiple quality renditions: 1080p, 720p, 480p, 360p, 160p
+  Client player selects quality based on measured bandwidth
+  Prevents buffering; degrades gracefully on poor connections
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. HIGH-LEVEL ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+INGESTION PATH (Streamer → Platform):
+  ┌──────────────┐   RTMP/SRT   ┌──────────────────────────┐
+  │  Streamer    ├─────────────►│  Ingest Servers           │
+  │  (OBS/App)   │              │  (edge-located, anycast)  │
+  └──────────────┘              └──────────────┬────────────┘
+                                               │ raw stream
+                                               ▼
+                                ┌──────────────────────────┐
+                                │  Transcoding Service     │
+                                │  (FFmpeg clusters)       │
+                                │  → 1080p, 720p, 480p,    │
+                                │    360p, 160p renditions │
+                                │  → H.264 + AAC           │
+                                │  → Segment into HLS .ts  │
+                                └──────────────┬────────────┘
+                                               │ HLS segments
+                              ┌────────────────▼───────────┐
+                              │  Origin Storage             │
+                              │  (Object Store: S3)         │
+                              │  - Live segments (cached)   │
+                              │  - VOD recording            │
+                              └────────────────┬────────────┘
+                                               │
+DELIVERY PATH (Platform → Viewers):            │
+  ┌──────────────────────────────────────────────────────────┐
+  │  CDN (CloudFront / Akamai / Fastly)                      │
+  │  - Edge caches: HLS segments served globally             │
+  │  - Viewer requests closest edge PoP                      │
+  │  - Cache miss → pull from origin S3                      │
+  │  - 100s of edge nodes globally                           │
+  └──────────────────────────────┬───────────────────────────┘
+                                 │ HLS playlist + segments
+  ┌──────────────────────────────▼───────────────────────────┐
+  │  VIEWER (browser, mobile, smart TV)                      │
+  │  HLS player (hls.js, Video.js, ExoPlayer)                │
+  │  - Downloads m3u8 playlist every 2s                      │
+  │  - Downloads new .ts segment as it appears               │
+  │  - ABR algorithm selects quality tier                    │
+  └──────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. TRANSCODING SERVICE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Transcoding is the most CPU-intensive part.
+
+Options:
+  - FFmpeg on GPU-accelerated instances (NVENC hardware encoding)
+  - AWS MediaLive / MediaConvert for managed transcoding
+  - Custom cluster with NVIDIA T4/A10G GPUs
+
+Per stream, transcode to 5 quality levels simultaneously.
+Each quality level = 1 FFmpeg process or GPU stream.
+
+GPU transcoding vs CPU:
+  - CPU (software): 50-100 streams per server (expensive)
+  - GPU (hardware): 500-1000 streams per GPU server
+  - GPU: 10-20x better price/stream
+
+Segment generation:
+  - Output: 2-second HLS segments (.ts files)
+  - Manifest (.m3u8) updated as new segments are ready
+  - Uploaded to S3 immediately; CDN invalidation triggered
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. INGEST LAYER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RTMP Ingest servers at edge PoPs (reduces upload latency for streamer).
+Anycast IP routing directs streamer to nearest ingest server.
+
+After receiving RTMP stream:
+  1. Authenticate streamer (stream key validation)
+  2. Forward raw stream to transcoding cluster via internal backbone
+  3. Transcoding cluster produces HLS segments → S3
+
+Backup stream routing:
+  - If primary ingest goes down, stream key reconnects to secondary
+  - Stateless ingest: any server can receive any stream
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. LIVE CHAT — REAL-TIME MESSAGING AT SCALE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Scale challenge: Popular streams have 100,000+ viewers sending messages.
+At 1 msg/viewer/min = 1,666 messages/second for one stream.
+
+Architecture:
+  Viewer browser → WebSocket → Chat Server (connection maintained)
+
+Chat servers (stateful — hold WebSocket connections):
+  - Each chat server holds ~10,000 connections
+  - For 1M concurrent viewers → 100 chat servers
+
+Pub/Sub for cross-server fan-out:
+  - When viewer sends a message, it goes to Kafka topic: chat-<streamId>
+  - All chat servers subscribed to that topic receive the message
+  - Each chat server broadcasts to its connected viewers
+
+Chat message flow:
+  Viewer → WebSocket → Chat Server A
+    → publish to Kafka topic: chat-stream-123
+    → all Chat Servers consume topic
+    → each broadcasts to their viewers watching stream-123
+
+Spam and moderation:
+  - Rate limiting per viewer (e.g., 1 message/second)
+  - AutoMod: ML model scores messages, blocks spam/hate
+  - Streamer can ban users; their messages dropped in real-time
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. VIEWER COUNT — REAL-TIME COUNTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Approaches:
+  1. WebSocket heartbeat: each viewer sends heartbeat every 30s
+     → count active connections in Redis HyperLogLog
+     → approximate count with < 1% error, very low memory
+
+  2. HLS player: requests m3u8 manifest every 2s
+     → count unique viewers in analytics pipeline (Flink/Spark)
+     → slightly delayed but accurate
+
+  3. Chat servers track viewer count per stream
+     → sum across all chat servers (broadcast join or Redis counter)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. VOD RECORDING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Live HLS segments are already persisted in S3 during streaming.
+When stream ends:
+  1. Concatenate all segments → full MP4 file
+  2. Run post-processing: thumbnail generation, chapter detection
+  3. Store VOD in S3 with a persistent, non-expiring manifest
+  4. Index in metadata DB for search and discovery
+
+Challenge: Stream lasts 8 hours at 1080p → ~15 GB raw
+  - Store compressed: ~3-5 GB with H.264
+  - Multi-part upload to S3 in parallel
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. SCALE ESTIMATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Concurrent streamers:  100,000
+  Concurrent viewers:    10,000,000
+  Viewers per streamer:  100 on average, 1M for top streams
+
+  Ingest bandwidth per stream (1080p): ~6 Mbps
+  Total ingest: 100,000 × 6 Mbps = 600 Gbps
+
+  Egress per viewer: 4 Mbps average (720p)
+  Total egress: 10M × 4 Mbps = 40 Tbps (served by CDN edge, not origin)
+
+  CDN serves ~99% of viewer traffic; origin serves only cache misses.
+
+  Transcoding servers:
+  - 1 GPU encodes ~500 streams
+  - 100,000 streams / 500 = 200 GPU servers
+
+  Chat servers:
+  - 10,000 connections per server
+  - 10,000,000 viewers / 10,000 = 1,000 chat servers
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+11. INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: Why not use WebRTC for live streaming at scale?
+A: WebRTC is peer-to-peer designed for 1:1 or small groups. Scaling to
+   millions of viewers requires server-side infrastructure (SFU/MCU) that
+   adds complexity and latency. HLS + CDN is proven at scale.
+
+Q: How do you reduce end-to-end latency in HLS?
+A: Low-Latency HLS (LL-HLS): 200ms segments + HTTP/2 server push
+   to deliver segments before the full segment is ready (partial segments).
+   Brings latency from 15-30s down to 2-4s.
+
+Q: Why does a top streamer with 1M viewers not bring down your origin?
+A: CDN caches HLS segments at edge PoPs. 1M viewers = 1M requests, but
+   CDN cache hit rate is ~99.9%. Only 1,000 requests hit origin (cache miss
+   on first segment request per edge node). Origin serves CDN, not viewers directly.
+
+Q: How do you handle a streamer who reconnects after a brief disconnect?
+A: Keep the RTMP session alive with a reconnection window (e.g., 60 seconds).
+   The transcoder continues the same segment sequence. Viewers experience
+   a brief gap but the stream key remains valid. If reconnect fails after
+   60s, stream is terminated and VOD finalized.
+
+Q: How does adaptive bitrate streaming work?
+A: The HLS manifest lists multiple quality renditions. The client player
+   monitors download speed and buffer level. If download is slow, it switches
+   to a lower quality rendition. If bandwidth improves, it switches up.
+   Prevents buffering at the cost of temporary quality reduction.

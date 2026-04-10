@@ -1,0 +1,825 @@
+================================================================================
+FILE 16 — TELECOM DOMAIN CODING EXERCISES
+================================================================================
+Target: Senior Java Developer — Hands-on coding practice with real telecom context
+Format: Problem statement → Full working solution → Follow-up questions
+Domain: CDR processing, billing, call routing, subscriber management, rating
+
+Each exercise is designed to take 20–40 minutes in a real coding interview.
+All solutions use Java 17+ features where appropriate.
+
+================================================================================
+EXERCISE 1 — CDR RATING ENGINE
+================================================================================
+
+PROBLEM:
+Implement a CDR (Call Detail Record) Rating Engine that:
+1. Accepts a stream of raw CDRs (callId, from, to, startTime, durationSeconds)
+2. Looks up the applicable tariff plan for the subscriber
+3. Computes the charge per CDR based on: per-second rate, peak/off-peak hours
+4. Returns a list of RatedCDR objects with the computed charge
+
+Peak hours: Monday–Friday 08:00–20:00. Everything else is off-peak.
+Off-peak discount: 50% of peak rate.
+
+SOLUTION:
+
+import java.time.*;
+import java.util.*;
+import java.util.stream.*;
+
+public record RawCDR(
+    String callId,
+    String fromMsisdn,
+    String toMsisdn,
+    LocalDateTime startTime,
+    int durationSeconds
+) {}
+
+public record TariffPlan(
+    String planId,
+    double peakRatePerSecond,     // in pence/£0.001
+    double offPeakRatePerSecond
+) {}
+
+public record RatedCDR(
+    String callId,
+    String fromMsisdn,
+    double charge,                 // in pence
+    boolean wasPeakCall
+) {}
+
+public class CdrRatingEngine {
+
+    private final Map<String, TariffPlan> subscriberPlans; // msisdn → TariffPlan
+
+    public CdrRatingEngine(Map<String, TariffPlan> subscriberPlans) {
+        this.subscriberPlans = Map.copyOf(subscriberPlans);
+    }
+
+    public List<RatedCDR> rate(List<RawCDR> cdrs) {
+        return cdrs.stream()
+            .map(this::rateCdr)
+            .filter(Optional::isPresent)
+            .map(Optional::get)
+            .collect(Collectors.toList());
+    }
+
+    private Optional<RatedCDR> rateCdr(RawCDR cdr) {
+        TariffPlan plan = subscriberPlans.get(cdr.fromMsisdn());
+        if (plan == null) {
+            System.err.println("No plan found for " + cdr.fromMsisdn() + ", skipping CDR " + cdr.callId());
+            return Optional.empty();
+        }
+        boolean isPeak = isPeakTime(cdr.startTime());
+        double rate = isPeak ? plan.peakRatePerSecond() : plan.offPeakRatePerSecond();
+        double charge = rate * cdr.durationSeconds();
+        return Optional.of(new RatedCDR(cdr.callId(), cdr.fromMsisdn(), charge, isPeak));
+    }
+
+    // Peak: Mon–Fri, 08:00–19:59
+    boolean isPeakTime(LocalDateTime dt) {
+        DayOfWeek day = dt.getDayOfWeek();
+        boolean isWeekday = day != DayOfWeek.SATURDAY && day != DayOfWeek.SUNDAY;
+        boolean isDuringPeakHours = dt.getHour() >= 8 && dt.getHour() < 20;
+        return isWeekday && isDuringPeakHours;
+    }
+}
+
+// Test cases to trace through in an interview:
+// CDR at Mon 14:00, 60s, peak rate 0.10p/s → charge = 6.0p ✓
+// CDR at Sat 10:00, 60s, off-peak rate 0.05p/s → charge = 3.0p ✓
+// CDR with unknown MSISDN → skipped, logged ✓
+
+// FOLLOW-UP QUESTIONS:
+// Q: How would you handle international calls with different rates per destination?
+//    → Add destinationRates: Map<String, Double> to TariffPlan keyed by country prefix.
+//    → Match longest-prefix of toMsisdn to find the rate.
+// Q: How would you make this fault-tolerant for a million CDRs/hour?
+//    → Process in parallel streams, batch to Kafka, use bounded retry for plan lookups.
+// Q: How do you ensure exactly-once rating in a distributed system?
+//    → Idempotency key on callId + subscriber; store processed callIds in Redis or DB.
+
+================================================================================
+EXERCISE 2 — SUBSCRIBER BILLING AGGREGATOR
+================================================================================
+
+PROBLEM:
+Given a list of RatedCDRs for a billing period, generate a monthly invoice for
+each subscriber containing:
+- Total minutes used (rounded up to nearest minute per call)
+- Total charge in pence
+- Breakdown by: voice, SMS, data (based on callType field)
+- Apply a £10.00 monthly access fee on top
+
+SOLUTION:
+
+public record RatedCDR2(
+    String callId,
+    String msisdn,
+    String callType,          // "VOICE", "SMS", "DATA"
+    int durationSeconds,
+    double chargeInPence
+) {}
+
+public record UsageBreakdown(
+    long totalMinutes,
+    double totalChargeInPence
+) {
+    public static UsageBreakdown ZERO = new UsageBreakdown(0, 0.0);
+
+    public UsageBreakdown add(RatedCDR2 cdr) {
+        long mins = (long) Math.ceil(cdr.durationSeconds() / 60.0);
+        return new UsageBreakdown(
+            this.totalMinutes + mins,
+            this.totalChargeInPence + cdr.chargeInPence()
+        );
+    }
+}
+
+public record Invoice(
+    String msisdn,
+    YearMonth billingPeriod,
+    Map<String, UsageBreakdown> byCallType,
+    double totalUsageChargeInPence,
+    double accessFeeInPence,
+    double totalInvoiceInPence
+) {}
+
+public class BillingAggregator {
+
+    private static final double MONTHLY_ACCESS_FEE_PENCE = 1000.0; // £10.00
+
+    public List<Invoice> generateInvoices(List<RatedCDR2> cdrs, YearMonth period) {
+        // Group CDRs by subscriber MSISDN
+        Map<String, List<RatedCDR2>> bySubscriber = cdrs.stream()
+            .collect(Collectors.groupingBy(RatedCDR2::msisdn));
+
+        return bySubscriber.entrySet().stream()
+            .map(entry -> buildInvoice(entry.getKey(), entry.getValue(), period))
+            .collect(Collectors.toList());
+    }
+
+    private Invoice buildInvoice(String msisdn, List<RatedCDR2> cdrs, YearMonth period) {
+        // Group by call type and aggregate usage
+        Map<String, UsageBreakdown> byType = cdrs.stream()
+            .collect(Collectors.groupingBy(
+                RatedCDR2::callType,
+                Collectors.reducing(UsageBreakdown.ZERO, UsageBreakdown::new,
+                    (a, b) -> new UsageBreakdown(0, 0))  // custom reduction
+            ));
+
+        // Better: use toMap with merge function
+        Map<String, UsageBreakdown> breakdown = new HashMap<>();
+        for (RatedCDR2 cdr : cdrs) {
+            breakdown.merge(cdr.callType(), new UsageBreakdown(
+                (long) Math.ceil(cdr.durationSeconds() / 60.0),
+                cdr.chargeInPence()
+            ), (a, b) -> new UsageBreakdown(
+                a.totalMinutes() + b.totalMinutes(),
+                a.totalChargeInPence() + b.totalChargeInPence()
+            ));
+        }
+
+        double totalUsage = breakdown.values().stream()
+            .mapToDouble(UsageBreakdown::totalChargeInPence).sum();
+        double total = totalUsage + MONTHLY_ACCESS_FEE_PENCE;
+
+        return new Invoice(msisdn, period, Collections.unmodifiableMap(breakdown),
+            totalUsage, MONTHLY_ACCESS_FEE_PENCE, total);
+    }
+}
+
+// FOLLOW-UP QUESTIONS:
+// Q: How would you handle subscribers with no calls this month?
+//    → Need a subscriber list input; join with CDRs (left join semantics).
+// Q: How would you add credit/discounts?
+//    → Add a List<Adjustment> to Invoice; apply before computing total.
+// Q: How do you test this with 10,000 CDRs?
+//    → Parameterized JUnit tests + property-based testing to verify:
+//      totalInvoice == sum(usageCharges) + accessFee for any input.
+
+================================================================================
+EXERCISE 3 — PHONE NUMBER PREFIX ROUTER (LONGEST PREFIX MATCH)
+================================================================================
+
+PROBLEM:
+Telecom call routing works by matching the destination phone number to the
+longest matching prefix in a routing table to determine the carrier/route.
+
+Implement a PhoneRouter that:
+- Accepts a routing table: Map<String prefix, String routeName>
+- Given a phone number, returns the best (longest matching prefix) route
+- Returns Optional.empty() if no prefix matches
+- Must handle 10 million lookups/second efficiently → use a Trie
+
+EXAMPLE:
+Routing table: { "+1" → "US_ROUTE", "+44" → "UK_ROUTE", "+447" → "UK_MOBILE" }
+"+447700900000" → "UK_MOBILE" ("+447" is longer match than "+44")
+"+441234567890" → "UK_ROUTE" (only "+44" matches)
+"+33123456789"  → Optional.empty() (no match for "+33")
+
+SOLUTION:
+
+public class PhoneRouter {
+
+    private final TrieNode root = new TrieNode();
+
+    // Build the Trie from routing table
+    public PhoneRouter(Map<String, String> routingTable) {
+        routingTable.forEach(this::addRoute);
+    }
+
+    private void addRoute(String prefix, String routeName) {
+        TrieNode current = root;
+        for (char c : prefix.toCharArray()) {
+            current = current.children.computeIfAbsent(c, k -> new TrieNode());
+        }
+        current.routeName = routeName; // mark end of prefix
+    }
+
+    // Longest prefix match: walk the trie, track last seen routeName
+    public Optional<String> route(String phoneNumber) {
+        TrieNode current = root;
+        String bestMatch = null;
+
+        for (char c : phoneNumber.toCharArray()) {
+            current = current.children.get(c);
+            if (current == null) break;           // no more matching children
+            if (current.routeName != null) {
+                bestMatch = current.routeName;    // update best match
+            }
+        }
+        return Optional.ofNullable(bestMatch);
+    }
+
+    private static class TrieNode {
+        final Map<Character, TrieNode> children = new HashMap<>();
+        String routeName = null; // non-null only at end of a prefix
+    }
+}
+
+// Verification:
+PhoneRouter router = new PhoneRouter(Map.of(
+    "+1",   "US_ROUTE",
+    "+44",  "UK_ROUTE",
+    "+447", "UK_MOBILE"
+));
+
+assert router.route("+447700900000").get().equals("UK_MOBILE");
+assert router.route("+441234567890").get().equals("UK_ROUTE");
+assert router.route("+33123456789").isEmpty();
+
+// Complexity: O(L) lookup where L = length of phone number.
+//   Much better than O(P×L) linear scan over all prefixes.
+
+// FOLLOW-UP QUESTIONS:
+// Q: How would you add priority when two prefixes have the same length?
+//    → Add priority field to TrieNode; keep highest-priority match, not just last.
+// Q: How would you make this thread-safe for concurrent route updates?
+//    → ReadWriteLock: multiple readers, exclusive writer.
+//    → Or rebuild trie atomically and swap via AtomicReference.
+// Q: How would you persist/reload the routing table?
+//    → Serialize to JSON/properties; load at startup from ConfigMap (Kubernetes).
+
+================================================================================
+EXERCISE 4 — CONCURRENT CDR BATCH PROCESSOR
+================================================================================
+
+PROBLEM:
+Process 1 million CDR files from an input directory:
+1. Each file contains one CDR per line (callId,from,to,duration)
+2. Parse and rate each CDR
+3. Write rated CDRs to an output directory (one output file per input file)
+4. Use a thread pool sized to available processors
+5. Return a ProcessingReport: total files, successes, failures, total duration
+
+SOLUTION:
+
+import java.nio.file.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+public class ConcurrentCdrBatchProcessor {
+
+    private final CdrRatingEngine ratingEngine;
+    private final int threadCount;
+
+    public ConcurrentCdrBatchProcessor(CdrRatingEngine ratingEngine) {
+        this.ratingEngine = ratingEngine;
+        this.threadCount = Runtime.getRuntime().availableProcessors();
+    }
+
+    public ProcessingReport processDirectory(Path inputDir, Path outputDir) throws Exception {
+        Files.createDirectories(outputDir);
+
+        List<Path> inputFiles;
+        try (var stream = Files.list(inputDir)) {
+            inputFiles = stream
+                .filter(p -> p.toString().endsWith(".csv"))
+                .collect(Collectors.toList());
+        }
+
+        AtomicInteger successCount = new AtomicInteger();
+        AtomicInteger failureCount = new AtomicInteger();
+        long startMs = System.currentTimeMillis();
+
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+        for (Path inputFile : inputFiles) {
+            CompletableFuture<Void> future = CompletableFuture
+                .runAsync(() -> processFile(inputFile, outputDir), executor)
+                .thenRun(successCount::incrementAndGet)
+                .exceptionally(ex -> {
+                    failureCount.incrementAndGet();
+                    System.err.println("Failed: " + inputFile + " — " + ex.getMessage());
+                    return null;
+                });
+            futures.add(future);
+        }
+
+        // Wait for ALL files to complete
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        executor.shutdown();
+
+        long elapsedMs = System.currentTimeMillis() - startMs;
+        return new ProcessingReport(inputFiles.size(), successCount.get(),
+            failureCount.get(), elapsedMs);
+    }
+
+    private void processFile(Path inputFile, Path outputDir) {
+        try {
+            List<RawCDR> cdrs = parseCsvFile(inputFile);
+            List<RatedCDR> rated = ratingEngine.rate(cdrs);
+            Path outputFile = outputDir.resolve("rated_" + inputFile.getFileName());
+            writeCsvFile(outputFile, rated);
+        } catch (Exception e) {
+            throw new RuntimeException("Error processing " + inputFile, e);
+        }
+    }
+
+    private List<RawCDR> parseCsvFile(Path file) throws Exception {
+        return Files.readAllLines(file).stream()
+            .skip(1) // header
+            .map(line -> {
+                String[] parts = line.split(",", -1);
+                return new RawCDR(
+                    parts[0].trim(),
+                    parts[1].trim(),
+                    parts[2].trim(),
+                    LocalDateTime.parse(parts[3].trim()),
+                    Integer.parseInt(parts[4].trim())
+                );
+            })
+            .collect(Collectors.toList());
+    }
+
+    private void writeCsvFile(Path output, List<RatedCDR> cdrs) throws Exception {
+        var lines = new ArrayList<String>();
+        lines.add("callId,fromMsisdn,charge,wasPeak");
+        for (var cdr : cdrs) {
+            lines.add(cdr.callId() + "," + cdr.fromMsisdn() + ","
+                + cdr.charge() + "," + cdr.wasPeakCall());
+        }
+        Files.write(output, lines);
+    }
+}
+
+public record ProcessingReport(int totalFiles, int succeeded, int failed, long elapsedMs) {
+    public double throughputFilesPerSecond() {
+        return totalFiles / (elapsedMs / 1000.0);
+    }
+}
+
+// FOLLOW-UP QUESTIONS:
+// Q: Why use CompletableFuture.runAsync() instead of submitting Callables directly?
+//    → Composable: thenRun, exceptionally, allOf. Callable/Future requires get() polling.
+// Q: What happens if the executor is not shut down?
+//    → Thread leak: non-daemon threads prevent JVM from exiting.
+// Q: How would you add progress reporting (% complete)?
+//    → AtomicInteger processedCount.incrementAndGet(); percentage = processed/total * 100.
+// Q: How would you handle backpressure if files arrive faster than processing?
+//    → Bounded queue in Executors.newFixedThreadPool with CallerRunsPolicy:
+//    → new ThreadPoolExecutor(n, n, 0, ms, new ArrayBlockingQueue<>(1000),
+//                              new CallerRunsPolicy())
+
+================================================================================
+EXERCISE 5 — TARIFF PLAN SELECTOR (DECISION TABLE PATTERN)
+================================================================================
+
+PROBLEM:
+Select the optimal tariff plan for a new subscriber based on their profile:
+- estimatedMinutesPerMonth: the expected monthly call volume
+- preferredCallHours: "PEAK_HEAVY", "OFF_PEAK_HEAVY", or "MIXED"
+- isInternationalUser: whether they call abroad
+- isBusiness: business vs. consumer
+
+Tariff plans: BASIC, STANDARD, PREMIUM, BUSINESS, INTERNATIONAL
+
+Implement a TariffPlanSelector using a decision table (not if-else chains).
+
+SOLUTION:
+
+public enum TariffPlan2 { BASIC, STANDARD, PREMIUM, BUSINESS, INTERNATIONAL }
+
+public record SubscriberProfile(
+    int estimatedMinutesPerMonth,
+    String preferredCallHours,    // "PEAK_HEAVY", "OFF_PEAK_HEAVY", "MIXED"
+    boolean isInternationalUser,
+    boolean isBusiness
+) {}
+
+@FunctionalInterface
+interface ProfileMatcher {
+    boolean matches(SubscriberProfile profile);
+}
+
+public class TariffPlanSelector {
+
+    // Decision table: ordered list of (condition, recommendation) pairs
+    // Evaluated top-to-bottom; first match wins
+    private static final List<Map.Entry<ProfileMatcher, TariffPlan2>> DECISION_TABLE = List.of(
+        Map.entry(p -> p.isBusiness() && p.isInternationalUser(),
+                  TariffPlan2.BUSINESS),
+        Map.entry(p -> p.isBusiness(),
+                  TariffPlan2.BUSINESS),
+        Map.entry(p -> p.isInternationalUser(),
+                  TariffPlan2.INTERNATIONAL),
+        Map.entry(p -> p.estimatedMinutesPerMonth() > 500 && "PEAK_HEAVY".equals(p.preferredCallHours()),
+                  TariffPlan2.PREMIUM),
+        Map.entry(p -> p.estimatedMinutesPerMonth() > 200,
+                  TariffPlan2.STANDARD),
+        Map.entry(p -> p.estimatedMinutesPerMonth() <= 200,
+                  TariffPlan2.BASIC)
+    );
+
+    public TariffPlan2 select(SubscriberProfile profile) {
+        return DECISION_TABLE.stream()
+            .filter(entry -> entry.getKey().matches(profile))
+            .map(Map.Entry::getValue)
+            .findFirst()
+            .orElseThrow(() -> new IllegalArgumentException(
+                "No plan matched for profile: " + profile));
+    }
+}
+
+// Decision table is easily maintained: add/reorder rows without touching other logic.
+// Test one row at a time — each entry is independently verifiable.
+
+// ── Alternative: Rule engine with scores ──────────────────────────────────────
+// For complex overlapping rules, assign scores per criterion and pick highest:
+public class ScoredTariffSelector {
+    public TariffPlan2 select(SubscriberProfile p) {
+        Map<TariffPlan2, Integer> scores = new EnumMap<>(TariffPlan2.class);
+        for (var plan : TariffPlan2.values()) scores.put(plan, 0);
+
+        if (p.isBusiness())                               scores.merge(TariffPlan2.BUSINESS, 100, Integer::sum);
+        if (p.isInternationalUser())                      scores.merge(TariffPlan2.INTERNATIONAL, 80, Integer::sum);
+        if (p.estimatedMinutesPerMonth() > 500)           scores.merge(TariffPlan2.PREMIUM, 60, Integer::sum);
+        if ("PEAK_HEAVY".equals(p.preferredCallHours()))  scores.merge(TariffPlan2.PREMIUM, 20, Integer::sum);
+
+        return scores.entrySet().stream()
+            .max(Map.Entry.comparingByValue())
+            .map(Map.Entry::getKey)
+            .orElse(TariffPlan2.BASIC);
+    }
+}
+
+// FOLLOW-UP QUESTIONS:
+// Q: How would you load decision rules from a database instead of hard-coding?
+//    → Map rows to ProfileMatcher via a DSL or SpEL expression evaluation.
+// Q: How would you explain/audit why a plan was selected?
+//    → Return a SelectionReason along with the plan: which rule matched, which score won.
+
+================================================================================
+EXERCISE 6 — REAL-TIME CALL FRAUD DETECTOR
+================================================================================
+
+PROBLEM:
+Detect potentially fraudulent calls in real-time based on these rules:
+1. More than 5 concurrent calls from same MSISDN → SUSPICIOUS
+2. Single call duration > 4 hours → SUSPICIOUS
+3. More than 10 international calls in 1 hour from same MSISDN → SUSPICIOUS
+4. More than 20 calls/minute from same MSISDN → SUSPICIOUS (velocity check)
+
+Implement FraudDetector with methods:
+- onCallStart(String callId, String fromMsisdn, LocalDateTime startTime, boolean isInternational)
+- onCallEnd(String callId, LocalDateTime endTime)
+- List<FraudAlert> checkVelocity(String msisdn, LocalDateTime now)
+
+SOLUTION:
+
+import java.util.concurrent.*;
+
+public class FraudDetector {
+
+    // Active calls: callId → CallRecord
+    private final Map<String, CallRecord> activeCalls = new ConcurrentHashMap<>();
+    // Concurrent call count per MSISDN
+    private final Map<String, AtomicInteger> concurrentCallCount = new ConcurrentHashMap<>();
+    // International call timestamps per MSISDN (last hour)
+    private final Map<String, ConcurrentLinkedDeque<LocalDateTime>> intlCallTimes = new ConcurrentHashMap<>();
+    // Recent call timestamps for velocity check
+    private final Map<String, ConcurrentLinkedDeque<LocalDateTime>> recentCallTimes = new ConcurrentHashMap<>();
+
+    private static final int MAX_CONCURRENT_CALLS = 5;
+    private static final int MAX_DURATION_SECONDS = 4 * 60 * 60; // 4 hours
+    private static final int MAX_INTL_CALLS_PER_HOUR = 10;
+    private static final int MAX_CALLS_PER_MINUTE = 20;
+
+    private record CallRecord(String callId, String fromMsisdn,
+                              LocalDateTime startTime, boolean isInternational) {}
+
+    public List<FraudAlert> onCallStart(String callId, String fromMsisdn,
+                                         LocalDateTime startTime, boolean isInternational) {
+        List<FraudAlert> alerts = new ArrayList<>();
+
+        // Register active call
+        activeCalls.put(callId, new CallRecord(callId, fromMsisdn, startTime, isInternational));
+
+        // Rule 1: concurrent calls
+        int concurrent = concurrentCallCount
+            .computeIfAbsent(fromMsisdn, k -> new AtomicInteger(0))
+            .incrementAndGet();
+        if (concurrent > MAX_CONCURRENT_CALLS) {
+            alerts.add(new FraudAlert(FraudType.TOO_MANY_CONCURRENT, fromMsisdn, callId,
+                "Concurrent calls: " + concurrent));
+        }
+
+        // Rule 3: international call frequency
+        if (isInternational) {
+            var times = intlCallTimes.computeIfAbsent(fromMsisdn, k -> new ConcurrentLinkedDeque<>());
+            times.addLast(startTime);
+            // Remove timestamps older than 1 hour
+            LocalDateTime cutoff = startTime.minusHours(1);
+            while (!times.isEmpty() && times.peekFirst().isBefore(cutoff)) times.pollFirst();
+            if (times.size() > MAX_INTL_CALLS_PER_HOUR) {
+                alerts.add(new FraudAlert(FraudType.TOO_MANY_INTL_CALLS, fromMsisdn, callId,
+                    "Intl calls in last hour: " + times.size()));
+            }
+        }
+
+        // Rule 4: call velocity
+        alerts.addAll(checkVelocity(fromMsisdn, startTime));
+
+        return alerts;
+    }
+
+    public List<FraudAlert> onCallEnd(String callId, LocalDateTime endTime) {
+        CallRecord call = activeCalls.remove(callId);
+        if (call == null) return List.of();
+
+        List<FraudAlert> alerts = new ArrayList<>();
+        concurrentCallCount.getOrDefault(call.fromMsisdn(), new AtomicInteger(0)).decrementAndGet();
+
+        // Rule 2: call duration
+        long durationSeconds = Duration.between(call.startTime(), endTime).getSeconds();
+        if (durationSeconds > MAX_DURATION_SECONDS) {
+            alerts.add(new FraudAlert(FraudType.EXCESSIVE_DURATION, call.fromMsisdn(), callId,
+                "Duration: " + durationSeconds + "s"));
+        }
+        return alerts;
+    }
+
+    public List<FraudAlert> checkVelocity(String msisdn, LocalDateTime now) {
+        var times = recentCallTimes.computeIfAbsent(msisdn, k -> new ConcurrentLinkedDeque<>());
+        times.addLast(now);
+        LocalDateTime cutoff = now.minusMinutes(1);
+        while (!times.isEmpty() && times.peekFirst().isBefore(cutoff)) times.pollFirst();
+        if (times.size() > MAX_CALLS_PER_MINUTE) {
+            return List.of(new FraudAlert(FraudType.HIGH_VELOCITY, msisdn, null,
+                "Calls in last minute: " + times.size()));
+        }
+        return List.of();
+    }
+}
+
+public enum FraudType {
+    TOO_MANY_CONCURRENT, EXCESSIVE_DURATION, TOO_MANY_INTL_CALLS, HIGH_VELOCITY
+}
+
+public record FraudAlert(FraudType type, String msisdn, String callId, String detail) {}
+
+// FOLLOW-UP QUESTIONS:
+// Q: This uses in-memory maps — what happens when we have multiple service instances?
+//    → Move state to Redis: INCR for counters, sorted sets for time-based windows.
+// Q: How do you test the time-window logic without Thread.sleep()?
+//    → Inject a Clock; use Clock.fixed() in tests to set specific times.
+// Q: What's the risk with ConcurrentLinkedDeque + manual cleanup?
+//    → Memory leak if onCallEnd never called (call dropped). Add TTL eviction.
+
+================================================================================
+EXERCISE 7 — INVOICE GENERATION PIPELINE (STREAM PROCESSING)
+================================================================================
+
+PROBLEM:
+Given rated CDRs for all subscribers in a month, build a streaming pipeline that:
+1. Groups CDRs by subscriber
+2. Applies a flat £10 monthly fee + usage charges
+3. Applies loyalty discounts: 5% for 12+ months, 10% for 24+ months
+4. Caps individual invoice at £500 (protect against billing bugs)
+5. Sorts invoices by total (highest first) for accounts review
+
+Use Java Streams throughout (no explicit for loops).
+
+SOLUTION:
+
+public record SubscriberMeta(String msisdn, int tenureMonths) {}
+
+public class InvoicePipeline {
+
+    private static final double ACCESS_FEE = 1000.0;      // pence
+    private static final double INVOICE_CAP = 50000.0;    // pence = £500
+    private static final double LOYALTY_12M = 0.05;
+    private static final double LOYALTY_24M = 0.10;
+
+    public List<Invoice2> generate(List<RatedCDR2> cdrs,
+                                   Map<String, SubscriberMeta> subscriberMeta) {
+        return cdrs.stream()
+            // Step 1: Group by MSISDN
+            .collect(Collectors.groupingBy(RatedCDR2::msisdn))
+            .entrySet().stream()
+            // Step 2: Build raw invoice per subscriber
+            .map(entry -> buildRawInvoice(entry.getKey(), entry.getValue(), subscriberMeta))
+            // Step 3: Apply loyalty discount
+            .map(inv -> applyLoyaltyDiscount(inv, subscriberMeta))
+            // Step 4: Cap invoice
+            .map(this::applyInvoiceCap)
+            // Step 5: Sort by total (highest first)
+            .sorted(Comparator.comparingDouble(Invoice2::totalPence).reversed())
+            .collect(Collectors.toList());
+    }
+
+    private Invoice2 buildRawInvoice(String msisdn, List<RatedCDR2> cdrs,
+                                      Map<String, SubscriberMeta> meta) {
+        double usageCharge = cdrs.stream().mapToDouble(RatedCDR2::chargeInPence).sum();
+        double total = usageCharge + ACCESS_FEE;
+        return new Invoice2(msisdn, usageCharge, ACCESS_FEE, 0.0, false, total);
+    }
+
+    private Invoice2 applyLoyaltyDiscount(Invoice2 inv, Map<String, SubscriberMeta> meta) {
+        SubscriberMeta subscriber = meta.get(inv.msisdn());
+        if (subscriber == null) return inv;
+        double discountRate = subscriber.tenureMonths() >= 24 ? LOYALTY_24M
+                            : subscriber.tenureMonths() >= 12 ? LOYALTY_12M : 0.0;
+        if (discountRate == 0) return inv;
+        double discount = inv.totalPence() * discountRate;
+        return new Invoice2(inv.msisdn(), inv.usageChargePence(), inv.accessFeePence(),
+            discount, false, inv.totalPence() - discount);
+    }
+
+    private Invoice2 applyInvoiceCap(Invoice2 inv) {
+        if (inv.totalPence() <= INVOICE_CAP) return inv;
+        return new Invoice2(inv.msisdn(), inv.usageChargePence(), inv.accessFeePence(),
+            inv.loyaltyDiscountPence(), true, INVOICE_CAP);
+    }
+}
+
+public record Invoice2(
+    String msisdn,
+    double usageChargePence,
+    double accessFeePence,
+    double loyaltyDiscountPence,
+    boolean cappedAtMaximum,
+    double totalPence
+) {
+    public double totalPounds() { return totalPence / 100.0; }
+}
+
+// FOLLOW-UP QUESTIONS:
+// Q: The pipeline is built with streams — how would you make it fault-tolerant?
+//    → Wrap each step in try-catch; collect failures to a separate list (Result<T>).
+// Q: How do you test the cap logic in isolation?
+//    → Unit test applyInvoiceCap() directly with an invoice just above/below/at the cap.
+// Q: How would you parallelise this for 10 million subscribers?
+//    → cdrs.parallelStream() — but ensure CDR list is thread-safe; groupingBy is safe.
+//    → Or partition by MSISDN range and process partitions in separate threads.
+
+================================================================================
+EXERCISE 8 — SUBSCRIBER STATE MACHINE
+================================================================================
+
+PROBLEM:
+A subscriber lifecycle follows these states:
+PENDING → ACTIVE → SUSPENDED → ACTIVE (can reactivate)
+ACTIVE → TERMINATED (cannot reactivate)
+PENDING → TERMINATED (e.g., failed KYC)
+
+Implement a SubscriberStateMachine that:
+- Tracks current state
+- Validates transitions (reject invalid ones)
+- Fires events on state change
+- Is thread-safe
+
+SOLUTION:
+
+public enum SubscriberState { PENDING, ACTIVE, SUSPENDED, TERMINATED }
+public enum SubscriberEvent { ACTIVATE, SUSPEND, REACTIVATE, TERMINATE }
+
+public class SubscriberStateMachine {
+
+    // Transition table: from state → (event → to state)
+    private static final Map<SubscriberState, Map<SubscriberEvent, SubscriberState>> TRANSITIONS =
+        Map.of(
+            SubscriberState.PENDING, Map.of(
+                SubscriberEvent.ACTIVATE,   SubscriberState.ACTIVE,
+                SubscriberEvent.TERMINATE,  SubscriberState.TERMINATED
+            ),
+            SubscriberState.ACTIVE, Map.of(
+                SubscriberEvent.SUSPEND,    SubscriberState.SUSPENDED,
+                SubscriberEvent.TERMINATE,  SubscriberState.TERMINATED
+            ),
+            SubscriberState.SUSPENDED, Map.of(
+                SubscriberEvent.REACTIVATE, SubscriberState.ACTIVE,
+                SubscriberEvent.TERMINATE,  SubscriberState.TERMINATED
+            )
+            // TERMINATED has no outgoing transitions (terminal state)
+        );
+
+    private volatile SubscriberState state;
+    private final String subscriberId;
+    private final List<StateChangeListener> listeners = new CopyOnWriteArrayList<>();
+
+    public SubscriberStateMachine(String subscriberId) {
+        this.subscriberId = subscriberId;
+        this.state = SubscriberState.PENDING;
+    }
+
+    public synchronized SubscriberState transition(SubscriberEvent event) {
+        Map<SubscriberEvent, SubscriberState> allowed = TRANSITIONS.getOrDefault(state, Map.of());
+        SubscriberState nextState = allowed.get(event);
+        if (nextState == null) {
+            throw new IllegalStateException(
+                "Invalid transition: " + state + " --[" + event + "]--> ???");
+        }
+        SubscriberState previous = state;
+        state = nextState;
+        notifyListeners(previous, event, nextState);
+        return state;
+    }
+
+    public SubscriberState getState() { return state; }
+
+    public boolean canTransition(SubscriberEvent event) {
+        return TRANSITIONS.getOrDefault(state, Map.of()).containsKey(event);
+    }
+
+    public void addListener(StateChangeListener listener) { listeners.add(listener); }
+
+    private void notifyListeners(SubscriberState from, SubscriberEvent event, SubscriberState to) {
+        listeners.forEach(l -> l.onStateChange(subscriberId, from, event, to));
+    }
+}
+
+@FunctionalInterface
+interface StateChangeListener {
+    void onStateChange(String subscriberId, SubscriberState from,
+                       SubscriberEvent event, SubscriberState to);
+}
+
+// Usage:
+SubscriberStateMachine sm = new SubscriberStateMachine("SUB-001");
+sm.addListener((id, from, event, to) ->
+    System.out.println(id + ": " + from + " --[" + event + "]--> " + to));
+
+sm.transition(SubscriberEvent.ACTIVATE);    // PENDING → ACTIVE
+sm.transition(SubscriberEvent.SUSPEND);     // ACTIVE → SUSPENDED
+sm.transition(SubscriberEvent.REACTIVATE);  // SUSPENDED → ACTIVE
+sm.transition(SubscriberEvent.TERMINATE);   // ACTIVE → TERMINATED
+
+// Throws IllegalStateException:
+// sm.transition(SubscriberEvent.ACTIVATE); // TERMINATED has no transitions
+
+// FOLLOW-UP QUESTIONS:
+// Q: How does Spring Statemachine differ from this implementation?
+//    → Adds: nested states, guards, actions, persistence, distributed state.
+// Q: How would you persist state across restarts?
+//    → Store current state in DB; load on startup; use optimistic locking on update.
+// Q: How would you handle the case where a subscriber terminates from PENDING?
+//    → Already handled: PENDING → TERMINATE is in the transition table.
+
+================================================================================
+QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+EXERCISE   | CORE TECHNIQUE             | KEY CLASS/PATTERN
+-----------|----------------------------|------------------------------------------
+1 CDR Rating     | Stream.filter/map      | Optional, record types, time boundary logic
+2 Billing        | groupingBy, reduce     | Collectors.groupingBy, merge with BiFunction
+3 Phone Router   | Trie (prefix tree)    | HashMap children, O(L) lookup
+4 Batch Processor| CompletableFuture     | allOf, runAsync, AtomicInteger counters
+5 Plan Selector  | Decision table        | List<Map.Entry<Predicate,Result>>, findFirst
+6 Fraud Detector | Sliding window        | ConcurrentLinkedDeque, ConcurrentHashMap
+7 Invoice Pipeline| Stream pipeline      | collect → stream → map → sorted chain
+8 State Machine  | Transition table      | Map<State, Map<Event, State>>, synchronized
+
+KEY INTERVIEW TIPS FOR TELECOM CODING ROUNDS:
+- Always handle missing data gracefully (Optional, skip with log)
+- Peak/off-peak time calculation: use DayOfWeek + LocalDateTime.getHour()
+- Currency: use pence/cents as long, never double for financial calculations
+- Thread safety: ConcurrentHashMap + AtomicInteger for counters; CopyOnWriteArrayList for listeners
+- Trie for prefix matching: O(L) vs O(P×L) for linear scan over prefix table
+- State machines: encode transition table as Map to avoid if-else chains
+- Billing: always apply adjustments in order (usage → fee → discount → cap)
+================================================================================

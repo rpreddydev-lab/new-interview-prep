@@ -1,0 +1,231 @@
+================================================================
+CONNECTION POOLING — DESIGN AND TUNING
+================================================================
+
+WHAT IS CONNECTION POOLING?
+----------------------------
+Creating a database connection is EXPENSIVE:
+  - TCP 3-way handshake
+  - TLS handshake (if SSL)
+  - DB authentication (username/password challenge)
+  - Session setup on the DB server
+
+Typical connection setup time: 20–200ms.
+A web request handler needs a DB connection for ~5ms of actual work.
+Without pooling: create connection per request → 200ms overhead every time.
+
+Connection Pool:
+  Pre-creates N connections at startup.
+  Requests BORROW a connection (< 1ms), use it, RETURN it.
+  Connection is reused for the next request.
+  The pool manages the lifecycle (validate, evict, create new as needed).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HIKARICP — THE GOLD STANDARD FOR JAVA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+HikariCP is the default connection pool for Spring Boot (since 2.0).
+It is the fastest Java connection pool:
+  - ~microsecond overhead to acquire a connection from pool
+  - Minimal object allocation (avoids GC pressure)
+  - Simple, small codebase (~130KB JAR)
+
+Named after "hikari" (光) = light in Japanese.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HIKARICP KEY CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+spring.datasource.hikari:
+  maximum-pool-size: 10        # Max connections in pool
+  minimum-idle: 5              # Min idle connections maintained
+  connection-timeout: 30000    # Max wait (ms) to get connection (30s)
+  idle-timeout: 600000         # Close idle connections after 10 min
+  max-lifetime: 1800000        # Replace connections after 30 min (prevents stale)
+  keepalive-time: 60000        # Send keepalive ping every 60s (prevents firewall timeout)
+  pool-name: "MyApp-DB-Pool"   # Name for monitoring/JMX
+  connection-test-query: "SELECT 1"  # Validation query (for older JDBC drivers)
+
+Or programmatically:
+  HikariConfig config = new HikariConfig();
+  config.setJdbcUrl("jdbc:postgresql://localhost:5432/mydb");
+  config.setUsername("user");
+  config.setPassword("pass");
+  config.setMaximumPoolSize(10);
+  config.setMinimumIdle(5);
+  config.setConnectionTimeout(30_000);
+  config.setIdleTimeout(600_000);
+  config.setMaxLifetime(1_800_000);
+  HikariDataSource dataSource = new HikariDataSource(config);
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+POOL SIZING — THE FORMULA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Counter-intuitive: SMALLER pool sizes often yield BETTER throughput.
+
+HikariCP's recommended formula:
+  pool_size = (core_count * 2) + effective_spindle_count
+  
+  For a server with 4 CPU cores, SSD (spindle=1):
+  pool_size = (4 * 2) + 1 = 9 → round to 10.
+
+WHY NOT BIGGER POOLS?
+
+Database connections use resources ON THE DB SERVER:
+  Each connection: ~1–10MB RAM on the DB server.
+  100 connections = 100–1000MB DB RAM just for connection overhead.
+  PostgreSQL: each connection is a separate OS process (forked).
+
+More connections ≠ more parallelism:
+  If CPU has 4 cores, DB can only run 4 things simultaneously.
+  100 waiting connections → all waiting for the same 4 cores.
+  Mutex contention on DB internal structures.
+  Disk seeks: HDD can only do one seek at a time (spindle count matters).
+
+The pool prevents thundering herd:
+  Requests queue up waiting for a connection.
+  Better: 10 requests processed serially at full speed, than 100 half-processed.
+
+BENCHMARK RESULT (HikariCP):
+  9-connection pool outperforms 100-connection pool at same concurrency.
+  "A 9-connection pool: 25M tx/minute on a 16-core server."
+  (HikariCP: https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONNECTION POOL EXHAUSTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SYMPTOMS:
+  SQLTimeoutException: "Connection is not available, request timed out after 30000ms"
+  Thread dumps show: many threads waiting at HikariPool.getConnection()
+  Metrics: hikaricp_pending_threads > 0, hikaricp_connections_active = max
+
+CAUSES:
+  1. SLOW QUERIES: Transactions hold connections for long periods.
+     10-second query × 10 threads = pool exhausted.
+  
+  2. TRANSACTIONS NOT CLOSED: Leaked connections (not returned to pool).
+     Always use try-with-resources or Spring @Transactional.
+  
+  3. POOL SIZE TOO SMALL: Legitimate traffic exceeds pool capacity.
+     Increase pool size carefully (don't go too high — see sizing section).
+  
+  4. EXTERNAL API CALLS IN TRANSACTIONS:
+     @Transactional method calls an external HTTP API (slow, may timeout).
+     Connection held for entire external call duration.
+     Rule: NEVER call external APIs inside a DB transaction.
+  
+  5. N+1 QUERIES: Many small queries per request, each holding a connection.
+
+DIAGNOSIS:
+  # Check active vs pending vs total connections
+  SELECT count(*), state FROM pg_stat_activity GROUP BY state;
+  
+  # Check long-running transactions (holding connections)
+  SELECT pid, now() - pg_stat_activity.query_start AS duration, query, state
+  FROM pg_stat_activity
+  WHERE state != 'idle' AND query_start < NOW() - INTERVAL '5 seconds';
+  
+  # HikariCP metrics (Prometheus via Micrometer)
+  hikaricp_connections{pool="MyApp-DB-Pool", state="active"}
+  hikaricp_connections{state="idle"}
+  hikaricp_connections{state="pending"}
+  hikaricp_connection_timeout_total
+
+SOLUTION — SHORT TERM:
+  Increase maximum-pool-size temporarily (monitoring impact on DB).
+  Kill long-running queries: SELECT pg_terminate_backend(pid) WHERE ...
+
+SOLUTION — LONG TERM:
+  Fix slow queries (add indexes, optimize query).
+  Remove external API calls from transactions.
+  Use async processing for non-critical operations.
+  Fix N+1 with JOIN FETCH or batch loading.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONNECTION VALIDATION AND KEEPALIVE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STALE CONNECTIONS:
+  Network firewalls/NAT drop idle TCP connections (often after 4–30 min).
+  Pool hands app a "stale" connection → first query fails.
+
+PREVENTION:
+  keepalive-time: 60000 (ms) — HikariCP sends keepalive ping every 60s.
+  max-lifetime: 1800000 — Replace connections before the DB kills them (PostgreSQL
+    default wait_timeout=8h, AWS RDS default connection timeout=hours).
+  
+  Set max-lifetime < DB's connection timeout + 2-minute safety margin.
+  AWS RDS: typical timeouts around 8 hours → max-lifetime: 1800000 (30 min) is safe.
+
+CONNECTION TESTING:
+  On borrow: HikariCP can validate connection before handing to app.
+  Modern JDBC drivers support isValid() (no extra SQL needed).
+  Older drivers: connectionTestQuery = "SELECT 1"
+  Validation adds latency (~1ms) — usually worth it.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+READ REPLICA ROUTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Use a separate pool for read replicas:
+  Write pool → primary DB (for mutations + reads within transactions)
+  Read pool  → read replicas (for non-critical read-heavy queries)
+
+Spring Boot with multiple DataSources:
+  @Primary DataSource → primary (writes)
+  @ReadOnly DataSource → replica (reads)
+  
+  RoutingDataSource can route based on @Transactional(readOnly = true).
+  AbstractRoutingDataSource: override determineCurrentLookupKey() to check
+  if current transaction is read-only → return "read" key → use read pool.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PGBOUNCER — CONNECTION POOLING AT DB LEVEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+In microservices: 10 services × 10 connections each = 100 connections to PostgreSQL.
+At 100 services: 1000 connections → DB can't handle this.
+
+PgBouncer: connection pooler that sits in front of PostgreSQL.
+  Services connect to PgBouncer (cheap, can have 1000+ connections).
+  PgBouncer maintains a smaller pool to PostgreSQL (e.g., 25 connections).
+  Multiplexes many application connections to few DB connections.
+
+PgBouncer modes:
+  Session mode:      Dedicated DB connection per session. Least efficient.
+  Transaction mode:  DB connection only held during transaction. Most efficient.
+                     Breaks features requiring persistent session state (temp tables, listen/notify).
+  Statement mode:    Connection returned after each statement (very restrictive).
+
+Production setup:
+  App (HikariCP, pool=5 per instance) → PgBouncer (25 to DB) → PostgreSQL
+  100 app instances × 5 HikariCP connections = 500 application-level connections.
+  PgBouncer multiplexes to 25–50 DB connections. PostgreSQL stays happy.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: Your application is throwing "connection timeout" errors. What do you check?
+A: 1. HikariCP metrics: how many connections are active/pending?
+   2. Is pool exhausted? → check hikaricp_connections{state="pending"} > 0
+   3. If yes: what's holding connections? → thread dump, pg_stat_activity
+   4. Common culprits: slow queries, external API in transactions, connection leak.
+   5. Check DB side: pg_stat_activity for long-running queries.
+   Fix: address the root cause (optimize slow queries, remove external call from
+   transaction), not just increase pool size.
+
+Q: Why would increasing the pool size make performance worse?
+A: Adding more connections means more concurrent access to DB resources
+   (locks, indexes, buffer pool). DB CPU only handles N things at once.
+   More connections → more lock contention → more context switching → slower.
+   Beyond the optimal size (CPU cores × 2), throughput plateaus then drops.
+   The pool size should match the DB's actual capacity to serve concurrent requests.
+
+Q: What is the difference between HikariCP and PgBouncer?
+A: HikariCP is application-side pooling: manages connections from JVM to DB.
+   PgBouncer is server-side pooling: sits in front of the DB, multiplexes many
+   app connections to fewer DB connections. They are complementary:
+   use both when you have many application instances (microservices at scale).

@@ -1,0 +1,267 @@
+======================================================
+RESILIENCE4J — FALLBACK PATTERN & REACTIVE TIMEOUT
+======================================================
+
+1. FALLBACK PATTERN
+────────────────────
+
+1a. What is a Fallback?
+  When a service call fails (circuit open, timeout, exception), instead of
+  propagating the error to the caller, a fallback provides a degraded but
+  acceptable response.
+
+  Fallback strategies:
+    - Return cached/stale data
+    - Return default/empty response
+    - Call an alternative service
+    - Return a meaningful error message
+    - Queue request for later processing
+
+
+1b. Fallback with Circuit Breaker:
+  @Service
+  public class ProductService {
+
+      @CircuitBreaker(name = "productService", fallbackMethod = "getProductFallback")
+      public Product getProduct(Long id) {
+          return productClient.getProduct(id);  // may throw
+      }
+
+      // Fallback method — must match signature + Exception parameter
+      public Product getProductFallback(Long id, Throwable ex) {
+          log.warn("Falling back for product {}: {}", id, ex.getMessage());
+          return Product.builder()
+              .id(id)
+              .name("Product Unavailable")
+              .available(false)
+              .build();
+      }
+  }
+
+  IMPORTANT: fallbackMethod signature must:
+    - Match the original method's parameters
+    - Add Throwable (or specific exception type) as the last parameter
+    - Return the same type
+
+
+1c. Fallback with Retry:
+  @Retry(name = "paymentService", fallbackMethod = "paymentFallback")
+  public PaymentResponse processPayment(PaymentRequest request) {
+      return paymentClient.process(request);
+  }
+
+  public PaymentResponse paymentFallback(PaymentRequest request, Throwable ex) {
+      // After all retry attempts exhausted
+      return PaymentResponse.queued(request.getId());  // queue for async processing
+  }
+
+
+1d. Chaining decorators (Circuit Breaker + Retry + Fallback):
+  @CircuitBreaker(name = "inventory", fallbackMethod = "inventoryFallback")
+  @Retry(name = "inventory")
+  @TimeLimiter(name = "inventory")
+  public CompletableFuture<Integer> getStock(Long productId) {
+      return CompletableFuture.supplyAsync(() ->
+          inventoryClient.getStock(productId));
+  }
+
+  public CompletableFuture<Integer> inventoryFallback(Long productId, Throwable ex) {
+      return CompletableFuture.completedFuture(-1);  // indicate unknown stock
+  }
+
+  Execution order: TimeLimiter → CircuitBreaker → Retry → actual call
+  Fallback executes if the outermost decorator fails.
+
+
+1e. Multiple fallback methods (type-specific fallbacks):
+  @CircuitBreaker(name = "service", fallbackMethod = "fallbackForTimeout")
+  public String callService() { ... }
+
+  // More specific exception takes priority
+  public String fallbackForTimeout(TimeoutException ex) {
+      return "Request timed out, please retry";
+  }
+
+  public String fallbackForTimeout(CallNotPermittedException ex) {
+      return "Service temporarily unavailable";
+  }
+
+  public String fallbackForTimeout(Throwable ex) {
+      return "Service error";  // catch-all
+  }
+
+
+1f. Programmatic fallback:
+  CircuitBreaker circuitBreaker = circuitBreakerRegistry.circuitBreaker("service");
+
+  Supplier<String> decoratedSupplier = CircuitBreaker.decorateSupplier(
+      circuitBreaker,
+      () -> remoteService.call()
+  );
+
+  String result = Try.ofSupplier(decoratedSupplier)
+      .recover(CallNotPermittedException.class, ex -> "fallback response")
+      .recover(TimeoutException.class, ex -> "timed out")
+      .getOrElse("default response");
+
+
+2. REACTIVE TIMEOUT (WEBFLUX + RESILIENCE4J)
+─────────────────────────────────────────────
+
+2a. TimeLimiter with CompletableFuture (non-reactive):
+  @TimeLimiter(name = "myService")
+  public CompletableFuture<String> asyncCall() {
+      return CompletableFuture.supplyAsync(() -> remoteService.call());
+  }
+
+  application.yml:
+    resilience4j:
+      timelimiter:
+        instances:
+          myService:
+            timeout-duration: 2s
+            cancel-running-future: true  # cancel future if timeout
+
+
+2b. Reactor timeout operators (WebFlux native — no Resilience4j needed):
+  Mono.timeout():
+    webClient.get()
+        .uri("/api/products")
+        .retrieve()
+        .bodyToMono(ProductResponse.class)
+        .timeout(Duration.ofSeconds(2))
+        .onErrorReturn(TimeoutException.class, ProductResponse.empty());
+
+  Flux.timeout():
+    Flux<Event> events = eventStream()
+        .timeout(Duration.ofSeconds(5))
+        .onErrorResume(TimeoutException.class, ex ->
+            Flux.just(Event.defaultEvent()));
+
+  timeout() per element:
+    webClient.get()
+        .uri("/api/stream")
+        .retrieve()
+        .bodyToFlux(Item.class)
+        .timeout(Duration.ofMillis(500),
+                 Flux.just(Item.fallback()));  // fallback stream on timeout
+
+
+2c. Resilience4j TimeLimiter with WebFlux:
+  @TimeLimiter(name = "reactiveService", fallbackMethod = "reactiveFallback")
+  public Mono<String> reactiveCall() {
+      return webClient.get()
+          .uri("/api/data")
+          .retrieve()
+          .bodyToMono(String.class);
+  }
+
+  // Note: Resilience4j TimeLimiter with Mono/Flux requires additional setup
+  // Prefer Reactor's .timeout() for WebFlux apps
+
+  Better approach with Resilience4j + Reactor:
+    TimeLimiter timeLimiter = TimeLimiter.of(TimeLimiterConfig.custom()
+        .timeoutDuration(Duration.ofSeconds(2))
+        .build());
+
+    // Wrap Mono manually:
+    return Mono.fromFuture(
+        TimeLimiter.decorateFutureSupplier(timeLimiter,
+            () -> reactiveService.call().toFuture()));
+
+
+2d. WebClient timeout configuration (preferred for reactive):
+  // Overall timeout: connection + read + write
+  @Bean
+  public WebClient webClient() {
+      HttpClient httpClient = HttpClient.create()
+          .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 3000)   // connection timeout
+          .responseTimeout(Duration.ofSeconds(5))                 // response timeout
+          .doOnConnected(conn -> conn
+              .addHandlerLast(new ReadTimeoutHandler(5, TimeUnit.SECONDS))
+              .addHandlerLast(new WriteTimeoutHandler(5, TimeUnit.SECONDS)));
+
+      return WebClient.builder()
+          .clientConnector(new ReactorClientHttpConnector(httpClient))
+          .build();
+  }
+
+  Timeout hierarchy (apply all):
+    1. Connection timeout (TCP connect): ChannelOption.CONNECT_TIMEOUT_MILLIS
+    2. Response timeout: .responseTimeout() on HttpClient
+    3. Reactive stream timeout: .timeout() on Mono/Flux
+    4. Read/Write timeout: ReadTimeoutHandler/WriteTimeoutHandler
+
+
+3. FALLBACK CACHE PATTERN
+──────────────────────────
+Cache last successful response; return on failure:
+
+  @CircuitBreaker(name = "productService", fallbackMethod = "cachedProduct")
+  public Product getProduct(Long id) {
+      Product product = productClient.getProduct(id);
+      cache.put("product:" + id, product);  // update cache on success
+      return product;
+  }
+
+  public Product cachedProduct(Long id, Throwable ex) {
+      Product cached = cache.get("product:" + id);
+      if (cached != null) {
+          log.warn("Returning stale cached product {}", id);
+          return cached;
+      }
+      throw new ServiceUnavailableException("Product service unavailable");
+  }
+
+
+4. CONFIGURATION
+─────────────────
+application.yml:
+  resilience4j:
+    circuitbreaker:
+      instances:
+        productService:
+          sliding-window-size: 10
+          failure-rate-threshold: 50
+          wait-duration-in-open-state: 30s
+          permitted-number-of-calls-in-half-open-state: 5
+          fallback: getProductFallback  # optional
+    retry:
+      instances:
+        productService:
+          max-attempts: 3
+          wait-duration: 500ms
+          retry-exceptions:
+            - org.springframework.web.client.ResourceAccessException
+    timelimiter:
+      instances:
+        productService:
+          timeout-duration: 2s
+
+
+5. INTERVIEW QUESTIONS
+──────────────────────
+Q: What is the Fallback pattern in Resilience4j?
+A: When a protected method fails (exception, circuit open, timeout), Resilience4j
+   invokes a fallback method. The fallback must match the original method's
+   parameters plus an additional Throwable parameter. It provides degraded
+   service rather than propagating the error.
+
+Q: How do you chain multiple Resilience4j decorators?
+A: Use stacked annotations (@TimeLimiter + @CircuitBreaker + @Retry).
+   Execution order (outermost to innermost): TimeLimiter → CircuitBreaker → Retry → call.
+   The fallback triggers when the outermost decorator fails.
+   For CompletableFuture: @TimeLimiter must be outermost.
+
+Q: How do you implement timeouts in a WebFlux (reactive) application?
+A: Prefer Reactor's native .timeout(Duration) operator on Mono/Flux.
+   This integrates naturally with the reactive pipeline. For WebClient:
+   set connection timeout, response timeout on the underlying HttpClient.
+   For Resilience4j integration: wrap Mono in CompletableFuture and use @TimeLimiter,
+   or use the TimeLimiter programmatic API with Mono.fromFuture().
+
+Q: What is the difference between timeout in WebClient and .timeout() on Mono?
+A: WebClient timeout (responseTimeout) is the time to receive the full HTTP response.
+   Mono.timeout() is a reactive stream operator that fires TimeoutException if the
+   Mono doesn't emit within the duration. Both can be combined: WebClient timeout
+   for network-level, Mono.timeout() for business-level SLA enforcement.

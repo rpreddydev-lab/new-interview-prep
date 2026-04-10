@@ -1,0 +1,468 @@
+================================================================================
+SERVICE-TO-SERVICE AUTHENTICATION IN SPRING BOOT
+================================================================================
+
+THE PROBLEM
+-----------
+Internal microservices need to call each other securely. Unlike user-facing auth
+(where a human provides credentials), service-to-service auth is machine-to-machine.
+
+Requirements:
+  - Caller service must prove its identity to callee service
+  - No human user credentials involved
+  - Token must be cached and refreshed automatically
+  - Must work with Feign clients and WebClient
+
+Two main approaches:
+  1. OAuth2 Client Credentials Flow (token-based, most common)
+  2. Mutual TLS / mTLS (certificate-based, strongest)
+
+────────────────────────────────────────────────────────────────────────────────
+
+1. OAUTH2 CLIENT CREDENTIALS FLOW
+===================================
+
+How it works:
+  [Service A] ──(client_id + client_secret)──→ [Auth Server (Keycloak/Auth0)]
+  [Auth Server] ──(access_token)──────────────→ [Service A]
+  [Service A]  ──(Bearer access_token)─────────→ [Service B]
+  [Service B]  ──(validate token)──────────────→ [Auth Server / JWKS endpoint]
+  [Service B]  ──(response)────────────────────→ [Service A]
+
+This is OAuth2 "client credentials" grant — no user involved, service acts as client.
+
+DEPENDENCIES (pom.xml):
+  <!-- Service A (calling service) -->
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-oauth2-client</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-webflux</artifactId>
+  </dependency>
+
+  <!-- Service B (receiving service) -->
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+  </dependency>
+
+════════════════════════════════════════════════════════════════════════════════
+SERVICE A — THE CALLER (OAUTH2 CLIENT)
+════════════════════════════════════════════════════════════════════════════════
+
+application.yml (Service A):
+  spring:
+    security:
+      oauth2:
+        client:
+          registration:
+            order-service:                          # Logical client name
+              client-id: order-service-client
+              client-secret: ${ORDER_SERVICE_SECRET}
+              authorization-grant-type: client_credentials
+              scope: inventory:read, payment:write
+          provider:
+            order-service:
+              token-uri: https://auth.example.com/realms/myapp/protocol/openid-connect/token
+
+WebClient Configuration (Service A):
+  @Configuration
+  @RequiredArgsConstructor
+  public class WebClientConfig {
+
+    private final ReactiveClientRegistrationRepository clientRegistrationRepository;
+
+    // Manages OAuth2 tokens — fetches and caches them automatically
+    @Bean
+    public ReactiveOAuth2AuthorizedClientManager authorizedClientManager(
+            ServerOAuth2AuthorizedClientRepository authorizedClientRepository) {
+      ReactiveOAuth2AuthorizedClientProvider provider =
+          ReactiveOAuth2AuthorizedClientProviderBuilder.builder()
+              .clientCredentials()   // Only client_credentials grant
+              .build();
+
+      DefaultReactiveOAuth2AuthorizedClientManager manager =
+          new DefaultReactiveOAuth2AuthorizedClientManager(
+              clientRegistrationRepository, authorizedClientRepository);
+      manager.setAuthorizedClientProvider(provider);
+      return manager;
+    }
+
+    // WebClient that auto-attaches Bearer token for "inventory-service" calls
+    @Bean
+    public WebClient inventoryServiceWebClient(
+            ReactiveOAuth2AuthorizedClientManager manager) {
+      ServerOAuth2AuthorizedClientExchangeFilterFunction oauth2Filter =
+          new ServerOAuth2AuthorizedClientExchangeFilterFunction(manager);
+      oauth2Filter.setDefaultClientRegistrationId("inventory-service");
+
+      return WebClient.builder()
+          .baseUrl("http://inventory-service:8080")
+          .filter(oauth2Filter)
+          .build();
+    }
+  }
+
+  // The token is fetched and cached automatically by Spring.
+  // When it expires, Spring fetches a new one transparently.
+
+Service A — Usage (calling inventory service):
+  @Service
+  @RequiredArgsConstructor
+  public class OrderService {
+
+    private final WebClient inventoryServiceWebClient;
+
+    public Mono<StockResponse> checkStock(String productId) {
+      return inventoryServiceWebClient
+          .get()
+          .uri("/api/v1/inventory/{productId}", productId)
+          // Token is auto-attached by the OAuth2 filter
+          .retrieve()
+          .bodyToMono(StockResponse.class);
+    }
+  }
+
+════════════════════════════════════════════════════════════════════════════════
+SERVICE A WITH FEIGN CLIENT (NON-REACTIVE)
+════════════════════════════════════════════════════════════════════════════════
+
+Dependencies:
+  <dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-openfeign</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-oauth2-client</artifactId>
+  </dependency>
+
+Feign OAuth2 Request Interceptor:
+  @Component
+  @RequiredArgsConstructor
+  public class OAuth2FeignRequestInterceptor implements RequestInterceptor {
+
+    private final OAuth2AuthorizedClientManager authorizedClientManager;
+    private final ClientRegistrationRepository clientRegistrationRepository;
+
+    @Override
+    public void apply(RequestTemplate template) {
+      OAuth2AuthorizeRequest authorizeRequest = OAuth2AuthorizeRequest
+          .withClientRegistrationId("inventory-service")
+          .principal("order-service")    // Name of the calling service
+          .build();
+
+      OAuth2AuthorizedClient client =
+          authorizedClientManager.authorize(authorizeRequest);
+
+      if (client != null && client.getAccessToken() != null) {
+        template.header("Authorization",
+            "Bearer " + client.getAccessToken().getTokenValue());
+      }
+    }
+  }
+
+  // Servlet (non-reactive) configuration for OAuth2AuthorizedClientManager:
+  @Bean
+  public OAuth2AuthorizedClientManager authorizedClientManager(
+          ClientRegistrationRepository clients,
+          OAuth2AuthorizedClientService service) {
+    OAuth2AuthorizedClientProvider provider =
+        OAuth2AuthorizedClientProviderBuilder.builder()
+            .clientCredentials()
+            .build();
+
+    AuthorizedClientServiceOAuth2AuthorizedClientManager manager =
+        new AuthorizedClientServiceOAuth2AuthorizedClientManager(clients, service);
+    manager.setAuthorizedClientProvider(provider);
+    return manager;
+  }
+
+Feign Client:
+  @FeignClient(
+    name = "inventory-service",
+    url = "http://inventory-service:8080",
+    configuration = FeignOAuth2Config.class
+  )
+  public interface InventoryClient {
+    @GetMapping("/api/v1/inventory/{productId}")
+    StockResponse getStock(@PathVariable String productId);
+  }
+
+  @Configuration
+  public class FeignOAuth2Config {
+    @Bean
+    public OAuth2FeignRequestInterceptor oAuth2FeignRequestInterceptor(
+            OAuth2AuthorizedClientManager manager,
+            ClientRegistrationRepository clients) {
+      return new OAuth2FeignRequestInterceptor(manager, clients);
+    }
+  }
+
+════════════════════════════════════════════════════════════════════════════════
+SERVICE B — THE RECEIVER (RESOURCE SERVER)
+════════════════════════════════════════════════════════════════════════════════
+
+application.yml (Service B):
+  spring:
+    security:
+      oauth2:
+        resourceserver:
+          jwt:
+            # JWKS endpoint — Spring auto-fetches public keys and caches them
+            jwk-set-uri: https://auth.example.com/realms/myapp/protocol/openid-connect/certs
+            # OR use issuer-uri for auto-discovery:
+            # issuer-uri: https://auth.example.com/realms/myapp
+
+Security Configuration (Service B):
+  @Configuration
+  @EnableWebSecurity
+  public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+      http
+          .authorizeHttpRequests(auth -> auth
+              .requestMatchers("/actuator/health").permitAll()
+              .requestMatchers(HttpMethod.GET, "/api/v1/inventory/**")
+                  .hasAuthority("SCOPE_inventory:read")
+              .anyRequest().authenticated()
+          )
+          .oauth2ResourceServer(oauth2 -> oauth2
+              .jwt(jwt -> jwt.jwtAuthenticationConverter(jwtConverter()))
+          )
+          .sessionManagement(session ->
+              session.sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+          );
+
+      return http.build();
+    }
+
+    // Convert JWT claims to Spring Security authorities
+    @Bean
+    public JwtAuthenticationConverter jwtConverter() {
+      JwtGrantedAuthoritiesConverter converter = new JwtGrantedAuthoritiesConverter();
+      // Keycloak puts scopes in "scope" claim by default; adjust per IdP
+      converter.setAuthoritiesClaimName("scope");
+      converter.setAuthorityPrefix("SCOPE_");
+
+      JwtAuthenticationConverter jwtConverter = new JwtAuthenticationConverter();
+      jwtConverter.setJwtGrantedAuthoritiesConverter(converter);
+      return jwtConverter;
+    }
+  }
+
+Service B — Controller:
+  @RestController
+  @RequestMapping("/api/v1/inventory")
+  @RequiredArgsConstructor
+  public class InventoryController {
+
+    private final InventoryService inventoryService;
+
+    @GetMapping("/{productId}")
+    @PreAuthorize("hasAuthority('SCOPE_inventory:read')")
+    public ResponseEntity<StockResponse> getStock(
+            @PathVariable String productId,
+            @AuthenticationPrincipal Jwt jwt) {
+
+      // Log which service is calling for audit
+      String callerClientId = jwt.getClaimAsString("client_id");
+      log.info("Stock request for {} from service: {}", productId, callerClientId);
+
+      return ResponseEntity.ok(inventoryService.getStock(productId));
+    }
+  }
+
+════════════════════════════════════════════════════════════════════════════════
+KEYCLOAK SETUP (Reference)
+════════════════════════════════════════════════════════════════════════════════
+
+1. Create Client: order-service
+   - Client type: confidential
+   - Authentication: client_id + client_secret
+   - Grant type: Service accounts enabled (client_credentials)
+
+2. Add scopes: inventory:read, payment:write
+
+3. Create Client: inventory-service
+   - Add "inventory:read" to its default scopes required by callers
+
+4. Docker Compose (local dev):
+  keycloak:
+    image: quay.io/keycloak/keycloak:23.0
+    command: start-dev
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8180:8080"
+
+════════════════════════════════════════════════════════════════════════════════
+TOKEN CACHING AND REFRESH (HOW SPRING HANDLES IT)
+════════════════════════════════════════════════════════════════════════════════
+
+Spring's OAuth2AuthorizedClientManager / ReactiveOAuth2AuthorizedClientManager:
+  - On first call: fetches token from Auth Server, stores in memory (or session)
+  - On subsequent calls: reuses cached token
+  - When token expires (or near expiry): automatically fetches new token
+
+  InMemoryReactiveOAuth2AuthorizedClientService caches tokens in memory.
+  For distributed environments, implement a custom ClientService backed by Redis:
+
+  @Bean
+  public ReactiveOAuth2AuthorizedClientService authorizedClientService(
+          ReactiveClientRegistrationRepository repository,
+          ReactiveRedisOperations<String, OAuth2AuthorizedClient> redisOps) {
+    return new RedisReactiveOAuth2AuthorizedClientService(repository, redisOps);
+    // Custom implementation — Spring doesn't provide this out-of-the-box
+    // But for client_credentials, each pod has its own token — in-memory is usually fine
+  }
+
+  Note: For client_credentials (machine-to-machine), each pod independently
+  fetches tokens. This is usually fine — the token is stateless (JWT).
+  No shared session needed (unlike user auth tokens).
+
+════════════════════════════════════════════════════════════════════════════════
+
+2. MUTUAL TLS (mTLS)
+=====================
+
+How it works:
+  Both client AND server present certificates.
+  Server validates client's cert (not just user presents a cert to a server).
+
+  [Service A] ──(TLS handshake: both present certs)──→ [Service B]
+  Service B validates Service A's certificate against its trust store.
+  No tokens needed.
+
+WHEN TO USE mTLS:
+  - Zero-trust networks (every hop must be authenticated)
+  - When an external Auth Server is not acceptable (compliance requirements)
+  - Service mesh environments (Istio/Linkerd handles mTLS automatically)
+
+mTLS WITH ISTIO (zero-code solution):
+  # Enable mTLS for the entire mesh
+  apiVersion: security.istio.io/v1beta1
+  kind: PeerAuthentication
+  metadata:
+    name: default
+    namespace: production
+  spec:
+    mtls:
+      mode: STRICT    # All service-to-service traffic must use mTLS
+
+  # Istio automatically issues and rotates certificates via SPIFFE/SVID.
+  # No application code changes needed — the sidecar proxy handles it.
+
+mTLS WITH SPRING BOOT (without service mesh):
+  # server (Service B):
+  server:
+    ssl:
+      enabled: true
+      key-store: classpath:service-b-keystore.p12
+      key-store-password: ${KEYSTORE_PASSWORD}
+      trust-store: classpath:ca-truststore.jks
+      trust-store-password: ${TRUSTSTORE_PASSWORD}
+      client-auth: need    # Require client certificate
+
+  # client (Service A — RestTemplate):
+  @Bean
+  public RestTemplate mtlsRestTemplate() throws Exception {
+    SSLContext sslContext = SSLContexts.custom()
+        .loadKeyMaterial(
+            keyStore,      // Service A's certificate + private key
+            keyPassword)
+        .loadTrustMaterial(
+            trustStore)    // CA cert that issued Service B's cert
+        .build();
+
+    SSLConnectionSocketFactory factory = new SSLConnectionSocketFactory(sslContext);
+    CloseableHttpClient httpClient = HttpClients.custom()
+        .setSSLSocketFactory(factory)
+        .build();
+
+    return new RestTemplate(new HttpComponentsClientHttpRequestFactory(httpClient));
+  }
+
+CERTIFICATE ROTATION:
+  Manual mTLS requires certificate rotation — complex.
+  Istio and cert-manager (K8s) automate rotation via SPIFFE.
+
+════════════════════════════════════════════════════════════════════════════════
+
+COMPARISON TABLE
+==================
+
+Approach              │ Complexity │ Overhead         │ Best For
+──────────────────────┼────────────┼──────────────────┼──────────────────────────
+OAuth2 Client Creds   │ Medium     │ Token fetch/valid │ Most microservices
+mTLS (manual)         │ High       │ TLS handshake     │ High-security, compliance
+mTLS (Istio)          │ Low (infra)│ Sidecar overhead  │ K8s + service mesh
+API Key               │ Low        │ Minimal           │ Internal only, lower trust
+JWT propagation       │ Medium     │ None extra        │ User context must flow through
+
+JWT PROPAGATION (passing user's JWT downstream):
+  When Service A receives a user's JWT and needs to call Service B:
+  Option 1: Pass the original JWT (Service B validates same token)
+  Option 2: Token exchange (Service A exchanges user JWT for a service JWT)
+
+  // Simple propagation (pass user JWT downstream via feign):
+  @Component
+  public class JwtPropagationInterceptor implements RequestInterceptor {
+    @Override
+    public void apply(RequestTemplate template) {
+      // Extract current request's Authorization header and forward it
+      Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+      if (auth instanceof JwtAuthenticationToken jwtAuth) {
+        template.header("Authorization",
+            "Bearer " + jwtAuth.getToken().getTokenValue());
+      }
+    }
+  }
+
+════════════════════════════════════════════════════════════════════════════════
+
+INTERVIEW QUESTIONS — SERVICE-TO-SERVICE AUTH
+==============================================
+
+Q: How do microservices authenticate with each other?
+A: The most common approach is OAuth2 Client Credentials flow. Each service has
+   a client_id and client_secret registered with an Authorization Server (Keycloak,
+   Auth0). The calling service fetches a short-lived access token (JWT) using its
+   credentials and attaches it as Bearer token in the request. The receiving service
+   validates the JWT signature using the Auth Server's JWKS endpoint. Spring Boot
+   provides spring-boot-starter-oauth2-client (caller) and spring-boot-starter-
+   oauth2-resource-server (receiver) to implement this. Tokens are cached and
+   auto-refreshed by Spring's OAuth2AuthorizedClientManager.
+
+Q: What is the Client Credentials grant type and how does it differ from
+   Authorization Code grant?
+A: Authorization Code grant involves a human user — the user authenticates with
+   the Auth Server directly, and an authorization code is exchanged for tokens.
+   Client Credentials grant is for machine-to-machine authentication — no human
+   user is involved. The service authenticates directly with its own credentials
+   (client_id + client_secret) and receives an access token scoped to service-level
+   permissions, not user-level permissions.
+
+Q: How does Spring Boot automatically refresh OAuth2 tokens for service calls?
+A: Spring's OAuth2AuthorizedClientManager (or its reactive variant) manages the
+   token lifecycle. On the first call, it fetches a token from the Auth Server and
+   caches it. On subsequent calls, it reuses the cached token. When the token is
+   close to expiry (or has expired), Spring automatically fetches a new token before
+   making the request. WebClient with ServerOAuth2AuthorizedClientExchangeFilterFunction
+   handles this transparently — the service code never manages token lifecycle directly.
+
+Q: What is mTLS and when would you use it over OAuth2?
+A: Mutual TLS (mTLS) requires both sides of a connection to present X.509
+   certificates. Unlike standard TLS where only the server proves its identity,
+   mTLS proves both client and server identities at the network/transport layer.
+   Use mTLS when: (1) you operate a zero-trust network where every hop must be
+   authenticated regardless of which network layer, (2) compliance requires
+   certificate-based authentication, or (3) you're using a service mesh like Istio
+   (which handles mTLS automatically with SPIFFE/SVID — zero code changes needed).
+   OAuth2 is simpler to implement and sufficient for most cases; Istio mTLS is ideal
+   for K8s environments where you get it "for free."
+================================================================================

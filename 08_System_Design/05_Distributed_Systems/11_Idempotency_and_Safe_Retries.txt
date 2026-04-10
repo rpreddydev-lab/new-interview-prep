@@ -1,0 +1,227 @@
+================================================================
+IDEMPOTENCY — DESIGNING SAFE RETRIES
+================================================================
+
+WHAT IS IDEMPOTENCY?
+---------------------
+An operation is IDEMPOTENT if performing it multiple times has
+the same effect as performing it once.
+
+Mathematical: f(f(x)) = f(x)
+
+Examples:
+  Idempotent:     PUT /users/123 { name: "Alice" }
+                  DELETE /orders/456
+                  SET counter = 100   (absolute assignment)
+  
+  NOT idempotent: POST /orders (creates new order each time)
+                  PATCH /account { balance: balance + 100 } (relative)
+                  Sending an email
+                  Charging a credit card
+
+WHY IDEMPOTENCY MATTERS IN DISTRIBUTED SYSTEMS:
+  Networks are unreliable. Retries are MANDATORY for resilience.
+  Without idempotency: retry → duplicate charge, duplicate order, duplicate email.
+  With idempotency: retry → safe, same result every time.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DELIVERY GUARANTEES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+AT-MOST-ONCE:
+  Send once. Never retry. If it fails — the request is lost.
+  Suitable for: fire-and-forget telemetry, UDP metrics.
+  NOT suitable for: business transactions.
+
+AT-LEAST-ONCE:
+  Retry until acknowledged. The receiver WILL process it eventually.
+  But: may process the same message MULTIPLE TIMES.
+  Requires consumer to be IDEMPOTENT.
+  Most message queues (SQS, Kafka) guarantee at-least-once.
+
+EXACTLY-ONCE:
+  Each message processed exactly once. No duplicates. No loss.
+  Very hard to achieve truly end-to-end.
+  
+  Kafka EOS (Exactly Once Semantics):
+    Works for Kafka-to-Kafka pipelines (Kafka Streams).
+    Producer: enable.idempotence=true + transactional.id
+    Consumer: isolation.level=read_committed
+  
+  For Kafka → Database: at-least-once + idempotent DB write = effective exactly-once.
+  
+  True exactly-once across distributed systems is extremely hard and expensive.
+  Industry norm: at-least-once + idempotent processing = "effectively exactly-once"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IDEMPOTENCY KEY PATTERN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The standard pattern for non-idempotent operations (POST, messaging):
+  Client generates a unique key per LOGICAL OPERATION (not per retry).
+  On retry, client sends the SAME key.
+  Server uses the key to detect and deduplicate.
+
+HTTP API PATTERN:
+  POST /api/payments
+  Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000   ← UUID per operation
+  Content-Type: application/json
+  { "amount": 99.99, "currency": "USD", "customerId": "cust_123" }
+  
+  First request:
+    Server processes payment → stores (key, response) in idempotency store.
+    Returns 200 { "paymentId": "pay_abc", "status": "COMPLETED" }
+  
+  Retry (network timeout, client didn't receive response):
+    Server finds key in store → returns stored response immediately.
+    Payment is NOT processed again.
+    Returns 200 { "paymentId": "pay_abc", "status": "COMPLETED" }
+  
+  Different operation (new payment):
+    Client generates NEW UUID → server doesn't find it → processes normally.
+
+IDEMPOTENCY STORE IMPLEMENTATION:
+  Table schema:
+  CREATE TABLE idempotency_keys (
+    key          VARCHAR(255) PRIMARY KEY,
+    tenant_id    UUID NOT NULL,       -- optional, for multi-tenant
+    response     JSONB NOT NULL,      -- cached response body
+    status_code  INT NOT NULL,        -- cached HTTP status
+    created_at   TIMESTAMP NOT NULL,
+    expires_at   TIMESTAMP NOT NULL   -- TTL: 24 hours is typical
+  );
+  
+  Expiry: after 24–48 hours, idempotency keys can be purged.
+  After expiry, a new request with the same key is treated as a new operation.
+
+ATOMIC CHECK-AND-INSERT:
+  CRITICAL: must check existence AND insert in one atomic operation.
+  Otherwise: two concurrent requests with same key both see "not found" → both process.
+  
+  PostgreSQL:
+  INSERT INTO idempotency_keys (key, response, status_code, created_at, expires_at)
+  VALUES (?, ?, ?, NOW(), NOW() + INTERVAL '24 hours')
+  ON CONFLICT (key) DO NOTHING;
+  -- if rows_affected = 0 → key already exists → return cached response
+  -- if rows_affected = 1 → new operation → process it
+  
+  Java + Spring:
+  @Transactional
+  public PaymentResponse processPayment(String idempotencyKey, PaymentRequest req) {
+      Optional<IdempotencyRecord> existing = idempotencyRepo.findById(idempotencyKey);
+      if (existing.isPresent()) {
+          return existing.get().getCachedResponse();
+      }
+      // Process payment
+      PaymentResponse response = paymentGateway.charge(req);
+      // Store result
+      idempotencyRepo.save(new IdempotencyRecord(idempotencyKey, response));
+      return response;
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NATURAL IDEMPOTENCY (NO KEY NEEDED)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Some operations are naturally idempotent:
+
+PUT /users/123 { name: "Alice" }
+  → Sets name to Alice every time. Second call is identical to first.
+
+Database UPSERT:
+  INSERT INTO user_settings (userId, theme, language)
+  VALUES ('123', 'dark', 'en')
+  ON CONFLICT (userId) DO UPDATE SET theme = 'dark', language = 'en';
+  → Safe to run multiple times.
+
+Conditional updates (optimistic locking):
+  UPDATE orders SET status = 'SHIPPED'
+  WHERE id = 123 AND status = 'PROCESSING';
+  → If already SHIPPED: rows_affected = 0 (no harm done).
+
+Kafka consumer: if processing already-processed event:
+  Check: has this eventId been processed already?
+  SELECT 1 FROM processed_events WHERE event_id = ?
+  If yes → skip (log warning). If no → process + insert event_id.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IDEMPOTENCY IN MESSAGE PROCESSING (KAFKA)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Kafka guarantees at-least-once → consumers must handle duplicates.
+
+Pattern:
+  1. Each event has a unique eventId (UUID in the message).
+  2. Consumer checks: has this eventId been processed?
+     SELECT 1 FROM processed_events WHERE event_id = ?
+  3. If yes → skip (idempotent skip).
+  4. If no → process event + insert eventId in SAME transaction.
+  
+  CREATE TABLE processed_events (
+    event_id    VARCHAR(255) PRIMARY KEY,
+    processed_at TIMESTAMP DEFAULT NOW(),
+    consumer_group VARCHAR(255)
+  );
+  
+  TTL: delete processed_events older than max Kafka retention (7 days).
+
+OUTBOX TABLE AS EVENT ID SOURCE:
+  If using the Outbox pattern, the outbox record's ID can serve as the eventId.
+  Consuming service checks outbox_event_id in processed_events.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RETRY STRATEGIES AND BACKOFF
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Retrying blindly can worsen overloaded services (thundering herd).
+
+EXPONENTIAL BACKOFF:
+  Wait = min(cap, base * 2^attempt)
+  
+  Attempt 1: wait 1s
+  Attempt 2: wait 2s
+  Attempt 3: wait 4s
+  Attempt 4: wait 8s
+  Attempt 5: wait 16s (capped at some max, e.g., 30s)
+
+JITTER (RANDOMIZED BACKOFF):
+  Multiple clients that fail simultaneously would all retry at the same moment.
+  Add random jitter: wait = random_between(0, base * 2^attempt)
+  Spreads retries over time — prevents thundering herd on recovery.
+  
+  AWS SDK, Spring Retry, Resilience4j all support exponential backoff with jitter.
+
+WHAT TO RETRY:
+  ✓ Retry: 429 Too Many Requests, 503 Service Unavailable, 5xx (network errors)
+  ✗ Don't retry: 400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not Found,
+    409 Conflict (these are client errors — retrying won't help)
+
+IDEMPOTENT RETRIES:
+  Only safe to retry if the operation is idempotent.
+  If not: send Idempotency-Key on first attempt and ALL retries.
+  HTTP client must preserve the key across retries.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: How do you prevent double charging in a payment system?
+A: Require an idempotency key on every payment request (UUID generated
+   by client, same on retries). Server stores (key → result) in an
+   idempotency table with atomic INSERT ON CONFLICT DO NOTHING.
+   If key exists → return cached result. Also: use Stripe's idempotency
+   key feature when calling external payment APIs.
+
+Q: A Kafka consumer fails after updating the DB but before committing offset.
+   The message is redelivered. How do you prevent double processing?
+A: Include a unique eventId in each Kafka message. Consumer tracks
+   processed eventIds in a processed_events table. Processing logic:
+   check → if already processed, skip. If not, process AND record eventId
+   in the same DB transaction. This makes the consumer idempotent.
+
+Q: What is the difference between idempotency and at-most-once delivery?
+A: At-most-once: the messaging infrastructure ensures the message is
+   delivered 0 or 1 times (never retried → risk of message loss).
+   Idempotency: your application logic can handle duplicate delivery safely.
+   They're complementary: at-least-once delivery + idempotent consumer
+   = safe processing despite retries.

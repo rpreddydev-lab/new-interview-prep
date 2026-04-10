@@ -1,0 +1,240 @@
+================================================================
+DESIGN: WEBHOOK SYSTEM
+================================================================
+
+1. REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WHAT IS A WEBHOOK?
+  Webhook = HTTP callback. Instead of clients polling your API for updates,
+  YOUR system calls THEIR endpoint when something happens.
+  "Don't call us, we'll call you." — event-driven push notification.
+
+Real-world examples:
+  Stripe sends webhook when payment succeeds/fails.
+  GitHub sends webhook on push, PR creation, issue comment.
+  Shopify sends webhook when new order is placed.
+  Twilio sends webhook on incoming SMS/call.
+
+FUNCTIONAL REQUIREMENTS:
+  - Subscribers register a URL endpoint to receive events.
+  - System delivers events to subscriber URLs via HTTP POST.
+  - Retry failed deliveries with exponential backoff.
+  - Support filtering: subscriber receives only events they care about.
+  - Subscriber can view delivery history and failures.
+  - Verify webhook authenticity (signature-based).
+  - Support event types: payment.succeeded, order.created, user.updated, etc.
+
+NON-FUNCTIONAL REQUIREMENTS:
+  - 1M events/day → ~12 events/second average
+  - Peak: 100 events/second
+  - At-least-once delivery (no event loss)
+  - Subscriber endpoints can be slow or unavailable — must not block
+  - Delivery latency: < 30 seconds from event to delivery (best effort)
+  - Retry for up to 72 hours before giving up
+  - Subscribers can have rate limits (max 100 deliveries/min)
+
+OUT OF SCOPE: Real-time streaming, WebSocket delivery, billing per webhook.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. HIGH-LEVEL DESIGN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CORE COMPONENTS:
+
+1. WEBHOOK REGISTRATION API:
+   POST /api/webhooks → register endpoint + event types
+   GET  /api/webhooks → list registrations
+   DELETE /api/webhooks/{id} → remove registration
+
+2. EVENT PRODUCER (source services):
+   Internal service generates events → publishes to Kafka topic "webhook-events"
+   Does NOT call subscriber URLs directly.
+   Decoupled from delivery concerns.
+
+3. WEBHOOK DISPATCHER (Consumer):
+   Reads from Kafka "webhook-events" topic.
+   Looks up subscribers for each event type.
+   Creates delivery tasks.
+
+4. DELIVERY WORKER POOL:
+   Executes HTTP POST to subscriber URL.
+   Records success/failure.
+   Schedules retries on failure.
+
+5. RETRY SCHEDULER:
+   Reads failed deliveries.
+   Applies exponential backoff.
+   Re-enqueues for retry.
+
+6. DELIVERY LOG / DASHBOARD:
+   Store all delivery attempts (timestamp, response code, duration).
+   Subscribers can query their webhook delivery history.
+
+FLOW:
+  [Source Service] → publish event → [Kafka: webhook-events]
+  [Dispatcher] consumes → looks up subscriptions → creates delivery records
+  [Worker Pool] delivers → POST subscriber URL → record result
+  [Retry Scheduler] → re-enqueue failed deliveries with backoff
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. DATA MODEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+webhook_subscriptions:
+  id           UUID PRIMARY KEY
+  owner_id     UUID NOT NULL          -- subscribing tenant/user
+  target_url   VARCHAR(500) NOT NULL  -- endpoint to call
+  event_types  TEXT[]                 -- e.g., ['payment.succeeded', 'order.created']
+  secret       VARCHAR(255) NOT NULL  -- for signing payloads (HMAC)
+  is_active    BOOLEAN DEFAULT TRUE
+  created_at   TIMESTAMP
+  updated_at   TIMESTAMP
+
+webhook_deliveries:
+  id              UUID PRIMARY KEY
+  subscription_id UUID REFERENCES webhook_subscriptions
+  event_id        UUID NOT NULL          -- deduplicate
+  event_type      VARCHAR(100) NOT NULL
+  payload         JSONB NOT NULL
+  status          ENUM('PENDING', 'DELIVERING', 'SUCCESS', 'FAILED', 'ABANDONED')
+  attempt_count   INT DEFAULT 0
+  next_retry_at   TIMESTAMP
+  last_http_code  INT
+  last_error      TEXT
+  created_at      TIMESTAMP
+  delivered_at    TIMESTAMP
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. DELIVERY AND RETRY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DELIVERY:
+  HTTP POST to subscriber URL with:
+  - Body: JSON payload of the event
+  - Headers:
+      Content-Type: application/json
+      X-Webhook-Event: payment.succeeded
+      X-Webhook-Id: {deliveryId}
+      X-Webhook-Timestamp: 1712613600
+      X-Webhook-Signature: sha256={HMAC signature}
+  
+  SUCCESS CRITERIA:
+  - HTTP 2xx response within timeout (5 seconds)
+  - Any 3xx followed to 2xx also success
+  - 4xx (except 429): non-retryable (subscriber misconfigured endpoint)
+  - 5xx, timeout, connection refused: retry
+
+RETRY SCHEDULE (exponential backoff with jitter):
+  Attempt 1:  immediate
+  Attempt 2:  5 minutes after failure
+  Attempt 3:  30 minutes
+  Attempt 4:  2 hours
+  Attempt 5:  8 hours
+  Attempt 6:  24 hours
+  Attempt 7+: 24 hours (cap)
+  
+  After 72 hours total or 10 attempts → ABANDONED status.
+  Notify subscriber via email + dashboard.
+
+TIMEOUT:
+  Subscriber endpoint must respond within 5 seconds.
+  Subscribers should: accept the webhook, enqueue for async processing, return 200 quickly.
+  Doing heavy processing synchronously in webhook handler → timeouts → retries → thundering herd.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. SECURITY: PAYLOAD SIGNING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROBLEM: How does the subscriber know the webhook is from YOU and not an attacker?
+  Anyone knowing the subscriber's URL can POST fake webhooks.
+
+SOLUTION: HMAC Signature (like Stripe):
+  1. At registration: generate a per-subscription secret (e.g., 32-byte random string).
+     Share this secret with the subscriber.
+  
+  2. On delivery: compute HMAC-SHA256 of (timestamp + "." + body) using the secret.
+     Header: X-Webhook-Signature: sha256=abc123...
+     Header: X-Webhook-Timestamp: 1712613600
+  
+  3. Subscriber verifies:
+     a. Check timestamp is recent (within 5 minutes) — prevents replay attacks.
+     b. Compute expected_sig = HMAC-SHA256(timestamp + "." + body, secret)
+     c. Compare expected_sig with received signature (constant-time comparison).
+     d. If mismatch → reject (return 400). If match → process.
+  
+  // Java verification:
+  Mac mac = Mac.getInstance("HmacSHA256");
+  mac.init(new SecretKeySpec(secret.getBytes(), "HmacSHA256"));
+  String expectedSig = Hex.encodeHexString(mac.doFinal((timestamp + "." + body).getBytes()));
+  if (!MessageDigest.isEqual(expectedSig.getBytes(), receivedSig.getBytes())) {
+      throw new SecurityException("Invalid webhook signature");
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. PREVENTING NOISY SUBSCRIBER PROBLEMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CIRCUIT BREAKER PER SUBSCRIPTION:
+  If subscriber's endpoint fails 10 times in a row → pause deliveries for that subscription.
+  Retry once after cool-down period (1 hour).
+  If still failing → alert subscriber + mark subscription as paused.
+  Prevents wasting resources on a permanently broken endpoint.
+
+RATE LIMITING PER SUBSCRIBER:
+  Max 100 delivery requests per minute per subscription.
+  Queue excess deliveries; deliver when rate allows.
+
+TIMEOUTS:
+  HTTP client timeout: 5 seconds connect + 5 seconds read.
+  Don't let slow subscribers hold worker threads.
+  Use non-blocking HTTP clients (Java: WebClient, OkHttp async).
+
+ISOLATION:
+  Failing/slow subscriber should not delay other subscribers.
+  Each subscription has its own retry queue.
+  Worker pool size limits per-subscriber concurrency.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. SCALABILITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ESTIMATIONS:
+  1M events/day, each event → avg 3 subscribers = 3M deliveries/day ≈ 35/second average.
+  Peak: 300–500 deliveries/second.
+
+SCALING THE DISPATCHER:
+  Kafka partitions = parallelism.
+  Multiple dispatcher instances (consumer group), each handling a partition.
+  Partition by subscription_id → one subscription always handled by same worker
+  (preserves per-subscription ordering).
+
+SCALING DELIVERY WORKERS:
+  Async HTTP delivery (non-blocking I/O, thread per worker can handle many in-flight calls).
+  Autoscale workers based on queue depth.
+
+DATABASE FOR DELIVERY LOG:
+  Write-heavy: 3M inserts/day + status updates.
+  Use connection pooling (HikariCP).
+  Partition delivery log table by date: webhook_deliveries_2026_04.
+  Purge old records after 30 days.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. INTERVIEW TALKING POINTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Trade-off: Why not just call subscriber URL synchronously from the source service?
+  - Source service would fail if subscriber is slow/down (tight coupling)
+  - Adds latency to the critical path (payment processing waits for your endpoint)
+  - Difficult to retry cleanly from within a synchronous flow
+  → Always decouple via queue/Kafka
+
+Why at-least-once instead of exactly-once?
+  - Exactly-once is extremely hard to guarantee for external HTTP calls
+  - Subscribers MUST be idempotent (use X-Webhook-Id to deduplicate)
+  - Much simpler and more reliable to deliver at-least-once + expect idempotent handling
+
+IDEMPOTENCY FOR SUBSCRIBERS:
+  Each delivery has a unique X-Webhook-Id (UUID).
+  Subscriber should store processed IDs and skip duplicates.
+  This is standard practice (Stripe documents this explicitly).

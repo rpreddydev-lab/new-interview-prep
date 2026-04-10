@@ -1,0 +1,316 @@
+================================================================================
+04 — DYNAMIC PROXY: JDK vs CGLIB
+================================================================================
+Target: Senior Java Developer Interview
+Topics: JDK Proxy, CGLIB Proxy, InvocationHandler, MethodInterceptor,
+        Spring AOP proxy selection, limitations, use cases
+
+================================================================================
+SECTION 1 — JDK DYNAMIC PROXY MECHANICS
+================================================================================
+
+Q1: How does JDK dynamic proxy work internally?
+
+A: JDK dynamic proxy creates a class at runtime that:
+   1. Implements all the specified interfaces
+   2. Delegates every method call to an InvocationHandler
+   3. Is created by Proxy.newProxyInstance()
+
+   KEY RESTRICTION: The target object must implement at least one interface.
+   JDK proxy cannot proxy concrete classes.
+
+   INTERNAL FLOW (per method call):
+   1. Caller invokes method on proxy object
+   2. JVM routes to InvocationHandler.invoke(proxy, method, args)
+   3. Handler performs pre-logic (log, time, validate)
+   4. Handler calls method.invoke(target, args) ← actual method
+   5. Handler performs post-logic
+   6. Returns result to caller
+
+   GENERATED CLASS (conceptually):
+   class $Proxy0 extends Proxy implements BillingService {
+       public Invoice generateInvoice(String msisdn) {
+           return (Invoice) h.invoke(this,
+               BillingService.class.getMethod("generateInvoice", String.class),
+               new Object[]{msisdn});
+       }
+   }
+
+──────────────────────────────────────────────────────────────────────────────
+Q2: Write a generic JDK proxy that measures execution time of every method.
+
+A:
+import java.lang.reflect.*;
+import java.util.logging.*;
+
+public class TimingProxyFactory {
+
+    private static final Logger log = Logger.getLogger(TimingProxyFactory.class.getName());
+
+    @SuppressWarnings("unchecked")
+    public static <T> T wrap(T target, Class<T> iface) {
+        return (T) Proxy.newProxyInstance(
+            iface.getClassLoader(),
+            new Class<?>[]{ iface },
+            new TimingHandler(target)
+        );
+    }
+
+    private static class TimingHandler implements InvocationHandler {
+        private final Object target;
+
+        TimingHandler(Object target) { this.target = target; }
+
+        @Override
+        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+            long start = System.nanoTime();
+            try {
+                return method.invoke(target, args);
+            } catch (InvocationTargetException e) {
+                throw e.getCause();    // unwrap to preserve original exception type
+            } finally {
+                long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+                log.info(() -> method.getName() + " took " + elapsedMs + "ms");
+            }
+        }
+    }
+}
+
+// Usage:
+BillingService real = new BillingServiceImpl();
+BillingService timed = TimingProxyFactory.wrap(real, BillingService.class);
+timed.generateInvoice("447700900001");
+// Logs: "generateInvoice took 12ms"
+
+   WHY throw e.getCause() not e?
+   → method.invoke() always wraps checked exceptions in InvocationTargetException.
+     Re-throwing the cause preserves the declared throws signature and stack trace.
+
+──────────────────────────────────────────────────────────────────────────────
+Q3: What is the self-invocation problem with JDK proxies?
+
+A: When a method inside the proxied object calls another method on 'this',
+   the call bypasses the proxy entirely because 'this' is the real target, not
+   the proxy.
+
+   // BillingServiceImpl.java
+   public Invoice generateAndLogInvoice(String msisdn) {
+       Invoice inv = generateInvoice(msisdn);   // ← bypasses proxy!
+       logInvoice(inv);
+       return inv;
+   }
+
+   FIX 1: Inject the proxy into the bean itself (ApplicationContext.getBean)
+   FIX 2: Use AspectJ compile-time or load-time weaving (modifies bytecode, no proxy)
+   FIX 3: Restructure code to avoid internal method call needing interception
+
+   This is why @Transactional on a private method does nothing in Spring —
+   the call is internal and never reaches the proxy.
+
+================================================================================
+SECTION 2 — CGLIB PROXY MECHANICS
+================================================================================
+
+Q4: How does CGLIB proxy differ from JDK proxy?
+
+A: CGLIB (Code Generation Library) creates a subclass of the target class
+   at runtime. It overrides all non-final methods and intercepts them via
+   a MethodInterceptor (its equivalent of InvocationHandler).
+
+   JDK PROXY vs CGLIB COMPARISON:
+   ┌─────────────────┬──────────────────────────┬──────────────────────────┐
+   │ Aspect          │ JDK Proxy                │ CGLIB                    │
+   ├─────────────────┼──────────────────────────┼──────────────────────────┤
+   │ Mechanism       │ Implements interface     │ Subclasses target class  │
+   │ Requires iface  │ YES (mandatory)          │ NO                       │
+   │ Can proxy final │ N/A (interface methods)  │ NO (final = not virtual) │
+   │ Constructor     │ Not invoked              │ No-arg constructor needed│
+   │ Performance     │ Slightly slower (reflect)│ Faster (direct dispatch) │
+   │ Dependency      │ JDK built-in             │ cglib/byte-buddy JAR     │
+   │ Used by Spring  │ When target has iface    │ When no interface        │
+   └─────────────────┴──────────────────────────┴──────────────────────────┘
+
+──────────────────────────────────────────────────────────────────────────────
+Q5: Write a CGLIB proxy example using the Enhancer API.
+
+A: (CGLIB is included via Spring or as a standalone dependency)
+
+import net.sf.cglib.proxy.*;
+
+public class CglibTimingProxyFactory {
+
+    public static <T> T wrap(T target) {
+        Enhancer enhancer = new Enhancer();
+        enhancer.setSuperclass(target.getClass());
+        enhancer.setCallback(new TimingInterceptor(target));
+        @SuppressWarnings("unchecked")
+        T proxy = (T) enhancer.create();   // calls no-arg constructor of target class
+        return proxy;
+    }
+
+    private static class TimingInterceptor implements MethodInterceptor {
+        private final Object target;
+
+        TimingInterceptor(Object target) { this.target = target; }
+
+        @Override
+        public Object intercept(Object proxy, Method method, Object[] args,
+                                MethodProxy methodProxy) throws Throwable {
+            long start = System.nanoTime();
+            try {
+                // Use methodProxy.invoke(target, args) — avoids reflection overhead
+                return methodProxy.invoke(target, args);
+            } finally {
+                long ms = (System.nanoTime() - start) / 1_000_000;
+                System.out.printf("%s took %dms%n", method.getName(), ms);
+            }
+        }
+    }
+}
+
+// Usage — no interface required:
+SubscriberService svc = new SubscriberServiceImpl(); // concrete class
+SubscriberService proxied = CglibTimingProxyFactory.wrap(svc);
+
+   NOTE: methodProxy.invokeSuper(proxy, args) calls the proxy's superclass method
+   (i.e., the original code). methodProxy.invoke(target, args) calls the actual
+   target object's method. Prefer invoke(target, args) to avoid infinite recursion.
+
+================================================================================
+SECTION 3 — SPRING AOP PROXY SELECTION
+================================================================================
+
+Q6: How does Spring decide which proxy type to use?
+
+A: Spring AOP selection algorithm (as of Spring 5+):
+
+   1. If target class implements at least one interface AND
+      proxyTargetClass = false (default):
+      → Uses JDK dynamic proxy
+
+   2. If target class implements no interface OR
+      proxyTargetClass = true (explicit) OR
+      @EnableAspectJAutoProxy(proxyTargetClass = true):
+      → Uses CGLIB
+
+   SPRING BOOT 2.x CHANGE: Spring Boot defaulted to proxyTargetClass = true
+   (CGLIB) even for interfaces to avoid type-cast surprises.
+
+   FORCE CGLIB for a specific bean:
+   @Scope(proxyMode = ScopedProxyMode.TARGET_CLASS)
+
+   FORCE JDK proxy globally:
+   spring.aop.proxy-target-class=false (application.properties)
+
+──────────────────────────────────────────────────────────────────────────────
+Q7: Why can't CGLIB proxy a class with a private no-arg constructor?
+
+A: CGLIB generates a subclass. To instantiate this subclass, Java's normal
+   constructor chaining requires calling a constructor of the superclass.
+   If the only constructor is private, the subclass cannot call super().
+
+   WORKAROUND 1: Add a protected or package-private no-arg constructor.
+   WORKAROUND 2: Use Objenesis (used by Spring/Mockito) which creates instances
+                 without invoking any constructor via JVM internals (Unsafe API).
+
+   Spring 4+ uses Objenesis automatically, so you no longer need a no-arg
+   constructor for Spring-managed beans proxied by CGLIB.
+
+================================================================================
+SECTION 4 — ADVANCED PROXY PATTERNS
+================================================================================
+
+Q8: Implement a caching proxy using JDK dynamic proxy.
+
+A:
+public class CachingProxyFactory {
+
+    @SuppressWarnings("unchecked")
+    public static <T> T wrap(T target, Class<T> iface) {
+        Map<String, Object> cache = new ConcurrentHashMap<>();
+        return (T) Proxy.newProxyInstance(
+            iface.getClassLoader(),
+            new Class<?>[]{ iface },
+            (proxy, method, args) -> {
+                // Only cache methods annotated with @Cacheable
+                if (!method.isAnnotationPresent(Cacheable.class)) {
+                    return method.invoke(target, args);
+                }
+                String key = method.getName() + ":" + Arrays.toString(args);
+                return cache.computeIfAbsent(key, k -> {
+                    try {
+                        return method.invoke(target, args);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+            }
+        );
+    }
+}
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface Cacheable {}
+
+// Interface with cacheable method:
+public interface SubscriberLookup {
+    @Cacheable
+    SubscriberProfile findByMsisdn(String msisdn);
+
+    void updateProfile(String msisdn, SubscriberProfile profile); // not cached
+}
+
+──────────────────────────────────────────────────────────────────────────────
+Q9: What is the difference between Spring AOP and AspectJ?
+
+A: 
+   SPRING AOP:
+   - Proxy-based: intercepts method calls at the proxy boundary
+   - Only works on Spring-managed beans
+   - Only method-level join points (no field access, constructors)
+   - No compilation step; works at runtime
+   - Cannot intercept self-invocations (this.method())
+   - Simpler setup; sufficient for 90% of enterprise use cases
+
+   ASPECTJ:
+   - Bytecode weaving: modifies .class files directly
+   - Works on ANY Java class, not just Spring beans
+   - Supports all join points: method call, method execution, constructor,
+     field get/set, static initializer
+   - Compile-time weaving (CTW) or load-time weaving (LTW)
+   - CAN intercept self-invocations (bytecode is woven into the class itself)
+   - More powerful; more complex setup
+
+   WHEN TO USE ASPECTJ over Spring AOP:
+   - Need to intercept non-Spring classes (domain objects, POJOs)
+   - Need field-level or constructor-level interception
+   - Need to intercept self-invocations (@Transactional on private methods)
+   - Performance-critical: compile-time weaving has zero runtime overhead
+
+================================================================================
+QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+JDK PROXY ESSENTIALS:
+  Proxy.newProxyInstance(classLoader, interfaces[], InvocationHandler)
+  handler.invoke(proxy, method, args) → call method.invoke(target, args)
+  ALWAYS: catch InvocationTargetException → throw e.getCause()
+  LIMIT: only proxies interfaces
+
+CGLIB ESSENTIALS:
+  Enhancer enhancer = new Enhancer()
+  enhancer.setSuperclass(TargetClass.class)
+  enhancer.setCallback(MethodInterceptor)
+  intercept(proxy, method, args, methodProxy)
+  CALL: methodProxy.invoke(target, args)  ← NOT invokeSuper(proxy, args)
+  LIMIT: cannot proxy final classes/methods
+
+SPRING PROXY RULES:
+  Has interface + proxyTargetClass=false  → JDK proxy (old default)
+  No interface OR proxyTargetClass=true   → CGLIB (Spring Boot 2+ default)
+  @Transactional on private method        → NEVER intercepted (self-invoke)
+
+PERFORMANCE: CGLIB via methodProxy.invoke() is 2-3x faster than JDK reflection
+THREAD SAFETY: Both are thread-safe — handler/interceptor is shared, target is separate
+================================================================================

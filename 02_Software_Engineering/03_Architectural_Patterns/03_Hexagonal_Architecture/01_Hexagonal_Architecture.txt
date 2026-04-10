@@ -1,0 +1,250 @@
+================================================================
+  HEXAGONAL ARCHITECTURE (PORTS & ADAPTERS)
+================================================================
+
+  Author:     Alistair Cockburn (2005)
+  Also known: Ports & Adapters Architecture
+  Frequency:  High at senior/lead level interviews; growing rapidly in use.
+
+----------------------------------------------------------------
+CORE PROBLEM SOLVED
+----------------------------------------------------------------
+
+  In traditional layered architecture, business logic (the domain) tends to
+  get polluted by infrastructure concerns:
+    - Domain entities annotated with @Entity, @Column (JPA leaks into domain).
+    - Services directly calling external APIs, making them untestable without
+      a real HTTP connection.
+    - Business rules bound to Spring/Hibernate, making framework upgrades painful.
+
+  Hexagonal architecture inverts this: the DOMAIN is at the center.
+  ALL external interactions (DB, HTTP, Kafka, email) plug in through Ports.
+
+----------------------------------------------------------------
+STRUCTURE
+----------------------------------------------------------------
+
+  [External World]       [HEXAGON — the Application Core]       [External World]
+
+  HTTP Request  ──────→  Primary Adapter (REST Controller)
+                              │
+                              ↓
+                         Primary Port (Inbound Interface)
+                              │
+                              ↓
+                         ┌─────────────────────────┐
+                         │   Application/Domain     │
+                         │   Service                │
+                         │   (pure business logic)  │
+                         └─────────────────────────┘
+                              │
+                              ↓
+                         Secondary Port (Outbound Interface)
+                              │
+                              ↓
+                         Secondary Adapter (JPA Repository / Kafka / Email)
+                              │
+                              ↓
+                          [Database / Kafka / SMTP]
+
+  Core concepts:
+    Primary Port:    interface defined by the application for incoming requests.
+                     e.g., CreateOrderUseCase, FindUserUseCase.
+    Secondary Port:  interface defined by the application for outgoing needs.
+                     e.g., OrderRepository, EmailNotificationPort.
+    Primary Adapter: drives the application (REST, gRPC, CLI, test).
+                     implements how incoming requests reach primary ports.
+    Secondary Adapter: driven by the application (JPA, Kafka, SMTP, S3).
+                     implements secondary ports.
+
+----------------------------------------------------------------
+JAVA/SPRING IMPLEMENTATION
+----------------------------------------------------------------
+
+  DOMAIN LAYER (pure Java — no Spring, no JPA annotations):
+  ----------------------------------------------------------
+    // Domain Entity — pure Java
+    public class Order {
+        private final OrderId id;
+        private final CustomerId customerId;
+        private OrderStatus status;
+        private final List<OrderItem> items;
+
+        public void confirm() {
+            if (this.status != OrderStatus.PENDING) {
+                throw new IllegalStateException("Only PENDING orders can be confirmed");
+            }
+            this.status = OrderStatus.CONFIRMED;
+        }
+        // domain behavior — no Spring, no JPA
+    }
+
+  PRIMARY PORT (use case interface — defined by the domain):
+  -----------------------------------------------------------
+    public interface CreateOrderUseCase {
+        OrderId createOrder(CreateOrderCommand command);
+    }
+
+    public interface FindOrderUseCase {
+        Order findOrder(OrderId orderId);
+    }
+
+  APPLICATION SERVICE (implements primary ports — orchestrates domain):
+  ---------------------------------------------------------------------
+    @Service
+    @RequiredArgsConstructor
+    @Transactional
+    public class OrderApplicationService implements CreateOrderUseCase, FindOrderUseCase {
+        private final OrderRepository orderRepository;  // secondary port (interface!)
+        private final NotificationPort notificationPort; // secondary port (interface!)
+
+        @Override
+        public OrderId createOrder(CreateOrderCommand command) {
+            Order order = Order.create(command.getCustomerId(), command.getItems());
+            orderRepository.save(order);
+            notificationPort.notifyOrderCreated(order);
+            return order.getId();
+        }
+
+        @Override
+        public Order findOrder(OrderId orderId) {
+            return orderRepository.findById(orderId)
+                .orElseThrow(() -> new OrderNotFoundException(orderId));
+        }
+    }
+
+  SECONDARY PORT (outbound interface — defined by the domain):
+  ------------------------------------------------------------
+    public interface OrderRepository {
+        void save(Order order);
+        Optional<Order> findById(OrderId orderId);
+        List<Order> findByCustomerId(CustomerId customerId);
+    }
+
+    public interface NotificationPort {
+        void notifyOrderCreated(Order order);
+    }
+
+  PRIMARY ADAPTER (REST — drives the application):
+  -------------------------------------------------
+    @RestController
+    @RequestMapping("/api/orders")
+    @RequiredArgsConstructor
+    public class OrderController {
+        private final CreateOrderUseCase createOrderUseCase; // injects the use case port
+        private final FindOrderUseCase findOrderUseCase;
+
+        @PostMapping
+        public ResponseEntity<OrderResponse> createOrder(@Valid @RequestBody CreateOrderRequest req) {
+            CreateOrderCommand command = OrderMapper.toCommand(req);
+            OrderId orderId = createOrderUseCase.createOrder(command);
+            return ResponseEntity.created(URI.create("/api/orders/" + orderId)).build();
+        }
+    }
+
+  SECONDARY ADAPTER (JPA — driven by the application):
+  -----------------------------------------------------
+    @Repository
+    @RequiredArgsConstructor
+    public class JpaOrderRepository implements OrderRepository {
+        private final OrderJpaRepository jpaRepository; // Spring Data JPA (separate JPA entity)
+
+        @Override
+        public void save(Order order) {
+            OrderJpaEntity entity = OrderMapper.toJpaEntity(order);
+            jpaRepository.save(entity);
+        }
+
+        @Override
+        public Optional<Order> findById(OrderId orderId) {
+            return jpaRepository.findById(orderId.getValue())
+                .map(OrderMapper::toDomain);
+        }
+    }
+
+----------------------------------------------------------------
+KEY INSIGHT: DEPENDENCY DIRECTION
+----------------------------------------------------------------
+
+  Traditional Layered:   Controller → Service → Repository (JPA entity)
+                         Domain depends on infrastructure (JPA, Spring)
+
+  Hexagonal:             Adapter → Port ← Application Service → Port ← Adapter
+                         ALL dependencies point INWARD toward the domain.
+                         Domain defines the ports; adapters implement them.
+                         Domain has ZERO dependencies on frameworks.
+
+  This is the Dependency Inversion Principle applied at architecture level.
+
+----------------------------------------------------------------
+ADVANTAGES
+----------------------------------------------------------------
+
+  1. Testability: Domain services tested with in-memory fake adapters (no DB needed).
+  2. Framework independence: Domain is pure Java — can swap Spring for Quarkus.
+  3. Multi-adapter: same business logic accessible via REST, gRPC, CLI, batch job —
+     just add a new primary adapter.
+  4. Clear boundaries: explicit ports make integration points visible and stable.
+  5. Parallel development: domain team works independently of adapter team.
+
+----------------------------------------------------------------
+FOLDER STRUCTURE (TYPICAL IN SPRING BOOT)
+----------------------------------------------------------------
+
+  src/main/java/com/example/orders/
+  ├── domain/
+  │   ├── model/          (Order, OrderItem, OrderId, OrderStatus — pure Java)
+  │   ├── port/
+  │   │   ├── in/         (CreateOrderUseCase, FindOrderUseCase — primary ports)
+  │   │   └── out/        (OrderRepository, NotificationPort — secondary ports)
+  │   └── service/        (OrderApplicationService — implements primary ports)
+  ├── adapter/
+  │   ├── in/
+  │   │   └── web/        (OrderController — REST primary adapter)
+  │   └── out/
+  │       ├── persistence/ (JpaOrderRepository, OrderJpaEntity — DB adapter)
+  │       └── messaging/   (KafkaNotificationAdapter — Kafka adapter)
+
+----------------------------------------------------------------
+COMMON INTERVIEW QUESTIONS
+----------------------------------------------------------------
+
+  Q: What is Hexagonal Architecture and why use it over layered?
+  A: Hexagonal Architecture (Ports & Adapters) places the domain at the center,
+     with all external interactions (HTTP, DB, messaging) isolated behind port
+     interfaces. Unlike layered architecture, the domain has ZERO dependencies
+     on infrastructure — no JPA annotations, no Spring on domain classes.
+     Benefits: the domain is purely unit-testable, framework-independent, and
+     the same business logic can be driven by multiple adapters (REST, gRPC, CLI).
+
+  Q: What is the difference between a Port and an Adapter?
+  A: A Port is an INTERFACE — a contract defined by the domain describing what
+     it needs (secondary port: OrderRepository) or how it can be driven
+     (primary port: CreateOrderUseCase).
+     An Adapter is an IMPLEMENTATION of a port — concrete technology-specific code
+     (JpaOrderRepository, OrderController). Ports are technology-agnostic; adapters
+     are technology-specific.
+
+  Q: How do you test in Hexagonal Architecture?
+  A: Three levels:
+     1. Domain unit tests: test OrderApplicationService with FakeOrderRepository
+        (in-memory Map) — zero Spring context, milliseconds to run.
+     2. Adapter unit tests: test JpaOrderRepository with @DataJpaTest (only JPA context).
+     3. Integration tests: test the full stack with @SpringBootTest + Testcontainers.
+     This separation gives fast, reliable test suites at each level.
+
+================================================================
+INTERVIEW TIPS
+================================================================
+
+  - Draw the hexagon with ports in the interview (if on whiteboard or asked).
+  - Show the INWARD dependency direction — this is the key differentiator.
+  - Contrast with layered: "In layered, Service knows about JPA. In Hexagonal,
+    JPA knows about the domain ports but not vice versa."
+  - Mention: this is the architecture Spring Boot applications naturally move
+    toward as they grow and add multiple integration points.
+  - Real scenario: "We had a service that needed to be accessible via REST and
+    also via a batch job. With Hexagonal, we added a batch adapter without
+    touching any business logic."
+
+================================================================

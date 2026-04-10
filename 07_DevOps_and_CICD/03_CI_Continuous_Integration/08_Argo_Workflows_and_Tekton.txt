@@ -1,0 +1,1345 @@
+================================================================================
+ARGO WORKFLOWS AND TEKTON — KUBERNETES-NATIVE CI/CD
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1.  Why Kubernetes-Native CI/CD?
+2.  Argo Workflows Overview
+3.  Argo Workflows Core Concepts
+4.  Argo Workflows Templates In Depth
+5.  Argo Workflows — Java/Maven Pipeline Example
+6.  Argo Events (Trigger Mechanism)
+7.  Tekton Overview
+8.  Tekton Core Concepts (Task, Pipeline, PipelineRun, etc.)
+9.  Tekton — Java/Spring Boot Pipeline Example
+10. Tekton Triggers (Event-Driven Pipelines)
+11. Argo Workflows vs Tekton Comparison
+12. Argo Workflows / Tekton vs Jenkins vs GitHub Actions
+13. When to Use Kubernetes-Native CI/CD
+14. Common Interview Questions & Answers
+15. Quick Reference Cheat Sheet
+
+================================================================================
+1. WHY KUBERNETES-NATIVE CI/CD?
+================================================================================
+
+Problems with Traditional CI (Jenkins, GitHub Actions runners):
+
+  Jenkins:
+    - Separate VM/server to manage
+    - Stateful (config drifts over time)
+    - Java-based master is a single point of failure
+    - Ephemeral agent creation is complex
+    - Plugin ecosystem is fragile
+  
+  GitHub Actions:
+    - Runners run outside your cluster (external SaaS)
+    - Limited access to internal K8s services (databases, registries)
+    - Can't use K8s RBAC, secrets directly
+    - No native workflow graph (DAG support limited)
+    - Vendor lock-in
+
+Kubernetes-Native CI/CD Advantages:
+
+  ✓ Runs IN the cluster → access to all internal services
+  ✓ Workflows defined as CRDs → managed by kubectl / GitOps
+  ✓ Ephermal pods for each step → clean environment every time
+  ✓ Native Kubernetes RBAC for pipeline permissions
+  ✓ Kubernetes secrets directly available to pipeline steps
+  ✓ Scale with K8s → no separate CI infrastructure to manage
+  ✓ Workflow history stored in etcd (queryable via kubectl)
+  ✓ Fanout/parallel execution natively via DAGs
+
+Trade-offs:
+
+  ✗ More complex to set up initially (requires K8s cluster)
+  ✗ Steeper learning curve (K8s YAML + workflow YAML)
+  ✗ Not ideal for open-source projects (requires self-hosted K8s)
+  ✗ Overkill for small teams without existing K8s footprint
+
+================================================================================
+2. ARGO WORKFLOWS OVERVIEW
+================================================================================
+
+What is Argo Workflows?
+
+  Argo Workflows is a CNCF graduated project for running workflows on
+  Kubernetes as a series of container-based steps or DAGs (Directed Acyclic
+  Graphs). Each step runs in its own Pod.
+  
+  Primary use cases:
+  - CI/CD pipelines
+  - Data processing (ETL, ML training pipelines)
+  - Batch processing
+  - Infrastructure automation
+
+Architecture:
+
+  ┌──────────────────────────────────────────────────────┐
+  │                  Kubernetes Cluster                   │
+  │                                                       │
+  │  ┌────────────────┐    ┌────────────────────────────┐ │
+  │  │ Argo Workflow  │    │  Workflow Controller        │ │
+  │  │ CRD (YAML)     │───▶│  (watches Workflow CRDs)   │ │
+  │  └────────────────┘    └─────────────┬──────────────┘ │
+  │                                      │ creates         │
+  │  ┌────────────────────────────────────▼──────────────┐ │
+  │  │                   Pods                            │ │
+  │  │  [Step 1 Pod] → [Step 2 Pod] → [Step 3 Pod]      │ │
+  │  │  (init/wait)    (main/build)   (test/deploy)      │ │
+  │  └───────────────────────────────────────────────────┘ │
+  │                                                         │
+  │  ┌──────────────────┐   ┌────────────────────────────┐  │
+  │  │   Argo Server    │   │  Artifact Repository       │  │
+  │  │  (Web UI + API)  │   │  (S3, GCS, MinIO)          │  │
+  │  └──────────────────┘   └────────────────────────────┘  │
+  └──────────────────────────────────────────────────────────┘
+
+Installation:
+
+  # Install Argo Workflows:
+  kubectl create namespace argo
+  kubectl apply -n argo -f \
+    https://github.com/argoproj/argo-workflows/releases/latest/download/install.yaml
+  
+  # Port-forward to access UI:
+  kubectl -n argo port-forward svc/argo-server 2746:2746
+  # UI: https://localhost:2746
+
+================================================================================
+3. ARGO WORKFLOWS CORE CONCEPTS
+================================================================================
+
+Workflow (Top-Level Resource):
+  
+  An Argo Workflow is a Kubernetes CRD that defines:
+  - entrypoint: which template to start
+  - templates: list of reusable steps/DAGs/containers
+
+Template Types:
+
+  1. Container template:  Runs a single container (like a Pod spec)
+  2. Steps template:      Runs templates in sequential stages, each stage parallel
+  3. DAG template:        Runs templates in a dependency graph
+  4. Script template:     Inline script (Python, bash, etc.)
+  5. Resource template:   Create/delete Kubernetes resources
+  6. Suspend template:    Pause for manual approval
+
+Artifacts:
+
+  Steps pass data between each other via Artifacts (files stored in S3/MinIO)
+  or Parameters (string values).
+
+Workflow:
+
+  apiVersion: argoproj.io/v1alpha1
+  kind: Workflow
+  metadata:
+    name: java-build-workflow
+    namespace: argo
+  spec:
+    serviceAccountName: argo-workflow-sa
+    entrypoint: main
+    
+    # Default container settings for all templates:
+    podSpecPatch: |
+      containers:
+        - name: main
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "2"
+    
+    templates:
+      - name: main
+        # ... (defined below)
+
+================================================================================
+4. ARGO WORKFLOWS TEMPLATES IN DEPTH
+================================================================================
+
+Steps Template (Sequential Stages):
+
+  templates:
+    - name: main
+      steps:
+        # Stage 1: Single step
+        - - name: validate
+            template: checkstyle
+        
+        # Stage 2: Parallel steps
+        - - name: unit-test
+            template: maven-test
+            arguments:
+              parameters:
+                - name: test-type
+                  value: unit
+          - name: integration-test
+            template: maven-test
+            arguments:
+              parameters:
+                - name: test-type
+                  value: integration
+        
+        # Stage 3: Only after both tests pass
+        - - name: build-image
+            template: docker-build
+
+DAG Template (Flexible Dependency Graph):
+
+  templates:
+    - name: main-dag
+      dag:
+        tasks:
+          - name: validate
+            template: checkstyle
+          
+          - name: compile
+            template: maven-compile
+            dependencies: [validate]
+          
+          - name: unit-test
+            template: maven-unit-test
+            dependencies: [compile]
+          
+          - name: integration-test
+            template: maven-integration-test
+            dependencies: [compile]
+          
+          - name: sonar
+            template: sonarqube-analysis
+            dependencies: [unit-test]
+          
+          - name: build-image
+            template: docker-build
+            # Depends on BOTH tests passing:
+            dependencies: [unit-test, integration-test]
+          
+          - name: push-image
+            template: docker-push
+            dependencies: [build-image, sonar]
+
+Container Template:
+
+  templates:
+    - name: checkstyle
+      container:
+        image: maven:3.9-eclipse-temurin-21
+        command: [./mvnw]
+        args: [-B, --no-transfer-progress, checkstyle:check]
+        workingDir: /workspace
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+          - name: m2-cache
+            mountPath: /root/.m2/repository
+
+Script Template:
+
+  templates:
+    - name: notify-slack
+      script:
+        image: curlimages/curl:latest
+        command: [sh]
+        source: |
+          curl -X POST $SLACK_WEBHOOK \
+            -H 'Content-type: application/json' \
+            -d "{\"text\": \"Build {{workflow.status}}: {{workflow.name}}\"}"
+
+With Parameters:
+
+  templates:
+    - name: maven-test
+      inputs:
+        parameters:
+          - name: test-type    # Required parameter
+          - name: jvm-args     # Optional parameter with default
+            default: "-Xmx512m"
+      container:
+        image: maven:3.9-eclipse-temurin-21
+        command: [sh, -c]
+        args:
+          - |
+            if [ "{{inputs.parameters.test-type}}" = "unit" ]; then
+              ./mvnw test -DexcludedGroups=integration \
+                -DargLine="{{inputs.parameters.jvm-args}}"
+            else
+              ./mvnw failsafe:integration-test failsafe:verify
+            fi
+
+Artifacts:
+
+  templates:
+    - name: maven-package
+      outputs:
+        artifacts:
+          - name: jar-artifact
+            path: /workspace/target/app.jar    # Store this file as artifact
+      container:
+        image: maven:3.9-eclipse-temurin-21
+        command: [./mvnw, -B, package, -DskipTests]
+    
+    - name: docker-build
+      inputs:
+        artifacts:
+          - name: jar-artifact       # Retrieve artifact from previous step
+            path: /workspace/target/app.jar
+      container:
+        image: docker:24
+        command: [docker, build, -t, myapp:latest, .]
+
+================================================================================
+5. ARGO WORKFLOWS — JAVA/MAVEN PIPELINE EXAMPLE
+================================================================================
+
+Complete Java CI Workflow with Argo:
+
+  apiVersion: argoproj.io/v1alpha1
+  kind: Workflow
+  metadata:
+    generateName: java-ci-
+    namespace: argo
+    labels:
+      app: order-service
+  spec:
+    serviceAccountName: ci-sa
+    entrypoint: java-ci-dag
+    
+    volumes:
+      - name: workspace
+        persistentVolumeClaim:
+          claimName: workspace-pvc
+      - name: m2-cache
+        persistentVolumeClaim:
+          claimName: maven-cache-pvc
+      - name: docker-sock
+        hostPath:
+          path: /var/run/docker.sock
+    
+    arguments:
+      parameters:
+        - name: git-sha
+          value: "{{workflow.name}}"
+        - name: image-tag
+          value: "sha-{{workflow.uid}}"
+        - name: registry
+          value: "my-registry.io"
+        - name: image-name
+          value: "order-service"
+    
+    templates:
+      # ─── DAG ENTRYPOINT ────────────────────────────────────
+      - name: java-ci-dag
+        dag:
+          tasks:
+            - name: checkout
+              template: git-checkout
+            
+            - name: checkstyle
+              template: maven-checkstyle
+              dependencies: [checkout]
+            
+            - name: unit-tests
+              template: maven-unit-test
+              dependencies: [checkstyle]
+            
+            - name: integration-tests
+              template: maven-integration-test
+              dependencies: [checkstyle]
+            
+            - name: build-jar
+              template: maven-package
+              dependencies: [unit-tests, integration-tests]
+            
+            - name: build-docker
+              template: docker-build
+              dependencies: [build-jar]
+              arguments:
+                parameters:
+                  - name: tag
+                    value: "{{workflow.parameters.registry}}/{{workflow.parameters.image-name}}:{{workflow.parameters.image-tag}}"
+            
+            - name: push-docker
+              template: docker-push
+              dependencies: [build-docker]
+              arguments:
+                parameters:
+                  - name: tag
+                    value: "{{workflow.parameters.registry}}/{{workflow.parameters.image-name}}:{{workflow.parameters.image-tag}}"
+      
+      # ─── GIT CHECKOUT ──────────────────────────────────────
+      - name: git-checkout
+        container:
+          image: alpine/git:latest
+          command: [sh, -c]
+          args:
+            - |
+              git clone $GIT_REPO /workspace/app && \
+              cd /workspace/app && \
+              git checkout $GIT_SHA
+          env:
+            - name: GIT_REPO
+              valueFrom:
+                secretKeyRef:
+                  name: ci-secrets
+                  key: git-repo
+            - name: GIT_SHA
+              value: "{{workflow.parameters.git-sha}}"
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      
+      # ─── CHECKSTYLE ────────────────────────────────────────
+      - name: maven-checkstyle
+        container:
+          image: maven:3.9-eclipse-temurin-21
+          workingDir: /workspace/app
+          command: [./mvnw]
+          args: [-B, --no-transfer-progress, checkstyle:check]
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: m2-cache
+              mountPath: /root/.m2/repository
+      
+      # ─── UNIT TESTS ────────────────────────────────────────
+      - name: maven-unit-test
+        container:
+          image: maven:3.9-eclipse-temurin-21
+          workingDir: /workspace/app
+          command: [./mvnw]
+          args: [-B, --no-transfer-progress, test, -DexcludedGroups=integration]
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: m2-cache
+              mountPath: /root/.m2/repository
+        outputs:
+          artifacts:
+            - name: test-results
+              path: /workspace/app/target/surefire-reports
+              archive:
+                none: {}
+      
+      # ─── INTEGRATION TESTS ─────────────────────────────────
+      - name: maven-integration-test
+        container:
+          image: maven:3.9-eclipse-temurin-21
+          workingDir: /workspace/app
+          command: [./mvnw]
+          args:
+            - -B
+            - --no-transfer-progress
+            - failsafe:integration-test
+            - failsafe:verify
+          env:
+            - name: TESTCONTAINERS_RYUK_DISABLED
+              value: "true"
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: m2-cache
+              mountPath: /root/.m2/repository
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+      
+      # ─── MAVEN PACKAGE ─────────────────────────────────────
+      - name: maven-package
+        container:
+          image: maven:3.9-eclipse-temurin-21
+          workingDir: /workspace/app
+          command: [./mvnw]
+          args: [-B, --no-transfer-progress, package, -DskipTests]
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: m2-cache
+              mountPath: /root/.m2/repository
+      
+      # ─── DOCKER BUILD ──────────────────────────────────────
+      - name: docker-build
+        inputs:
+          parameters:
+            - name: tag
+        container:
+          image: docker:24
+          workingDir: /workspace/app
+          command: [docker, build, -t, "{{inputs.parameters.tag}}", .]
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+      
+      # ─── DOCKER PUSH ───────────────────────────────────────
+      - name: docker-push
+        inputs:
+          parameters:
+            - name: tag
+        container:
+          image: docker:24
+          command: [docker, push, "{{inputs.parameters.tag}}"]
+          env:
+            - name: DOCKER_REGISTRY_USER
+              valueFrom:
+                secretKeyRef:
+                  name: ci-secrets
+                  key: registry-user
+            - name: DOCKER_REGISTRY_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: ci-secrets
+                  key: registry-pass
+          volumeMounts:
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+
+Trigger via WorkflowTemplate (Reusable):
+
+  apiVersion: argoproj.io/v1alpha1
+  kind: WorkflowTemplate
+  metadata:
+    name: java-ci-template
+    namespace: argo
+  spec:
+    # ... same as above but reusable across projects
+
+  # Reference in another workflow:
+  templates:
+    - name: main
+      steps:
+        - - name: ci
+            templateRef:
+              name: java-ci-template
+              template: java-ci-dag
+
+================================================================================
+6. ARGO EVENTS (TRIGGER MECHANISM)
+================================================================================
+
+What is Argo Events?
+
+  Argo Events is the event-driven trigger layer for Argo Workflows.
+  It listens to external events (GitHub webhooks, S3 uploads, Kafka messages)
+  and triggers Argo Workflows automatically.
+
+Core Components:
+
+  EventSource:   Listens to external events (GitHub, webhook, Kafka, etc.)
+  Sensor:        Defines what to do when events occur (trigger Workflow)
+  EventBus:      NATS JetStream message bus connecting sources to sensors
+
+GitHub Webhook EventSource:
+
+  apiVersion: argoproj.io/v1alpha1
+  kind: EventSource
+  metadata:
+    name: github-webhook
+    namespace: argo
+  spec:
+    github:
+      order-service:
+        repositories:
+          - owner: my-org
+            names:
+              - order-service
+        webhook:
+          endpoint: /push
+          port: "12000"
+          method: POST
+        events:
+          - push          # Trigger on push
+          - pull_request  # Trigger on PR
+
+Sensor (Triggers Workflow):
+
+  apiVersion: argoproj.io/v1alpha1
+  kind: Sensor
+  metadata:
+    name: github-sensor
+    namespace: argo
+  spec:
+    dependencies:
+      - name: github-dep
+        eventSourceName: github-webhook
+        eventName: order-service
+        filters:
+          data:
+            - path: body.ref
+              type: string
+              value:
+                - refs/heads/main    # Only trigger on main branch pushes
+    
+    triggers:
+      - template:
+          name: trigger-ci
+          argoWorkflow:
+            operation: submit
+            source:
+              resource:
+                apiVersion: argoproj.io/v1alpha1
+                kind: Workflow
+                metadata:
+                  generateName: java-ci-
+                spec:
+                  workflowTemplateRef:
+                    name: java-ci-template
+                  arguments:
+                    parameters:
+                      - name: git-sha
+                        # Extract from GitHub event payload:
+                        value: "{{.Input.body.after}}"
+
+================================================================================
+7. TEKTON OVERVIEW
+================================================================================
+
+What is Tekton?
+
+  Tekton is a CNCF incubating project providing K8s-native CI/CD primitives.
+  Originally from Google's Knative project. Now part of Linux Foundation.
+  
+  Tekton is the CI/CD "framework" — you assemble pipelines from reusable
+  Tasks. Strong emphasis on reusability and composability.
+  
+  Key difference from Argo Workflows:
+    - Tekton is specialized for CI/CD (build, test, deploy)
+    - Argo Workflows is general-purpose (CI/CD + data pipelines + batch)
+    - Tekton has stronger tooling: Tekton Hub (shared task catalog)
+    - Argo Workflows has richer workflow patterns (DAG, loops, conditionals)
+
+Architecture:
+
+  ┌──────────────────────────────────────────────────────────┐
+  │                   Kubernetes Cluster                      │
+  │                                                           │
+  │  Tekton CRDs:                                             │
+  │  ┌───────────────────────────────────────────────────┐   │
+  │  │ Task           → defines steps (containers)       │   │
+  │  │ ClusterTask    → cluster-wide reusable Task       │   │
+  │  │ Pipeline       → chains Tasks together            │   │
+  │  │ TaskRun        → executes a Task                  │   │
+  │  │ PipelineRun    → executes a Pipeline              │   │
+  │  │ TriggerTemplate → defines what to run on event   │   │
+  │  │ TriggerBinding  → maps event data to params      │   │
+  │  │ EventListener   → HTTP endpoint for webhooks     │   │
+  │  └───────────────────────────────────────────────────┘   │
+  │                                                           │
+  │  ┌──────────────┐  creates  ┌──────────────────────────┐  │
+  │  │ PipelineRun  │──────────▶│  TaskRun Pods            │  │
+  │  └──────────────┘           │  [clone] → [build] → ... │  │
+  │                             └──────────────────────────┘  │
+  └────────────────────────────────────────────────────────────┘
+
+Installation:
+
+  # Install Tekton Pipelines:
+  kubectl apply --filename \
+    https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
+  
+  # Install Tekton Triggers:
+  kubectl apply --filename \
+    https://storage.googleapis.com/tekton-releases/triggers/latest/release.yaml
+  
+  # Install Tekton Dashboard (UI):
+  kubectl apply --filename \
+    https://storage.googleapis.com/tekton-releases/dashboard/latest/release.yaml
+
+  # Install Tekton CLI:
+  brew install tektoncd-cli    # macOS
+
+================================================================================
+8. TEKTON CORE CONCEPTS
+================================================================================
+
+Task (Unit of Work):
+
+  A Task defines a list of steps (containers).
+  Each step runs sequentially within the same Pod.
+  Steps share the workspace (PersistentVolume).
+  
+  apiVersion: tekton.dev/v1
+  kind: Task
+  metadata:
+    name: maven-build
+  spec:
+    params:
+      - name: maven-image
+        type: string
+        default: maven:3.9-eclipse-temurin-21
+      - name: goals
+        type: array
+        default:
+          - clean
+          - verify
+    
+    workspaces:
+      - name: source       # Shared volume mounted to all steps
+      - name: maven-cache  # Maven .m2 cache
+    
+    steps:
+      - name: build
+        image: $(params.maven-image)
+        workingDir: $(workspaces.source.path)
+        command: [./mvnw]
+        args:
+          - -B
+          - --no-transfer-progress
+          - "$(params.goals[*])"    # Expand array param
+        volumeMounts:
+          - name: $(workspaces.maven-cache.volume)
+            mountPath: /root/.m2/repository
+
+ClusterTask (Cluster-Wide Reusable):
+
+  # Same as Task but available across all namespaces:
+  kind: ClusterTask
+  
+  # Tekton Hub provides ready-made ClusterTasks:
+  # https://hub.tekton.dev/
+  # Examples: git-clone, kaniko, buildah, maven, helm-upgrade-from-source
+
+Pipeline (Chain of Tasks):
+
+  apiVersion: tekton.dev/v1
+  kind: Pipeline
+  metadata:
+    name: java-ci-pipeline
+  spec:
+    params:
+      - name: git-url
+        type: string
+      - name: git-revision
+        type: string
+        default: main
+      - name: image-name
+        type: string
+    
+    workspaces:
+      - name: shared-workspace
+      - name: maven-cache
+      - name: docker-credentials
+    
+    tasks:
+      # Task 1: Clone repo
+      - name: fetch-source
+        taskRef:
+          name: git-clone     # From Tekton Hub
+          kind: ClusterTask
+        workspaces:
+          - name: output
+            workspace: shared-workspace
+        params:
+          - name: url
+            value: $(params.git-url)
+          - name: revision
+            value: $(params.git-revision)
+      
+      # Task 2: Run tests (after clone)
+      - name: run-tests
+        taskRef:
+          name: maven-test
+        runAfter:
+          - fetch-source
+        workspaces:
+          - name: source
+            workspace: shared-workspace
+          - name: maven-cache
+            workspace: maven-cache
+      
+      # Task 3: Build image (after tests)
+      - name: build-image
+        taskRef:
+          name: kaniko         # Kaniko: Docker image build without Docker daemon
+          kind: ClusterTask
+        runAfter:
+          - run-tests
+        workspaces:
+          - name: source
+            workspace: shared-workspace
+          - name: dockerconfig
+            workspace: docker-credentials
+        params:
+          - name: IMAGE
+            value: $(params.image-name)
+          - name: CONTEXT
+            value: "."
+          - name: DOCKERFILE
+            value: ./Dockerfile
+
+TaskRun (Execute a Task):
+
+  apiVersion: tekton.dev/v1
+  kind: TaskRun
+  metadata:
+    name: maven-build-run
+  spec:
+    taskRef:
+      name: maven-build
+    params:
+      - name: goals
+        value:
+          - clean
+          - verify
+    workspaces:
+      - name: source
+        persistentVolumeClaim:
+          claimName: source-pvc
+      - name: maven-cache
+        persistentVolumeClaim:
+          claimName: maven-cache-pvc
+
+PipelineRun (Execute a Pipeline):
+
+  apiVersion: tekton.dev/v1
+  kind: PipelineRun
+  metadata:
+    generateName: java-ci-run-
+  spec:
+    pipelineRef:
+      name: java-ci-pipeline
+    params:
+      - name: git-url
+        value: https://github.com/my-org/order-service.git
+      - name: git-revision
+        value: main
+      - name: image-name
+        value: my-registry.io/order-service:latest
+    workspaces:
+      - name: shared-workspace
+        volumeClaimTemplate:
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 1Gi
+      - name: maven-cache
+        persistentVolumeClaim:
+          claimName: maven-cache-pvc
+      - name: docker-credentials
+        secret:
+          secretName: docker-credentials
+
+================================================================================
+9. TEKTON — JAVA/SPRING BOOT PIPELINE EXAMPLE
+================================================================================
+
+Custom Maven Tasks:
+
+  # Task: Maven checkstyle
+  apiVersion: tekton.dev/v1
+  kind: Task
+  metadata:
+    name: maven-checkstyle
+    namespace: tekton-ci
+  spec:
+    workspaces:
+      - name: source
+      - name: maven-settings
+    steps:
+      - name: checkstyle
+        image: maven:3.9-eclipse-temurin-21
+        workingDir: $(workspaces.source.path)
+        script: |
+          ./mvnw -B --no-transfer-progress -s $(workspaces.maven-settings.path)/settings.xml \
+            checkstyle:check spotbugs:check
+  
+  ---
+  
+  # Task: Maven test with JaCoCo
+  apiVersion: tekton.dev/v1
+  kind: Task
+  metadata:
+    name: maven-test-coverage
+    namespace: tekton-ci
+  spec:
+    params:
+      - name: test-groups
+        type: string
+        default: "!integration"
+    workspaces:
+      - name: source
+    results:
+      - name: test-count
+        description: "Number of tests executed"
+    steps:
+      - name: test
+        image: maven:3.9-eclipse-temurin-21
+        workingDir: $(workspaces.source.path)
+        script: |
+          ./mvnw -B --no-transfer-progress test \
+            -DexcludedGroups=$(params.test-groups)
+          # Output test count as result:
+          TEST_COUNT=$(grep -o "Tests run: [0-9]*" target/surefire-reports/*.txt | \
+            awk -F: '{sum+=$2} END {print sum}')
+          echo -n "$TEST_COUNT" > $(results.test-count.path)
+      
+      - name: verify-coverage
+        image: maven:3.9-eclipse-temurin-21
+        workingDir: $(workspaces.source.path)
+        script: |
+          ./mvnw -B jacoco:check
+  
+  ---
+  
+  # Task: Kaniko image build (Docker without Docker daemon)
+  # Use Kaniko ClusterTask from Tekton Hub:
+  # tkn hub install task kaniko
+
+Full Spring Boot Pipeline:
+
+  apiVersion: tekton.dev/v1
+  kind: Pipeline
+  metadata:
+    name: spring-boot-ci
+    namespace: tekton-ci
+  spec:
+    params:
+      - name: git-url
+        type: string
+      - name: git-revision
+        type: string
+        default: main
+      - name: registry
+        type: string
+        default: "my-registry.io"
+      - name: app-name
+        type: string
+    
+    workspaces:
+      - name: source
+      - name: maven-cache
+      - name: docker-credentials
+    
+    results:
+      - name: image-url
+        value: $(tasks.build-image.results.IMAGE_URL)
+      - name: image-digest
+        value: $(tasks.build-image.results.IMAGE_DIGEST)
+    
+    tasks:
+      - name: fetch-source
+        taskRef:
+          resolver: cluster
+          params:
+            - name: kind
+              value: task
+            - name: name
+              value: git-clone
+            - name: namespace
+              value: tekton-ci
+        workspaces:
+          - name: output
+            workspace: source
+        params:
+          - name: url
+            value: $(params.git-url)
+          - name: revision
+            value: $(params.git-revision)
+      
+      - name: code-quality
+        taskRef:
+          name: maven-checkstyle
+        runAfter: [fetch-source]
+        workspaces:
+          - name: source
+            workspace: source
+      
+      - name: unit-tests
+        taskRef:
+          name: maven-test-coverage
+        runAfter: [code-quality]
+        workspaces:
+          - name: source
+            workspace: source
+        params:
+          - name: test-groups
+            value: "!integration"
+      
+      - name: integration-tests
+        taskRef:
+          name: maven-integration-test
+        runAfter: [code-quality]
+        workspaces:
+          - name: source
+            workspace: source
+      
+      - name: build-image
+        taskRef:
+          name: kaniko
+          kind: ClusterTask
+        runAfter: [unit-tests, integration-tests]
+        workspaces:
+          - name: source
+            workspace: source
+          - name: dockerconfig
+            workspace: docker-credentials
+        params:
+          - name: IMAGE
+            value: $(params.registry)/$(params.app-name):$(tasks.fetch-source.results.commit)
+          - name: EXTRA_ARGS
+            value:
+              - --cache=true          # Kaniko layer caching
+              - --cache-repo=$(params.registry)/cache
+              - --snapshot-mode=redo
+
+================================================================================
+10. TEKTON TRIGGERS (EVENT-DRIVEN PIPELINES)
+================================================================================
+
+EventListener (Webhook endpoint):
+
+  apiVersion: triggers.tekton.dev/v1beta1
+  kind: EventListener
+  metadata:
+    name: github-listener
+    namespace: tekton-ci
+  spec:
+    serviceAccountName: tekton-triggers-sa
+    triggers:
+      - name: github-push-trigger
+        interceptors:
+          - ref:
+              name: github           # Verify GitHub webhook signature
+            params:
+              - name: secretRef
+                value:
+                  secretName: github-webhook-secret
+                  secretKey: secret
+              - name: eventTypes
+                value: [push]
+        bindings:
+          - ref: github-push-binding
+        template:
+          ref: java-ci-trigger-template
+
+TriggerBinding (Map event → params):
+
+  apiVersion: triggers.tekton.dev/v1beta1
+  kind: TriggerBinding
+  metadata:
+    name: github-push-binding
+  spec:
+    params:
+      - name: git-url
+        value: $(body.repository.clone_url)
+      - name: git-revision
+        value: $(body.after)          # SHA of the pushed commit
+      - name: app-name
+        value: $(body.repository.name)
+
+TriggerTemplate (Create PipelineRun):
+
+  apiVersion: triggers.tekton.dev/v1beta1
+  kind: TriggerTemplate
+  metadata:
+    name: java-ci-trigger-template
+  spec:
+    params:
+      - name: git-url
+      - name: git-revision
+      - name: app-name
+    resourcetemplates:
+      - apiVersion: tekton.dev/v1
+        kind: PipelineRun
+        metadata:
+          generateName: java-ci-run-
+        spec:
+          pipelineRef:
+            name: spring-boot-ci
+          params:
+            - name: git-url
+              value: $(tt.params.git-url)
+            - name: git-revision
+              value: $(tt.params.git-revision)
+            - name: app-name
+              value: $(tt.params.app-name)
+          workspaces:
+            - name: source
+              volumeClaimTemplate:
+                spec:
+                  accessModes: [ReadWriteOnce]
+                  resources:
+                    requests:
+                      storage: 1Gi
+            - name: maven-cache
+              persistentVolumeClaim:
+                claimName: maven-cache-pvc
+            - name: docker-credentials
+              secret:
+                secretName: docker-credentials
+
+================================================================================
+11. ARGO WORKFLOWS VS TEKTON COMPARISON
+================================================================================
+
+  ┌─────────────────────────┬────────────────────────┬──────────────────────────┐
+  │ Feature                 │ Argo Workflows         │ Tekton                   │
+  ├─────────────────────────┼────────────────────────┼──────────────────────────┤
+  │ CNCF Status             │ Graduated              │ Incubating               │
+  │ Primary Use Case        │ General workflows + CI │ CI/CD specifically       │
+  │ Workflow Patterns       │ DAG, Steps, Loops,     │ Sequential, Parallel     │
+  │                         │ Conditionals, Fan-out  │ (limited conditionals)   │
+  │ Reusability             │ WorkflowTemplates      │ Tasks (ClusterTasks)     │
+  │ Shared Task Catalog     │ Limited                │ Tekton Hub (excellent)   │
+  │ UI                      │ Argo Server (rich)     │ Tekton Dashboard (basic) │
+  │ Event triggering        │ Argo Events (separate) │ Tekton Triggers (native) │
+  │ Artifact handling       │ Built-in (S3/GCS)      │ Workspaces (PVCs)        │
+  │ Learning curve          │ Medium                 │ Lower (simpler model)    │
+  │ Parallel steps          │ DAG (very flexible)    │ runAfter (less flexible) │
+  │ Conditional execution   │ Built-in (when)        │ Limited (CEL expressions)│
+  │ Retry/timeout           │ Rich options           │ Basic                    │
+  │ Loop/fanout             │ withItems, withParam   │ Not native               │
+  │ Step granularity        │ Each step = Pod        │ Steps share same Pod     │
+  │ Ecosystem               │ Argo ecosystem (CD,    │ Tekton ecosystem only    │
+  │                         │ Rollouts, Events)      │                          │
+  │ Community               │ Very active            │ Active (Google-backed)   │
+  └─────────────────────────┴────────────────────────┴──────────────────────────┘
+
+Step Execution Model Difference:
+
+  Argo Workflows:
+    Each template step = NEW Pod (fresh container, separate scheduling)
+    Pro: Complete isolation between steps
+    Con: Pod startup overhead for every step
+
+  Tekton:
+    All steps within one Task = SAME Pod (sequential containers)
+    Pro: Faster (no Pod startup overhead between steps)
+    Con: Less isolation; sharing files via workspace is simpler
+
+Recommendation:
+
+  Choose Argo Workflows if:
+    - You need complex DAG workflows (not just linear pipelines)
+    - You're already using Argo CD (common Argo ecosystem)
+    - You need data processing workflows (ML, ETL) in addition to CI
+    - You need dynamic parallelism (withItems loops)
+  
+  Choose Tekton if:
+    - You specifically need Kubernetes-native CI/CD
+    - You want to leverage Tekton Hub (ready-made tasks)
+    - Simpler mental model (tasks + pipelines) is preferred
+    - Your team already knows Tekton from OpenShift (built-in)
+
+================================================================================
+12. ARGO WORKFLOWS / TEKTON vs JENKINS vs GITHUB ACTIONS
+================================================================================
+
+  ┌──────────────────┬──────────────┬──────────────┬──────────────┬────────────┐
+  │ Criteria         │ Argo         │ Tekton       │ Jenkins      │ GitHub     │
+  │                  │ Workflows    │              │              │ Actions    │
+  ├──────────────────┼──────────────┼──────────────┼──────────────┼────────────┤
+  │ Infra required   │ K8s cluster  │ K8s cluster  │ VM/server    │ SaaS       │
+  │ K8s native       │ ✓ Yes        │ ✓ Yes        │ ✗ No         │ ✗ No       │
+  │ Setup complexity │ Medium       │ Medium       │ High         │ Low        │
+  │ Managed option   │ No           │ No           │ CloudBees    │ GitHub.com │
+  │ Cost (small)     │ K8s cost     │ K8s cost     │ Server cost  │ Free tier  │
+  │ Scalability      │ Excellent    │ Excellent    │ Complex      │ Good       │
+  │ Plugin ecosystem │ Limited      │ Tekton Hub   │ 1800+ plugins│ Actions Mkt│
+  │ Secret mgmt      │ K8s Secrets  │ K8s Secrets  │ Jenkins Creds│ GH Secrets │
+  │ Internal access  │ ✓ Yes        │ ✓ Yes        │ Partial      │ Tunneling  │
+  │ YAML config      │ Verbose      │ Verbose      │ Groovy/YAML  │ Simple     │
+  │ Parallel DAG     │ Excellent    │ Good         │ Moderate     │ Matrix     │
+  │ Artifact mgmt    │ S3/GCS       │ PVC          │ Nexus/Artifcty│ GH Pkgs   │
+  │ Best for         │ ML + CI/CD   │ Enterprise K8s│ Legacy/Plugin│ Cloud/OSS  │
+  └──────────────────┴──────────────┴──────────────┴──────────────┴────────────┘
+
+Real-World Adoption (2024):
+
+  GitHub Actions:    Most popular for cloud-hosted open source projects
+  Jenkins:           Still dominant in large enterprise (legacy)
+  Tekton:            Growing in OpenShift/enterprise K8s environments
+  Argo Workflows:    Popular in ML/data companies; GitOps-heavy shops
+
+================================================================================
+13. WHEN TO USE KUBERNETES-NATIVE CI/CD
+================================================================================
+
+Use Argo Workflows / Tekton WHEN:
+
+  1. Your application is already deployed on Kubernetes
+     → CI runs in the same cluster → no network boundary for internal services
+  
+  2. You need pipelines to access internal K8s resources
+     → Databases, service meshes, internal registries (no tunneling needed)
+  
+  3. You want CI/CD managed as code via GitOps
+     → WorkflowTemplates / Pipelines stored in Git, deployed via ArgoCD
+  
+  4. You have complex parallel workflows
+     → ML training pipelines, integration test suites with many services
+  
+  5. Enterprise security requirement
+     → All CI runs inside your VPC, no external runner access
+
+AVOID Argo/Tekton WHEN:
+
+  1. Small team without Kubernetes expertise
+     → Operational overhead outweighs benefits
+  
+  2. Open-source project needing simple CI
+     → GitHub Actions is free, simpler, and sufficient
+  
+  3. No existing K8s cluster
+     → Managing K8s just for CI is usually overkill
+  
+  4. You need marketplace plugins (JIRA, Slack, etc.)
+     → Jenkins / GitHub Actions have far richer ecosystems
+
+================================================================================
+14. COMMON INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: What is the difference between Argo Workflows and Argo CD?
+    Are they related?
+
+A: Both are part of the Argo ecosystem (CNCF graduated).
+   
+   Argo CD (GitOps Continuous Delivery):
+   - Monitors a Git repository for desired Kubernetes state
+   - Continuously syncs the cluster to match Git (reconciliation loop)
+   - Think: "Deploy whatever is in Git to Kubernetes"
+   - Use case: CD/deployment automation
+   
+   Argo Workflows (General Workflow Engine):
+   - Runs ad-hoc workflow graphs (DAGs or steps) on Kubernetes
+   - Think: "Execute this sequence of container jobs"
+   - Use case: CI pipelines, ML training, ETL
+   
+   They complement each other in a GitOps stack:
+   - Argo Workflows handles CI (build/test/package image)
+   - Argo CD handles CD (detect new image → sync to cluster)
+   
+   Argo Rollouts is a third Argo component for:
+   - Blue-green and canary deployment strategies with automated analysis
+
+---
+
+Q2: How does Tekton differ from Jenkins pipelines?
+    Why would you migrate from Jenkins to Tekton?
+
+A: Core difference:
+   
+   Jenkins:
+   - Runs on a dedicated JVM master (stateful)
+   - Agents are VMs or containers managed by Jenkins itself
+   - Pipelines defined in Groovy (Jenkinsfile)
+   - 1800+ plugins (powerful but brittle)
+   - Single point of failure (master)
+   
+   Tekton:
+   - Runs natively on Kubernetes as CRDs
+   - Pipelines managed by K8s (reconciliation, scaling)
+   - Defined in YAML (Kubernetes-idiomatic)
+   - Reusable Tasks shared via Tekton Hub
+   - Scales with K8s — no master to manage
+   
+   Migration reasons:
+   1. Already running on Kubernetes — Tekton reuses that infrastructure
+   2. Ephemeral pods → clean environment every build
+   3. K8s RBAC for CI permissions → no separate Jenkins user management
+   4. GitOps for pipelines — Tekton CRDs in Git, deployed via ArgoCD
+   5. Reduce plugin dependency hell (Jenkins's biggest pain point)
+   
+   Migration challenges:
+   - Significant rewrite (Groovy → Tekton YAML)
+   - Less mature ecosystem (fewer integrations)
+   - Team training needed on K8s concepts
+
+---
+
+Q3: How would you implement a Java CI pipeline with Argo Workflows?
+    What are the key design decisions?
+
+A: Design decisions:
+
+   1. Workspace sharing strategy:
+      Use a PersistentVolumeClaim for workspace (source code + build artifacts)
+      shared across all steps. Maven cache in separate PVC for reuse across runs.
+   
+   2. DAG vs Steps:
+      Use DAG for Java CI to run unit tests and integration tests in PARALLEL
+      while both depending on compile, and image build depending on BOTH tests.
+   
+   3. Docker building strategy:
+      Option A: Mount Docker socket (privileged, simpler)
+      Option B: Kaniko (no Docker daemon, runs unprivileged) — PREFERRED
+      Option C: Buildah (rootless)
+      Use Kaniko in production (no privileged pods needed).
+   
+   4. Maven cache:
+      Separate PVC for .m2/repository mounted read-write.
+      Cache persists across workflow runs → faster builds.
+   
+   5. Secrets:
+      Kubernetes Secrets mounted as volumes or environment variables.
+      Never bake secrets into workflow YAML.
+   
+   6. Triggering:
+      Use Argo Events with GitHub webhook EventSource + Sensor.
+      Filter by branch (only main branch triggers image push).
+   
+   Real pipeline structure:
+     [git-clone] → [checkstyle] → [compile]
+                                      ├─→ [unit-tests]  ──┐
+                                      └─→ [integ-tests] ──┴→ [kaniko build] → [push]
+
+================================================================================
+15. QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+ARGO WORKFLOWS:
+  Resource type:  Workflow, WorkflowTemplate, CronWorkflow
+  Template types: container, steps, dag, script, resource, suspend
+  Key fields:     entrypoint, templates, arguments, volumes, parallelism
+  
+  kubectl apply -f workflow.yaml            # Submit workflow
+  argo submit workflow.yaml                 # Submit via Argo CLI
+  argo watch java-ci-xyz                    # Watch workflow progress
+  argo logs java-ci-xyz                     # View all logs
+  argo delete java-ci-xyz                   # Delete workflow
+
+TEKTON:
+  Resource types: Task, ClusterTask, Pipeline, TaskRun, PipelineRun
+  Key fields:     steps, tasks, runAfter, workspaces, params, results
+  
+  kubectl apply -f pipeline.yaml            # Create pipeline
+  tkn pipeline start java-ci-pipeline       # Start pipeline (interactive)
+  tkn pipelinerun list                      # List runs
+  tkn pipelinerun logs java-ci-run-xyz -f   # Follow logs
+  tkn task list                             # List tasks
+  tkn hub search maven                      # Search Tekton Hub
+
+KEY DIFFERENCES:
+  Argo DAG      → tasks depend on each other by name
+  Tekton runAfter → tasks listed after dependencies
+  
+  Argo step     → each template = new Pod
+  Tekton step   → all steps in Task = same Pod (sequential containers)
+  
+  Argo artifacts → S3/GCS/MinIO files
+  Tekton workspaces → PersistentVolumeClaims
+
+KANIKO (Docker build without daemon):
+  image: gcr.io/kaniko-project/executor:latest
+  args:
+    - --context=$(workspaces.source.path)
+    - --dockerfile=./Dockerfile
+    - --destination=my-registry/my-app:latest
+    - --cache=true
+
+TEKTON HUB COMMANDS:
+  tkn hub search maven
+  tkn hub install task git-clone
+  tkn hub install task kaniko
+  tkn hub install task sonarqube-scanner
+
+================================================================================
+END OF ARGO WORKFLOWS AND TEKTON GUIDE
+================================================================================

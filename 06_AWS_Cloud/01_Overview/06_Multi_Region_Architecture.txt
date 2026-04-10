@@ -1,0 +1,295 @@
+================================================================
+AWS CLOUD — MULTI-REGION ARCHITECTURE
+Complete Interview Preparation Guide
+================================================================
+
+1. WHY MULTI-REGION?
+================================================================
+
+  Single-region failure scenarios:
+    - AWS region-wide outage (rare but possible — us-east-1 had outages in 2021)
+    - Natural disasters affecting a geographic area
+    - Regulatory requirements (data residency in specific countries)
+    - Latency — users in Europe should not hit us-east-1
+
+  OBJECTIVES THAT DRIVE MULTI-REGION:
+  ┌────────────────────────┬──────────────────────────────────────────────────────┐
+  │ Objective              │ Description                                          │
+  ├────────────────────────┼──────────────────────────────────────────────────────┤
+  │ Disaster Recovery      │ Survive complete region failure                      │
+  │ Low Latency            │ Route users to nearest region                        │
+  │ Data Residency/Compliance│ Data must stay within a country/region             │
+  │ High Availability      │ > 99.99% uptime across regions                       │
+  └────────────────────────┴──────────────────────────────────────────────────────┘
+
+================================================================
+2. RECOVERY OBJECTIVES — KEY METRICS
+================================================================
+
+  RTO (Recovery Time Objective):
+    Maximum acceptable downtime before business impact is unacceptable.
+    "We can be down for no more than 4 hours."
+
+  RPO (Recovery Point Objective):
+    Maximum acceptable data loss measured in time.
+    "We can lose no more than 1 hour of data."
+
+  ┌────────────────────────┬────────────────────────┬──────────────────────────┐
+  │ Strategy               │ Typical RTO            │ Typical RPO              │
+  ├────────────────────────┼────────────────────────┼──────────────────────────┤
+  │ Backup & Restore       │ Hours                  │ Hours                    │
+  │ Pilot Light            │ 10–30 minutes          │ Minutes                  │
+  │ Warm Standby           │ Minutes                │ Seconds–Minutes          │
+  │ Multi-Site Active-Active│ Near zero             │ Near zero                │
+  └────────────────────────┴────────────────────────┴──────────────────────────┘
+
+================================================================
+3. DISASTER RECOVERY STRATEGIES
+================================================================
+
+  STRATEGY 1: BACKUP AND RESTORE (cheapest)
+  ──────────────────────────────────────────
+    - Regular backups to S3 (cross-region replication enabled)
+    - On disaster: restore from S3 backup in new region
+    - RTO: hours. RPO: last backup (hours)
+    - Cost: very low (only storage + restore compute)
+    - Use: non-critical systems, batch data archives
+
+    AWS Tools:
+    - S3 Cross-Region Replication (CRR)
+    - RDS automated backups with cross-region copy
+    - AWS Backup with cross-region vault
+
+  STRATEGY 2: PILOT LIGHT
+  ───────────────────────
+    - Minimal core infrastructure always running in DR region
+    - Data is replicated continuously (DB replica in DR region)
+    - Compute (EC2/ECS) is stopped/minimal — scale up during failover
+    - RTO: 10–30 min (time to scale up compute). RPO: seconds (replication lag)
+    - Cost: low (only running DB replica + minimal compute)
+
+    Architecture:
+    Primary (us-east-1):   Full fleet (EC2/ECS) + RDS Primary
+    DR (us-west-2):         RDS Read Replica (always on) + stopped EC2 AMIs
+    
+    Failover steps:
+    1. Promote RDS Read Replica to primary
+    2. Start EC2 instances from AMI / scale up ECS tasks
+    3. Update Route53 DNS to point to DR region
+    4. Update app config to point to new DB
+
+  STRATEGY 3: WARM STANDBY
+  ─────────────────────────
+    - Scaled-down but RUNNING copy of production in DR region
+    - All services running at reduced capacity (e.g., 20% of prod)
+    - Data replicated continuously
+    - RTO: minutes (just scale up capacity). RPO: seconds
+    - Cost: medium (always running infrastructure in both regions)
+
+    Architecture:
+    Primary (us-east-1):   10 ECS tasks + RDS Primary (db.r5.4xlarge)
+    DR (us-west-2):         2 ECS tasks + RDS Read Replica (db.r5.large) — always running
+
+    Failover: Scale up DR region ECS tasks + promote DB, update Route53.
+
+  STRATEGY 4: ACTIVE-ACTIVE (MULTI-SITE)
+  ────────────────────────────────────────
+    - Full production in BOTH regions simultaneously
+    - Traffic split across regions (Route53 latency-based or geolocation routing)
+    - No failover — traffic automatically reroutes if one region goes down
+    - RTO: near-zero (Route53 health check failover). RPO: near-zero
+    - Cost: high (2x infrastructure)
+    - Challenge: DATA CONSISTENCY across regions
+
+    Architecture:
+    Route53 (latency routing)
+         ├── us-east-1: ALB → ECS → Aurora Global (Primary)
+         └── eu-west-1: ALB → ECS → Aurora Global (Secondary, can read/write)
+
+================================================================
+4. KEY SERVICES FOR MULTI-REGION
+================================================================
+
+  DATABASE: AURORA GLOBAL DATABASE
+  ─────────────────────────────────
+    - Primary region: read/write
+    - Up to 5 secondary regions: replicated with < 1 second lag (typically < 100ms)
+    - Managed failover: promote secondary to primary in < 1 minute
+    - Write forwarding: secondaries can forward writes to primary (Active-Active-like)
+    
+    Java Spring Boot config for multi-region Aurora:
+    // Use Aurora cluster endpoint for reads in local region
+    // Use Aurora writer endpoint for writes (always primary region)
+    
+    spring:
+      datasource:
+        # Read from local region replica (low latency)
+        url: jdbc:mysql://cluster-ro.us-east-1.rds.amazonaws.com/mydb
+    
+    // Separate DataSource for writes:
+    @Primary
+    @Bean
+    public DataSource writeDataSource() {
+        return DataSourceBuilder.create()
+            .url("jdbc:mysql://cluster.us-east-1.rds.amazonaws.com/mydb")
+            .build();
+    }
+    
+    @Bean
+    @Qualifier("readDataSource")
+    public DataSource readDataSource() {
+        return DataSourceBuilder.create()
+            .url("jdbc:mysql://cluster-ro.eu-west-1.rds.amazonaws.com/mydb")
+            .build();
+    }
+
+  DATABASE: DYNAMODB GLOBAL TABLES
+  ──────────────────────────────────
+    - Multi-region, multi-master (write in any region)
+    - Automatic replication to all regions (typically < 1 second)
+    - Conflict resolution: last-writer-wins (by timestamp)
+    - Enable on existing table: add replica regions in DynamoDB console
+    
+    Java SDK — reads automatically from local region:
+    DynamoDbClient dynamo = DynamoDbClient.builder()
+        .region(Region.EU_WEST_1)   // Always reads from closest replica
+        .build();
+    
+    // Writes go to the local region — replicated automatically
+
+  DNS: ROUTE53 ROUTING POLICIES
+  ───────────────────────────────
+    ┌────────────────────┬──────────────────────────────────────────────────────┐
+    │ Policy             │ Use Case                                             │
+    ├────────────────────┼──────────────────────────────────────────────────────┤
+    │ Latency-based      │ Route to region with lowest latency for user         │
+    │ Geolocation        │ EU users → eu-west-1, US users → us-east-1           │
+    │ Failover           │ Primary + standby. Auto-failover on health check fail│
+    │ Weighted           │ Split traffic (canary: 10% new region, 90% old)      │
+    └────────────────────┴──────────────────────────────────────────────────────┘
+
+    HEALTH CHECKS:
+    - Route53 health check: HTTP(S) endpoint check every 10–30 seconds
+    - Failover policy: if primary health check fails → auto-route to secondary
+    - Combined health checks: monitor CloudWatch alarms (DB, ECS, Lambda errors)
+
+  STORAGE: S3 CROSS-REGION REPLICATION (CRR)
+  ────────────────────────────────────────────
+    - Replicates objects to another region bucket automatically
+    - RPO: seconds–minutes (asynchronous replication)
+    - Replicate all objects or filter by prefix/tag
+    - Enable versioning on both source and destination buckets
+    
+    Java pattern: write to us-east-1 S3, reads in eu-west-1 come from replica.
+    Use CloudFront in front of S3 for global low-latency reads.
+
+  MESSAGING: SQS + SNS MULTI-REGION
+  ───────────────────────────────────
+    - SQS and SNS are regional services — no built-in cross-region replication
+    - Pattern: publish to SNS in primary, fan out to SQS in both regions
+    - Or: use EventBridge with cross-region event buses
+    
+    EventBridge cross-region:
+    Primary bus (us-east-1) → EventBridge Rule → Target: Event Bus (eu-west-1)
+    → SQS → Lambda/ECS consumer in eu-west-1
+
+================================================================
+5. JAVA APPLICATION DESIGN FOR MULTI-REGION
+================================================================
+
+  PRINCIPLE: Applications must be region-aware but not region-coupled.
+
+  1. EXTERNALIZE REGION-SPECIFIC CONFIG:
+     Use environment variables or SSM Parameter Store (per-region namespace):
+     /myapp/us-east-1/db-url   → Aurora primary endpoint
+     /myapp/eu-west-1/db-url   → Aurora replica endpoint
+     
+     @Value("${db.url}")   // injected per region at deploy time
+     private String dbUrl;
+
+  2. IDEMPOTENT OPERATIONS:
+     In Active-Active, the same event may arrive in both regions.
+     Use idempotency keys (orderId, requestId) in DB operations:
+     
+     INSERT INTO orders (order_id, ...) VALUES (?) ON CONFLICT (order_id) DO NOTHING;
+     // DynamoDB: use condition expression to check item doesn't exist
+
+  3. CIRCUIT BREAKER FOR CROSS-REGION CALLS:
+     If your service calls another region's API, use Resilience4j circuit breaker.
+     Never let a slow cross-region call cascade into your latency.
+
+  4. READ LOCAL, WRITE GLOBAL:
+     Best pattern for active-active:
+     - Reads from local region replica (low latency)
+     - Writes to primary region or DynamoDB Global Tables (any region)
+     
+     @Transactional(readOnly = true)
+     public Order getOrder(String id) {
+         return readOnlyRepository.findById(id).orElseThrow();
+         // Backed by local Aurora read replica
+     }
+     
+     @Transactional
+     public Order createOrder(CreateOrderRequest req) {
+         return writeRepository.save(new Order(req));
+         // Backed by Aurora primary (or DynamoDB Global Table local write)
+     }
+
+  5. AVOID DISTRIBUTED TRANSACTIONS:
+     Never use 2PC across regions — extremely slow and failure-prone.
+     Use eventual consistency + compensating transactions (Saga pattern).
+
+================================================================
+6. INTERVIEW QUESTIONS
+================================================================
+
+Q: What is the difference between RTO and RPO? How do they influence architecture?
+
+A: RTO (Recovery Time Objective) is the maximum acceptable downtime after a 
+   failure. RPO (Recovery Point Objective) is the maximum acceptable data loss. 
+   Low RTO requires always-running infrastructure in DR (Warm Standby or Active-
+   Active). Low RPO requires continuous data replication (Aurora Global DB, 
+   DynamoDB Global Tables, S3 CRR). The lower these objectives, the higher the 
+   cost. Backup & Restore is cheapest but has high RTO/RPO. Active-Active is 
+   most resilient but most expensive (2x infrastructure).
+
+---
+
+Q: How does Aurora Global Database work and how do you use it in a Java app?
+
+A: Aurora Global DB has one primary region (read/write) and up to 5 secondary 
+   regions (read replicas) with < 1 second replication lag. Managed failover 
+   promotes a secondary to primary in < 1 minute. In Java Spring Boot: configure 
+   two DataSources — one pointing to the local region's reader endpoint (low 
+   latency reads) and one to the primary writer endpoint (writes). Use Spring's 
+   @Transactional(readOnly=true) to route reads vs. writes, or use read/write 
+   routing with AbstractRoutingDataSource.
+
+---
+
+Q: Explain Active-Active vs Active-Passive multi-region. When do you choose each?
+
+A: Active-Passive: traffic serves from one region; second region is standby 
+   (warm or pilot light). Failover required to switch traffic. Lower cost but 
+   some downtime during failover. Good for most applications that can tolerate 
+   minutes of downtime.
+   Active-Active: both regions serve live traffic simultaneously. Route53 routes 
+   users to nearest region. No failover needed — Route53 health checks auto-reroute. 
+   Requires careful data design (DynamoDB Global Tables, Aurora write forwarding) 
+   to handle writes in multiple regions. Choose Active-Active for < 1 minute RTO 
+   requirements or for globally distributed user bases with latency SLAs.
+
+---
+
+Q: What is the key challenge of Active-Active multi-region and how do you solve it?
+
+A: Data consistency. When users in two regions can write simultaneously, you risk 
+   conflicts (same record updated differently). Solutions:
+   1. DynamoDB Global Tables: last-writer-wins conflict resolution (by timestamp).
+      Design keys so the same record is only written from one region (e.g., 
+      home region per user/tenant).
+   2. Aurora Global DB write forwarding: secondary regions forward writes to 
+      primary — no true multi-master but transparent to app.
+   3. Eventual consistency + Saga: accept that different regions see slightly 
+      stale data, use compensating transactions for conflicts.
+   4. CQRS: reads are local (stale OK), writes go to a single global write service.

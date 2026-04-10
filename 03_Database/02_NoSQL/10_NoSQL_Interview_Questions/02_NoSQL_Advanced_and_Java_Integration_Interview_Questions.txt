@@ -1,0 +1,377 @@
+NoSQL ADVANCED & JAVA INTEGRATION — INTERVIEW QUESTIONS & ANSWERS
+(For Java Developers with 7+ Years Experience)
+===========================================================================================================
+
+Q1. How does Spring Data MongoDB work? What are its key features?
+-----------------------------------------------------------------
+Spring Data MongoDB provides a high-level abstraction over MongoDB Java driver.
+
+Key Components:
+  MongoTemplate:    Low-level MongoDB operations. Flexible but verbose.
+  MongoRepository:  JPA-like repository interfaces with derived query methods.
+  @Document:        Maps Java class to MongoDB collection.
+  @Id:              Maps field to _id field.
+  @Field:           Custom field name mapping.
+
+Example:
+  @Document(collection = "employees")
+  public class Employee {
+    @Id
+    private String id;
+    @Field("dept_name")
+    private String department;
+    private double salary;
+    // getters, setters
+  }
+
+  public interface EmployeeRepository extends MongoRepository<Employee, String> {
+    List<Employee> findByDepartmentAndSalaryGreaterThan(String dept, double salary);
+    
+    @Query("{ 'department': ?0, 'salary': { $gt: ?1 } }")
+    List<Employee> findHighEarners(String dept, double salary);
+  }
+
+Aggregation Pipeline in Spring Data:
+  Aggregation agg = Aggregation.newAggregation(
+    Aggregation.match(Criteria.where("department").is("Engineering")),
+    Aggregation.group("department").avg("salary").as("avgSalary"),
+    Aggregation.sort(Sort.Direction.DESC, "avgSalary")
+  );
+  AggregationResults<Map> results = mongoTemplate.aggregate(agg, "employees", Map.class);
+
+---
+
+Q2. How does Spring Data Redis work? Explain caching with Spring's cache abstraction.
+-------------------------------------------------------------------------------------
+Spring Data Redis abstracts the Jedis/Lettuce Redis clients.
+
+Connection Setup (Spring Boot auto-configuration):
+  spring.data.redis.host=localhost
+  spring.data.redis.port=6379
+  spring.data.redis.password=secret
+
+Using RedisTemplate:
+  @Autowired
+  private RedisTemplate<String, Object> redisTemplate;
+
+  // Set with TTL
+  redisTemplate.opsForValue().set("user:123", user, Duration.ofHours(1));
+
+  // Get
+  User user = (User) redisTemplate.opsForValue().get("user:123");
+
+Spring Cache Abstraction (declarative):
+  @EnableCaching  // in @Configuration class
+
+  @Cacheable(value = "users", key = "#id")
+  public User findById(Long id) {
+    return userRepository.findById(id).orElseThrow();  // Not called on cache hit
+  }
+
+  @CachePut(value = "users", key = "#user.id")
+  public User updateUser(User user) {
+    return userRepository.save(user);  // Always executes, updates cache
+  }
+
+  @CacheEvict(value = "users", key = "#id")
+  public void deleteUser(Long id) {
+    userRepository.deleteById(id);  // Removes from cache
+  }
+
+Key consideration: Cache key design is critical. Include all parameters that affect the result.
+Use TTL (time-to-live) to prevent stale data. Don't cache null values without explicit handling.
+
+---
+
+Q3. How would you implement distributed locking with Redis in Java?
+-------------------------------------------------------------------
+Distributed lock ensures only ONE instance of a service executes a critical section at a time.
+
+Naive approach (wrong):
+  SET lock "acquired"    // Two instances could race between check and set!
+
+Correct approach (atomic SETNX + EXPIRE):
+  // Using Redis command: SET key value NX EX seconds
+  Boolean acquired = redisTemplate.opsForValue()
+      .setIfAbsent("lock:payment", uniqueId, Duration.ofSeconds(30));
+
+  if (Boolean.TRUE.equals(acquired)) {
+    try {
+      // Critical section
+      processPayment();
+    } finally {
+      // Only release YOUR lock (check value = uniqueId before deleting)
+      String script = "if redis.call('get',KEYS[1]) == ARGV[1] then "
+                    + "return redis.call('del',KEYS[1]) else return 0 end";
+      redisTemplate.execute(new DefaultRedisScript<>(script, Long.class),
+                            List.of("lock:payment"), uniqueId);
+    }
+  }
+
+Use Redisson library for production:
+  RLock lock = redissonClient.getLock("payment-lock");
+  lock.lock(30, TimeUnit.SECONDS);
+  try { processPayment(); } finally { lock.unlock(); }
+
+Redlock: Multi-node locking across N Redis instances for fault tolerance.
+Acquire lock from majority (N/2 + 1) nodes simultaneously.
+
+---
+
+Q4. What is the N+1 problem in MongoDB? How do you fix it?
+----------------------------------------------------------
+N+1 in MongoDB occurs when you make N separate queries for embedded/referenced docs.
+
+Example (N+1 with references):
+  List<Order> orders = orderRepo.findAll();    // 1 query
+  for (Order o : orders) {
+    Customer c = customerRepo.findById(o.getCustomerId()).get();  // N queries!
+    // process c
+  }
+
+Fixes:
+
+  1. Embedding (best): Include customer data inside order document.
+     No additional query needed.
+
+  2. $lookup (aggregation join):
+     db.orders.aggregate([
+       { $lookup: {
+           from: "customers",
+           localField: "customerId",
+           foreignField: "_id",
+           as: "customer"
+         }
+       }
+     ]);
+
+  3. Batch loading:
+     List<String> customerIds = orders.stream().map(Order::getCustomerId).toList();
+     List<Customer> customers = customerRepo.findAllById(customerIds);  // Single query
+     Map<String, Customer> customerMap = customers.stream()
+         .collect(Collectors.toMap(Customer::getId, c -> c));
+
+---
+
+Q5. How does Cassandra handle data modeling differently from SQL?
+----------------------------------------------------------------
+Cassandra's golden rule: MODEL YOUR DATA BASED ON YOUR QUERIES, not based on entity relationships.
+
+In SQL: Model entities, create relationships. Write queries to join.
+In Cassandra: Write queries first, design tables to satisfy those queries.
+
+Key Data Modeling Rules:
+  1. Primary Key determines data distribution and retrieval.
+     Partition Key: which node stores the data (must be in WHERE clause).
+     Clustering Key: order of data within a partition (range queries).
+
+  2. Denormalize aggressively. Duplicate data is acceptable.
+     No JOINs in Cassandra — embed what you need per query.
+
+  3. One table per query pattern.
+
+Example:
+  Requirement: "Find orders by customer" AND "Find orders by product"
+  
+  SQL: One orders table with indexes on customer_id and product_id.
+  
+  Cassandra:
+    -- Table 1: for "orders by customer"
+    CREATE TABLE orders_by_customer (
+      customer_id UUID,
+      order_date TIMESTAMP,
+      order_id UUID,
+      total DECIMAL,
+      PRIMARY KEY (customer_id, order_date, order_id)
+    ) WITH CLUSTERING ORDER BY (order_date DESC);
+
+    -- Table 2: for "orders by product"
+    CREATE TABLE orders_by_product (
+      product_id UUID,
+      order_date TIMESTAMP,
+      order_id UUID,
+      customer_id UUID,
+      PRIMARY KEY (product_id, order_date, order_id)
+    );
+
+  Write to BOTH tables on every order create/update — denormalized.
+
+Cassandra anti-patterns:
+  ❌ Using ALLOW FILTERING (full partition scan)
+  ❌ Queries without partition key in WHERE clause
+  ❌ Large partitions (millions of rows in one partition → hotspot)
+  ❌ Using secondary indexes for high-cardinality columns
+
+---
+
+Q6. How does Elasticsearch differ from a relational database? When to use each?
+-------------------------------------------------------------------------------
+| Aspect          | Elasticsearch              | Relational DB             |
+|-----------------|---------------------------|---------------------------|
+| Storage         | Inverted index            | B-Tree / Heap files       |
+| Schema          | Dynamic mapping (flexible) | Fixed schema              |
+| Query Language  | Query DSL (JSON)          | SQL                       |
+| Joins           | Nested docs / parent-child | Full JOIN support         |
+| Transactions    | None (document-level)     | Full ACID                 |
+| Consistency     | Eventually consistent      | Strong (configurable)     |
+| Search          | Best in class              | Limited (LIKE is slow)    |
+| Analytics       | Aggregations (real-time)   | GROUP BY (heavy)          |
+
+Use Elasticsearch when:
+  - Full-text search across millions of documents
+  - Log aggregation and analysis (ELK Stack)
+  - Autocomplete and fuzzy search
+  - Real-time analytics dashboards
+
+Use RDBMS when:
+  - Transactional integrity is needed
+  - Complex relationships and joins
+  - Authoritative data store
+
+Common architecture: RDBMS as system of record → Elasticsearch as search index.
+  Sync via Change Data Capture (CDC), Kafka, or Debezium.
+
+---
+
+Q7. How do you handle Redis cache invalidation? What are the common pitfalls?
+----------------------------------------------------------------------------
+Cache invalidation is one of the hardest problems in computer science.
+
+Strategies:
+  1. TTL-based expiration: Simplest. Cache expires automatically after N seconds.
+     Risk: Stale data window = TTL duration.
+
+  2. Event-driven invalidation: On every DB write, explicitly evict/update cache.
+     @CacheEvict(value = "products", key = "#id") on update/delete methods.
+     Risk: Race conditions if two services update DB simultaneously.
+
+  3. Write-through: On DB write, update cache. Always consistent.
+     Higher write latency.
+
+Common pitfalls:
+
+  Cache Stampede (Thundering Herd):
+    Many requests miss cache simultaneously → all hit DB at once.
+    Fix: Use cache locking (only one request populates cache, others wait).
+         Probabilistic early expiration (refresh before TTL expires).
+
+  Cache Poisoning:
+    Bug in code causes wrong data to be cached.
+    Fix: Validate data before caching. Monitor cache hit/miss rates.
+
+  Stale-while-revalidate:
+    Return stale cached data while asynchronously refreshing.
+    Good UX — no latency spike during refresh.
+
+  Cold start:
+    After cache restart, all requests miss → DB overload.
+    Fix: Pre-warm cache on startup with most accessed data.
+
+---
+
+Q8. What is the difference between Redis Cluster and Redis Sentinel?
+--------------------------------------------------------------------
+REDIS SENTINEL (High Availability):
+  - Monitors Redis master and replicas
+  - Automatic failover: promotes replica to master on failure
+  - No sharding — all data on one master (replicas are read-only copies)
+  - Good for: HA without needing to scale data across nodes
+
+  Components: Sentinel processes monitor Redis instances, vote on failover.
+  Quorum: Majority of sentinels must agree before failover.
+
+REDIS CLUSTER (Horizontal Scalability + HA):
+  - Data automatically sharded across 16384 hash slots across multiple nodes
+  - Each node handles a subset of hash slots
+  - Automatic failover (no sentinel needed)
+  - Supports multiple masters + replicas per master
+
+  Use when: Dataset exceeds single-node memory, OR need to distribute write load.
+
+Summary:
+  Need HA only (data fits in one node)? → Redis Sentinel
+  Need HA + horizontal scaling?         → Redis Cluster
+
+Spring Boot:
+  Sentinel: spring.data.redis.sentinel.master + nodes
+  Cluster:  spring.data.redis.cluster.nodes
+
+---
+
+Q9. How do you sync data between an RDBMS and Elasticsearch?
+------------------------------------------------------------
+Common approaches:
+
+  1. Dual Write (application level):
+     On every DB write, also write to Elasticsearch.
+     PRO: Simple. CON: Risk of inconsistency if ES write fails. Tight coupling.
+
+  2. Change Data Capture (CDC) with Debezium:
+     Debezium reads MySQL/PostgreSQL WAL/binlog → publishes change events to Kafka.
+     Kafka consumer reads events → writes to Elasticsearch.
+     PRO: Decoupled, reliable, handles all DB changes (including direct DB updates).
+     CON: More infrastructure.
+
+  3. Scheduled Sync (batch):
+     Periodically query DB for recently modified records → sync to ES.
+     PRO: Simple. CON: Near-real-time only, complex delta detection, missed deletes.
+
+  4. Application event-driven:
+     Publish domain events (Spring ApplicationEventPublisher or outbox pattern)
+     → async consumer writes to ES.
+
+Best practice for production: CDC with Debezium + Kafka. Most reliable and decoupled.
+
+---
+
+Q10. What are the main differences between MongoDB transactions and Cassandra's "transactions"?
+----------------------------------------------------------------------------------------------
+MongoDB Multi-Document Transactions:
+  - Full ACID transactions across multiple documents/collections
+  - Added in MongoDB 4.0 (replica sets) and 4.2 (sharded clusters)
+  - Works like RDBMS transactions: session.startTransaction(), commit(), abort()
+  - Performance overhead compared to single-document operations
+  - Single-document operations are ALWAYS atomic in MongoDB
+
+Cassandra's Lightweight Transactions (LWT):
+  - Uses Paxos consensus protocol for compare-and-set (CAS) operations
+  - IF NOT EXISTS or IF column = value conditions
+  - Example: INSERT INTO users(id, email) VALUES(1, 'a@b.com') IF NOT EXISTS;
+  - Only within a single partition — NOT multi-partition transactions
+  - 4-6x slower than regular writes (Paxos rounds)
+  - NOT full ACID; only provides linearizability for single-partition CAS
+
+Key differences:
+  MongoDB: Full multi-document ACID (PostgreSQL-like).
+  Cassandra: No true multi-row transactions; LWTs only for compare-and-set.
+
+For multi-partition operations in Cassandra:
+  → Use the SAGA pattern at the application layer.
+  → Accept eventual consistency where appropriate.
+
+---
+
+Q11. What NoSQL database would you choose for a real-time leaderboard?
+----------------------------------------------------------------------
+Answer: Redis Sorted Set (ZSET)
+
+Why Redis Sorted Set is perfect:
+  - ZADD leaderboard:global score userId    -- O(log N) to add/update
+  - ZRANK leaderboard:global userId         -- O(log N) to get rank
+  - ZRANGE leaderboard:global 0 9 WITHSCORES  -- O(log N + M) to get top 10
+  - ZSCORE leaderboard:global userId        -- O(1) to get score
+  - ZINCRBY leaderboard:global points userId -- O(log N) to increment score
+
+All operations are extremely fast even with millions of entries.
+
+Full implementation considerations:
+  1. Partition by time period (daily, weekly, all-time):
+       ZADD leaderboard:2024-04-09 score userId
+  2. Use pipeline/multi-exec for atomic multi-command updates
+  3. Persist to DB asynchronously (Redis is in-memory — set up persistence RDB/AOF)
+  4. Use Redis Cluster if leaderboard exceeds single-node memory
+
+MongoDB alternative (with less efficiency):
+  Use aggregation with $sort + $limit. Works but slower than Redis for real-time updates.
+
+---

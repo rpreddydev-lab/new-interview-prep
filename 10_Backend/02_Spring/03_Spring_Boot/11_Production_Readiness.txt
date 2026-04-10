@@ -1,0 +1,273 @@
+======================================================
+SPRING BOOT PRODUCTION READINESS
+======================================================
+
+1. GRACEFUL SHUTDOWN
+──────────────────────
+Graceful shutdown ensures in-flight requests are completed before the app stops.
+
+Enable (Spring Boot 2.3+):
+  application.yml:
+    server:
+      shutdown: graceful   # default is "immediate"
+
+    spring:
+      lifecycle:
+        timeout-per-shutdown-phase: 30s  # max wait before forcing shutdown
+
+How it works:
+  1. SIGTERM received (Kubernetes sends this before SIGKILL)
+  2. Spring context closes: @PreDestroy, ApplicationContext.close()
+  3. Embedded Tomcat stops accepting new connections
+  4. Existing requests given `timeout-per-shutdown-phase` to complete
+  5. If timeout exceeded: remaining requests aborted
+
+With Kubernetes:
+  spec:
+    containers:
+      - lifecycle:
+          preStop:
+            exec:
+              command: ["sleep", "5"]    # Give k8s time to remove from load balancer
+    terminationGracePeriodSeconds: 60    # Must be > Spring's timeout
+
+  Why preStop sleep? Kubernetes takes a few seconds to update endpoints.
+  Without it, new requests arrive during shutdown window.
+
+
+2. LIVENESS AND READINESS PROBES
+──────────────────────────────────
+Spring Boot Actuator exposes probe-specific endpoints (2.3+):
+
+application.yml:
+  management:
+    endpoint:
+      health:
+        probes:
+          enabled: true
+    health:
+      livenessstate:
+        enabled: true
+      readinessstate:
+        enabled: true
+
+Endpoints:
+  GET /actuator/health/liveness   → HealthIndicator: LIVE or BROKEN
+  GET /actuator/health/readiness  → HealthIndicator: ACCEPTING_TRAFFIC or REFUSING_TRAFFIC
+
+Liveness probe (Is the app alive?):
+  - Failing liveness → Kubernetes restarts the pod
+  - Should only fail on UNRECOVERABLE errors (deadlock, corrupted state)
+  - Do NOT fail on transient issues (DB down, Redis down)
+
+Readiness probe (Is the app ready to serve traffic?):
+  - Failing readiness → Kubernetes removes pod from load balancer (no restart)
+  - Should fail when: DB is unavailable, dependent service is down
+  - Passes again automatically when dependencies recover
+
+Kubernetes config:
+  livenessProbe:
+    httpGet:
+      path: /actuator/health/liveness
+      port: 8080
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    failureThreshold: 3
+
+  readinessProbe:
+    httpGet:
+      path: /actuator/health/readiness
+      port: 8080
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    failureThreshold: 3
+
+Custom health indicators:
+  @Component
+  public class DatabaseHealthIndicator extends AbstractHealthIndicator {
+      @Override
+      protected void doHealthCheck(Health.Builder builder) {
+          // check DB connectivity
+          builder.up().withDetail("db", "PostgreSQL OK");
+      }
+  }
+
+Programmatic state change:
+  @Autowired
+  private ApplicationEventPublisher eventPublisher;
+
+  // Mark as not ready (e.g., maintenance mode)
+  eventPublisher.publishEvent(new AvailabilityChangeEvent<>(this,
+      ReadinessState.REFUSING_TRAFFIC));
+
+  // Mark as ready again
+  eventPublisher.publishEvent(new AvailabilityChangeEvent<>(this,
+      ReadinessState.ACCEPTING_TRAFFIC));
+
+
+3. LAZY INITIALIZATION
+───────────────────────
+By default, Spring Boot eagerly initializes all beans at startup.
+Lazy init defers bean creation until first use → faster startup.
+
+application.yml:
+  spring:
+    main:
+      lazy-initialization: true
+
+Or per-bean:
+  @Lazy
+  @Service
+  public class HeavyService { ... }
+
+Pros:
+  - Faster startup (important for serverless, frequent pod restarts)
+  - Reduced initial memory footprint
+
+Cons:
+  - First request is slower (beans initialized on demand)
+  - Configuration errors discovered at runtime, not startup
+  - Not recommended for health-critical beans
+
+Recommendation:
+  - Use in development or serverless; prefer eager init in production
+  - If using lazy init in prod: use readiness probes to mask init latency
+
+
+4. DOCKER LAYERED JARS
+────────────────────────
+Spring Boot 2.3+ supports layered JARs for more efficient Docker caching.
+
+Why layered JARs?
+  Traditional fat JAR: dependencies + app code in one layer.
+  Code changes → entire layer invalidated → slow rebuilds.
+
+  Layered: dependencies, spring-boot-loader, snapshot-dependencies, app-code
+  Code changes → only app-code layer rebuilt → fast, small push.
+
+application:
+  build:
+    layers:
+      enabled: true  # (default in Spring Boot 2.3+)
+
+Extract layers:
+  java -Djarmode=layertools -jar app.jar extract
+
+Dockerfile using layers:
+  FROM eclipse-temurin:21-jre AS builder
+  WORKDIR /app
+  COPY app.jar app.jar
+  RUN java -Djarmode=layertools -jar app.jar extract
+
+  FROM eclipse-temurin:21-jre
+  WORKDIR /app
+  COPY --from=builder /app/dependencies ./
+  COPY --from=builder /app/spring-boot-loader ./
+  COPY --from=builder /app/snapshot-dependencies ./
+  COPY --from=builder /app/application ./
+
+  ENTRYPOINT ["java", "org.springframework.boot.loader.JarLauncher"]
+
+Build layer order (least to most volatile):
+  1. dependencies          (3rd-party libs — rarely change)
+  2. spring-boot-loader    (Spring Boot loader — rarely changes)
+  3. snapshot-dependencies (SNAPSHOT libs — change occasionally)
+  4. application           (your code — changes frequently)
+
+
+5. CLOUD NATIVE BUILDPACKS (CNB)
+──────────────────────────────────
+No Dockerfile required. Spring Boot Maven/Gradle plugin builds OCI images.
+
+Maven:
+  ./mvnw spring-boot:build-image -Dspring-boot.build-image.imageName=myapp:latest
+
+Gradle:
+  ./gradlew bootBuildImage --imageName=myapp:latest
+
+Features:
+  - Auto-detects JDK version, uses Bellsoft Liberica or Temurin
+  - Produces layered image automatically
+  - Adds memory calculator for container-aware JVM settings
+  - Produces SBOM (Software Bill of Materials)
+
+Configure Buildpacks:
+  <plugin>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-maven-plugin</artifactId>
+    <configuration>
+      <image>
+        <name>myapp:${project.version}</name>
+        <builder>paketobuildpacks/builder-jammy-base</builder>
+        <env>
+          <BP_JVM_VERSION>21</BP_JVM_VERSION>
+          <BPE_JAVA_TOOL_OPTIONS>-XX:+UseZGC -XX:MaxRAMPercentage=75</BPE_JAVA_TOOL_OPTIONS>
+        </env>
+      </image>
+    </configuration>
+  </plugin>
+
+Paketo Buildpacks (most used):
+  - paketobuildpacks/builder-jammy-base    → Ubuntu Jammy
+  - paketobuildpacks/builder-jammy-full    → includes more tools
+
+
+6. STARTUP TIME OPTIMIZATION
+──────────────────────────────
+Techniques to reduce Spring Boot startup time:
+  a) Lazy initialization (see #3)
+  b) Class Data Sharing (CDS):
+       java -XX:ArchiveClassesAtExit=app.jsa -jar app.jar
+       java -XX:SharedArchiveFile=app.jsa -jar app.jar
+  c) Spring AOT (Ahead-of-Time) processing — Spring Boot 3+:
+       Generates proxy classes and bean configs at build time
+       Reduces runtime reflection overhead
+  d) GraalVM Native Image — startup in milliseconds (see Spring Native section)
+  e) Reduce auto-configuration: exclude unused auto-configs:
+       @SpringBootApplication(exclude = {DataSourceAutoConfiguration.class})
+  f) Use -XX:TieredStopAtLevel=1 for short-lived containers (interpreter only)
+
+
+7. PRODUCTION CHECKLIST
+─────────────────────────
+  □ Set Xms = Xmx (or use MaxRAMPercentage in containers)
+  □ Enable GC logging
+  □ HeapDumpOnOutOfMemoryError
+  □ ExitOnOutOfMemoryError (restart pod vs limp on)
+  □ Graceful shutdown enabled
+  □ Liveness + readiness probes configured
+  □ Actuator secured (not publicly exposed)
+  □ Profiles configured (prod profile active)
+  □ Sensitive configs from Vault/Config Server (not in app.yml)
+  □ Connection pool properly sized (HikariCP)
+  □ Logging level set to WARN/ERROR in production
+  □ HTTPS enforced
+  □ CORS configured correctly
+  □ Rate limiting in place
+  □ Metrics exposed to Prometheus
+
+
+8. INTERVIEW QUESTIONS
+──────────────────────
+Q: What is the difference between liveness and readiness probes?
+A: Liveness checks if the app is alive; failure triggers a pod restart.
+   Readiness checks if the app can serve traffic; failure removes the pod
+   from the load balancer. Readiness is for transient issues; liveness
+   is for unrecoverable failures.
+
+Q: How does graceful shutdown work in Spring Boot + Kubernetes?
+A: Spring Boot waits for in-flight requests to complete (up to the configured
+   timeout). In Kubernetes: add a preStop lifecycle hook with sleep to allow
+   load balancer updates before Spring starts rejecting new connections.
+   terminationGracePeriodSeconds must exceed the Spring timeout.
+
+Q: What are layered JARs and why do they improve Docker build performance?
+A: Layered JARs split the fat JAR into layers by volatility. Dependencies
+   (rarely changed) are separate from app code (frequently changed).
+   Docker caches unchanged layers, so only the app code layer is rebuilt
+   and pushed on code changes.
+
+Q: How does Spring Boot Buildpacks differ from a Dockerfile?
+A: Buildpacks auto-detect language/runtime, apply best-practice base images,
+   add memory calculators, and produce layered OCI images without any Dockerfile.
+   They enforce reproducibility and security by using curated builder images.

@@ -1,0 +1,500 @@
+================================================================================
+GRAPHQL IN MICROSERVICES
+================================================================================
+
+WHAT IS GRAPHQL?
+-----------------
+GraphQL is a query language for APIs and a runtime for executing those queries.
+Developed by Facebook (2012), open-sourced in 2015.
+
+Instead of multiple REST endpoints, GraphQL exposes a SINGLE ENDPOINT (/graphql)
+where clients specify exactly what data they need.
+
+REST PROBLEM:
+  GET /users/123          → returns full user (over-fetching)
+  GET /users/123/orders   → separate call (N+1 problem)
+  GET /orders/456/items   → another call
+
+GRAPHQL SOLUTION:
+  POST /graphql
+  {
+    user(id: "123") {
+      name
+      email
+      orders(last: 5) {
+        id
+        status
+        items { productName quantity }
+      }
+    }
+  }
+  → One request, exactly the fields you asked for, no over-fetching
+
+────────────────────────────────────────────────────────────────────────────────
+
+GRAPHQL CORE CONCEPTS
+=======================
+
+Schema:       Contract between client and server (SDL — Schema Definition Language)
+Query:        Read operation (like GET)
+Mutation:     Write operation (like POST/PUT/DELETE)
+Subscription: Real-time updates (WebSocket-based)
+Resolver:     Function that fetches data for a field
+Type:         Object, Scalar (String, Int, Boolean, ID, Float), Enum, Interface, Union
+
+SCHEMA EXAMPLE:
+
+  # schema.graphqls
+  type Query {
+    order(id: ID!): Order
+    orders(customerId: ID!, status: OrderStatus): [Order!]!
+    product(id: ID!): Product
+  }
+
+  type Mutation {
+    createOrder(input: CreateOrderInput!): OrderResult!
+    cancelOrder(id: ID!): Order!
+    updateOrderStatus(id: ID!, status: OrderStatus!): Order!
+  }
+
+  type Subscription {
+    orderStatusUpdated(orderId: ID!): Order!
+  }
+
+  type Order {
+    id: ID!
+    status: OrderStatus!
+    customer: Customer!
+    items: [OrderItem!]!
+    totalAmount: Float!
+    createdAt: String!
+  }
+
+  type OrderItem {
+    product: Product!
+    quantity: Int!
+    unitPrice: Float!
+  }
+
+  type Customer {
+    id: ID!
+    name: String!
+    email: String!
+  }
+
+  type Product {
+    id: ID!
+    name: String!
+    price: Float!
+    inventory: Int!
+  }
+
+  enum OrderStatus { PENDING CONFIRMED SHIPPED DELIVERED CANCELLED }
+
+  input CreateOrderInput {
+    customerId: ID!
+    items: [OrderItemInput!]!
+    deliveryAddress: String!
+  }
+
+  input OrderItemInput {
+    productId: ID!
+    quantity: Int!
+  }
+
+  type OrderResult {
+    order: Order
+    errors: [String!]
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+SPRING BOOT + GRAPHQL SETUP
+==============================
+
+pom.xml:
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-graphql</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+  </dependency>
+  <!-- For WebSocket subscriptions -->
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-websocket</artifactId>
+  </dependency>
+
+application.yml:
+  spring:
+    graphql:
+      graphiql:
+        enabled: true          # Enable GraphiQL UI at /graphiql (dev only)
+      schema:
+        locations: classpath:graphql/**   # .graphqls files here
+      websocket:
+        path: /graphql-ws      # Subscriptions endpoint
+
+File structure:
+  src/main/resources/graphql/schema.graphqls
+
+────────────────────────────────────────────────────────────────────────────────
+
+GRAPHQL RESOLVERS — SPRING BOOT
+=================================
+
+  @Controller   // Not @RestController — Spring GraphQL uses @Controller
+  @RequiredArgsConstructor
+  public class OrderController {
+
+    private final OrderService orderService;
+
+    // ── Query Resolvers ──────────────────────────────────────────────────────
+
+    @QueryMapping                // Maps to Query.order(id: ID!)
+    public Order order(@Argument String id) {
+      return orderService.findById(id)
+          .orElseThrow(() -> new OrderNotFoundException(id));
+    }
+
+    @QueryMapping               // Maps to Query.orders(customerId, status)
+    public List<Order> orders(@Argument String customerId,
+                              @Argument OrderStatus status) {
+      return orderService.findByCustomer(customerId, status);
+    }
+
+    // ── Mutation Resolvers ───────────────────────────────────────────────────
+
+    @MutationMapping            // Maps to Mutation.createOrder(input)
+    public OrderResult createOrder(@Argument CreateOrderInput input) {
+      try {
+        Order order = orderService.createOrder(input);
+        return new OrderResult(order, null);
+      } catch (ValidationException e) {
+        return new OrderResult(null, List.of(e.getMessage()));
+      }
+    }
+
+    @MutationMapping
+    public Order cancelOrder(@Argument String id) {
+      return orderService.cancel(id);
+    }
+
+    // ── Subscription Resolver ────────────────────────────────────────────────
+
+    @SubscriptionMapping        // Maps to Subscription.orderStatusUpdated
+    public Flux<Order> orderStatusUpdated(@Argument String orderId) {
+      return orderEventPublisher.orderUpdates()
+          .filter(order -> order.getId().equals(orderId));
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+FIELD RESOLVERS (Schema-Field Mapping)
+========================================
+
+The N+1 PROBLEM: For each Order, resolving customer requires a DB call.
+100 orders → 100 customer queries. Solution: DataLoader (batching).
+
+  @Controller
+  @RequiredArgsConstructor
+  public class OrderFieldResolver {
+
+    private final CustomerService customerService;
+    private final ProductService productService;
+
+    // Maps to Order.customer field — called for each Order object
+    @SchemaMapping(typeName = "Order", field = "customer")
+    public Customer customer(Order order) {
+      // NAIVE — causes N+1 if 100 orders → 100 calls
+      return customerService.findById(order.getCustomerId());
+    }
+
+    // BETTER — BatchMapping uses DataLoader to batch calls
+    @BatchMapping(typeName = "Order", field = "customer")
+    public Map<Order, Customer> customers(List<Order> orders) {
+      // Called ONCE with all orders — returns map of Order → Customer
+      Set<String> customerIds = orders.stream()
+          .map(Order::getCustomerId)
+          .collect(Collectors.toSet());
+      Map<String, Customer> customerMap = customerService.findByIds(customerIds);
+      return orders.stream()
+          .collect(Collectors.toMap(
+              o -> o,
+              o -> customerMap.get(o.getCustomerId())));
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+GRAPHQL ERROR HANDLING
+========================
+
+  @ControllerAdvice
+  public class GraphQLExceptionHandler implements DataFetcherExceptionResolverAdapter {
+
+    @Override
+    protected GraphQLError resolveToSingleError(Throwable ex, DataFetchingEnvironment env) {
+      if (ex instanceof OrderNotFoundException e) {
+        return GraphqlErrorBuilder.newError(env)
+            .errorType(ErrorType.NOT_FOUND)
+            .message("Order not found: " + e.getId())
+            .extensions(Map.of("orderId", e.getId()))
+            .build();
+      }
+      if (ex instanceof AccessDeniedException) {
+        return GraphqlErrorBuilder.newError(env)
+            .errorType(ErrorType.FORBIDDEN)
+            .message("Access denied")
+            .build();
+      }
+      // Let Spring handle other exceptions
+      return null;
+    }
+  }
+
+GraphQL error response (unlike REST, status code is always 200):
+  {
+    "data": { "order": null },
+    "errors": [{
+      "message": "Order not found: ord-999",
+      "errorType": "NOT_FOUND",
+      "extensions": { "orderId": "ord-999" },
+      "locations": [{ "line": 2, "column": 3 }],
+      "path": ["order"]
+    }]
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+GRAPHQL SECURITY
+=================
+
+  @Configuration
+  @EnableWebSecurity
+  public class GraphQLSecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+      http
+        .authorizeHttpRequests(auth -> auth
+            .requestMatchers("/graphql").authenticated()   // All GraphQL requires auth
+            .requestMatchers("/graphiql").permitAll()      // Dev tool
+        )
+        .oauth2ResourceServer(OAuth2ResourceServerConfigurer::jwt);
+      return http.build();
+    }
+  }
+
+  // Field-level security with @PreAuthorize
+  @Controller
+  public class AdminOrderController {
+
+    @QueryMapping
+    @PreAuthorize("hasRole('ADMIN')")
+    public List<Order> allOrders() {
+      return orderService.findAll();
+    }
+
+    @MutationMapping
+    @PreAuthorize("hasRole('ORDER_MANAGER')")
+    public Order forceCompleteOrder(@Argument String id) {
+      return orderService.forceComplete(id);
+    }
+  }
+
+  // Accessing authenticated user in resolver
+  @QueryMapping
+  public List<Order> myOrders(@AuthenticationPrincipal Jwt jwt) {
+    String customerId = jwt.getSubject();
+    return orderService.findByCustomer(customerId, null);
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+GRAPHQL FEDERATION — DISTRIBUTED SCHEMA
+==========================================
+
+Problem: With many microservices, each has its own schema.
+         How do you provide a unified API to the frontend?
+
+Solution: GRAPHQL FEDERATION (Apollo Federation / DGS Federation)
+  - Each service defines its own schema + exposes it as a subgraph
+  - A Gateway (Router) merges all subgraphs into a SUPERGRAPH
+  - Clients query the gateway as if it were a single service
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                     Apollo Router                           │
+  │              (Supergraph — unified schema)                   │
+  └──────────┬───────────────┬────────────────┬────────────────┘
+             │               │                │
+      Order Subgraph    Customer Subgraph   Product Subgraph
+      (Order Service)  (Customer Service)  (Product Service)
+
+Each subgraph owns its types and extends shared types:
+
+  # Order Service schema
+  type Order @key(fields: "id") {
+    id: ID!
+    status: OrderStatus!
+    customer: Customer!    # Resolved by Customer Service via federation
+    items: [OrderItem!]!
+  }
+
+  # Customer Service schema
+  type Customer @key(fields: "id") {
+    id: ID!
+    name: String!
+    email: String!
+    orders: [Order!]!      # Resolved by Order Service via federation
+  }
+
+  extend type Query {
+    customer(id: ID!): Customer
+  }
+
+ALTERNATIVES TO FEDERATION:
+  - BFF (Backend for Frontend): Each frontend has its own aggregation service
+  - API Gateway with REST aggregation (simpler, less GraphQL-specific)
+  - Schema stitching (older, less recommended)
+
+────────────────────────────────────────────────────────────────────────────────
+
+GRAPHQL vs REST — WHEN TO CHOOSE
+====================================
+
+Choose GraphQL when:
+  ✓ Multiple clients (web, mobile, IoT) with different data needs
+  ✓ Data fetching from multiple sources in one call
+  ✓ Rapidly evolving API (clients can add fields without server changes)
+  ✓ BFF layer for frontend (replaces multiple REST calls)
+  ✓ Complex relationships between entities
+
+Choose REST when:
+  ✓ Simple CRUD with well-defined resources
+  ✓ Public API (cacheable with HTTP caching)
+  ✓ File uploads/downloads
+  ✓ Team unfamiliar with GraphQL
+  ✓ Webhooks and event notifications
+  ✓ Simple mobile app with few data needs
+
+GraphQL CAVEATS:
+  ✗ HTTP caching doesn't work out of the box (all requests are POST /graphql)
+  ✗ N+1 queries if DataLoader not used
+  ✗ Complex queries can be expensive — need query depth/complexity limiting
+  ✗ Learning curve for teams unfamiliar with GraphQL
+
+────────────────────────────────────────────────────────────────────────────────
+
+GRAPHQL PERFORMANCE — QUERY DEPTH LIMITING
+============================================
+
+Malicious or accidental deeply nested queries can kill performance:
+
+  # Dangerous query — deeply nested:
+  { orders { items { product { orders { items { product { ... } } } } } } }
+
+Solution: Query depth and complexity limits
+
+  @Configuration
+  public class GraphQLConfig {
+
+    @Bean
+    public Instrumentation maxQueryDepthInstrumentation() {
+      return new MaxQueryDepthInstrumentation(10);  // Max depth = 10
+    }
+
+    @Bean
+    public Instrumentation maxQueryComplexityInstrumentation() {
+      return new MaxQueryComplexityInstrumentation(200); // Max complexity score
+    }
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+TESTING GRAPHQL — SPRING BOOT
+================================
+
+  @SpringBootTest
+  @AutoConfigureHttpGraphQlTester
+  class OrderGraphQLTest {
+
+    @Autowired HttpGraphQlTester graphQlTester;
+
+    @MockBean OrderService orderService;
+
+    @Test
+    void query_order_byId_returnsOrder() {
+      when(orderService.findById("ord-123"))
+          .thenReturn(Optional.of(new Order("ord-123", OrderStatus.CONFIRMED, /* ... */)));
+
+      graphQlTester.documentName("get-order")   // loads get-order.graphql from test resources
+          .variable("id", "ord-123")
+          .execute()
+          .path("order.id").entity(String.class).isEqualTo("ord-123")
+          .path("order.status").entity(String.class).isEqualTo("CONFIRMED");
+    }
+
+    @Test
+    void mutation_createOrder_invalidInput_returnsErrors() {
+      graphQlTester.document("""
+          mutation {
+            createOrder(input: { customerId: "", items: [] }) {
+              order { id }
+              errors
+            }
+          }
+          """)
+          .execute()
+          .path("createOrder.errors[0]").entity(String.class)
+          .satisfies(error -> assertThat(error).contains("customerId"));
+    }
+  }
+
+  // Test document file: src/test/resources/graphql/get-order.graphql
+  // query GetOrder($id: ID!) {
+  //   order(id: $id) {
+  //     id
+  //     status
+  //     totalAmount
+  //   }
+  // }
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS — GRAPHQL
+================================
+
+Q: What problem does GraphQL solve compared to REST?
+A: REST suffers from over-fetching (getting more data than needed) and under-
+   fetching (needing multiple requests for related data). GraphQL lets clients
+   specify exactly what fields they need in a single request. Eliminates N+1
+   round trips for related entities.
+
+Q: What is the N+1 problem in GraphQL and how do you solve it?
+A: When resolving a list of Orders and each needs a Customer, a naive resolver
+   makes 1 query for orders + N queries for customers (N+1). Solution: DataLoader
+   (or Spring's @BatchMapping) — collects all customer IDs across the list, makes
+   a single batched DB call, and distributes results back to resolvers.
+
+Q: How does GraphQL handle errors differently from REST?
+A: In GraphQL, the HTTP status code is always 200 (even for errors). Errors are
+   returned in the `errors` array alongside partial data in `data`. This allows
+   partial success — some fields may resolve successfully while others have errors.
+
+Q: What is GraphQL Federation and when would you use it?
+A: Federation allows multiple microservices to each define a subgraph (partial schema).
+   An Apollo Router merges them into a supergraph. Clients query the router as a
+   single unified schema. Use it when multiple teams own different parts of the
+   schema and you want a unified GraphQL API without a single monolithic resolver.
+
+Q: How do you secure a GraphQL API?
+A: (1) Authenticate at the HTTP layer (JWT/OAuth2 via Spring Security).
+   (2) Authorize at field/mutation level with @PreAuthorize.
+   (3) Limit query depth and complexity to prevent DoS attacks.
+   (4) Disable GraphiQL and introspection in production.
+   (5) Rate limit by user/IP at the gateway level.
+================================================================================

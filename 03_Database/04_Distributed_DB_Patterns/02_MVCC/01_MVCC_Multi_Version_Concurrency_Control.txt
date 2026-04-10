@@ -1,0 +1,227 @@
+MVCC — MULTI-VERSION CONCURRENCY CONTROL
+===========================================================================================================
+
+WHAT IS MVCC?
+--------------
+MVCC (Multi-Version Concurrency Control) is a concurrency control mechanism used by databases
+to allow multiple transactions to read and write data concurrently without blocking each other.
+
+Core idea: Instead of modifying data IN PLACE, the database keeps MULTIPLE VERSIONS of each row.
+Readers see an old snapshot. Writers create a new version. Readers and writers never block each other.
+
+Used by: PostgreSQL, MySQL InnoDB, Oracle, CockroachDB, MongoDB.
+
+===========================================================================================================
+1. HOW MVCC WORKS IN PostgreSQL
+===========================================================================================================
+
+Every row (tuple) in PostgreSQL has hidden system columns:
+  xmin: The transaction ID that CREATED this row version.
+  xmax: The transaction ID that DELETED or UPDATED this row version (0 if still current).
+  ctid:  Physical location of the row (file block, offset).
+
+When you UPDATE a row:
+  PostgreSQL does NOT overwrite the row in place.
+  1. Marks the old row's xmax with the current transaction ID (marks it "deleted").
+  2. Creates a NEW row with xmin = current transaction ID.
+  3. Both versions exist on disk simultaneously.
+
+When you DELETE a row:
+  Just sets xmax on the row. Row remains on disk until VACUUM cleans it up.
+
+Transaction Snapshots:
+  When a transaction starts, PostgreSQL captures a SNAPSHOT:
+    - Which transaction IDs are active (in-progress)
+    - Highest committed transaction ID at snapshot time
+
+  The transaction sees ONLY rows where:
+    xmin < snapshot's lowest active xmin (committed before snapshot)
+    xmax is not set, or xmax was NOT committed before snapshot
+
+  This means: Each transaction sees a consistent view of the database as of its start time.
+
+---
+
+EXAMPLE:
+  Initial state: Product(id=1, price=100, xmin=5, xmax=0)
+  
+  Transaction T10 reads product: Sees price=100 (xmin=5 committed, xmax=0).
+  
+  Transaction T11 updates price to 200:
+    Old row: Product(id=1, price=100, xmin=5, xmax=11)  -- marked deleted by T11
+    New row: Product(id=1, price=200, xmin=11, xmax=0)  -- new version by T11
+  
+  T11 commits.
+  
+  Transaction T10 still running:
+    Sees old row: Product(id=1, price=100, xmin=5, xmax=11)
+    T11 started AFTER T10's snapshot → T10 doesn't see T11's changes.
+    T10 still reads price=100 (consistent snapshot).
+  
+  Transaction T12 starts AFTER T11 commits:
+    Sees new row: Product(id=1, price=200, xmin=11, xmax=0).
+    T12 reads price=200.
+
+Result: T10 and T12 read CONCURRENTLY without blocking each other.
+        T11 wrote without blocking T10 or T12's reads.
+
+===========================================================================================================
+2. MVCC BENEFITS
+===========================================================================================================
+
+1. Readers don't block writers:
+   Traditional locking: Read locks block writes and vice versa.
+   MVCC: Readers see old snapshot → no lock needed → writers can proceed concurrently.
+
+2. Writers don't block readers:
+   Writers create new versions → existing readers see old versions → no blocking.
+
+3. No read locks:
+   SELECT statements in PostgreSQL/MySQL InnoDB acquire NO locks at default isolation levels.
+   This dramatically improves read concurrency.
+
+4. Snapshot isolation:
+   Each transaction sees a consistent view (no dirty reads, no non-repeatable reads at REPEATABLE READ).
+   Prevents most concurrency anomalies without locking.
+
+===========================================================================================================
+3. MVCC TRADE-OFFS AND CHALLENGES
+===========================================================================================================
+
+STORAGE OVERHEAD (PostgreSQL):
+  Old row versions remain on disk until cleaned up.
+  Long-running transactions prevent cleanup of old versions they might still read.
+  → Table bloat: table grows even if data hasn't grown.
+
+  Example:
+    T1 starts (long query running for 30 minutes).
+    Many UPDATEs happen to a high-traffic table during those 30 minutes.
+    All old versions must be retained because T1 might need to read them.
+    After T1 commits → VACUUM cleans up those old versions.
+    During those 30 minutes: table is bloated with millions of dead tuples.
+
+VACUUM (PostgreSQL):
+  Regular process that reclaims space from dead row versions.
+  Autovacuum: Runs automatically in background.
+  Must run regularly on high-update tables.
+  Tuning:
+    autovacuum_vacuum_threshold, autovacuum_vacuum_scale_factor
+    autovacuum_vacuum_cost_delay (throttle VACUUM I/O impact)
+
+UNDO LOG (MySQL InnoDB):
+  MySQL keeps old row versions in an UNDO LOG (not the table itself).
+  Less table bloat, but undo log can grow very large with long transactions.
+  innodb_max_undo_log_size controls this.
+
+TRANSACTION ID WRAPAROUND (PostgreSQL):
+  PostgreSQL uses 32-bit transaction IDs. After ~2 billion transactions, it wraps around.
+  VACUUM FREEZE marks rows as frozen (not subject to wraparound issues).
+  If not maintained → CATASTROPHIC database shutdown to prevent data corruption.
+  Monitor: pg_stat_user_tables.n_dead_tup, age(relfrozenxid).
+
+===========================================================================================================
+4. MVCC AND ISOLATION LEVELS
+===========================================================================================================
+
+MVCC enables different isolation levels without traditional locking:
+
+READ COMMITTED (PostgreSQL default):
+  Each statement within a transaction gets a FRESH snapshot at statement start.
+  Sees committed data up to that statement's time.
+  Non-repeatable reads ARE possible (different statements in same TX see different data).
+
+REPEATABLE READ (PostgreSQL):
+  Snapshot taken at TRANSACTION START (not per statement).
+  All reads within the transaction see the same snapshot.
+  Prevents dirty reads AND non-repeatable reads.
+  PostgreSQL REPEATABLE READ also prevents phantom reads (via snapshot, not gap locks).
+
+SERIALIZABLE (PostgreSQL):
+  Full serializable isolation. Detects serialization anomalies (write skew).
+  Uses SSI (Serializable Snapshot Isolation) — no locks, detects conflicts at commit.
+  PostgreSQL 9.1+ implements true serializable with SSI.
+
+MySQL InnoDB:
+  REPEATABLE READ: Uses MVCC for reads + gap locks for phantom prevention.
+  READ COMMITTED: Uses MVCC without gap locks.
+  SERIALIZABLE: Adds shared locks on SELECT.
+
+===========================================================================================================
+5. WRITE SKEW — THE MVCC ANOMALY
+===========================================================================================================
+
+Write Skew: Two transactions read the same rows, make decisions based on the read,
+            then update DIFFERENT rows. Neither violates isolation alone, but combined
+            they violate a constraint.
+
+Example: On-call scheduling system.
+  Constraint: At least 1 doctor must be on call.
+  Current state: Doctor A (on_call=true), Doctor B (on_call=true).
+
+  TX1: Reads both doctors — sees 2 on call → OK to take Doctor A off call.
+  TX2: Reads both doctors — sees 2 on call → OK to take Doctor B off call.
+  
+  TX1: UPDATE doctors SET on_call=false WHERE id='A';  -- Commits
+  TX2: UPDATE doctors SET on_call=false WHERE id='B';  -- Commits
+  
+  Result: 0 doctors on call! Constraint violated!
+  
+  Neither TX violated isolation (they updated different rows).
+  This is a "write skew" anomaly. Happens at REPEATABLE READ.
+
+Fix: Use SERIALIZABLE isolation (PostgreSQL SSI detects this conflict and aborts one TX).
+     Or: Use SELECT FOR UPDATE to lock both rows, preventing concurrent modification.
+
+===========================================================================================================
+6. MVCC IN MySQL InnoDB
+===========================================================================================================
+
+MySQL InnoDB implements MVCC via UNDO LOGS:
+
+  1. Current data is always the latest version in the table.
+  2. Old versions are stored in the UNDO LOG (rollback segments).
+  3. A "read view" is created per transaction (or per statement at READ COMMITTED).
+  4. DB reconstructs old versions by applying undo logs backwards as needed.
+
+Unlike PostgreSQL: Table doesn't accumulate old versions.
+Trade-off: Heavy read workloads accessing old versions require traversing undo log chains.
+           Very long undo log chains (many historical versions) slow reads.
+
+Monitor: innodb_history_list_length — how many undo log entries exist.
+High value: Long-running transactions or high update rate. Investigate.
+
+===========================================================================================================
+7. INTERVIEW Q&A
+===========================================================================================================
+
+Q: What is MVCC and why is it better than traditional locking?
+A: MVCC maintains multiple versions of rows, allowing readers to see old snapshots
+   while writers create new versions. Readers never block writers and writers never
+   block readers. Traditional locking requires exclusive locks for writes which block
+   reads, and shared locks for reads which block writes — much lower concurrency.
+
+Q: What is the role of VACUUM in PostgreSQL?
+A: PostgreSQL keeps old row versions on disk until explicitly cleaned up.
+   VACUUM reclaims space occupied by dead tuples (old row versions no longer visible
+   to any transaction). Autovacuum does this automatically. Without regular VACUUM:
+   tables bloat (wasted space) and eventually transaction ID wraparound threatens data.
+
+Q: What is transaction ID wraparound in PostgreSQL and why is it dangerous?
+A: PostgreSQL uses 32-bit transaction IDs (~2 billion). After 2 billion transactions,
+   the ID wraps around. Without VACUUM FREEZE, old rows could appear as "future" transactions
+   and become invisible. PostgreSQL monitors this and will shut down the database (refusing
+   writes) if wraparound is imminent. Solution: Ensure regular autovacuum runs, monitor
+   with pg_stat_user_tables.age(relfrozenxid).
+
+Q: What is write skew? Which isolation level prevents it?
+A: Write skew occurs when two transactions read overlapping data and update DIFFERENT rows
+   based on what they read, violating a global constraint. Neither transaction individually
+   breaks isolation rules, but their combined effect does.
+   Prevention: SERIALIZABLE isolation (PostgreSQL's SSI detects the conflict).
+   Alternatively, use SELECT FOR UPDATE to lock all rows that affect the decision.
+
+Q: What happens when a long-running read transaction exists in PostgreSQL?
+A: PostgreSQL cannot remove old row versions that might be visible to the long-running transaction.
+   Table bloat occurs — dead tuples accumulate, wasting disk space and slowing queries (page scans).
+   The undo log (equivalent in concept) also grows. Best practice: keep transactions short,
+   monitor pg_stat_activity for long-running transactions.

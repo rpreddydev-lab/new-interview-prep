@@ -1,0 +1,398 @@
+================================================================
+AWS FOR JAVA DEVELOPERS — COGNITO AND AUTHENTICATION
+Complete Interview Preparation Guide
+================================================================
+
+1. COGNITO — OVERVIEW
+================================================================
+
+  Amazon Cognito provides two distinct services:
+
+  ┌─────────────────────┬────────────────────────────────────────────────────────┐
+  │ Service             │ Purpose                                                │
+  ├─────────────────────┼────────────────────────────────────────────────────────┤
+  │ User Pools          │ AuthN — User directory. Handles sign-up, sign-in,      │
+  │                     │ MFA, password reset, JWT token issuance.               │
+  ├─────────────────────┼────────────────────────────────────────────────────────┤
+  │ Identity Pools      │ AuthZ — Federated identities. Exchange tokens for      │
+  │(Federated Identity) │ temporary AWS credentials (IAM role assumption).       │
+  └─────────────────────┴────────────────────────────────────────────────────────┘
+
+  INTERVIEW KEY:
+    User Pool  = authentication (WHO are you?) → issues JWT tokens
+    Identity Pool = authorization (WHAT AWS resources can you access?) → issues AWS creds
+
+================================================================
+2. USER POOLS — DEEP DIVE
+================================================================
+
+  TOKENS ISSUED BY COGNITO USER POOL:
+  ┌──────────────────┬──────────────────────────────────────────────────────────┐
+  │ Token            │ Purpose                                                  │
+  ├──────────────────┼──────────────────────────────────────────────────────────┤
+  │ ID Token (JWT)   │ Contains user identity claims (sub, email, custom attrs) │
+  │                  │ Used by API Gateway Cognito authorizer                   │
+  ├──────────────────┼──────────────────────────────────────────────────────────┤
+  │ Access Token     │ Contains scopes/groups. Used to authorize API calls.     │
+  │                  │ Opaque to client — validated by Cognito or locally.      │
+  ├──────────────────┼──────────────────────────────────────────────────────────┤
+  │ Refresh Token    │ Long-lived. Used to get new ID + Access tokens.          │
+  │                  │ Default expiry: 30 days.                                 │
+  └──────────────────┴──────────────────────────────────────────────────────────┘
+
+  JWT STRUCTURE:
+    Header.Payload.Signature  (Base64URL encoded)
+    
+    Payload claims:
+    {
+      "sub": "uuid-of-user",              // Stable unique user ID
+      "email": "user@example.com",
+      "cognito:groups": ["ADMIN", "USER"],
+      "custom:tenantId": "tenant-abc",    // Custom attributes (prefixed with custom:)
+      "iss": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_XXXXX",
+      "aud": "app-client-id",
+      "exp": 1234567890,
+      "iat": 1234564290
+    }
+
+  VERIFICATION:
+    Cognito provides JWKS (JSON Web Key Set) endpoint:
+    https://cognito-idp.{region}.amazonaws.com/{userPoolId}/.well-known/jwks.json
+    
+    JWT libraries verify: signature (RSA RS256), expiry, issuer, audience.
+
+================================================================
+3. COGNITO WITH SPRING BOOT — SPRING SECURITY INTEGRATION
+================================================================
+
+  ── DEPENDENCIES ───────────────────────────────────────────────
+
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+  </dependency>
+
+  ── APPLICATION.YML ────────────────────────────────────────────
+
+  spring:
+    security:
+      oauth2:
+        resourceserver:
+          jwt:
+            # Cognito JWKS endpoint — Spring Security auto-fetches and caches keys
+            jwk-set-uri: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_XXXXX/.well-known/jwks.json
+            # Alternative: issuer-uri (Spring auto-discovers jwks endpoint)
+            issuer-uri: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_XXXXX
+
+  ── SECURITY CONFIGURATION ────────────────────────────────────
+
+  @Configuration
+  @EnableWebSecurity
+  @EnableMethodSecurity          // Enables @PreAuthorize
+  public class SecurityConfig {
+
+      @Bean
+      public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+          http
+              .csrf(csrf -> csrf.disable())                // Stateless API
+              .sessionManagement(sm -> sm
+                  .sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+              .authorizeHttpRequests(auth -> auth
+                  .requestMatchers("/actuator/health").permitAll()
+                  .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                  .anyRequest().authenticated())
+              .oauth2ResourceServer(oauth2 -> oauth2
+                  .jwt(jwt -> jwt
+                      .jwtAuthenticationConverter(cognitoJwtConverter())));
+          return http.build();
+      }
+
+      @Bean
+      public JwtAuthenticationConverter cognitoJwtConverter() {
+          // Cognito puts groups in "cognito:groups" claim, NOT "roles"
+          // Spring Security expects roles in "scope" or specific claim
+          // Must extract manually:
+          
+          JwtGrantedAuthoritiesConverter grantedAuthoritiesConverter = 
+              new JwtGrantedAuthoritiesConverter();
+          grantedAuthoritiesConverter.setAuthoritiesClaimName("cognito:groups");
+          grantedAuthoritiesConverter.setAuthorityPrefix("ROLE_");   // ROLE_ADMIN
+
+          JwtAuthenticationConverter converter = new JwtAuthenticationConverter();
+          converter.setJwtGrantedAuthoritiesConverter(grantedAuthoritiesConverter);
+          return converter;
+      }
+  }
+
+  ── EXTRACTING USER INFO IN CONTROLLERS ──────────────────────
+
+  @RestController
+  @RequestMapping("/api/orders")
+  public class OrderController {
+
+      @GetMapping("/{id}")
+      @PreAuthorize("hasRole('USER') or hasRole('ADMIN')")
+      public Order getOrder(@PathVariable String id,
+                            @AuthenticationPrincipal Jwt jwt) {
+          
+          String userId = jwt.getSubject();                              // "sub" claim
+          String email = jwt.getClaimAsString("email");
+          String tenantId = jwt.getClaimAsString("custom:tenantId");
+          List<String> groups = jwt.getClaimAsStringList("cognito:groups");
+          
+          return orderService.getOrder(id, userId);
+      }
+
+      @DeleteMapping("/{id}")
+      @PreAuthorize("hasRole('ADMIN')")
+      public void deleteOrder(@PathVariable String id,
+                               @AuthenticationPrincipal Jwt jwt) {
+          String adminId = jwt.getSubject();
+          orderService.deleteOrder(id, adminId);
+      }
+  }
+
+  ── MULTI-TENANT USING CUSTOM ATTRIBUTES ─────────────────────
+
+  // Cognito custom attribute: custom:tenantId
+  // Every API call filtered by tenant:
+  
+  @GetMapping
+  public List<Order> getOrders(@AuthenticationPrincipal Jwt jwt) {
+      String tenantId = jwt.getClaimAsString("custom:tenantId");
+      // Always scope queries to tenantId — never trust client-provided tenant
+      return orderService.getOrdersByTenant(tenantId);
+  }
+
+================================================================
+4. COGNITO WITH API GATEWAY (Lambda)
+================================================================
+
+  ── REST API — COGNITO AUTHORIZER ─────────────────────────────
+
+  API Gateway validates the JWT token against the Cognito User Pool.
+  Token is extracted from Authorization header (Bearer token).
+  Claims are injected into requestContext.authorizer.claims.
+
+  // Java Lambda reading Cognito claims:
+  public class OrderHandler 
+      implements RequestHandler<APIGatewayProxyRequestEvent, APIGatewayProxyResponseEvent> {
+
+      @Override
+      public APIGatewayProxyResponseEvent handleRequest(
+              APIGatewayProxyRequestEvent request, Context context) {
+
+          Map<String, String> claims = 
+              request.getRequestContext().getAuthorizer().getClaims();
+          
+          String userId = claims.get("sub");
+          String email = claims.get("email");
+          String tenantId = claims.get("custom:tenantId");
+          String groups = claims.get("cognito:groups");  // Comma-separated string
+          
+          // Note: groups comes as "[ADMIN,USER]" string — parse it
+          boolean isAdmin = groups != null && groups.contains("ADMIN");
+          
+          return processRequest(userId, tenantId, isAdmin);
+      }
+  }
+
+  ── HTTP API — JWT AUTHORIZER ─────────────────────────────────
+
+  HTTP API natively validates JWTs — no extra Lambda authorizer needed.
+  Configure: issuer URL (Cognito pool URL) + audience (app client ID).
+  Claims available in $context.authorizer.jwt.claims.{claimName}.
+
+================================================================
+5. IDENTITY POOLS — AWS CREDENTIALS FOR END USERS
+================================================================
+
+  USE CASE: Mobile/web app where users need DIRECT access to AWS resources
+  (e.g., upload to their own S3 folder, read their DynamoDB items).
+
+  FLOW:
+  1. User authenticates with Cognito User Pool → gets JWT
+  2. App sends JWT to Cognito Identity Pool
+  3. Identity Pool returns temporary AWS credentials (from STS AssumeRoleWithWebIdentity)
+  4. App uses AWS credentials to call S3/DynamoDB/etc. directly
+
+  IAM ROLE POLICY (scoped to user's own data):
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": ["s3:GetObject", "s3:PutObject"],
+        "Resource": "arn:aws:s3:::my-app-uploads/${cognito-identity.amazonaws.com:sub}/*"
+        // ${cognito-identity.amazonaws.com:sub} = the user's identity ID
+        // Each user can only access their own prefix
+      }
+    ]
+  }
+
+  WHEN TO USE IDENTITY POOLS vs BACKEND API:
+  - Identity Pools: mobile apps needing direct S3 upload (avoids Lambda for file upload)
+  - Backend API (Lambda/Spring Boot): most business logic, better control, auditing
+
+================================================================
+6. COGNITO TRIGGERS — JAVA LAMBDA CUSTOMIZATION
+================================================================
+
+  Cognito invokes Lambda at various points in the auth flow:
+
+  ┌────────────────────────────────┬─────────────────────────────────────────────┐
+  │ Trigger                        │ Use Case                                    │
+  ├────────────────────────────────┼─────────────────────────────────────────────┤
+  │ Pre Sign-up                    │ Validate email domain, block disposable emails│
+  │ Post Confirmation              │ Create user record in DB after email verify  │
+  │ Pre Token Generation           │ Add custom claims to JWT (tenantId, roles)   │
+  │ Custom Authentication          │ Custom auth challenge (CAPTCHA, OTP)         │
+  │ Pre Authentication             │ Block sign-in based on IP/device             │
+  │ Post Authentication            │ Log sign-in events, update last-login        │
+  │ User Migration                 │ Migrate users from legacy system on-the-fly  │
+  └────────────────────────────────┴─────────────────────────────────────────────┘
+
+  ── PRE TOKEN GENERATION — ADDING CUSTOM CLAIMS (Java) ───────
+
+  Most important trigger for Java backends — inject custom data into JWT.
+
+  public class PreTokenGenerationFn 
+      implements RequestHandler<CognitoUserPoolPreTokenGenerationEvent, 
+                                 CognitoUserPoolPreTokenGenerationEvent> {
+
+      private static final DynamoDbClient DYNAMO = DynamoDbClient.create();
+
+      @Override
+      public CognitoUserPoolPreTokenGenerationEvent handleRequest(
+              CognitoUserPoolPreTokenGenerationEvent event, Context context) {
+
+          String userId = event.getUserName();
+          
+          // Look up tenant from DB
+          String tenantId = tenantService.getTenantForUser(userId);
+          List<String> permissions = permissionService.getPermissions(userId);
+          
+          // Add custom claims to ID token
+          event.getResponse().setClaimsOverrideDetails(
+              CognitoUserPoolPreTokenGenerationEvent.ClaimsOverrideDetails.builder()
+                  .claimsToAddOrOverride(Map.of(
+                      "tenantId", tenantId,
+                      "permissions", String.join(",", permissions)
+                  ))
+                  .groupOverrideDetails(
+                      CognitoUserPoolPreTokenGenerationEvent.GroupConfiguration.builder()
+                          .groupsToOverride(List.of("PREMIUM_USER"))
+                          .build())
+                  .build());
+
+          return event;  // Must return the modified event
+      }
+  }
+
+  ── POST CONFIRMATION — CREATE USER IN DB (Java) ─────────────
+
+  public class PostConfirmationFn 
+      implements RequestHandler<CognitoUserPoolPostConfirmationEvent, 
+                                 CognitoUserPoolPostConfirmationEvent> {
+
+      @Override
+      public CognitoUserPoolPostConfirmationEvent handleRequest(
+              CognitoUserPoolPostConfirmationEvent event, Context context) {
+
+          String userId = event.getUserName();
+          String email = event.getRequest().getUserAttributes().get("email");
+          
+          // Create user profile in DynamoDB
+          userRepository.createUser(User.builder()
+              .userId(userId)
+              .email(email)
+              .createdAt(Instant.now())
+              .build());
+
+          return event;  // Must return event unchanged
+      }
+  }
+
+================================================================
+7. COMMON PATTERNS AND PITFALLS
+================================================================
+
+  PITFALL 1: Cognito:groups vs Spring Security roles
+    - Cognito groups come in "cognito:groups" claim
+    - Spring Security expects ROLE_ prefix
+    - Fix: custom JwtGrantedAuthoritiesConverter (see section 3)
+
+  PITFALL 2: Token expiry handling
+    - ID/Access token default: 1 hour
+    - Use refresh token on 401 response (transparent to user)
+    - Spring Security does NOT auto-refresh — handle in client
+
+  PITFALL 3: Validating JWT in Lambda (without API Gateway authorizer)
+    - Don't manually validate JWT — use API Gateway Cognito authorizer or
+      JWT Authorizer on HTTP API instead
+    - If you must validate in Lambda: use java-jwt or nimbus-jose-jwt library
+    
+    // Using nimbus-jose-jwt:
+    JWKSource<SecurityContext> keySource = 
+        JWKSourceBuilder.create(new URL(JWKS_URL)).cache(true).build();
+    ConfigurableJWTProcessor<SecurityContext> processor = new DefaultJWTProcessor<>();
+    processor.setJWSKeySelector(new JWSVerificationKeySelector<>(JWSAlgorithm.RS256, keySource));
+    JWTClaimsSet claims = processor.process(token, null);
+    String userId = claims.getSubject();
+
+  PITFALL 4: Custom attributes require explicit read/write permissions
+    - App client must have read/write access to custom attributes
+    - Pre Token Generation trigger can add claims from external sources
+
+================================================================
+8. INTERVIEW QUESTIONS
+================================================================
+
+Q: What is the difference between Cognito User Pools and Identity Pools?
+
+A: User Pools handle authentication — they are a managed user directory that 
+   handles sign-up, sign-in, MFA, and issue JWT tokens (ID, Access, Refresh). 
+   Identity Pools handle authorization for AWS resources — they exchange a JWT 
+   (from User Pool or third-party provider) for temporary AWS credentials via 
+   STS AssumeRoleWithWebIdentity. Use User Pool when you need to authenticate 
+   users and get JWTs for API calls. Use Identity Pools when users need direct 
+   AWS resource access (e.g., S3 uploads from mobile) scoped to their identity.
+
+---
+
+Q: How do you integrate Cognito with a Spring Boot microservice?
+
+A: Use spring-boot-starter-oauth2-resource-server. Configure the Cognito JWKS 
+   endpoint or issuer-uri in application.yml. Spring Security auto-fetches and 
+   caches the public keys, validates JWT on each request. Key challenge: Cognito 
+   puts groups in "cognito:groups" claim (not "roles"), so you need a custom 
+   JwtGrantedAuthoritiesConverter to map them to ROLE_ prefixed authorities. 
+   Read user info in controllers via @AuthenticationPrincipal Jwt jwt and 
+   jwt.getClaimAsString("sub") etc.
+
+---
+
+Q: What is the Pre Token Generation trigger and when would you use it?
+
+A: It's a Lambda trigger that fires just before Cognito issues tokens. It lets 
+   you add, modify, or suppress claims in the JWT. Common uses: 
+   1. Add tenantId from a database to support multi-tenant apps 
+   2. Add custom permissions/roles from an authorization service 
+   3. Override Cognito group memberships based on your own permission model. 
+   This avoids the need to call a separate user service on every API request 
+   since the claims are already in the JWT.
+
+---
+
+Q: How do you scope API access to a user's own data using Cognito?
+
+A: In API Gateway + Lambda: read the "sub" claim from 
+   requestContext.authorizer.claims (or from the Jwt object in Spring Security). 
+   Always filter DynamoDB/RDS queries by this userId — never trust a userId 
+   from the request body. For direct AWS access (Identity Pools): use IAM policy 
+   conditions with ${cognito-identity.amazonaws.com:sub} to restrict S3 paths 
+   or DynamoDB item-level access to the user's own data.

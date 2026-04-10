@@ -1,0 +1,356 @@
+================================================================================
+SERVICE DISCOVERY: EUREKA vs CONSUL vs KUBERNETES
+================================================================================
+
+OVERVIEW
+---------
+Service discovery is the mechanism by which services find each other's network
+locations (IP:port) in a dynamic environment where instances come and go.
+
+Three dominant approaches in Java/Spring Boot microservices:
+  1. Netflix Eureka (Spring Cloud Netflix)
+  2. HashiCorp Consul
+  3. Kubernetes-native (DNS + Services)
+
+────────────────────────────────────────────────────────────────────────────────
+
+NETFLIX EUREKA — SPRING CLOUD NATIVE
+=======================================
+
+What it is:
+  Eureka is a REST-based service registry developed by Netflix.
+  Every service registers itself and periodically renews its registration (heartbeat).
+  Clients fetch the registry and cache it locally for resilience.
+
+Architecture:
+  ┌────────────────────────────────────────────────┐
+  │              Eureka Server                      │
+  │  (Registry: service-name → [ip:port, ip:port]) │
+  └────────────────────┬───────────────────────────┘
+                       │ Register + Heartbeat (every 30s)
+           ┌───────────┴────────────────┐
+    Order Service                Inventory Service
+    (Eureka Client)              (Eureka Client)
+    - Registers itself           - Registers itself
+    - Fetches registry           - Fetches registry
+    - Calls Inventory            
+      using registry             
+
+SETUP — Eureka Server:
+
+  pom.xml:
+    <dependency>
+      <groupId>org.springframework.cloud</groupId>
+      <artifactId>spring-cloud-starter-netflix-eureka-server</artifactId>
+    </dependency>
+
+  @SpringBootApplication
+  @EnableEurekaServer
+  public class EurekaServerApplication { ... }
+
+  application.yml:
+    server:
+      port: 8761
+    eureka:
+      client:
+        register-with-eureka: false    # Server doesn't register itself
+        fetch-registry: false
+
+SETUP — Eureka Client (every microservice):
+
+  pom.xml:
+    <dependency>
+      <groupId>org.springframework.cloud</groupId>
+      <artifactId>spring-cloud-starter-netflix-eureka-client</artifactId>
+    </dependency>
+
+  application.yml:
+    spring:
+      application:
+        name: order-service   # Registration name in Eureka
+    eureka:
+      client:
+        service-url:
+          defaultZone: http://eureka-server:8761/eureka/
+      instance:
+        prefer-ip-address: true
+        instance-id: ${spring.application.name}:${server.port}:${random.value}
+        lease-renewal-interval-in-seconds: 30    # Heartbeat interval
+        lease-expiration-duration-in-seconds: 90 # Remove if no heartbeat for 90s
+
+  // Service discovery (client-side with load balancing):
+  @Bean
+  @LoadBalanced
+  public RestTemplate restTemplate() {
+    return new RestTemplate();
+  }
+
+  // Use service NAME instead of IP:port — Eureka + Ribbon resolves it
+  String url = "http://inventory-service/api/v1/inventory/" + productId;
+  InventoryResponse response = restTemplate.getForObject(url, InventoryResponse.class);
+
+  // With Feign (declarative, automatic Eureka resolution):
+  @FeignClient(name = "inventory-service")   // name matches Eureka registration
+  public interface InventoryClient { ... }
+
+SELF-PRESERVATION MODE:
+  Eureka enters self-preservation when it stops receiving heartbeats from > 85%
+  of instances (indicates network partition, not mass failure).
+  In self-preservation: Eureka keeps existing registrations (doesn't expire them).
+  Pros: Avoids removing healthy instances during network hiccup.
+  Cons: Stale entries may remain if services actually died.
+
+EUREKA PROS:
+  ✓ Native Spring Cloud integration — minimal configuration
+  ✓ Built-in client-side load balancing (Spring Cloud LoadBalancer)
+  ✓ Self-preservation for network partitions
+  ✓ Simple UI dashboard at /
+
+EUREKA CONS:
+  ✗ Java/JVM only (no native agents for other languages)
+  ✗ AP system (eventual consistency) — stale registry possible
+  ✗ Netflix has stopped active development (maintenance mode)
+  ✗ No built-in health check scripts — relies on heartbeat only
+  ✗ No service mesh, no KV store
+
+────────────────────────────────────────────────────────────────────────────────
+
+HASHICORP CONSUL — MULTI-PLATFORM SERVICE MESH
+================================================
+
+What it is:
+  Consul is a multi-purpose tool: service discovery + health checking +
+  key-value store + service mesh (mTLS). Language-agnostic via sidecar agents.
+
+Architecture:
+  Each node runs a Consul Agent (sidecar-like)
+  Agents communicate with Consul Servers (Raft consensus)
+
+  ┌──────────────────────────────────────────────────────┐
+  │          Consul Server Cluster (3 or 5 nodes)        │
+  │              (Raft consensus — CP system)             │
+  └──────────────────────────────────────────────────────┘
+                        │ Gossip protocol
+      ┌─────────────────┼──────────────────┐
+  Consul Agent      Consul Agent        Consul Agent
+  + Order Svc       + Inventory Svc     + Payment Svc
+
+SPRING BOOT + CONSUL:
+
+  pom.xml:
+    <dependency>
+      <groupId>org.springframework.cloud</groupId>
+      <artifactId>spring-cloud-starter-consul-discovery</artifactId>
+    </dependency>
+
+  application.yml:
+    spring:
+      application:
+        name: order-service
+      cloud:
+        consul:
+          host: consul-server
+          port: 8500
+          discovery:
+            health-check-path: /actuator/health
+            health-check-interval: 15s
+            register: true
+            tags:
+              - version=1.2.0
+              - env=production
+
+CONSUL KEY-VALUE STORE (bonus feature — distributed config):
+  # Store config:
+  consul kv put config/order-service/feature.express-shipping true
+
+  # Read in Spring Boot:
+  spring.cloud.consul.config.enabled=true
+  spring.cloud.consul.config.prefix=config
+  # Access as @Value("${feature.express-shipping}")
+
+CONSUL HEALTH CHECKS:
+  Consul actively polls each service's health endpoint.
+  Unhealthy services are immediately removed from discovery — more accurate than heartbeat.
+
+  Types of health checks:
+    HTTP check: GET /actuator/health → 200 OK means healthy
+    TCP check: Port is open → healthy
+    Script check: Custom shell script
+    TTL check: Service must ping Consul within TTL → similar to heartbeat
+
+CONSUL PROS:
+  ✓ Language-agnostic (Go, Java, Python, etc.)
+  ✓ Active health checking (not just heartbeat)
+  ✓ Built-in KV store (distributed config)
+  ✓ Service mesh with mTLS (Consul Connect)
+  ✓ CP system (strong consistency via Raft)
+  ✓ Multi-datacenter support
+  ✓ Rich tagging and metadata
+
+CONSUL CONS:
+  ✗ More operational complexity (Consul cluster to manage)
+  ✗ CP system → availability impact during leader election
+  ✗ Less native Spring Cloud integration vs Eureka
+  ✗ Additional infrastructure component to run
+
+────────────────────────────────────────────────────────────────────────────────
+
+KUBERNETES — NATIVE SERVICE DISCOVERY
+=======================================
+
+What it is:
+  Kubernetes has built-in service discovery via Services and DNS.
+  No external registry needed — K8s control plane manages everything.
+
+HOW K8s SERVICE DISCOVERY WORKS:
+
+  1. Pod starts → gets a dynamic IP (cannot hardcode)
+  2. Kubernetes Service (ClusterIP) groups Pods by label selector
+  3. kube-dns creates DNS entry: {service-name}.{namespace}.svc.cluster.local
+  4. Other services use DNS name → K8s kube-proxy routes to a healthy Pod
+
+  order-service Pod  →  calls  →  http://inventory-service/api/v1/inventory/123
+                                   ↓ kube-dns resolution
+                                   inventory-service (ClusterIP: 10.96.45.23)
+                                   ↓ iptables/IPVS routing
+                                   Inventory Pod 1 or Pod 2 or Pod 3
+
+KUBERNETES SERVICE TYPES:
+  ClusterIP:    Internal DNS, accessible only within cluster (service-to-service)
+  NodePort:     Exposes service on each node's IP at a port (dev/testing)
+  LoadBalancer: External cloud load balancer (AWS ALB, GCP LB) for external traffic
+  ExternalName: Maps service to an external DNS name
+
+SERVICE MANIFEST:
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: inventory-service
+    namespace: ecommerce
+  spec:
+    selector:
+      app: inventory-service          # Selects pods with this label
+    ports:
+      - protocol: TCP
+        port: 80
+        targetPort: 8080
+    type: ClusterIP
+
+SPRING BOOT ON K8s — NO EUREKA NEEDED:
+  application.yml:
+    spring:
+      application:
+        name: order-service
+  # No Eureka config — just use service DNS names:
+  services:
+    inventory-url: http://inventory-service.ecommerce.svc.cluster.local
+    payment-url: http://payment-service.ecommerce.svc.cluster.local
+
+  # Or simpler (within same namespace):
+  services:
+    inventory-url: http://inventory-service
+
+SPRING CLOUD KUBERNETES (optional):
+  Integrates Spring Cloud abstractions with K8s natively.
+  Allows @LoadBalanced RestTemplate/Feign to use K8s Services.
+  Also supports reading ConfigMaps/Secrets as Spring config.
+
+  <dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-kubernetes-client-all</artifactId>
+  </dependency>
+
+K8s PROS:
+  ✓ Zero external dependency — built into K8s
+  ✓ Automatically removes unhealthy pods (readiness probes)
+  ✓ Supports rolling updates, blue-green, canary natively
+  ✓ Scales with the cluster — no separate registry to manage
+  ✓ Standard in cloud-native environments
+
+K8s CONS:
+  ✗ DNS TTL caching can cause stale entries (short TTL needed)
+  ✗ No cross-cluster discovery out of the box (needs Istio/Consul)
+  ✗ Requires K8s — heavier infrastructure requirement
+  ✗ Debugging DNS issues can be complex
+
+────────────────────────────────────────────────────────────────────────────────
+
+SIDE-BY-SIDE COMPARISON
+==========================
+
+Feature                    │ Eureka              │ Consul              │ Kubernetes
+───────────────────────────┼─────────────────────┼─────────────────────┼──────────────────
+Consistency model          │ AP (eventual)       │ CP (strong)         │ CP (etcd-backed)
+Health checking            │ Heartbeat (push)    │ Active polling      │ Readiness probes
+Language support           │ Java primarily      │ Any language        │ Any (containerized)
+Spring Cloud integration   │ Excellent (native)  │ Good                │ Good (spring-cloud-k8s)
+KV store / Config          │ No                  │ Yes                 │ ConfigMap / Secret
+Service mesh               │ No                  │ Yes (Consul Connect)│ Via Istio / Linkerd
+Multi-datacenter           │ Limited             │ Native support      │ Complex (federated)
+Operational overhead       │ Low (embedded)      │ Medium (Consul cluster)│ Low (if on K8s)
+Best for                   │ Pure Spring Cloud   │ Polyglot + config   │ Cloud-native K8s
+Active development         │ Maintenance mode    │ Active              │ Active (K8s)
+
+────────────────────────────────────────────────────────────────────────────────
+
+WHEN TO USE WHICH
+==================
+
+Use EUREKA when:
+  ✓ All services are Java/Spring Boot
+  ✓ Not on Kubernetes (bare metal, VMs)
+  ✓ Team already familiar with Spring Cloud Netflix
+  ✓ Simple microservices without service mesh needs
+
+Use CONSUL when:
+  ✓ Polyglot microservices (Java + Go + Python)
+  ✓ Need distributed config (KV store)
+  ✓ Multi-datacenter or hybrid cloud
+  ✓ Need service mesh with mTLS (Consul Connect)
+  ✓ Not on Kubernetes
+
+Use KUBERNETES when:
+  ✓ Deploying to Kubernetes (most common modern choice)
+  ✓ Cloud-native architecture
+  ✓ Want to minimize external dependencies
+  ✓ Need rolling updates, autoscaling, pod management
+  ✓ Using Istio/Linkerd service mesh alongside
+
+REALISTIC PRODUCTION CHOICES (2024+):
+  - Greenfield K8s project: K8s DNS + Istio (no Eureka/Consul)
+  - Legacy Spring Cloud: Eureka (if not migrating to K8s)
+  - Polyglot, multi-cloud: Consul
+  - Migrating monolith to K8s: Consul (bridge period), then K8s native
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS
+====================
+
+Q: How does service discovery work in Kubernetes without Eureka?
+A: Kubernetes assigns a ClusterIP Service to each microservice. kube-dns creates
+   a DNS entry ({service}.{namespace}.svc.cluster.local). When Service A calls
+   inventory-service, kube-dns resolves it to the ClusterIP, and kube-proxy routes
+   to a healthy Pod behind that Service. K8s readiness probes ensure traffic is
+   only sent to ready Pods — no separate registry needed.
+
+Q: What is the difference between client-side and server-side discovery?
+A: Client-side (Eureka + Ribbon): Client queries registry, gets list of instances,
+   and picks one using its own load balancing algorithm. Client has more control.
+   Server-side (AWS ALB, K8s Service): Client sends to a load balancer which
+   queries the registry and routes. Client is unaware of discovery mechanism.
+   K8s uses server-side (kube-proxy routes transparently).
+
+Q: Why is Eureka considered AP and Consul CP?
+A: Eureka: When a network partition occurs, Eureka prefers AVAILABILITY over
+   CONSISTENCY — it keeps serving potentially stale registry data (self-preservation
+   mode). Consul: Uses Raft consensus — during a partition, the minority side stops
+   serving to maintain consistency (may briefly be unavailable).
+
+Q: How do health checks differ between Eureka and Consul?
+A: Eureka uses heartbeat (services push renewals every 30s). If a service dies and
+   stops renewing, Eureka waits for the lease expiration duration (90s default)
+   before deregistering — stale entries persist briefly. Consul actively polls
+   the health endpoint (e.g., /actuator/health) every 15s — unhealthy services
+   are immediately removed from discovery, making it more accurate.
+================================================================================

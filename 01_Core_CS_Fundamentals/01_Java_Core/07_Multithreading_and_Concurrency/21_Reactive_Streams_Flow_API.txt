@@ -1,0 +1,208 @@
+REACTIVE STREAMS AND java.util.concurrent.Flow API
+====================================================
+
+BACKGROUND: WHY REACTIVE STREAMS?
+-----------------------------------
+  Traditional imperative code:
+    List<Order> orders = orderService.getOrders();  // blocks until all loaded
+    orders.forEach(this::process);
+
+  Problems at scale:
+  - Entire result set loaded into memory before processing starts
+  - Thread blocks during I/O waiting for data
+  - No backpressure — producer can overwhelm the consumer
+  - Wasted resources under variable load
+
+  Reactive Streams solve this with:
+  1. Asynchronous, non-blocking data pipelines
+  2. Backpressure — consumer controls the rate of data flow
+  3. Push-based data model (publisher pushes when consumer is ready)
+
+─────────────────────────────────────────────────────────────
+THE REACTIVE STREAMS SPECIFICATION
+─────────────────────────────────────────────────────────────
+  Published at reactive-streams.org (2015), standardized 4 interfaces.
+  Adopted by: RxJava, Project Reactor (Spring WebFlux), Akka Streams.
+  Java 9 adopted the spec as java.util.concurrent.Flow.
+
+  The four interfaces:
+    Publisher<T>    — produces data
+    Subscriber<T>   — consumes data
+    Subscription    — link between Publisher and Subscriber (controls flow)
+    Processor<T,R>  — both Publisher and Subscriber (transforms data)
+
+─────────────────────────────────────────────────────────────
+java.util.concurrent.Flow (Java 9+)
+─────────────────────────────────────────────────────────────
+
+  1. Flow.Publisher<T>
+  ---------------------
+    @FunctionalInterface
+    public interface Publisher<T> {
+        void subscribe(Subscriber<? super T> subscriber);
+    }
+    // Publisher registers the subscriber and begins the data relationship.
+
+  2. Flow.Subscriber<T>
+  ----------------------
+    public interface Subscriber<T> {
+        void onSubscribe(Subscription subscription);  // called once at start
+        void onNext(T item);                           // called per item
+        void onError(Throwable throwable);             // terminal: error
+        void onComplete();                             // terminal: success
+    }
+
+  3. Flow.Subscription
+  ---------------------
+    public interface Subscription {
+        void request(long n);  // Subscriber asks for n more items (BACKPRESSURE)
+        void cancel();         // Subscriber cancels the subscription
+    }
+    // This is the KEY to backpressure:
+    // Subscriber controls how much data it pulls via request(n).
+
+  4. Flow.Processor<T,R>
+  -----------------------
+    public interface Processor<T,R> extends Subscriber<T>, Publisher<R> { }
+    // Receives T from upstream, publishes R to downstream.
+    // Example: JSON parsing, filtering, mapping transformations.
+
+─────────────────────────────────────────────────────────────
+BACKPRESSURE — THE CORE CONCEPT
+─────────────────────────────────────────────────────────────
+  Backpressure = the consumer's ability to signal to the producer
+  how much data it can handle at a time.
+
+  Protocol:
+    1. Publisher calls subscriber.onSubscribe(subscription)
+    2. Subscriber calls subscription.request(n) — "I can handle n items"
+    3. Publisher calls subscriber.onNext(item) up to n times
+    4. Subscriber calls request(n) again when ready for more
+    5. Publisher calls onComplete() or onError() when done
+
+  Without backpressure:
+    - Producer outpaces consumer → unbounded buffer → OOM
+    - Or items are dropped → data loss
+
+  With backpressure:
+    - Consumer dictates pace
+    - Producer can adapt: slow down, buffer, or apply overflow strategies
+
+─────────────────────────────────────────────────────────────
+BUILT-IN IMPLEMENTATION: SubmissionPublisher
+─────────────────────────────────────────────────────────────
+  Java 9 provides SubmissionPublisher<T> — a concrete Publisher:
+
+  SubmissionPublisher<String> publisher = new SubmissionPublisher<>();
+
+  publisher.subscribe(new Flow.Subscriber<String>() {
+      private Flow.Subscription sub;
+
+      public void onSubscribe(Flow.Subscription subscription) {
+          this.sub = subscription;
+          subscription.request(1);  // request first item
+      }
+
+      public void onNext(String item) {
+          System.out.println("Received: " + item);
+          sub.request(1);  // request next item after processing this one
+      }
+
+      public void onError(Throwable t) { t.printStackTrace(); }
+      public void onComplete() { System.out.println("Done"); }
+  });
+
+  publisher.submit("Hello");
+  publisher.submit("World");
+  publisher.close();  // triggers onComplete()
+
+  SubmissionPublisher uses an executor (ForkJoinPool by default) for async delivery.
+
+─────────────────────────────────────────────────────────────
+REACTIVE STREAMS IN PRACTICE: PROJECT REACTOR
+─────────────────────────────────────────────────────────────
+  The Flow API is the standard, but raw usage is verbose.
+  In practice, use Project Reactor (Spring WebFlux) or RxJava.
+
+  Project Reactor types:
+    Mono<T>   — 0 or 1 item (like Optional but async)
+    Flux<T>   — 0 to N items (like Stream but async with backpressure)
+
+  Example with Reactor (Spring WebFlux):
+  ----------------------------------------
+    // Mono — single async result
+    Mono<User> user = userRepo.findById(id);  // non-blocking DB call
+
+    // Flux — stream of results
+    Flux<Order> orders = orderRepo.findByUserId(id);
+
+    // Composition
+    Flux<OrderSummary> summaries = orders
+        .filter(o -> o.getStatus() == ACTIVE)
+        .map(OrderSummary::from)
+        .take(10);
+
+    // Backpressure strategies on Flux
+    flux.onBackpressureBuffer(100);     // buffer up to 100
+    flux.onBackpressureDrop();          // drop items when slow
+    flux.onBackpressureLatest();        // keep only latest
+
+    // Subscribe
+    summaries.subscribe(
+        summary -> render(summary),
+        error   -> handleError(error),
+        ()      -> log.info("completed")
+    );
+
+─────────────────────────────────────────────────────────────
+COLD vs HOT PUBLISHERS
+─────────────────────────────────────────────────────────────
+  Cold Publisher:
+  - Starts producing data fresh for EACH subscriber
+  - Example: HTTP request — each subscriber triggers its own request
+  - Flux.fromIterable(), Mono.fromCallable()
+
+  Hot Publisher:
+  - Produces data regardless of subscribers; late subscribers miss past items
+  - Example: stock tick feed, UI events, Kafka topic
+  - Reactor: .share(), .publish(), .replay()
+
+─────────────────────────────────────────────────────────────
+REACTIVE STREAMS vs JAVA STREAMS vs COMPLETABLEFUTURE
+─────────────────────────────────────────────────────────────
+  Feature           | Java Stream       | CompletableFuture  | Reactive Streams (Flux/Mono)
+  ──────────────────┼───────────────────┼────────────────────┼─────────────────────────────
+  Cardinality       | 0..N              | 0..1               | 0..N (Flux), 0..1 (Mono)
+  Async             | ❌ (blocking)     | ✅                  | ✅
+  Lazy evaluation   | ✅                | ❌                  | ✅
+  Backpressure      | ❌                | ❌                  | ✅
+  Cancellable       | ❌                | ✅                  | ✅
+  Composable        | ✅                | ✅                  | ✅
+
+─────────────────────────────────────────────────────────────
+COMMON INTERVIEW QUESTIONS
+─────────────────────────────────────────────────────────────
+  Q: What is backpressure and why does it matter?
+  A: Backpressure is the ability of a consumer to control how fast a producer
+     sends data, preventing buffer overflows and memory exhaustion. In reactive
+     streams, the Subscriber.request(n) call signals demand.
+
+  Q: What is the difference between Mono and Flux?
+  A: Mono represents 0 or 1 asynchronous value; Flux represents 0 to N.
+     Similar to Optional vs Stream, but both are non-blocking with backpressure.
+
+  Q: Is java.util.concurrent.Flow the same as Project Reactor?
+  A: No. Flow is the standard API (interfaces only) from Java 9.
+     Project Reactor implements those interfaces and provides rich operators
+     (map, filter, flatMap, zip, etc.). Spring WebFlux is built on Reactor.
+
+  Q: What is the difference between cold and hot publishers?
+  A: Cold: data flow starts fresh per subscriber (e.g., DB query).
+     Hot: data flows regardless of subscribers; late subscribers miss past
+     emissions (e.g., event bus, stock prices).
+
+  Q: When would you choose reactive over traditional blocking code?
+  A: When handling many concurrent I/O-bound requests with limited threads —
+     e.g., calling multiple microservices, streaming large datasets, building
+     high-throughput APIs. Virtual Threads (Java 21) are an alternative for
+     simpler blocking code at scale.

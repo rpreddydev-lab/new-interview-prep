@@ -1,0 +1,276 @@
+DISTRIBUTED TRANSACTIONS — 2PC, XA, AND SAGA PATTERN
+===========================================================================================================
+
+THE PROBLEM: TRANSACTIONS ACROSS MULTIPLE SERVICES/DATABASES
+--------------------------------------------------------------
+In a monolith with a single database → ACID transactions are easy (@Transactional).
+
+In microservices with multiple databases → you CANNOT use a single ACID transaction.
+
+Example: Place an order involves:
+  1. Order Service DB: Create order record
+  2. Inventory Service DB: Decrement stock
+  3. Payment Service DB: Create payment record
+  4. Notification Service: Send confirmation email
+
+All must succeed together, or all must roll back.
+These span 3 different databases → no single @Transactional can span them.
+
+Solutions:
+  1. Two-Phase Commit (2PC / XA) — distributed ACID transaction (old approach)
+  2. Saga Pattern — application-level coordination (modern approach)
+
+===========================================================================================================
+1. TWO-PHASE COMMIT (2PC / XA TRANSACTIONS)
+===========================================================================================================
+
+Two-Phase Commit coordinates multiple resource managers (databases) via a COORDINATOR.
+
+Phase 1 — Prepare:
+  Coordinator asks all participants: "Can you commit?"
+  Each participant writes to its WAL (write-ahead log), acquires locks, and votes YES or NO.
+
+Phase 2 — Commit (or Rollback):
+  If ALL participants voted YES → Coordinator sends COMMIT to all.
+  If ANY participant voted NO → Coordinator sends ROLLBACK to all.
+
+XA Protocol: Industry standard for 2PC.
+  Java supports XA via javax.transaction.xa.XAResource.
+  JTA (Java Transaction API) provides the programming model.
+  JTA implementations: Atomikos, Bitronix, Narayana, Jakarta EE servers.
+
+Spring XA Configuration (Atomikos):
+  @Bean
+  public PlatformTransactionManager transactionManager() {
+    return new JtaTransactionManager();  // Atomikos JTA transaction manager
+  }
+
+  // XA DataSources for each DB:
+  @Bean
+  public DataSource orderDataSource() {
+    AtomikosDataSourceBean ds = new AtomikosDataSourceBean();
+    ds.setXaDataSourceClassName("org.postgresql.xa.PGXADataSource");
+    ds.setXaProperties(...);
+    return ds;
+  }
+
+  @Bean
+  public DataSource inventoryDataSource() {
+    AtomikosDataSourceBean ds = new AtomikosDataSourceBean();
+    ds.setXaDataSourceClassName("org.postgresql.xa.PGXADataSource");
+    // different DB properties
+    return ds;
+  }
+
+  // Now @Transactional spans BOTH databases
+  @Transactional  // JTA transaction — spans orderDataSource + inventoryDataSource
+  public void placeOrder(Order order) {
+    orderRepo.save(order);       // writes to order DB
+    inventoryRepo.decrement(...); // writes to inventory DB
+    // Atomikos coordinates 2PC automatically
+  }
+
+---
+
+PROBLEMS WITH 2PC
+-----------------
+1. PERFORMANCE: Two rounds of network communication for every transaction.
+                All participants hold locks between Phase 1 and Phase 2.
+                Low throughput, high latency.
+
+2. AVAILABILITY: If coordinator crashes between Phase 1 and Phase 2 → participants stuck
+                 in "prepared" state with locks held → system may be unavailable.
+
+3. NOT CLOUD-FRIENDLY: Serverless databases, managed cloud services often don't support XA.
+                       Cassandra, DynamoDB, MongoDB don't support XA.
+
+4. BLOCKING PROTOCOL: Participants hold locks while waiting for coordinator decision.
+
+5. SCALABILITY: Doesn't scale horizontally well.
+
+When to use 2PC:
+  Legacy enterprise systems with JEE application servers (WebLogic, JBoss, WebSphere).
+  When both databases support XA and strict ACID is non-negotiable.
+  Internal microservices within the same company's infrastructure.
+
+Avoid in:
+  Cloud-native microservices. Modern systems favor Saga instead.
+
+===========================================================================================================
+2. SAGA PATTERN
+===========================================================================================================
+
+Saga: A sequence of local transactions, each in its own service with its own DB.
+Each local transaction publishes events or sends commands to trigger the next step.
+If a step fails → execute compensating transactions to undo previous steps.
+
+Sagas achieve EVENTUAL CONSISTENCY (not ACID), which is acceptable for most business operations.
+
+---
+
+TWO TYPES OF SAGA:
+
+A. CHOREOGRAPHY (event-driven, decentralized):
+   Each service listens for events and decides what to do.
+   No central orchestrator.
+
+   Order Placement Saga (Choreography):
+   
+   Order Service:
+     Creates order in PENDING state.
+     Publishes: OrderCreated event.
+   
+   Inventory Service:
+     Listens for OrderCreated.
+     Reserves stock.
+     If success → publishes: StockReserved event.
+     If failure → publishes: StockReservationFailed event.
+   
+   Payment Service:
+     Listens for StockReserved.
+     Charges customer.
+     If success → publishes: PaymentSucceeded event.
+     If failure → publishes: PaymentFailed event.
+   
+   Order Service:
+     Listens for PaymentSucceeded → marks order as CONFIRMED.
+     Listens for PaymentFailed → publishes OrderCancelled event.
+   
+   Inventory Service:
+     Listens for OrderCancelled → releases reserved stock (compensating transaction).
+   
+   PRO: Loose coupling, no single point of failure, scalable.
+   CON: Hard to understand and debug ("where is the saga?"), risk of cyclic dependencies.
+
+B. ORCHESTRATION (centralized coordinator, recommended for complex flows):
+   A dedicated Saga Orchestrator (or Saga Manager) controls the flow.
+   It knows all steps, calls each service, handles failures.
+
+   Order Placement Saga (Orchestration):
+
+   OrderSagaOrchestrator:
+     Step 1: Call Order Service → create order in PENDING state.
+     Step 2: Call Inventory Service → reserve stock.
+       On failure: Call Order Service → cancel order. (Compensate step 1)
+     Step 3: Call Payment Service → charge customer.
+       On failure: Call Inventory Service → release stock. (Compensate step 2)
+                   Call Order Service → cancel order. (Compensate step 1)
+     Step 4: Call Order Service → confirm order.
+     Step 5: Call Notification Service → send confirmation.
+
+   Tools for Orchestration:
+     - Temporal.io: Durable workflow engine. Handles retries, timeouts, state.
+     - AWS Step Functions: Managed orchestration for AWS.
+     - Conductor (Netflix OSS): Saga orchestration for microservices.
+     - Camunda: BPMN-based workflow engine.
+     - Custom: Saga state machine in DB + event loop.
+
+   PRO: Clear visibility, easy to debug, centralized error handling.
+   CON: Orchestrator is a central dependency.
+
+---
+
+COMPENSATING TRANSACTIONS
+--------------------------
+The Saga's alternative to rollback. Must be designed for each step.
+
+Step → Compensating Transaction:
+  "Create Order (PENDING)"    → "Cancel Order"
+  "Reserve Stock"             → "Release Stock Reservation"
+  "Charge Payment"            → "Refund Payment"
+  "Send Confirmation Email"   → (Cannot unsend! Log for manual handling)
+
+Key insight: Not all steps are compensatable (idempotent).
+  Sending an email can't be unsent. Design for this — accept partial failures.
+
+Idempotency: Compensating transactions must be IDEMPOTENT.
+  If the same compensation runs twice (due to retry) → same end result.
+  Use unique transaction IDs + "already compensated" status check.
+
+---
+
+OUTBOX PATTERN (For reliable event publishing with Saga)
+---------------------------------------------------------
+Problem: After a local transaction, how do you reliably publish an event?
+
+  // WRONG: This is not atomic — DB commit can succeed, Kafka publish can fail
+  @Transactional
+  public void createOrder(Order order) {
+    orderRepo.save(order);
+    kafkaTemplate.send("order.created", order);  // What if this fails?
+  }
+
+Outbox Pattern:
+  Write both the business data AND the event to the SAME database transaction.
+  A separate process (poller or CDC) reads the outbox table and publishes to Kafka.
+
+  @Transactional
+  public void createOrder(Order order) {
+    orderRepo.save(order);
+    outboxRepo.save(new OutboxEvent("ORDER_CREATED", toJson(order)));
+    // Atomic: both in same DB transaction
+  }
+
+  // Separate Outbox Poller:
+  @Scheduled(fixedDelay = 1000)
+  public void pollAndPublish() {
+    List<OutboxEvent> events = outboxRepo.findUnpublished();
+    for (OutboxEvent event : events) {
+      kafkaTemplate.send(event.getType(), event.getPayload());
+      event.markPublished();
+      outboxRepo.save(event);
+    }
+  }
+
+Even better: Use CDC (Debezium) to read the outbox table via DB WAL → publish to Kafka.
+  No polling needed. Near-real-time. Used by major microservices implementations.
+
+---
+
+===========================================================================================================
+3. COMPARISON: 2PC vs SAGA
+===========================================================================================================
+
+| Aspect              | 2PC / XA               | Saga                       |
+|---------------------|------------------------|----------------------------|
+| Consistency         | Strong ACID            | Eventual consistency       |
+| Latency             | High (2 round trips)   | Low (async)                |
+| Availability        | Lower (lock contention)| Higher (no distributed lock)|
+| Failure handling    | Automatic rollback     | Manual compensating txns   |
+| Cloud-native        | Poor                   | Excellent                  |
+| DB support needed   | XA-capable DBs         | Any DB                     |
+| Complexity          | Low (just use JTA)     | High (design compensation) |
+| Best for            | Legacy enterprise, small| Microservices, cloud-native |
+|                     | critical transactions  | complex business flows     |
+
+Modern recommendation: Use Saga for microservices. Use 2PC only for legacy systems.
+
+===========================================================================================================
+INTERVIEW Q&A
+===========================================================================================================
+
+Q: Why can't you use @Transactional across two microservices?
+A: @Transactional manages a single database connection/session.
+   Two microservices each have their own database. There's no shared JDBC connection
+   to span both. You need either 2PC (complex, limited DB support) or Saga (recommended).
+
+Q: What is eventual consistency and how does Saga achieve it?
+A: Eventual consistency means all replicas/services will converge to the same state
+   eventually, but may be temporarily inconsistent.
+   Saga achieves it by breaking distributed operations into local transactions.
+   Each step commits independently. If a later step fails, compensating transactions
+   undo earlier steps. During the saga's execution, the system is in an intermediate state.
+
+Q: What is the Outbox Pattern and why is it needed?
+A: When a service commits a DB transaction and then publishes an event to Kafka/messaging,
+   these two operations are not atomic. If the app crashes between them, the event is lost.
+   The Outbox Pattern solves this by writing the event to a local "outbox" table in the same
+   DB transaction. A separate process then reliably publishes these events.
+   "At-least-once delivery" with idempotent consumers ensures correctness.
+
+Q: How do you handle partial failures in a Saga?
+A: Define compensating transactions for each step that can fail.
+   For idempotent steps (create, reserve) — write the compensating transaction (cancel, release).
+   For non-idempotent steps (send email, external API) — accept partial failure,
+   log for manual intervention, or design the system to tolerate the inconsistency.
+   Use a Saga state machine to track current step and handle retries with exponential backoff.

@@ -1,0 +1,418 @@
+================================================================================
+CONTRACT TESTING WITH PACT — CONSUMER-DRIVEN CONTRACT TESTING
+================================================================================
+
+WHAT IS PACT?
+--------------
+Pact is a consumer-driven contract testing framework.
+Instead of integration tests that require both services to run simultaneously,
+Pact captures the consumer's expectations as a "pact" (contract) and verifies
+the provider satisfies it — independently, without coupling test environments.
+
+CONTRACT TESTING FLOW:
+  1. Consumer writes tests defining what it expects from Provider
+  2. Pact generates a JSON contract (pact file) from those tests
+  3. Pact file is published to Pact Broker (or PactFlow)
+  4. Provider fetches the contract and runs provider verification tests
+  5. CI/CD gate: provider can deploy only if all consumer contracts pass
+
+────────────────────────────────────────────────────────────────────────────────
+
+SETUP — pom.xml
+=================
+
+Consumer service (Order Service):
+  <dependency>
+    <groupId>au.com.dius.pact.consumer</groupId>
+    <artifactId>junit5</artifactId>
+    <version>4.6.7</version>
+    <scope>test</scope>
+  </dependency>
+
+Provider service (Inventory Service):
+  <dependency>
+    <groupId>au.com.dius.pact.provider</groupId>
+    <artifactId>junit5</artifactId>
+    <version>4.6.7</version>
+    <scope>test</scope>
+  </dependency>
+  <dependency>
+    <groupId>au.com.dius.pact.provider</groupId>
+    <artifactId>junit5spring</artifactId>
+    <version>4.6.7</version>
+    <scope>test</scope>
+  </dependency>
+
+────────────────────────────────────────────────────────────────────────────────
+
+STEP 1 — CONSUMER TEST (Order Service)
+========================================
+
+The consumer (Order Service) defines what it expects from Inventory Service.
+
+  @ExtendWith(PactConsumerTestExt.class)
+  @PactTestFor(providerName = "inventory-service", port = "8090")
+  class OrderServiceInventoryClientPactTest {
+
+    // ── Define the Pact (contract) ─────────────────────────────────────────
+
+    @Pact(consumer = "order-service", provider = "inventory-service")
+    public RequestResponsePact getInventoryAvailable(PactDslWithProvider builder) {
+      return builder
+          .given("product prod-123 exists with 50 available")   // Provider state
+          .uponReceiving("a request for inventory of product prod-123")
+              .method("GET")
+              .path("/api/v1/inventory/prod-123")
+              .headers(Map.of("Accept", "application/json"))
+          .willRespondWith()
+              .status(200)
+              .headers(Map.of("Content-Type", "application/json"))
+              .body(LambdaDsl.newJsonBody(body -> body
+                  .stringType("productId", "prod-123")
+                  .integerType("availableQuantity", 50)
+                  .integerType("reservedQuantity", 5)
+                  .booleanType("inStock", true)
+              ).build())
+          .toPact();
+    }
+
+    @Pact(consumer = "order-service", provider = "inventory-service")
+    public RequestResponsePact getInventoryNotFound(PactDslWithProvider builder) {
+      return builder
+          .given("product prod-999 does not exist")
+          .uponReceiving("a request for inventory of non-existent product")
+              .method("GET")
+              .path("/api/v1/inventory/prod-999")
+          .willRespondWith()
+              .status(404)
+              .headers(Map.of("Content-Type", "application/problem+json"))
+              .body(LambdaDsl.newJsonBody(body -> body
+                  .stringType("title", "Product Not Found")
+                  .integerType("status", 404)
+              ).build())
+          .toPact();
+    }
+
+    @Pact(consumer = "order-service", provider = "inventory-service")
+    public RequestResponsePact reserveInventory(PactDslWithProvider builder) {
+      return builder
+          .given("product prod-123 exists with 50 available")
+          .uponReceiving("a request to reserve 2 units of prod-123")
+              .method("POST")
+              .path("/api/v1/inventory/prod-123/reserve")
+              .headers(Map.of("Content-Type", "application/json"))
+              .body(LambdaDsl.newJsonBody(body -> body
+                  .integerType("quantity", 2)
+                  .stringType("orderId", "ord-456")
+              ).build())
+          .willRespondWith()
+              .status(200)
+              .body(LambdaDsl.newJsonBody(body -> body
+                  .stringType("reservationId", "res-789")
+                  .stringType("status", "RESERVED")
+              ).build())
+          .toPact();
+    }
+
+    // ── Consumer tests using the Pact (mock provider) ──────────────────────
+
+    @Test
+    @PactTestFor(pactMethod = "getInventoryAvailable")
+    void getInventory_existingProduct_returnsInventory(MockServer mockServer) {
+      // InventoryClient is configured to use mockServer.getUrl()
+      InventoryClient client = new InventoryClient(mockServer.getUrl());
+
+      InventoryResponse response = client.getInventory("prod-123");
+
+      assertThat(response.getProductId()).isEqualTo("prod-123");
+      assertThat(response.getAvailableQuantity()).isEqualTo(50);
+      assertThat(response.isInStock()).isTrue();
+    }
+
+    @Test
+    @PactTestFor(pactMethod = "getInventoryNotFound")
+    void getInventory_missingProduct_throwsNotFoundException(MockServer mockServer) {
+      InventoryClient client = new InventoryClient(mockServer.getUrl());
+
+      assertThrows(ProductNotFoundException.class,
+          () -> client.getInventory("prod-999"));
+    }
+
+    @Test
+    @PactTestFor(pactMethod = "reserveInventory")
+    void reserveInventory_validRequest_returnsReservationId(MockServer mockServer) {
+      InventoryClient client = new InventoryClient(mockServer.getUrl());
+
+      ReservationResponse res = client.reserve("prod-123", 2, "ord-456");
+
+      assertThat(res.getStatus()).isEqualTo("RESERVED");
+    }
+  }
+
+WHAT PACT GENERATES:
+  After running the consumer tests, Pact writes a JSON pact file:
+  target/pacts/order-service-inventory-service.json
+
+  This file captures all interactions: request + response expectations.
+  It becomes the CONTRACT that the provider must honor.
+
+────────────────────────────────────────────────────────────────────────────────
+
+PACT MATCHING RULES (IMPORTANT)
+=================================
+
+Pact uses MATCHERS, not exact values. This prevents brittle tests.
+
+  // Exact match (brittle — breaks if value changes):
+  .body(new PactDslJsonBody().stringValue("status", "RESERVED"))
+
+  // Type matcher (flexible — any String value):
+  .body(LambdaDsl.newJsonBody(body -> body
+      .stringType("status", "RESERVED")       // any String, example: "RESERVED"
+      .integerType("availableQuantity", 50)   // any Integer, example: 50
+      .booleanType("inStock", true)           // any Boolean
+      .uuid("productId", "prod-123")          // any valid UUID format
+      .datetime("createdAt", "yyyy-MM-dd'T'HH:mm:ss") // any ISO datetime
+      .minArrayLike("items", 1, item -> item  // array with min 1 element
+          .stringType("name")
+          .numberType("price"))
+  ).build())
+
+RULE OF THUMB:
+  Use type matchers for provider-controlled fields (IDs, timestamps, auto-generated values)
+  Use exact values only for field you control (status enums, error codes)
+
+────────────────────────────────────────────────────────────────────────────────
+
+STEP 2 — PUBLISH PACT TO BROKER
+=================================
+
+Pact Broker is a central server where pact files are published and shared.
+
+application.yml (build config):
+  pactbroker:
+    url: https://pact-broker.example.com
+    auth:
+      username: ${PACT_BROKER_USER}
+      password: ${PACT_BROKER_PASSWORD}
+
+Maven plugin to publish:
+  <plugin>
+    <groupId>au.com.dius.pact.provider</groupId>
+    <artifactId>maven</artifactId>
+    <version>4.6.7</version>
+    <configuration>
+      <pactBrokerUrl>https://pact-broker.example.com</pactBrokerUrl>
+      <pactBrokerToken>${PACT_BROKER_TOKEN}</pactBrokerToken>
+      <projectVersion>${project.version}</projectVersion>
+      <tags>
+        <tag>main</tag>
+      </tags>
+    </configuration>
+  </plugin>
+
+  mvn pact:publish   # Publishes target/pacts/*.json to Pact Broker
+
+────────────────────────────────────────────────────────────────────────────────
+
+STEP 3 — PROVIDER VERIFICATION (Inventory Service)
+====================================================
+
+The provider (Inventory Service) fetches the contract and verifies it.
+
+  @Provider("inventory-service")
+  @PactBroker(
+      url = "${PACT_BROKER_URL:https://pact-broker.example.com}",
+      authentication = @PactBrokerAuth(token = "${PACT_BROKER_TOKEN}")
+  )
+  @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+  class InventoryServicePactVerificationTest {
+
+    @LocalServerPort
+    private int port;
+
+    @Autowired
+    private InventoryRepository inventoryRepository;
+
+    @BeforeEach
+    void setup(PactVerificationContext context) {
+      context.setTarget(new HttpTestTarget("localhost", port));
+    }
+
+    @TestTemplate
+    @ExtendWith(PactVerificationInvocationContextProvider.class)
+    void verifyPacts(PactVerificationContext context) {
+      context.verifyInteraction();
+    }
+
+    // ── Provider States ────────────────────────────────────────────────────
+    // Must match exactly the state strings defined in consumer tests
+
+    @State("product prod-123 exists with 50 available")
+    public void productExists() {
+      inventoryRepository.save(new Inventory("prod-123", 50, 5));
+    }
+
+    @State("product prod-999 does not exist")
+    public void productDoesNotExist() {
+      inventoryRepository.deleteById("prod-999");
+    }
+
+    @State(value = "product prod-123 exists with 50 available",
+           action = StateChangeAction.TEARDOWN)
+    public void productExistsTeardown() {
+      inventoryRepository.deleteById("prod-123");
+    }
+  }
+
+WHAT HAPPENS DURING VERIFICATION:
+  1. Pact fetches all contracts from Pact Broker for "inventory-service"
+  2. For each interaction, it calls @State method to set up DB state
+  3. It replays the exact HTTP request captured from the consumer test
+  4. It verifies the actual response matches the consumer's expectations
+  5. Reports pass/fail back to Pact Broker
+
+────────────────────────────────────────────────────────────────────────────────
+
+PACT BROKER — CAN I DEPLOY?
+==============================
+
+Pact Broker tracks which consumer/provider versions have verified contracts.
+The "can-i-deploy" tool checks if it's safe to deploy.
+
+  # Is it safe to deploy inventory-service version 2.1.0 to production?
+  pact-broker can-i-deploy \
+    --pacticipant inventory-service \
+    --version 2.1.0 \
+    --to-environment production
+
+  # Output:
+  # Computer says yes ✓
+  # order-service v1.5.0 (main) — VERIFIED ✓
+  # payment-service v3.0.0 (main) — VERIFIED ✓
+
+CI/CD integration:
+  # In GitHub Actions / Jenkins pipeline:
+  - name: Verify pacts
+    run: mvn verify -Dpact.verifier.publishResults=true
+
+  - name: Can I deploy?
+    run: pact-broker can-i-deploy --pacticipant inventory-service --version $VERSION --to-environment production
+
+────────────────────────────────────────────────────────────────────────────────
+
+PACT vs SPRING CLOUD CONTRACT
+================================
+
+Feature                    │ Pact                          │ Spring Cloud Contract
+───────────────────────────┼───────────────────────────────┼────────────────────────────
+Contract owner             │ Consumer defines              │ Provider defines
+Contract format            │ JSON (generated from tests)   │ Groovy DSL / YAML / Kotlin
+Broker                     │ Pact Broker / PactFlow        │ None (Maven artifact)
+Language support           │ Multi-language                │ JVM primarily
+Spring integration         │ Good (via junit5)             │ Native (Spring project)
+Can-I-Deploy               │ Yes (Pact Broker feature)     │ No
+Best for                   │ Polyglot teams, consumer-first│ All-Java/Spring teams
+
+When to choose Pact:
+  ✓ Consumer-driven (consumers define contracts)
+  ✓ Polyglot environments (Java + Node.js + Python)
+  ✓ "Can I deploy" gates in CI/CD
+  ✓ Multiple consumers of the same service
+
+When to choose Spring Cloud Contract:
+  ✓ Provider-driven (providers publish stubs)
+  ✓ Pure Java/Spring ecosystems
+  ✓ Simpler setup (no Pact Broker needed)
+  ✓ Teams already using Spring Cloud
+
+────────────────────────────────────────────────────────────────────────────────
+
+PACT WITH MESSAGING (Kafka / RabbitMQ)
+========================================
+
+Pact also supports asynchronous messaging contracts:
+
+Consumer (Inventory Service consuming OrderCreatedEvent):
+  @Pact(consumer = "inventory-service", provider = "order-service")
+  public MessagePact orderCreatedMessage(MessagePactBuilder builder) {
+    return builder
+        .given("order was placed")
+        .expectsToReceive("an OrderCreated event")
+        .withContent(LambdaDsl.newJsonBody(body -> body
+            .uuid("eventId")
+            .stringValue("eventType", "ORDER_CREATED")
+            .uuid("orderId")
+            .minArrayLike("items", 1, item -> item
+                .uuid("productId")
+                .integerType("quantity", 1))
+        ).build())
+        .toPact();
+  }
+
+  @Test
+  @PactTestFor(pactMethod = "orderCreatedMessage",
+               providerType = ProviderType.ASYNCH)
+  void whenOrderCreated_inventoryIsReserved(List<Message> messages) {
+    OrderCreatedEvent event = objectMapper.readValue(
+        messages.get(0).contentsAsString(), OrderCreatedEvent.class);
+
+    inventoryService.handleOrderCreated(event);
+
+    assertThat(inventoryRepository.findReservation(event.getOrderId())).isPresent();
+  }
+
+Provider (Order Service publishes OrderCreatedEvent):
+  @State("order was placed")
+  public void orderWasPlaced() { /* No DB setup needed for messaging */ }
+
+  @PactVerifyProvider("an OrderCreated event")
+  public MessageAndMetadata publishOrderCreatedEvent() {
+    Order order = new Order("ord-123", "cust-456", /* items */);
+    OrderCreatedEvent event = orderEventPublisher.buildEvent(order);
+    return MessageAndMetadata.create(objectMapper.writeValueAsBytes(event));
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+
+INTERVIEW QUESTIONS — CONTRACT TESTING / PACT
+===============================================
+
+Q: What is consumer-driven contract testing and why is it better than integration testing?
+A: Consumer-driven contract testing lets the consumer define what it needs from
+   the provider as a contract. The provider verifies it fulfills these contracts
+   independently — no need to run both services simultaneously. Unlike integration
+   tests that are slow, flaky, and require full environments, contract tests are
+   fast and isolated. They also give the provider visibility into exactly which
+   fields consumers depend on — safe to remove unused fields.
+
+Q: What is a "provider state" in Pact?
+A: A provider state is a named precondition that describes the state the provider's
+   data must be in for a specific interaction to make sense. Example: "product
+   prod-123 exists with 50 available." The consumer declares this state; the
+   provider implements a @State method that sets up the required DB data before
+   the request is replayed. This decouples test data setup between consumer and
+   provider.
+
+Q: How does Pact prevent breaking changes in API contracts?
+A: Consumer tests generate a pact file capturing expected requests/responses.
+   This is published to Pact Broker. Provider CI runs verification against all
+   consumer contracts before each deployment. If the provider changes an API
+   in a way that breaks any consumer contract (e.g., removes a field, changes
+   status codes), the verification fails and deployment is blocked until all
+   consumers are updated.
+
+Q: What is the difference between exact matching and type matching in Pact?
+A: Exact matching (stringValue) asserts a specific value — brittle if the
+   provider changes a generated value like an ID. Type matching (stringType,
+   integerType) asserts the type of the value, using an example for documentation.
+   Best practice: use type matchers for IDs, timestamps, auto-generated data;
+   use exact matching only for enums, status codes, fixed strings.
+
+Q: How does Pact handle asynchronous messaging (Kafka)?
+A: Pact supports message pacts for async communication. The consumer writes a
+   test asserting what message format it expects to receive. The provider
+   implements a @PactVerifyProvider that produces the actual message using its
+   real publishing code. Pact verifies that the published message matches the
+   consumer's expected format — without needing a real Kafka broker.
+================================================================================

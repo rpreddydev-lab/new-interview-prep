@@ -1,0 +1,443 @@
+DATABASE VERSIONING AND AUDIT LOGGING
+===========================================================================================================
+
+WHY THIS MATTERS
+-----------------
+Senior Java developers must answer: "Who changed what, when, and what did it look like before?"
+Use cases: compliance audits, debugging production issues, data recovery, regulatory requirements (SOX, HIPAA, GDPR right to erasure), undo functionality.
+
+Topics covered:
+  1. Soft Deletes
+  2. Temporal Tables (System-Versioned)
+  3. Spring Data Auditing (@CreatedBy, @LastModifiedBy, @CreatedDate, @LastModifiedDate)
+  4. Hibernate Envers (entity change history)
+  5. Database Triggers for Audit Tables
+  6. Change Data Capture (CDC) with Debezium
+  7. Event Sourcing Basics
+
+===========================================================================================================
+1. SOFT DELETES
+===========================================================================================================
+
+Hard delete: DELETE FROM orders WHERE id = 1; — Data is gone forever.
+
+Soft delete: Mark row as deleted without removing it.
+
+  ALTER TABLE orders ADD COLUMN is_deleted BOOLEAN DEFAULT FALSE;
+  ALTER TABLE orders ADD COLUMN deleted_at TIMESTAMP;
+  ALTER TABLE orders ADD COLUMN deleted_by VARCHAR(100);
+
+  -- Soft delete:
+  UPDATE orders SET is_deleted = TRUE, deleted_at = NOW(), deleted_by = 'user_123' WHERE id = 1;
+
+  -- All queries filter by is_deleted = FALSE:
+  SELECT * FROM orders WHERE is_deleted = FALSE;
+
+JPA / Hibernate soft delete:
+  
+  @Entity
+  @Table(name = "orders")
+  @SQLDelete(sql = "UPDATE orders SET is_deleted = true, deleted_at = CURRENT_TIMESTAMP WHERE id = ?")
+  @Where(clause = "is_deleted = false")   // auto-applied to all queries
+  public class Order {
+    @Id @GeneratedValue
+    private Long id;
+    
+    @Column(name = "is_deleted")
+    private boolean deleted = false;
+    
+    @Column(name = "deleted_at")
+    private LocalDateTime deletedAt;
+    
+    private String customerName;
+    // ...
+  }
+  
+  // Calling repository.delete(order) now fires the UPDATE instead of DELETE
+  // @Where ensures all findById, findAll, etc. exclude deleted records automatically
+
+PITFALLS with Soft Deletes:
+  1. Unique constraints broken: If email must be unique and user soft-deletes and re-registers.
+     Fix: Make the unique constraint on (email, is_deleted) or use partial unique index:
+       CREATE UNIQUE INDEX idx_users_email ON users(email) WHERE is_deleted = FALSE;
+  
+  2. Foreign key complexity: Deleted parent with live children? Add cascade logic.
+  
+  3. Performance: is_deleted = FALSE is a low-cardinality filter — index helps:
+       CREATE INDEX idx_orders_not_deleted ON orders(id) WHERE is_deleted = FALSE;
+       CREATE INDEX idx_orders_tenant ON orders(tenant_id) WHERE is_deleted = FALSE;
+  
+  4. GDPR Right to Erasure: Soft delete is NOT erasure. For GDPR, must anonymize data:
+       UPDATE users SET email = 'deleted_' || id || '@example.com',
+                        name = 'Deleted User', phone = NULL
+       WHERE id = ? AND is_deleted = TRUE;
+
+===========================================================================================================
+2. TEMPORAL TABLES (System-Versioned / Bi-temporal)
+===========================================================================================================
+
+SYSTEM-VERSIONED TEMPORAL TABLE:
+  The database automatically tracks every row version with valid time range.
+  
+  -- PostgreSQL doesn't have native temporal, but SQL Server / MySQL 8.0+ do:
+  
+  -- MySQL 8.0+ temporal table:
+  CREATE TABLE employees (
+    id INT PRIMARY KEY,
+    name VARCHAR(100),
+    salary DECIMAL(10,2),
+    department VARCHAR(50),
+    row_start DATETIME(6) GENERATED ALWAYS AS ROW START,
+    row_end   DATETIME(6) GENERATED ALWAYS AS ROW END,
+    PERIOD FOR SYSTEM_TIME(row_start, row_end)
+  ) WITH SYSTEM VERSIONING;
+  
+  -- DB auto-tracks history. Current data:
+  SELECT * FROM employees;
+  
+  -- As of a specific time:
+  SELECT * FROM employees FOR SYSTEM_TIME AS OF '2024-01-15 10:00:00';
+  
+  -- Full history of one employee:
+  SELECT * FROM employees FOR SYSTEM_TIME ALL WHERE id = 42;
+
+PostgreSQL workaround with triggers (since no native temporal):
+  CREATE TABLE employees_history (
+    id INT, name VARCHAR(100), salary DECIMAL, department VARCHAR(50),
+    valid_from TIMESTAMP, valid_to TIMESTAMP, operation CHAR(1)
+  );
+  
+  CREATE OR REPLACE FUNCTION log_employee_changes() RETURNS TRIGGER AS $$
+  BEGIN
+    IF TG_OP = 'UPDATE' THEN
+      INSERT INTO employees_history VALUES (OLD.*, NOW(), NULL, 'U');
+    ELSIF TG_OP = 'DELETE' THEN
+      INSERT INTO employees_history VALUES (OLD.*, NOW(), NULL, 'D');
+    END IF;
+    RETURN NEW;
+  END;
+  $$ LANGUAGE plpgsql;
+  
+  CREATE TRIGGER employees_audit_trigger
+  AFTER UPDATE OR DELETE ON employees
+  FOR EACH ROW EXECUTE FUNCTION log_employee_changes();
+
+BI-TEMPORAL TABLE:
+  Tracks two time dimensions:
+  1. Valid Time: When the fact was true in the real world (e.g., employee's salary was $100k from Jan to June).
+  2. Transaction Time: When the DB record was entered (system time).
+  
+  Used in: financial systems, regulatory compliance, healthcare, insurance.
+  
+  Example: Insurance policy with effective date vs when it was recorded:
+  CREATE TABLE policies (
+    policy_id INT,
+    coverage_amount DECIMAL,
+    valid_from DATE,   -- when coverage is effective in real world
+    valid_to   DATE,   -- when coverage expires in real world
+    rec_from   TIMESTAMP,  -- when this row was inserted in DB
+    rec_to     TIMESTAMP   -- when this row was superseded in DB
+  );
+
+===========================================================================================================
+3. SPRING DATA AUDITING
+===========================================================================================================
+
+Spring Data provides out-of-the-box tracking of who created/modified a record.
+
+Step 1: Enable auditing:
+  @SpringBootApplication
+  @EnableJpaAuditing(auditorAwareRef = "auditorAware")
+  public class Application { ... }
+
+Step 2: Define AuditorAware to extract current user:
+  @Component("auditorAware")
+  public class SpringSecurityAuditorAware implements AuditorAware<String> {
+    @Override
+    public Optional<String> getCurrentAuditor() {
+      return Optional.ofNullable(SecurityContextHolder.getContext().getAuthentication())
+             .filter(Authentication::isAuthenticated)
+             .map(Authentication::getName);
+    }
+  }
+
+Step 3: Add audit fields to entities (base class approach):
+  @MappedSuperclass
+  @EntityListeners(AuditingEntityListener.class)
+  public abstract class Auditable {
+    
+    @CreatedBy
+    @Column(name = "created_by", updatable = false)
+    private String createdBy;
+    
+    @CreatedDate
+    @Column(name = "created_at", updatable = false)
+    private LocalDateTime createdAt;
+    
+    @LastModifiedBy
+    @Column(name = "updated_by")
+    private String updatedBy;
+    
+    @LastModifiedDate
+    @Column(name = "updated_at")
+    private LocalDateTime updatedAt;
+  }
+  
+  @Entity
+  public class Order extends Auditable {
+    @Id @GeneratedValue private Long id;
+    private String customerName;
+    private BigDecimal amount;
+    // ...
+  }
+
+Spring Data auto-fills these fields on INSERT and UPDATE.
+No boilerplate in service layer needed!
+
+@Version for optimistic locking (often added to Auditable):
+  @Version
+  private Long version;   // Auto-incremented by Hibernate on every UPDATE
+
+===========================================================================================================
+4. HIBERNATE ENVERS (Entity Change History)
+===========================================================================================================
+
+Hibernate Envers automatically creates audit tables and logs all entity changes.
+
+Dependency:
+  <dependency>
+    <groupId>org.hibernate.orm</groupId>
+    <artifactId>hibernate-envers</artifactId>
+  </dependency>
+
+Mark entities to audit:
+  @Entity
+  @Audited   // All fields tracked. Use @NotAudited on fields to exclude.
+  public class Product {
+    @Id @GeneratedValue private Long id;
+    private String name;
+    private BigDecimal price;
+    
+    @NotAudited  // Don't track view count changes in audit history
+    private Long viewCount;
+  }
+
+Envers creates: products_AUD table automatically:
+  products_AUD:
+    id, name, price,        -- mirrored entity fields
+    REV (revision number),
+    REVTYPE (0=INSERT, 1=UPDATE, 2=DELETE)
+
+  REVINFO table:
+    REV, REVTSTMP (timestamp)
+
+To add user info to revisions:
+  @RevisionEntity(CustomRevisionListener.class)
+  @Entity
+  public class CustomRevision extends DefaultRevisionEntity {
+    private String username;
+  }
+  
+  public class CustomRevisionListener implements RevisionListener {
+    @Override
+    public void newRevision(Object revisionEntity) {
+      CustomRevision rev = (CustomRevision) revisionEntity;
+      rev.setUsername(getCurrentUsername());  // From SecurityContext
+    }
+  }
+
+Query audit history in Java:
+  AuditReader reader = AuditReaderFactory.get(entityManager);
+  
+  // Get product at revision 5:
+  Product productAtRev5 = reader.find(Product.class, productId, 5);
+  
+  // Get all revisions for a product:
+  List<Number> revisions = reader.getRevisions(Product.class, productId);
+  
+  // Query: all products that changed after date X:
+  AuditQuery query = reader.createQuery()
+    .forRevisionsOfEntity(Product.class, false, true)
+    .add(AuditEntity.revisionProperty("timestamp").gt(sinceTimestamp.getTime()))
+    .getResultList();
+
+===========================================================================================================
+5. DATABASE TRIGGERS FOR AUDIT TABLES
+===========================================================================================================
+
+When you need audit logging but can't use Hibernate (native SQL, stored procs, multiple apps).
+
+Setup (PostgreSQL):
+  -- Create audit table:
+  CREATE TABLE audit_log (
+    id          BIGSERIAL PRIMARY KEY,
+    table_name  VARCHAR(100) NOT NULL,
+    record_id   BIGINT NOT NULL,
+    operation   CHAR(1) NOT NULL CHECK (operation IN ('I','U','D')),
+    old_values  JSONB,
+    new_values  JSONB,
+    changed_by  VARCHAR(100),
+    changed_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+  
+  -- Generic audit trigger function:
+  CREATE OR REPLACE FUNCTION audit_trigger_function() RETURNS TRIGGER AS $$
+  BEGIN
+    IF TG_OP = 'INSERT' THEN
+      INSERT INTO audit_log (table_name, record_id, operation, new_values, changed_by)
+      VALUES (TG_TABLE_NAME, NEW.id, 'I', row_to_json(NEW)::jsonb, current_setting('app.user', true));
+    ELSIF TG_OP = 'UPDATE' THEN
+      INSERT INTO audit_log (table_name, record_id, operation, old_values, new_values, changed_by)
+      VALUES (TG_TABLE_NAME, NEW.id, 'U', row_to_json(OLD)::jsonb, row_to_json(NEW)::jsonb,
+              current_setting('app.user', true));
+    ELSIF TG_OP = 'DELETE' THEN
+      INSERT INTO audit_log (table_name, record_id, operation, old_values, changed_by)
+      VALUES (TG_TABLE_NAME, OLD.id, 'D', row_to_json(OLD)::jsonb, current_setting('app.user', true));
+    END IF;
+    RETURN NULL;
+  END;
+  $$ LANGUAGE plpgsql;
+  
+  -- Apply to any table:
+  CREATE TRIGGER audit_orders
+  AFTER INSERT OR UPDATE OR DELETE ON orders
+  FOR EACH ROW EXECUTE FUNCTION audit_trigger_function();
+  
+  -- Set user context before queries in Java (JDBC):
+  connection.createStatement().execute("SET LOCAL app.user = 'user_123'");
+
+PRO: Works for ALL applications (not just Hibernate). Enforced at DB level.
+CON: JSONB storage can be large. Trigger adds latency to every DML. Hard to query structured fields.
+
+===========================================================================================================
+6. CHANGE DATA CAPTURE (CDC) WITH DEBEZIUM
+===========================================================================================================
+
+CDC reads the database transaction log (WAL in PostgreSQL, binlog in MySQL) and publishes events.
+No application change needed. Works for ANY operation.
+
+Architecture:
+  Database → (transaction log) → Debezium Connector → Kafka → Consumers
+  
+  PostgreSQL → WAL (Write-Ahead Log) → Debezium → Kafka Topic: myapp.public.orders
+
+Event structure:
+  {
+    "op": "u",           // i=insert, u=update, d=delete, r=read/snapshot
+    "before": { "id": 1, "amount": 100.00, "status": "PENDING" },
+    "after":  { "id": 1, "amount": 100.00, "status": "SHIPPED" },
+    "source": {
+      "ts_ms": 1699900000000,
+      "table": "orders",
+      "txId": 55678
+    }
+  }
+
+Spring Boot Debezium Consumer:
+  @Component
+  public class OrderAuditConsumer {
+    
+    @KafkaListener(topics = "myapp.public.orders")
+    public void handleOrderChange(String eventJson) {
+      JsonNode event = objectMapper.readTree(eventJson);
+      String operation = event.get("op").asText();
+      JsonNode before = event.get("before");
+      JsonNode after = event.get("after");
+      
+      AuditEntry entry = AuditEntry.builder()
+        .operation(operation)
+        .tableName("orders")
+        .recordId(after != null ? after.get("id").asLong() : before.get("id").asLong())
+        .oldValues(before != null ? before.toString() : null)
+        .newValues(after != null ? after.toString() : null)
+        .timestamp(Instant.ofEpochMilli(event.at("/source/ts_ms").asLong()))
+        .build();
+      
+      auditRepository.save(entry);
+    }
+  }
+
+Use Cases for Debezium beyond auditing:
+  - Event-driven architecture (order placed → inventory service reacts)
+  - Cache invalidation (DB change → evict Redis cache)
+  - Search index sync (DB change → update Elasticsearch)
+  - Outbox Pattern (atomically write events and business data)
+
+PRO: No app code change, captures ALL changes (including direct SQL), low latency, no DB performance hit.
+CON: Requires Kafka infrastructure, complex setup, schema changes require Debezium reconfiguration.
+
+===========================================================================================================
+7. EVENT SOURCING (Brief Overview)
+===========================================================================================================
+
+Instead of storing current state, store the sequence of events that led to the current state.
+
+Traditional:  orders table → { id=1, status=SHIPPED, amount=100 }  (current state only)
+Event Sourced: order_events table →
+  { orderId=1, event=OrderPlaced,  data={amount:100, item:"Book"}, ts=10:00 }
+  { orderId=1, event=PaymentTaken, data={method:"card"},           ts=10:05 }
+  { orderId=1, event=OrderShipped, data={trackingId:"TRK123"},     ts=14:30 }
+  
+  Current state is reconstructed by replaying events.
+
+PRO:
+  ✅ Complete audit trail is the data model itself
+  ✅ Can reconstruct state at any point in time
+  ✅ Naturally produces domain events for other services
+  ✅ Can replay events to fix bugs (reprocess with corrected logic)
+
+CON:
+  ❌ Query complexity: Must rebuild projections (read models) for queries
+  ❌ Event schema evolution is tricky
+  ❌ Snapshots needed to avoid replaying thousands of events
+  ❌ Significant mindset shift from CRUD
+
+Frameworks: Axon Framework (Java), EventStoreDB.
+
+===========================================================================================================
+CHOOSING THE RIGHT APPROACH
+===========================================================================================================
+
+| Requirement                        | Recommended Approach                          |
+|------------------------------------|-----------------------------------------------|
+| Track who created/modified         | Spring Data @CreatedBy/@LastModifiedDate       |
+| Full entity change history (Java)  | Hibernate Envers                              |
+| Audit without changing code        | DB Triggers or CDC/Debezium                   |
+| Compliance (HIPAA, SOX, GDPR)      | DB Triggers + dedicated audit DB             |
+| Real-time events to other services | CDC with Debezium → Kafka                     |
+| Point-in-time recovery             | Temporal tables or Event Sourcing             |
+| Undo feature for users             | Hibernate Envers or Event Sourcing            |
+| Soft deletes                       | @SQLDelete + @Where or isDeleted column       |
+
+===========================================================================================================
+INTERVIEW Q&A
+===========================================================================================================
+
+Q: What is the difference between soft delete and hard delete? When would you use each?
+A: Hard delete: physically removes the row with DELETE SQL. Data is unrecoverable without backup.
+   Soft delete: sets is_deleted = true. Data remains queryable. Adds is_deleted = FALSE filter to all reads.
+   Use soft delete when: you need audit history, undo capability, data recovery, or the data is referenced
+   by foreign keys. Use hard delete for truly ephemeral data or when GDPR erasure is required
+   (soft delete alone is not GDPR erasure — you must also anonymize PII fields).
+
+Q: How does Hibernate Envers work and what does it store?
+A: @Audited annotation tells Envers to track that entity. Envers hooks into Hibernate's event system —
+   after every INSERT, UPDATE, or DELETE, it writes to a shadow audit table named {table}_AUD.
+   That table mirrors all audited columns plus REV (revision number) and REVTYPE (0=insert/1=update/2=delete).
+   A REVINFO table stores the revision number and timestamp. You can extend it with username via RevisionListener.
+   Querying is done through AuditReader API — you can get the entity as it looked at any revision number.
+
+Q: What is CDC and how does Debezium enable audit logging?
+A: Change Data Capture reads the database's transaction log (WAL in PostgreSQL, binlog in MySQL) to capture
+   every row change without any application code change. Debezium is a Kafka Connect plugin that reads the
+   transaction log and publishes structured events to Kafka topics. Each event has "before" (old state) and
+   "after" (new state) plus metadata (table, timestamp, transaction ID). A consumer can write these to an
+   audit store. Benefits: captures ALL changes (even direct SQL), no app change required, no performance
+   impact on OLTP queries, near real-time.
+
+Q: What is the difference between Spring Data @LastModifiedDate and Hibernate Envers? When would you use each?
+A: @LastModifiedDate (Spring Data Auditing) tracks just one point in time — the last time the entity changed.
+   You can only see the current state, not historical states. Good for "when was this last touched."
+   Hibernate Envers keeps the full change history — every revision, with before/after values.
+   You can query "what did this order look like 3 weeks ago." Good for audit trails, debugging, compliance.
+   In practice: use both together — @LastModifiedBy/@LastModifiedDate for convenience, Envers for full history.

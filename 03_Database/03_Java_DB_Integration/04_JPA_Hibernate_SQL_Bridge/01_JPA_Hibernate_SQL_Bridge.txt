@@ -1,0 +1,410 @@
+JPA / HIBERNATE & SQL — BRIDGING ORM AND DATABASE
+(What SQL Does Hibernate Generate, N+1, Lazy Loading, Flush Modes)
+===========================================================================================================
+
+OVERVIEW
+---------
+JPA (Jakarta Persistence API) is the specification.
+Hibernate is the most popular JPA implementation.
+Spring Data JPA adds repository abstraction on top of JPA.
+
+As a Java developer, you MUST understand what SQL Hibernate generates
+and how to optimize it — this is heavily tested in senior interviews.
+
+===========================================================================================================
+1. ENTITY MAPPING & GENERATED SQL
+===========================================================================================================
+
+Basic Entity:
+  @Entity
+  @Table(name = "employees")
+  public class Employee {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)  // Uses DB auto-increment
+    private Long id;
+    
+    @Column(name = "full_name", nullable = false, length = 100)
+    private String name;
+    
+    @Column(unique = true)
+    private String email;
+    
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "dept_id")
+    private Department department;
+    
+    @CreationTimestamp
+    private LocalDateTime createdAt;
+    
+    @UpdateTimestamp
+    private LocalDateTime updatedAt;
+  }
+
+GenerationType strategies:
+  IDENTITY:   Uses DB auto-increment (MySQL: AUTO_INCREMENT, PostgreSQL: SERIAL/IDENTITY)
+              Generated SQL: INSERT INTO employees (name, email, dept_id) VALUES (?, ?, ?)
+              Hibernate reads generated ID after insert.
+              
+  SEQUENCE:   Uses DB sequence. Hibernate pre-fetches IDs in batches (allocationSize=50).
+              Better for batch inserts. Default strategy for PostgreSQL in production.
+              
+  TABLE:      Uses a generator table. Portable but slow — avoids this.
+  
+  AUTO:       Hibernate picks based on DB (usually SEQUENCE for PostgreSQL, IDENTITY for MySQL).
+  
+  UUID:       @GeneratedValue(generator = "uuid2") @GenericGenerator(name = "uuid2", strategy = "uuid2")
+              Good for distributed systems (no coordination needed).
+
+---
+
+===========================================================================================================
+2. RELATIONSHIPS AND THEIR SQL IMPACT
+===========================================================================================================
+
+@ManyToOne (Many employees → One department):
+  @ManyToOne(fetch = FetchType.LAZY)
+  @JoinColumn(name = "dept_id", nullable = false)
+  private Department department;
+  
+  Generated SQL (on entity load):
+    SELECT e.id, e.full_name, e.email, e.dept_id FROM employees e WHERE e.id = ?
+    -- dept_id loaded, but Department NOT fetched yet (LAZY)
+  
+  When accessing employee.getDepartment():
+    SELECT d.id, d.name FROM departments d WHERE d.id = ?  -- triggers separate query
+
+@OneToMany (One department → Many employees):
+  @OneToMany(mappedBy = "department", cascade = CascadeType.ALL, fetch = FetchType.LAZY)
+  private List<Employee> employees = new ArrayList<>();
+  
+  Default: LAZY — employees NOT loaded when department is loaded.
+  If you call dept.getEmployees() → triggers: SELECT * FROM employees WHERE dept_id = ?
+
+@ManyToMany:
+  @ManyToMany
+  @JoinTable(
+    name = "employee_project",
+    joinColumns = @JoinColumn(name = "employee_id"),
+    inverseJoinColumns = @JoinColumn(name = "project_id")
+  )
+  private Set<Project> projects;
+  
+  This creates a join table: employee_project(employee_id, project_id)
+
+EAGER vs LAZY loading:
+  EAGER (FetchType.EAGER): Related entity loaded IMMEDIATELY with parent.
+    Generated SQL: JOIN query fetching both parent and child.
+    BAD for @OneToMany with EAGER — leads to Cartesian product!
+    
+  LAZY (FetchType.LAZY): Related entity loaded ON ACCESS (proxy).
+    Requires open Hibernate session. Efficient — loads only when needed.
+    Risk: LazyInitializationException if accessed outside transaction.
+
+DEFAULT fetch types:
+  @ManyToOne, @OneToOne: EAGER (Hibernate default — CHANGE TO LAZY!)
+  @OneToMany, @ManyToMany: LAZY
+
+Best practice: Make everything LAZY, then eagerly fetch only what you need via JOIN FETCH.
+
+---
+
+===========================================================================================================
+3. THE N+1 PROBLEM — MOST COMMON HIBERNATE INTERVIEW TOPIC
+===========================================================================================================
+
+The Problem:
+  // Load all departments
+  List<Department> depts = deptRepo.findAll();  // Query 1: SELECT * FROM departments
+  
+  for (Department dept : depts) {
+    // Accessing lazy collection triggers a query PER department!
+    dept.getEmployees().size();  // Query 2 to N+1: SELECT * FROM employees WHERE dept_id = ?
+  }
+  
+  Result: 1 + N queries = N+1 problem. For 100 departments → 101 SQL queries!
+
+Detection:
+  Enable SQL logging:
+    spring.jpa.show-sql=true
+    spring.jpa.properties.hibernate.format_sql=true
+    logging.level.org.hibernate.SQL=DEBUG
+    logging.level.org.hibernate.type.descriptor.sql.BasicBinder=TRACE
+  
+  Use Hibernate's statistics:
+    spring.jpa.properties.hibernate.generate_statistics=true
+
+Solutions:
+
+1. JOIN FETCH in JPQL (best for specific queries):
+   @Query("SELECT d FROM Department d JOIN FETCH d.employees")
+   List<Department> findAllWithEmployees();
+   
+   Generated SQL: SELECT d.*, e.* FROM departments d 
+                  INNER JOIN employees e ON e.dept_id = d.id
+   
+   Single query! But: returns duplicate departments if a dept has multiple employees.
+   Fix: Use DISTINCT in JPQL:
+   @Query("SELECT DISTINCT d FROM Department d JOIN FETCH d.employees")
+
+2. @EntityGraph (declarative, composable):
+   @EntityGraph(attributePaths = {"employees", "employees.projects"})
+   List<Department> findAll();
+   
+   Spring Data generates JOIN FETCH based on the graph.
+
+3. Batch fetching (Hibernate-specific):
+   @BatchSize(size = 50) on the collection.
+   Instead of N individual queries → loads in batches of 50.
+   Good when you can't control the query.
+
+4. @NamedEntityGraph:
+   @NamedEntityGraph(
+     name = "department.employees",
+     attributeNodes = @NamedAttributeNode("employees")
+   )
+   @Entity
+   public class Department { ... }
+
+5. DTO Projection (most efficient for read-only):
+   @Query("SELECT new com.example.DeptSummaryDto(d.id, d.name, COUNT(e)) "
+        + "FROM Department d LEFT JOIN d.employees e GROUP BY d.id, d.name")
+   List<DeptSummaryDto> getDepartmentSummaries();
+   
+   Fetches ONLY the data you need. No entity managed by Hibernate → no dirty checking.
+
+---
+
+===========================================================================================================
+4. HIBERNATE FLUSH MODES
+===========================================================================================================
+
+Flush = synchronize the Hibernate in-memory state (first-level cache) with the database.
+
+Flush Modes:
+  AUTO (default): Hibernate flushes BEFORE query execution (to ensure queries see latest state)
+                  and at transaction commit.
+  
+  COMMIT:         Flush only at COMMIT. Faster but query may not see pending changes.
+  
+  ALWAYS:         Flush before every query. Safest but slowest.
+  
+  MANUAL:         Only flush when session.flush() is explicitly called.
+                  Use with care — easy to miss updates.
+
+Default behavior (AUTO) example:
+  @Transactional
+  public void process() {
+    Employee emp = empRepo.findById(1L).get();
+    emp.setSalary(90000);  // Hibernate marks entity as "dirty"
+    // No save() called! But...
+    
+    List<Employee> highEarners = empRepo.findBySalaryGreaterThan(80000);
+    // AUTO flush: Hibernate flushes UPDATE before this query → includes emp!
+    
+    // Transaction commit: Hibernate flushes again → UPDATE employee SET salary=90000 WHERE id=1
+  }
+  // No explicit save() needed — Hibernate auto-detects changes on managed entities!
+
+For read-only queries, use:
+  @Transactional(readOnly = true)
+  // Hibernate skips dirty checking entirely → better performance
+
+---
+
+===========================================================================================================
+5. FIRST-LEVEL CACHE (SESSION CACHE)
+===========================================================================================================
+
+Hibernate has a first-level cache (session/persistence context cache) by default.
+Every entity loaded within a session is cached in memory.
+
+  Employee emp1 = empRepo.findById(1L).get();  // SELECT from DB
+  Employee emp2 = empRepo.findById(1L).get();  // Returned from CACHE — no DB query!
+  
+  emp1 == emp2  // true — same object reference!
+
+Benefits: Prevents repeated queries for same entity within a transaction.
+
+Pitfall: Large batch operations load thousands of entities into session cache → OutOfMemoryError.
+
+  Fix for batch processing:
+    entityManager.clear();      // Clear session cache after each batch
+    entityManager.flush();      // Flush pending changes to DB first
+    
+    // Or use JDBC directly for bulk updates/deletes:
+    @Modifying
+    @Query("UPDATE Employee e SET e.salary = e.salary * 1.1 WHERE e.dept = :dept")
+    int giveRaiseByDept(@Param("dept") String dept);  // Single UPDATE, no entity loading!
+
+---
+
+===========================================================================================================
+6. SECOND-LEVEL CACHE (L2 CACHE)
+===========================================================================================================
+
+Second-level cache: Shared across sessions (not transaction-scoped).
+Caches entity data between transactions.
+
+Popular providers: Ehcache, Hazelcast, Caffeine, Redis (Hibernate-Redis integration).
+
+Enable:
+  spring.jpa.properties.hibernate.cache.use_second_level_cache=true
+  spring.jpa.properties.hibernate.cache.region.factory_class=org.hibernate.cache.jcache.JCacheRegionFactory
+
+  @Entity
+  @Cacheable
+  @Cache(usage = CacheConcurrencyStrategy.READ_WRITE)
+  public class Product { ... }
+
+Cache concurrency strategies:
+  READ_ONLY:     Immutable data. Never modified after creation. Fastest.
+  READ_WRITE:    Soft locking. Safe for entities that are occasionally updated.
+  NONSTRICT_READ_WRITE: No locking. May briefly show stale data. High concurrency.
+  TRANSACTIONAL: Full transactional cache. Requires JTA. Rarely used.
+
+When to use L2 cache:
+  ✅ Reference data that rarely changes (countries, categories, config)
+  ✅ Read-heavy data with low update frequency
+  ❌ Frequently updated data (cache invalidation overhead outweighs benefit)
+
+---
+
+===========================================================================================================
+7. OPTIMISTIC LOCKING WITH @VERSION
+===========================================================================================================
+
+Optimistic locking assumes conflicts are rare. No DB lock held during business processing.
+At commit time, checks if the version has changed since read.
+
+  @Entity
+  public class Product {
+    @Id
+    private Long id;
+    
+    private int quantity;
+    
+    @Version  // Hibernate manages this automatically
+    private Long version;
+  }
+
+Generated SQL:
+  -- Read: SELECT id, quantity, version FROM products WHERE id = 1
+  -- Update: UPDATE products SET quantity = 8, version = 2 WHERE id = 1 AND version = 1
+  --         If version doesn't match → 0 rows updated → Hibernate throws OptimisticLockException
+
+Flow:
+  1. Thread A reads product (version=1, quantity=10)
+  2. Thread B reads product (version=1, quantity=10)
+  3. Thread A buys 2 → UPDATE ... WHERE version=1 → SUCCESS → version becomes 2
+  4. Thread B buys 2 → UPDATE ... WHERE version=1 → FAILS (version is now 2)
+  5. Thread B receives OptimisticLockException → retry with fresh read
+
+Handle in Spring:
+  catch (ObjectOptimisticLockingFailureException ex) {
+    // retry the operation
+  }
+
+---
+
+===========================================================================================================
+8. BULK OPERATIONS — WHEN TO USE JPQL, SQL, OR BATCH INSERTS
+===========================================================================================================
+
+For bulk updates/deletes:
+  // BAD: Loads all entities, updates in Java, Hibernate generates N UPDATE statements
+  empRepo.findAllByDept("IT").forEach(e -> e.setSalary(e.getSalary() * 1.1));
+  
+  // GOOD: Single UPDATE in DB, bypasses persistence context
+  @Modifying
+  @Transactional
+  @Query("UPDATE Employee e SET e.salary = e.salary * 1.1 WHERE e.department.name = :dept")
+  int updateSalariesByDept(@Param("dept") String dept);
+
+For bulk inserts:
+  Configure batch inserts in Hibernate:
+    spring.jpa.properties.hibernate.jdbc.batch_size=50
+    spring.jpa.properties.hibernate.order_inserts=true
+    spring.jpa.properties.hibernate.order_updates=true
+  
+  // With batch_size=50, Hibernate sends inserts in batches of 50 → fewer round trips
+  // IMPORTANT: Use GenerationType.SEQUENCE (not IDENTITY) for batch inserts
+  //            IDENTITY requires per-row DB round trip to get generated ID → disables batching
+
+For very large bulk operations: Use JDBC directly or Spring Batch.
+
+---
+
+===========================================================================================================
+9. CRITERIA API VS JPQL VS NATIVE QUERY
+===========================================================================================================
+
+JPQL (Java Persistence Query Language):
+  Object-oriented query language (uses entity/field names, not table/column names).
+  @Query("SELECT e FROM Employee e WHERE e.salary > :minSal AND e.department.name = :dept")
+  List<Employee> findHighEarners(@Param("minSal") double minSal, @Param("dept") String dept);
+  
+  Good for: Most queries. Readable, portable across DBs.
+
+Criteria API (type-safe, programmatic):
+  CriteriaBuilder cb = em.getCriteriaBuilder();
+  CriteriaQuery<Employee> cq = cb.createQuery(Employee.class);
+  Root<Employee> root = cq.from(Employee.class);
+  
+  cq.select(root)
+    .where(cb.and(
+      cb.gt(root.get("salary"), minSal),
+      cb.equal(root.join("department").get("name"), dept)
+    ));
+  
+  Good for: Dynamic queries built at runtime (variable WHERE conditions).
+  Trade-off: Verbose but type-safe and refactoring-friendly.
+
+Native SQL Query:
+  @Query(value = "SELECT * FROM employees e JOIN departments d ON e.dept_id = d.id "
+               + "WHERE d.name = :dept AND e.salary > :minSal", nativeQuery = true)
+  List<Employee> findHighEarners(@Param("dept") String dept, @Param("minSal") double minSal);
+  
+  Good for: DB-specific features (window functions, JSON operators, ARRAY types).
+  Trade-off: DB-specific, bypasses ORM abstraction.
+
+Projections (interface/DTO-based):
+  public interface EmployeeSummary {
+    String getName();
+    double getSalary();
+  }
+  
+  List<EmployeeSummary> findByDepartmentName(String dept);  // Spring Data auto-maps
+  
+  Good for: Read-only views where you don't need the full entity.
+
+---
+
+===========================================================================================================
+10. INTERVIEW QUICK-REFERENCE
+===========================================================================================================
+
+Q: What is the difference between persist(), merge(), save(), saveAndFlush() in Spring Data?
+A: persist(): Adds new entity to persistence context. Must be new (no ID).
+   merge(): Detaches entity, merges state into managed entity. Works for new or existing.
+   JPA save() in Spring Data: Uses persist() for new entity, merge() for existing.
+   saveAndFlush(): Saves and immediately flushes to DB (triggers SQL before transaction commit).
+
+Q: What is a detached entity?
+A: An entity that was previously managed but is no longer associated with a session.
+   Typically happens after: transaction closes, EntityManager.detach(), EntityManager.clear().
+   Accessing lazy collections on detached entities → LazyInitializationException.
+
+Q: What is the difference between FetchType.LAZY and FetchType.EAGER?
+A: LAZY: Association not loaded until first access. Proxy placeholder used.
+   EAGER: Association loaded IMMEDIATELY with parent entity (JOIN in SQL).
+   Best practice: Always LAZY, fetch eagerly only when needed via JOIN FETCH.
+
+Q: What does @Modifying do?
+A: Marks a @Query that modifies data (UPDATE, DELETE, INSERT).
+   Required for any non-SELECT @Query. Without it, Hibernate throws an exception.
+   Should be used with @Transactional.
+
+Q: Why should you prefer GenerationType.SEQUENCE over IDENTITY for batch inserts?
+A: IDENTITY requires a DB round trip after each INSERT to get the generated ID.
+   This prevents JDBC batching. SEQUENCE allows Hibernate to pre-allocate ID ranges
+   (allocationSize) and batch inserts without extra round trips.

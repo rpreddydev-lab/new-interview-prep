@@ -1,0 +1,311 @@
+READ REPLICAS & WRITE-READ SEPARATION
+===========================================================================================================
+
+OVERVIEW
+---------
+In high-traffic applications, a single database cannot handle all reads and writes.
+Read replicas allow distributing read traffic across multiple nodes while the primary
+handles all writes.
+
+Typical read:write ratio in web apps: 70-90% reads, 10-30% writes.
+Read replicas can dramatically scale read capacity.
+
+===========================================================================================================
+1. ARCHITECTURE
+===========================================================================================================
+
+Primary (Master):
+  - Handles ALL writes (INSERT, UPDATE, DELETE)
+  - Handles strongly consistent reads
+  - Streams changes to replicas (via WAL in PostgreSQL, binlog in MySQL)
+
+Read Replicas (Secondaries):
+  - Receive changes from primary via replication
+  - Handle READ queries
+  - Cannot accept writes (read-only)
+  - Multiple replicas can be added independently
+  - Can be in different geographic regions (geo-distribution)
+
+Application:
+  - Routes writes → Primary
+  - Routes reads → Replicas (or Primary if strong consistency needed)
+
+               ┌──────────────────────────────────┐
+               │           Load Balancer           │
+               └──────────────────────────────────┘
+                     │ writes        │ reads
+               ┌─────▼─────┐  ┌─────▼──────────────┐
+               │  Primary  │  │  Read Replica Pool  │
+               │  (Master) │  │  (Replica 1, 2, 3)  │
+               └─────┬─────┘  └─────────────────────┘
+                     │ replication (WAL/binlog)
+                     ▼
+              (Replica 1, Replica 2, Replica 3)
+
+===========================================================================================================
+2. REPLICATION TYPES
+===========================================================================================================
+
+SYNCHRONOUS REPLICATION:
+  Primary waits for at least ONE replica to confirm write before acknowledging to client.
+  
+  PRO: Zero data loss on primary failure. Replica always has latest data.
+  CON: Write latency increases (waits for network round trip to replica).
+  
+  PostgreSQL:
+    synchronous_standby_names = 'replica1'
+    -- Commit only returns after replica1 confirms write.
+  
+  Use when: Financial systems, banking — data loss is unacceptable.
+
+ASYNCHRONOUS REPLICATION:
+  Primary commits and acknowledges to client immediately.
+  Replication to replicas happens in the background.
+  
+  PRO: Write latency unaffected.
+  CON: Replication lag — replica may be slightly behind primary.
+       If primary crashes, unsynced data is lost.
+  
+  Most common in practice. Replication lag is usually milliseconds.
+  
+  Use when: Most web applications, social media, e-commerce.
+
+SEMI-SYNCHRONOUS:
+  Primary waits for confirmation from at least one replica (not all).
+  Balance between safety and performance.
+  MySQL supports semi-synchronous replication natively.
+
+===========================================================================================================
+3. REPLICATION LAG
+===========================================================================================================
+
+Replication Lag: Time delay between a write on primary and it appearing on replica.
+
+Causes:
+  - Network latency between primary and replica
+  - Heavy write load on primary (replica can't keep up)
+  - Long-running queries on replica blocking replication (MySQL)
+  - Single-threaded replication (older MySQL versions)
+
+Impact:
+  Read from replica → may return stale data (seconds or more behind primary).
+
+Monitoring:
+  PostgreSQL: SELECT now() - pg_last_xact_replay_timestamp() AS lag;
+  MySQL:      SHOW SLAVE STATUS\G → Seconds_Behind_Master
+  AWS RDS:    ReplicaLag CloudWatch metric
+
+---
+
+HOW TO HANDLE REPLICATION LAG IN APPLICATION:
+
+1. Read-your-writes consistency:
+   After a user writes data, subsequent reads should see that write.
+   Strategy: For a short time after a write, route reads to PRIMARY.
+   
+   // After save, redirect to primary for next N seconds
+   @Service
+   public class UserService {
+     @Transactional
+     public User updateProfile(Long id, UserUpdateDto dto) {
+       User user = userRepo.findById(id).get();
+       user.updateFrom(dto);
+       User saved = userRepo.save(user);
+       
+       // Hint to route next reads to primary (for this user's session)
+       replicationRoutingContext.preferPrimary(Duration.ofSeconds(5));
+       return saved;
+     }
+   }
+
+2. Monotonic reads:
+   Ensure a user always sees data at least as new as their last read.
+   Once routed to replica-1, always route to same replica (session pinning).
+   Or always route to primary for reads immediately after writes.
+
+3. Sticky sessions on replica:
+   Route specific users to specific replicas consistently.
+   They won't see data going "back in time" between reads.
+
+4. Strongly consistent reads directly from primary:
+   For critical operations (checkout, payment confirmation) → ALWAYS read from primary.
+   
+   @Transactional(readOnly = false)  // Force primary routing
+   public Order confirmPayment(Long orderId) {
+     Order order = orderRepo.findById(orderId).get();  // Read from primary
+     order.setStatus(OrderStatus.CONFIRMED);
+     return orderRepo.save(order);
+   }
+
+===========================================================================================================
+4. IMPLEMENTING READ-WRITE ROUTING IN SPRING BOOT
+===========================================================================================================
+
+Using AbstractRoutingDataSource to dynamically route to primary or replica:
+
+Step 1: Define DataSource enum:
+  public enum DataSourceType {
+    PRIMARY, REPLICA
+  }
+
+Step 2: ThreadLocal context holder:
+  public class DataSourceContextHolder {
+    private static final ThreadLocal<DataSourceType> contextHolder = new ThreadLocal<>();
+    
+    public static void setDataSourceType(DataSourceType type) { contextHolder.set(type); }
+    public static DataSourceType getDataSourceType() { return contextHolder.get(); }
+    public static void clearDataSourceType() { contextHolder.remove(); }
+  }
+
+Step 3: Routing DataSource:
+  @Component
+  public class RoutingDataSource extends AbstractRoutingDataSource {
+    @Override
+    protected Object determineCurrentLookupKey() {
+      // Route read-only transactions to replica, others to primary
+      return TransactionSynchronizationManager.isCurrentTransactionReadOnly()
+          ? DataSourceType.REPLICA
+          : DataSourceType.PRIMARY;
+    }
+  }
+
+Step 4: Configure beans:
+  @Configuration
+  public class DataSourceConfig {
+    
+    @Bean("primaryDataSource")
+    @ConfigurationProperties("spring.datasource.primary")
+    public DataSource primaryDataSource() { return DataSourceBuilder.create().build(); }
+    
+    @Bean("replicaDataSource")
+    @ConfigurationProperties("spring.datasource.replica")
+    public DataSource replicaDataSource() { return DataSourceBuilder.create().build(); }
+    
+    @Primary
+    @Bean
+    public DataSource routingDataSource(
+        @Qualifier("primaryDataSource") DataSource primary,
+        @Qualifier("replicaDataSource") DataSource replica) {
+      
+      RoutingDataSource routingDS = new RoutingDataSource();
+      Map<Object, Object> targetDataSources = new HashMap<>();
+      targetDataSources.put(DataSourceType.PRIMARY, primary);
+      targetDataSources.put(DataSourceType.REPLICA, replica);
+      
+      routingDS.setTargetDataSources(targetDataSources);
+      routingDS.setDefaultTargetDataSource(primary);  // Default to primary
+      return routingDS;
+    }
+  }
+
+Step 5: Use in service layer:
+  @Service
+  public class ProductService {
+    
+    @Transactional(readOnly = true)   // → RoutingDataSource sends to REPLICA
+    public List<Product> findAll() { return productRepo.findAll(); }
+    
+    @Transactional                    // → RoutingDataSource sends to PRIMARY
+    public Product save(Product p) { return productRepo.save(p); }
+  }
+
+IMPORTANT: Use LazyConnectionDataSourceProxy to delay actual connection checkout
+           until the first actual DB statement (ensures routing key is set first).
+
+  @Bean
+  @Primary
+  public DataSource dataSource() {
+    return new LazyConnectionDataSourceProxy(routingDataSource(...));
+  }
+
+===========================================================================================================
+5. READ REPLICA PATTERNS IN CLOUD
+===========================================================================================================
+
+AWS RDS Read Replicas:
+  - Create via: AWS Console / CLI / Terraform
+  - Each replica has its own endpoint (URL)
+  - Up to 15 replicas for MySQL, 5 for PostgreSQL (standard)
+  - Cross-region replicas supported (for DR and geo-routing)
+  - Aurora: Up to 15 Aurora Replicas sharing same storage (no replication lag!)
+
+Amazon Aurora:
+  Unique architecture: All instances share the SAME distributed storage layer.
+  Reads from replicas see writes instantly (no traditional replication lag).
+  Replicas can be promoted to writer in <30 seconds on failure.
+  Aurora Global Database: Cross-region replication with <1 second lag.
+
+Spring Boot + AWS RDS:
+  Configure separate datasource URLs for primary and read replica endpoints.
+  Use the routing approach above.
+
+===========================================================================================================
+6. LOAD BALANCING ACROSS MULTIPLE REPLICAS
+===========================================================================================================
+
+When you have multiple replicas, distribute read load:
+
+Options:
+  1. Round-robin: Route reads to replicas in order. Simple but doesn't account for lag.
+  
+  2. Least lag: Route to replica with smallest replication lag.
+                More complex — requires monitoring lag per replica.
+  
+  3. Random: Randomly pick a replica. Good enough with multiple replicas.
+  
+  4. ProxySQL (MySQL): Middleware that automatically load-balances reads across replicas.
+  
+  5. PgBouncer + HAProxy (PostgreSQL): Connection pooler + load balancer.
+
+Spring Boot with multiple replicas (round-robin):
+  @Component
+  public class MultiReplicaRoutingDataSource extends AbstractRoutingDataSource {
+    private final List<DataSource> replicas;
+    private final AtomicInteger counter = new AtomicInteger(0);
+    
+    @Override
+    protected Object determineCurrentLookupKey() {
+      if (TransactionSynchronizationManager.isCurrentTransactionReadOnly()) {
+        int idx = counter.getAndIncrement() % replicas.size();
+        return "REPLICA_" + idx;
+      }
+      return "PRIMARY";
+    }
+  }
+
+===========================================================================================================
+7. INTERVIEW Q&A
+===========================================================================================================
+
+Q: What is replication lag and how do you handle it in a Java application?
+A: Replication lag is the delay between a write on the primary and it appearing on a replica.
+   During this window, reads from replicas may return stale data.
+   
+   Handling:
+   1. Read-your-writes: After a write, route reads to primary for a short period.
+   2. Session pinning: Route a user's reads to the same replica consistently.
+   3. Strong consistency reads: Use primary for reads that must be current.
+   4. Accept eventual consistency where appropriate (product listings, social feeds).
+   5. Monitor lag and alert when it exceeds thresholds.
+
+Q: How does AbstractRoutingDataSource work in Spring?
+A: AbstractRoutingDataSource is a Spring DataSource implementation that delegates
+   connection acquisition to one of several target DataSources based on the routing key.
+   Override determineCurrentLookupKey() to return a key (e.g., PRIMARY or REPLICA).
+   Spring uses this key to pick the corresponding DataSource from a configured map.
+   Combined with @Transactional(readOnly = true) + TransactionSynchronizationManager,
+   read-only transactions automatically route to replicas.
+
+Q: What is the difference between a read replica and a standby (hot standby)?
+A: Hot Standby: A replica kept in sync for FAILOVER purposes. May or may not serve reads.
+               In PostgreSQL: "hot_standby = on" allows reads during standby mode.
+   Read Replica: Specifically intended to serve read traffic. May or may not be a failover candidate.
+   In practice, AWS RDS Read Replicas can be promoted to primary on failure.
+   Aurora Replicas serve reads AND can be auto-promoted to writer < 30 seconds.
+
+Q: How does Amazon Aurora achieve near-zero replication lag on its read replicas?
+A: Aurora uses a shared distributed storage layer (not traditional replication).
+   All Aurora instances (writer and readers) share the SAME storage volume.
+   Reads from replicas see writes without waiting for log replication — near-zero lag.
+   This is architecturally different from MySQL/PostgreSQL replication where log transfer
+   introduces lag.

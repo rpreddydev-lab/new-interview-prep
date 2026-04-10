@@ -1,0 +1,326 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LLD: DESIGN A THREAD POOL (EXECUTOR)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WHY THIS QUESTION?
+  Thread pools are fundamental to Java concurrency.
+  Designing one demonstrates: threading, blocking queues, lifecycle management,
+  producer-consumer pattern, and Java concurrency primitives.
+  Frequently asked at Amazon, Google, Meta for senior Java roles.
+
+1. REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FUNCTIONAL:
+  - Submit tasks (Runnable or Callable<T>) for execution.
+  - Configurable pool size (min threads, max threads).
+  - Tasks queued if all threads are busy.
+  - Return Future<T> for Callable tasks.
+  - Graceful shutdown: stop accepting tasks, complete queued tasks.
+  - Immediate shutdown: stop accepting, interrupt running tasks.
+
+NON-FUNCTIONAL:
+  - Thread-safe task submission from multiple producers.
+  - Efficient blocking when no tasks available (no busy-waiting).
+  - Workers should block waiting for tasks (not spin-loop).
+
+2. KEY DESIGN DECISIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BLOCKING QUEUE for task queue:
+  - Producer (task submitter) puts tasks in the queue.
+  - Worker threads take tasks from the queue (blocking when empty).
+  - BlockingQueue handles thread safety internally.
+  - LinkedBlockingQueue: unbounded (risk of OOM under load)
+  - ArrayBlockingQueue: bounded (submit blocks/rejects when full) ← preferred for production
+
+WORKER THREAD LIFECYCLE:
+  - Workers run in a loop: take task → execute → take next task
+  - Block (wait) on empty queue
+  - Exit loop on shutdown signal
+
+SHUTDOWN MODES:
+  - shutdown():     stop accepting, complete pending tasks, then stop workers
+  - shutdownNow():  stop accepting, interrupt running tasks, return unfinished tasks
+
+3. CLASS DESIGN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+// ----- Task Wrapper (for Callable → Future) -----
+
+class FutureTask<T> implements Future<T> {
+    private final Callable<T> callable;
+    private volatile T result;
+    private volatile Exception exception;
+    private volatile boolean done = false;
+    private final CountDownLatch latch = new CountDownLatch(1);
+    
+    FutureTask(Callable<T> callable) { this.callable = callable; }
+    
+    void run() {
+        try {
+            result = callable.call();
+        } catch (Exception e) {
+            exception = e;
+        } finally {
+            done = true;
+            latch.countDown();
+        }
+    }
+    
+    @Override
+    public T get() throws InterruptedException, ExecutionException {
+        latch.await();  // block until task completes
+        if (exception != null) throw new ExecutionException(exception);
+        return result;
+    }
+    
+    @Override
+    public T get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
+        if (!latch.await(timeout, unit)) throw new TimeoutException();
+        if (exception != null) throw new ExecutionException(exception);
+        return result;
+    }
+    
+    @Override public boolean isDone()                     { return done; }
+    @Override public boolean isCancelled()               { return false; } // simplified
+    @Override public boolean cancel(boolean mayInterrupt) { return false; } // simplified
+}
+
+// ----- Worker Thread -----
+
+class Worker implements Runnable {
+    private final BlockingQueue<Runnable> taskQueue;
+    private final AtomicBoolean isShutdown;
+    private volatile Thread thread;
+    
+    Worker(BlockingQueue<Runnable> taskQueue, AtomicBoolean isShutdown) {
+        this.taskQueue = taskQueue;
+        this.isShutdown = isShutdown;
+    }
+    
+    @Override
+    public void run() {
+        thread = Thread.currentThread();
+        
+        while (!isShutdown.get() || !taskQueue.isEmpty()) {
+            try {
+                // Block for up to 1 second waiting for a task
+                // (poll with timeout vs take: allows checking shutdown flag)
+                Runnable task = taskQueue.poll(1, TimeUnit.SECONDS);
+                
+                if (task != null) {
+                    task.run();  // execute the task
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                // Check if we should stop
+                if (isShutdown.get()) break;
+            } catch (Exception e) {
+                // Task threw an exception — log it, but keep worker alive
+                System.err.println("Task failed: " + e.getMessage());
+            }
+        }
+    }
+    
+    public void interrupt() {
+        if (thread != null) thread.interrupt();
+    }
+}
+
+// ----- ThreadPool -----
+
+class ThreadPool {
+    private final int corePoolSize;
+    private final int maxPoolSize;
+    private final BlockingQueue<Runnable> taskQueue;
+    private final List<Worker> workers;
+    private final List<Thread> workerThreads;
+    private final AtomicBoolean isShutdown;
+    private final AtomicInteger activeWorkers;
+    private final Object lock = new Object();
+    
+    ThreadPool(int corePoolSize, int maxPoolSize, int queueCapacity) {
+        this.corePoolSize = corePoolSize;
+        this.maxPoolSize = maxPoolSize;
+        this.taskQueue = new ArrayBlockingQueue<>(queueCapacity);
+        this.workers = new ArrayList<>();
+        this.workerThreads = new ArrayList<>();
+        this.isShutdown = new AtomicBoolean(false);
+        this.activeWorkers = new AtomicInteger(0);
+        
+        // Pre-start core workers
+        for (int i = 0; i < corePoolSize; i++) {
+            startWorker();
+        }
+    }
+    
+    private void startWorker() {
+        Worker worker = new Worker(taskQueue, isShutdown);
+        Thread thread = new Thread(worker, "ThreadPool-Worker-" + activeWorkers.incrementAndGet());
+        thread.setDaemon(false); // keep JVM alive while workers are running
+        
+        synchronized (lock) {
+            workers.add(worker);
+            workerThreads.add(thread);
+        }
+        thread.start();
+    }
+    
+    // Submit Runnable task
+    public void submit(Runnable task) {
+        if (isShutdown.get()) {
+            throw new RejectedExecutionException("ThreadPool is shutdown");
+        }
+        
+        // If queue is full and we can grow beyond core pool size
+        if (taskQueue.remainingCapacity() == 0 && activeWorkers.get() < maxPoolSize) {
+            startWorker();
+        }
+        
+        // Offer task to queue; reject if still full
+        if (!taskQueue.offer(task)) {
+            throw new RejectedExecutionException("Task queue is full");
+        }
+    }
+    
+    // Submit Callable task, return Future
+    public <T> Future<T> submit(Callable<T> callable) {
+        FutureTask<T> future = new FutureTask<>(callable);
+        submit((Runnable) future::run);
+        return future;
+    }
+    
+    // Graceful shutdown: no new tasks, complete pending
+    public void shutdown() {
+        isShutdown.set(true);
+        // Workers will drain the queue and then exit
+    }
+    
+    // Immediate shutdown: interrupt all workers
+    public List<Runnable> shutdownNow() {
+        isShutdown.set(true);
+        synchronized (lock) {
+            workers.forEach(Worker::interrupt);
+        }
+        List<Runnable> unfinished = new ArrayList<>();
+        taskQueue.drainTo(unfinished);
+        return unfinished;
+    }
+    
+    // Wait for all workers to finish
+    public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + unit.toMillis(timeout);
+        synchronized (lock) {
+            for (Thread thread : workerThreads) {
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) return false;
+                thread.join(remaining);
+                if (thread.isAlive()) return false;
+            }
+        }
+        return true;
+    }
+    
+    public boolean isShutdown()    { return isShutdown.get(); }
+    public int getActiveWorkers()  { return activeWorkers.get(); }
+    public int getQueueSize()      { return taskQueue.size(); }
+}
+
+4. USAGE EXAMPLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Create pool with 4 core threads, max 8, queue capacity 100
+ThreadPool pool = new ThreadPool(4, 8, 100);
+
+// Submit Runnable
+pool.submit(() -> System.out.println("Task 1 - Thread: " + Thread.currentThread().getName()));
+
+// Submit Callable with Future
+Future<Integer> future = pool.submit(() -> {
+    Thread.sleep(100);
+    return 42;
+});
+
+System.out.println("Result: " + future.get()); // blocks until done
+
+// Shutdown gracefully
+pool.shutdown();
+pool.awaitTermination(30, TimeUnit.SECONDS);
+
+5. HOW java.util.concurrent.ThreadPoolExecutor DOES IT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Real Java ThreadPoolExecutor (extends AbstractExecutorService):
+  new ThreadPoolExecutor(
+      corePoolSize,         // min threads always alive
+      maximumPoolSize,      // max threads during burst
+      keepAliveTime,        // idle threads above core are removed after this
+      unit,
+      workQueue,            // BlockingQueue for pending tasks
+      threadFactory,        // creates threads (set name, daemon flag)
+      rejectedExecutionHandler  // what to do when queue full + max threads reached
+  );
+
+Rejection Policies:
+  AbortPolicy (default):  throw RejectedExecutionException
+  CallerRunsPolicy:       caller thread runs the task (backpressure to producer)
+  DiscardPolicy:          silently drop the task
+  DiscardOldestPolicy:    drop oldest queued task, try submitting again
+
+Executors factory methods (convenience):
+  Executors.newFixedThreadPool(10):
+    corePoolSize=10, max=10, LinkedBlockingQueue (unbounded!)
+    Risk: OOM if tasks faster than consumption
+  
+  Executors.newCachedThreadPool():
+    core=0, max=Integer.MAX_VALUE, SynchronousQueue
+    Creates new thread per task if all busy. Risk: too many threads.
+  
+  Executors.newSingleThreadExecutor():
+    core=max=1. Tasks executed sequentially.
+  
+  BEST PRACTICE: Never use Executors factory methods in production.
+  Create ThreadPoolExecutor directly with bounded queue (prevents OOM).
+
+6. DESIGN PATTERNS USED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PRODUCER-CONSUMER PATTERN:
+  Producers: task submitters (multiple threads calling submit())
+  Consumer:  worker threads (multiple threads calling take() on BlockingQueue)
+  Decoupled via BlockingQueue — producers don't know which worker will run their task.
+
+TEMPLATE METHOD (Java's AbstractExecutorService):
+  Base class defines the algorithm skeleton (execute Callable → FutureTask → submit).
+  Subclass (ThreadPoolExecutor) implements execute(Runnable).
+
+FUTURE / PROMISE PATTERN:
+  submit(Callable) returns Future<T>.
+  Caller can block on get() or poll with timeout.
+  Decouples computation from result retrieval.
+
+7. INTERVIEW DISCUSSION POINTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: Why use a bounded queue over unbounded?
+A: Unbounded queue can grow without limit if tasks arrive faster than
+   consumed → OutOfMemoryError. Bounded queue applies back-pressure:
+   producers slow down or are rejected. CallerRunsPolicy on bounded queue
+   is elegant: caller's thread runs the task, naturally slowing producer.
+
+Q: What is the difference between shutdown() and shutdownNow()?
+A: shutdown() = graceful. Stop accepting new tasks, let queue drain, stop threads.
+   shutdownNow() = abrupt. Interrupt all workers, return queued tasks.
+   Always call shutdown() first; if it takes too long → shutdownNow().
+
+Q: How does VirtualThread (Java 21) change this?
+A: Virtual threads (Project Loom, Java 21) are lightweight (thousands/millions possible).
+   Thread-per-task is now viable without a pool.
+   Executors.newVirtualThreadPerTaskExecutor() creates virtual thread per task.
+   No need for pool sizing. Blocking operations (I/O) park virtual thread, not platform thread.
+   ThreadPoolExecutor still relevant for CPU-bound tasks with bounded concurrency.
