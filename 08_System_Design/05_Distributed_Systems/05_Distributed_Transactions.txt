@@ -183,7 +183,7 @@ COMPARISON: 2PC vs SAGA
 │ Suitable for      │ Financial, low vol.  │ Microservices, scale │
 └───────────────────┴──────────────────────┴──────────────────────┘
 
-INTERVIEW ANSWER:
+  INTERVIEW ANSWER:
   "For transactions spanning multiple services, I avoid 2PC because
    it's blocking and slow. Instead, I use the Saga pattern with an
    orchestrator. Each step executes a local transaction and publishes
@@ -191,3 +191,223 @@ INTERVIEW ANSWER:
    steps. I combine this with the Outbox Pattern to ensure events are
    reliably published. The trade-off is losing isolation — I design
    around this by using 'pending' states and idempotent operations."
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TCC PATTERN (Try-Confirm-Cancel)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TCC is a business-level distributed transaction protocol popular in
+Java (Apache Seata, ByteTCC) and e-commerce (Alibaba, Ant Financial).
+
+CONCEPT: Each operation is split into three explicit phases:
+  TRY:     Reserve/check resources without final commitment.
+           "Is it possible to do this? Hold the resources."
+  CONFIRM: Actually execute and finalize the operation.
+           "All services said TRY succeeded — go ahead."
+  CANCEL:  Release held resources if anything failed.
+           "Some TRY failed — undo all reservations."
+
+EXAMPLE — Booking flight + hotel:
+  TRY:
+    FlightService.tryBook(seat=23A) → reserves seat, marks "PENDING"
+    HotelService.tryBook(room=301) → reserves room, marks "PENDING"
+  
+  CONFIRM (if all TRYs succeeded):
+    FlightService.confirm(seat=23A) → marks seat "CONFIRMED", charges card
+    HotelService.confirm(room=301) → marks room "CONFIRMED", charges card
+  
+  CANCEL (if any TRY failed):
+    FlightService.cancel(seat=23A) → releases seat, marks "AVAILABLE"
+    HotelService.cancel(room=301) → releases room, marks "AVAILABLE"
+
+IMPLEMENTATION REQUIREMENTS:
+  1. ALL THREE phases must be idempotent (network retries).
+  2. TRY must be reversible by CANCEL.
+  3. CONFIRM must succeed if TRY succeeded (no new failures allowed).
+  4. Services must maintain PENDING state until coordinator calls CONFIRM or CANCEL.
+  5. Coordinator must persist state to survive crashes and retry.
+
+RESOURCE ISOLATION IN TCC:
+  Unlike 2PC which holds DB locks during PREPARE, TCC uses application-level
+  reservation. Resources are "soft-locked" in PENDING state.
+  
+  Benefit: No long-held DB locks. Better throughput.
+  Cost: Application must implement try/confirm/cancel logic explicitly.
+        Business logic complexity increases significantly.
+
+TCC vs SAGA:
+┌───────────────┬───────────────────────────┬──────────────────────────┐
+│ Property      │ TCC                       │ Saga                     │
+├───────────────┼───────────────────────────┼──────────────────────────┤
+│ Isolation     │ Better (soft-lock via TRY)│ None (other txns see it) │
+│ Rollback      │ CANCEL (pre-planned)      │ Compensating transactions │
+│ Complexity    │ High (3 phases per svc)   │ Medium (1 compensate/op)  │
+│ Locking       │ App-level reservation     │ None                     │
+│ Use case      │ Financial, travel booking │ Order fulfillment, general│
+└───────────────┴───────────────────────────┴──────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTBOX PATTERN + CDC (Change Data Capture)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+THE DUAL-WRITE PROBLEM:
+  In a Saga or event-driven system, after a local DB transaction you must
+  also publish an event to a message broker (Kafka, RabbitMQ).
+  
+  These two operations CANNOT be wrapped in a single ACID transaction
+  (DB and message broker are separate systems).
+  
+  Failure scenario:
+    1. Service writes to DB: SUCCESS
+    2. Service publishes to Kafka: CRASH
+    → DB has the record, but no event was published.
+    → Downstream services never know this happened.
+    → System is NOW INCONSISTENT.
+
+OUTBOX PATTERN (solving dual-write):
+  Instead of writing to Kafka directly, write the "to-be-published" event
+  into a local OUTBOX TABLE in the SAME database transaction as the business data.
+  
+  This converts the dual-write (DB + Kafka) into a single ACID transaction
+  (DB write + outbox row insertion = atomic).
+  
+  A separate OUTBOX POLLER process reads the outbox table and publishes to Kafka.
+  After successful publish, marks the outbox row as published.
+  
+  Schema:
+    CREATE TABLE outbox_events (
+      id UUID PRIMARY KEY,
+      aggregate_type VARCHAR(50),   -- e.g., 'Order'
+      aggregate_id UUID,            -- e.g., order_id
+      event_type VARCHAR(100),      -- e.g., 'OrderCreated'
+      payload JSONB,                -- event body
+      created_at TIMESTAMP,
+      published_at TIMESTAMP        -- null = not yet published
+    );
+  
+  Flow:
+    ┌──────────────────────────────────────────┐
+    │  BEGIN TRANSACTION                       │
+    │    INSERT INTO orders (...)              │
+    │    INSERT INTO outbox_events (...)       │
+    │  COMMIT                                  │
+    └──────────────────────────────────────────┘
+                        ↓
+    ┌──────────────────────────────────────────┐
+    │  Outbox Poller (async)                   │
+    │    SELECT * FROM outbox_events           │
+    │      WHERE published_at IS NULL          │
+    │    → Publish each event to Kafka         │
+    │    → UPDATE outbox_events                │
+    │        SET published_at = NOW()          │
+    └──────────────────────────────────────────┘
+
+  Guarantees:
+    ✓ At-least-once delivery: poller retries until successful publish.
+    ✓ Events are NEVER lost (they're in DB until published).
+    ✓ Event publishing is ordered by created_at (per aggregate_id).
+
+CDC-BASED OUTBOX (Change Data Capture):
+  Instead of a polling query, use Debezium (CDC tool) to watch the
+  database's binary log (WAL / binlog) for inserts into the outbox table.
+  
+  Debezium tails the WAL → detects outbox inserts → publishes to Kafka.
+  
+  Advantages over polling:
+    - Lower latency (no polling interval delay)
+    - No extra DB load from polling queries
+    - Can capture deletes and updates too
+  
+  Stack: PostgreSQL WAL → Debezium (Kafka Connect) → Kafka → consumers
+  
+  Used by: Debezium (Red Hat), LinkedIn, Uber, many microservices adopters.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DISTRIBUTED LOCKING WITH REDIS REDLOCK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Sometimes you don't need a full transaction — you just need ONE process
+to hold a resource at a time across services (e.g., run a cron job,
+process a file, coordinate a resource).
+
+SIMPLE REDIS LOCK (SET NX PX):
+  // Acquire lock: SET key value NX PX <ttl_ms>
+  // NX = only if Not eXists; PX = expire in milliseconds
+  String lockValue = UUID.randomUUID().toString();  // unique per holder
+  boolean acquired = redis.set("lock:job-processor", lockValue,
+                               SetArgs.ifAbsent().px(30_000)); // 30s TTL
+  
+  if (!acquired) return;  // Another instance holds the lock
+  
+  try {
+      doWork();
+  } finally {
+      // Release lock ONLY if still ours (compare-and-delete)
+      // Use Lua script for atomicity:
+      redis.eval(
+          "if redis.call('GET', KEYS[1]) == ARGV[1] then " +
+          "  return redis.call('DEL', KEYS[1]) " +
+          "else return 0 end",
+          1, "lock:job-processor", lockValue
+      );
+  }
+  
+  Key: The unique lockValue prevents accidentally releasing another holder's lock.
+  Key: TTL prevents lock being held forever if process crashes.
+
+REDLOCK ALGORITHM (Multi-Node Redis):
+  Problem: Single Redis node is a SPOF. If Redis crashes, lock is gone.
+           If Redis is partitioned, two processes might both "acquire."
+  
+  Redlock uses N independent Redis nodes (typically 5).
+  
+  ACQUIRE:
+    1. Record current time T1.
+    2. Try to acquire lock on ALL N nodes sequentially (with short timeout per node).
+    3. Count successful acquisitions.
+    4. If acquired on MAJORITY (≥ N/2 + 1) AND total time < lock TTL:
+       Lock is successfully held. Effective TTL = original TTL − time_elapsed.
+    5. If not majority: release all acquired locks and fail.
+  
+  RELEASE:
+    Release lock on ALL N nodes.
+  
+  Why majority? Even if some nodes are down or partitioned,
+  no other process can acquire a majority simultaneously.
+  (At most one process can hold majority at a time.)
+
+  CONTROVERSY — Martin Kleppmann's critique:
+    Redlock is NOT safe under these conditions:
+    1. Clock skew: If a node's clock jumps, TTL expires prematurely,
+       allowing a second holder before the first releases.
+    2. Process pauses: GC pause after acquiring lock but before doing work
+       can cause TTL to expire. Lock is "held" by a paused process.
+    
+    Kleppmann's recommendation: Use Raft-based locks (etcd, ZooKeeper)
+    for strong guarantees. Use fencing tokens alongside any lock.
+    
+    Antirez (Redis author) disagrees, arguing Redlock is safe enough
+    for most practical scenarios where perfect correctness isn't critical.
+
+WHEN TO USE WHAT:
+  Mutex (critical correctness):       etcd / ZooKeeper + fencing tokens
+  Leader election:                    etcd / ZooKeeper ephemeral nodes
+  Advisory lock (best-effort):        Redis SETNX (simple, single node)
+  Cross-region lock (best-effort):    Redlock (use with caution)
+  Database-level lock:                SELECT FOR UPDATE (same DB txn)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FULL COMPARISON: 2PC vs SAGA vs TCC
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌───────────────────┬─────────────────┬──────────────────┬──────────────────┐
+│ Property          │ 2PC             │ Saga             │ TCC              │
+├───────────────────┼─────────────────┼──────────────────┼──────────────────┤
+│ Atomicity         │ True ACID       │ Best-effort      │ Better than Saga │
+│ Isolation         │ Full            │ NONE             │ Soft (via TRY)   │
+│ Consistency       │ Strong          │ Eventual         │ Near-strong       │
+│ Latency           │ High (2RTT+sync)│ Low (async)      │ Medium           │
+│ Blocking on fail  │ YES             │ No               │ No               │
+│ Complexity        │ Low             │ Medium           │ HIGH             │
+│ Suitable for      │ Finance/low vol │ General micro    │ Financial/booking │
+└───────────────────┴─────────────────┴──────────────────┴──────────────────┘

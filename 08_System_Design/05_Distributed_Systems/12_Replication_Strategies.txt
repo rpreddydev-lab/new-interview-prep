@@ -1,0 +1,406 @@
+================================================================
+REPLICATION STRATEGIES
+================================================================
+
+What to use this for: "How does your database handle failures?" /
+"What happens if the primary goes down?" / "How do you handle read
+scaling?" / "Explain replication lag and how you dealt with it."
+
+WHY REPLICATION?
+-----------------
+  1. HIGH AVAILABILITY: If one node fails, another takes over.
+  2. READ SCALING: Spread read traffic across multiple replicas.
+  3. LATENCY: Place data closer to users geographically.
+  4. DURABILITY: Multiple copies of data survive disk failures.
+
+THE FUNDAMENTAL TRADE-OFF:
+  Replication = keeping COPIES of data on multiple nodes.
+  The hard problem: What happens when a write lands on one node?
+  How and when do you update the other copies?
+  → This drives every consistency vs. availability trade-off.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 1: REPLICATION TOPOLOGIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────────────────────────────────────────┐
+│  TOPOLOGY 1: SINGLE-LEADER (Primary-Replica)            │
+│                                                         │
+│           ┌─────────┐                                   │
+│  Write ──►│ Leader  │                                   │
+│           └────┬────┘                                   │
+│                │ replication stream                      │
+│       ┌────────┼────────┐                               │
+│       ▼        ▼        ▼                               │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐                   │
+│  │Replica 1│ │Replica 2│ │Replica 3│                   │
+│  └─────────┘ └─────────┘ └─────────┘                   │
+│       ▲           ▲           ▲                         │
+│       └─── Read ──┴─── Read ──┘                         │
+└─────────────────────────────────────────────────────────┘
+
+How it works:
+  - ALL writes go to exactly one node: the Leader/Primary.
+  - Leader writes to its local storage and replication log (WAL).
+  - Replicas apply the log → eventually match leader state.
+  - Reads can go to any replica (with caveats — see replication lag).
+
+Used by: PostgreSQL, MySQL, MongoDB (replica sets), Redis Sentinel,
+         Kafka (per-partition leader), most relational databases.
+
+Pros:
+  ✓ Simple mental model — one source of truth for writes.
+  ✓ No write conflicts (only one writer).
+  ✓ Reads scale horizontally by adding replicas.
+
+Cons:
+  ✗ Leader is the write bottleneck — can't scale writes.
+  ✗ Leader failure requires failover (downtime or automated HA).
+  ✗ Replicas may be stale — reading from replica can return old data.
+
+FAILOVER (What happens when leader dies?):
+  Manual failover: Ops team promotes a replica. Downtime = minutes.
+  Automated failover: Sentinel (Redis), Patroni (PostgreSQL), MHA (MySQL).
+    Steps:
+      1. Detect leader failure (missed heartbeats).
+      2. Pick the most up-to-date replica (least replication lag).
+      3. Promote it to leader. Reconfigure others to follow new leader.
+      4. Update routing (DNS, load balancer, service discovery).
+    
+    Split-brain risk: old leader comes back, thinks it's still leader.
+    Fix: fencing tokens, STONITH (Shoot The Other Node In The Head),
+         require quorum agreement before promoting.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────────────────────────────────────────┐
+│  TOPOLOGY 2: MULTI-LEADER (Active-Active)               │
+│                                                         │
+│  ┌─────────┐  ◄── sync ──►  ┌─────────┐               │
+│  │Leader 1 │                │Leader 2 │               │
+│  └─────────┘                └─────────┘               │
+│  Write/Read                 Write/Read                  │
+│  (Region A)                 (Region B)                  │
+└─────────────────────────────────────────────────────────┘
+
+How it works:
+  - Multiple nodes can accept writes simultaneously.
+  - Each leader replicates its writes to all other leaders.
+  - Used primarily for multi-datacenter deployments.
+
+Used by: CouchDB, MySQL multi-source replication, PostgreSQL BDR,
+         Google Docs (collaborative editing), calendar sync.
+
+Pros:
+  ✓ Writes in each region go to a local leader (low latency).
+  ✓ Survives loss of an entire datacenter.
+  ✓ No single write bottleneck.
+
+Cons:
+  ✗ WRITE CONFLICTS: Two users edit the same record at the same time
+    in different regions. Which write wins?
+    → This is the hardest problem in distributed systems.
+
+CONFLICT RESOLUTION:
+  1. Last Write Wins (LWW):
+     Use timestamp (or logical clock) to pick winner.
+     Loser's write is silently discarded.
+     Risk: clock skew can cause the WRONG write to win.
+     Used by: Cassandra (default), DynamoDB (optional).
+  
+  2. Version Vectors / Vector Clocks:
+     Track causal history. If concurrent, surface the conflict to the app.
+     App or user resolves the conflict explicitly.
+     Used by: Riak, Amazon shopping cart (add all items from both carts).
+  
+  3. CRDTs (Conflict-free Replicated Data Types):
+     Design data types that merge automatically without conflicts.
+     G-Counter: only increments → merge by taking max per node.
+     OR-Set: "observed-remove set" for set operations.
+     Used by: Redis (certain data types), collaborative editors.
+  
+  4. Custom Application Logic:
+     Application defines merge function per record type.
+     Most flexible but most work.
+
+AVOID MULTI-LEADER when:
+  - You have any writes that must be atomic across both leaders.
+  - Conflict resolution is hard for your domain (financial transactions).
+  - You don't actually need writes from multiple regions.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────────────────────────────────────────┐
+│  TOPOLOGY 3: LEADERLESS (Dynamo-style)                  │
+│                                                         │
+│  Client ──Write(W=2)──► Node A  ✓                       │
+│          ──Write(W=2)──► Node B  ✓                       │
+│          ──Write(W=2)──► Node C  ✗ (down)               │
+│                                                         │
+│  Client ──Read(R=2)───► Node A  (v2) ✓                  │
+│          ──Read(R=2)───► Node B  (v2) ✓                  │
+│          Return: v2 (highest version wins)              │
+└─────────────────────────────────────────────────────────┘
+
+How it works:
+  - NO designated leader. Any node can accept reads and writes.
+  - Client (or a coordinator node) sends reads/writes to N replicas.
+  - Write succeeds when W replicas acknowledge.
+  - Read succeeds when R replicas respond (take the highest version).
+  - Strong consistency when W + R > N.
+
+Used by: Cassandra, DynamoDB, Riak, Voldemort.
+
+Quorum formulas (N=3 typical):
+  W=2, R=2: W+R=4 > 3 → consistent (at least 1 overlap guaranteed).
+  W=1, R=1: Eventual consistency (fastest, least durable).
+  W=3, R=1: Write to all, read from any (slow writes, fast reads).
+
+SLOPPY QUORUM (Cassandra/DynamoDB):
+  If a target node is down, another healthy node temporarily accepts
+  the write on its behalf (hinted handoff).
+  When the failed node recovers, hints are replayed to it.
+  This makes the system AP — available during partitions, but
+  W+R > N no longer guarantees consistency during the partition.
+
+READ REPAIR:
+  When a read returns different versions from different replicas,
+  the coordinator writes the latest version back to stale replicas.
+  This gradually heals divergence without a background process.
+
+ANTI-ENTROPY (Merkle Trees):
+  Background process compares data between replicas using Merkle trees.
+  Quickly identifies which data segments differ without full scan.
+  Used by: Cassandra, DynamoDB for background synchronization.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 2: SYNCHRONOUS vs. ASYNCHRONOUS REPLICATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SYNCHRONOUS REPLICATION:
+  Leader waits for replica(s) to confirm write before ACKing the client.
+  
+  Client ──Write──► Leader ──replicate──► Replica
+                    Leader waits... ◄─── ACK ────
+                    Leader ──ACK──► Client
+  
+  ✓ Guarantee: If leader crashes after ACK, replica has the data.
+  ✓ Strong durability: No acknowledged write can be lost.
+  ✗ Latency: write latency = leader latency + replica latency.
+  ✗ Availability: If ANY sync replica is slow/down, writes stall.
+  
+  In practice: Make AT MOST ONE replica synchronous (semi-sync).
+  PostgreSQL: synchronous_commit = on → waits for 1 replica WAL flush.
+  MySQL: semi-synchronous replication (wait for at least 1 replica ACK).
+
+ASYNCHRONOUS REPLICATION:
+  Leader ACKs the client immediately. Replica catches up in the background.
+  
+  Client ──Write──► Leader ──ACK──► Client
+                    Leader ──replicate──► Replica (async, later)
+  
+  ✓ Low write latency — leader doesn't wait for replicas.
+  ✓ Available even when replicas are slow or down.
+  ✗ Durability risk: If leader crashes before replica catches up,
+    data that was ACKed to client is LOST (the replica becomes leader
+    without that data).
+  ✗ Reads from replicas may be stale (replication lag).
+  
+  PostgreSQL default: asynchronous (synchronous_commit = off).
+  Kafka: acks=1 (leader only) is async; acks=all is sync to all ISR.
+
+SEMI-SYNCHRONOUS (Best of Both):
+  Wait for exactly 1 replica to confirm, not all.
+  One confirmed copy beyond the leader for durability.
+  Still fast — only waits for fastest replica, not slowest.
+  Used by: MySQL 5.5+, PostgreSQL with synchronous_standby_names = 'ANY 1'.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 3: REPLICATION LAG AND ITS PROBLEMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+REPLICATION LAG = the delay between a write landing on the leader
+and that write becoming visible on a replica.
+
+Typical lag: milliseconds to seconds under normal load.
+Under heavy write load or slow replica: can grow to minutes.
+
+This creates 3 classic anomalies:
+
+─────────────────────────────────────────────────────────────
+ANOMALY 1: READ-YOUR-OWN-WRITES VIOLATION
+─────────────────────────────────────────────────────────────
+
+Scenario:
+  1. User updates their profile photo. Write goes to leader. ✓
+  2. User immediately refreshes profile page.
+  3. Read goes to replica (lagging by 500ms).
+  4. Replica doesn't have the new photo yet → user sees OLD photo.
+  
+  User thinks: "My update didn't save!" 
+  (It did save — the replica just hasn't caught up.)
+
+Fixes:
+  1. READ FROM LEADER for data the user just modified:
+     "After a write, for the next 60 seconds, route that user's reads
+      to the leader for the affected resource."
+     Implement: store last_write_timestamp in session; if
+     now - last_write < 60s, always read from leader.
+  
+  2. READ FROM REPLICA WITH MONOTONIC READ GUARANTEE:
+     Track the replication position (LSN in PostgreSQL, offset in Kafka).
+     After a write, client receives the write's LSN.
+     On next read, route to a replica that has caught up to at least that LSN.
+  
+  3. ROUTE ALL WRITES AND READS FOR A USER TO THE SAME REPLICA:
+     Sticky sessions per user. Breaks if that replica fails.
+     Simple but not scalable.
+  
+  PostgreSQL solution: use synchronous_commit = on for user-facing writes,
+  or read from primary for 1 minute post-write.
+
+─────────────────────────────────────────────────────────────
+ANOMALY 2: MONOTONIC READS VIOLATION
+─────────────────────────────────────────────────────────────
+
+Scenario:
+  1. User queries comments. Request hits Replica A (lag=1s): sees 10 comments.
+  2. User refreshes. Request hits Replica B (lag=5s): sees 8 comments.
+  3. User sees comments "disappear" — going backwards in time.
+
+Fix:
+  Route each user's reads to the SAME replica consistently.
+  If that replica is down, failover to another but accept a reset.
+  Hash(user_id) % num_replicas → sticky routing.
+
+─────────────────────────────────────────────────────────────
+ANOMALY 3: CONSISTENT PREFIX READS VIOLATION
+─────────────────────────────────────────────────────────────
+
+Scenario (two causally related writes):
+  Write 1: "How's the weather?" (from user A)
+  Write 2: "It's sunny!" (from user B, in reply)
+  
+  Due to replication lag, a reader sees Write 2 before Write 1:
+  "It's sunny!" appears before "How's the weather?" — out of order.
+
+Fix:
+  Causally related writes go to the same shard/partition.
+  The same replica processes them in order.
+  Or: use causal timestamps (vector clocks) to enforce ordering.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 4: REPLICATION IMPLEMENTATION METHODS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STATEMENT-BASED REPLICATION:
+  Leader logs every SQL statement (INSERT, UPDATE, DELETE).
+  Replicas re-execute the SQL.
+  Problem: Non-deterministic functions (NOW(), RAND(), UUID()) produce
+           different results on each replica → divergence.
+  Used by: MySQL statement-based replication (legacy mode).
+  Mostly abandoned in favor of row-based.
+
+ROW-BASED REPLICATION (Logical Replication):
+  Leader logs the actual before/after values of each row changed.
+  Replicas apply those exact values — no re-execution.
+  ✓ Deterministic — no non-determinism issues.
+  ✓ Works across different schema versions (useful for zero-downtime migrations).
+  ✗ More data to log for bulk updates (every row change is recorded).
+  Used by: PostgreSQL logical replication, MySQL row-based, Debezium CDC.
+
+WAL-BASED REPLICATION (Physical):
+  Leader streams its Write-Ahead Log (WAL) to replicas.
+  Replicas apply WAL entries byte-for-byte.
+  ✓ Very fast (no parsing, just apply).
+  ✗ Tightly coupled to storage engine internals — can't replicate across
+    major PostgreSQL versions.
+  Used by: PostgreSQL streaming replication (physical), MySQL binary log.
+
+CHANGE DATA CAPTURE (CDC):
+  Read the database's replication log as an event stream.
+  Publish those events to Kafka or other consumers.
+  Consumers can be other databases, search indices, caches.
+  Used by: Debezium (PostgreSQL, MySQL → Kafka), AWS DMS.
+  
+  Use case: Keep Elasticsearch in sync with PostgreSQL without
+            dual-writes in application code.
+  
+  Architecture:
+  PostgreSQL → Debezium (CDC connector) → Kafka → Elasticsearch
+                                                → Redis (cache invalidation)
+                                                → Analytics DB
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUICK COMPARISON TABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌────────────────┬──────────────────┬──────────────────┬──────────────────┐
+│ Property       │ Single-Leader    │ Multi-Leader     │ Leaderless       │
+├────────────────┼──────────────────┼──────────────────┼──────────────────┤
+│ Write scaling  │ ✗ (one leader)   │ ✓ (per region)   │ ✓ (any node)     │
+│ Read scaling   │ ✓ (replicas)     │ ✓                │ ✓                │
+│ Conflicts      │ None             │ Hard to resolve  │ Managed by W+R   │
+│ Consistency    │ Strong (if sync) │ Eventual         │ Tunable          │
+│ Complexity     │ Low              │ High             │ Medium           │
+│ Availability   │ Medium (1 leader)│ High             │ High             │
+│ Use case       │ Most RDBMS, Kafka│ Multi-region     │ IoT, write-heavy │
+│ Examples       │ PostgreSQL, MySQL│ CouchDB, Dynamo  │ Cassandra, Riak  │
+└────────────────┴──────────────────┴──────────────────┴──────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: "You write to the database and immediately read back — you get stale
+    data. What's happening and how do you fix it?"
+A: "This is a read-your-own-writes violation caused by replication lag.
+    The write went to the leader, but the read hit a replica that hasn't
+    caught up yet. Fix options: (1) Route reads for recently-modified data
+    to the leader for a short window (60 seconds). (2) Track the write's
+    LSN and only read from replicas that have applied that LSN or later.
+    (3) Use synchronous replication so replicas are always up-to-date
+    before the write is acknowledged — at the cost of write latency."
+
+Q: "What's the difference between synchronous and asynchronous replication?
+    Which would you use for a payment system?"
+A: "Synchronous: leader waits for replica(s) to confirm before ACKing the
+    client. Durability guarantee — acknowledged writes can't be lost if
+    the leader crashes. Cost: higher write latency, availability risk if
+    replica is slow.
+    Asynchronous: leader ACKs immediately, replica catches up in the
+    background. Low latency, but acknowledged writes can be lost if the
+    leader crashes before replication completes.
+    For payments: at minimum semi-synchronous — ensure at least one
+    replica has confirmed. I'd also use synchronous_commit = on for
+    critical financial writes in PostgreSQL, or Kafka acks=all for event
+    durability."
+
+Q: "You have 5 replicas. How do you ensure a user always sees their
+    own writes?"
+A: "Read-your-own-writes consistency. After a write, store the write's
+    replication position (LSN) in the user's session. For subsequent
+    reads, route to any replica that has caught up to at least that LSN.
+    Or, simpler: route all reads and writes for a given user to the same
+    replica using consistent hashing on user_id. The tradeoff there is
+    a hot replica if one user is very active."
+
+Q: "When would you choose leaderless replication over single-leader?"
+A: "When write throughput must scale horizontally, or when you need
+    high availability across multiple datacenters without a cross-DC
+    leader. Cassandra with leaderless is a good fit for IoT sensor data,
+    time-series writes, or any write-heavy workload where the app can
+    tolerate eventual consistency. I'd avoid it for anything needing
+    strong isolation — financial records, inventory counts — where
+    single-leader with synchronous replication is safer."
+
+Q: "What is CDC and when would you use it?"
+A: "Change Data Capture reads the database's replication log (WAL in
+    PostgreSQL) and publishes every row change as an event stream.
+    I'd use it to keep secondary data stores in sync — for example,
+    keeping Elasticsearch in sync with PostgreSQL for full-text search,
+    or invalidating Redis cache entries when the source record changes.
+    The key benefit over dual-writes: it's atomic with the database
+    write. If your app crashes after writing to the DB but before writing
+    to the cache, CDC still catches the change. Debezium + Kafka is the
+    most common stack."

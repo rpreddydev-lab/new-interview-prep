@@ -1,0 +1,293 @@
+================================================================
+FAILURE DETECTION IN DISTRIBUTED SYSTEMS
+================================================================
+
+What to use this for: "How do you know when a node is dead?" /
+"How does Cassandra detect node failures?" / "What is the Phi Accrual
+failure detector?" / "What's the difference between crash and slowness?"
+
+THE CORE PROBLEM
+-----------------
+In a distributed system, you can never truly KNOW if a remote node
+has crashed or is just slow (network congestion, GC pause, heavy load).
+
+The network gives you no signal — a dropped packet looks identical to
+a slow packet. A crashed server looks identical to a partitioned server.
+
+This is the fundamental ambiguity:
+  Crashed node: will never respond.
+  Slow node: will respond, eventually.
+  Partitioned node: alive, but unreachable from your perspective.
+
+From your perspective, all three look the same: no response (yet).
+
+WHY THIS MATTERS:
+  If you declare a slow node "dead" and promote a replica:
+    → Two nodes may now both think they are the leader (split brain).
+    → Data corruption.
+  If you wait too long before declaring a node dead:
+    → System is unavailable during the wait.
+    → Users see timeouts.
+  
+  The failure detector must balance: sensitivity (detect fast) vs.
+  accuracy (don't false-positive on slow nodes).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+APPROACH 1: FIXED TIMEOUT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The simplest approach: if no heartbeat for T seconds, declare dead.
+
+HEARTBEAT PROTOCOL:
+  Each node sends periodic "I'm alive" messages (heartbeats) to others.
+  Monitor tracks: last_heartbeat_time[node].
+  If now - last_heartbeat_time[node] > T: declare node SUSPECTED/DEAD.
+
+CHOOSING T:
+  T too small: false positives (GC pauses, slow network → wrongly declared dead).
+  T too large: slow failure detection → long unavailability.
+  
+  GC pause times (Java):
+    G1GC typical: < 200ms
+    G1GC worst case: < 500ms
+    ZGC/Shenandoah: < 10ms (designed for low pause)
+    CMS (old): 1-2 seconds possible
+  
+  Network jitter: 1-50ms typical; spike to 500ms under congestion.
+  
+  Practical timeout for same-datacenter: 5-10 seconds.
+  Practical timeout for cross-datacenter: 30-60 seconds.
+  Zookeeper default session timeout: 10 seconds.
+  etcd default leader heartbeat timeout: 500ms check, 2.5s election timeout.
+
+PROBLEMS WITH FIXED TIMEOUT:
+  ✗ One-size-fits-all: doesn't adapt to network conditions.
+  ✗ Under high load, network latency spikes → mass false positives.
+  ✗ Thundering herd: all nodes detect failure simultaneously and all
+    start leader election at once.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+APPROACH 2: PHI ACCRUAL FAILURE DETECTOR
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Invented by Hayashibara et al., 2004.
+Used by: Cassandra, Akka, Riak.
+
+CORE IDEA:
+  Instead of binary ALIVE/DEAD, output a continuous suspicion level φ (phi).
+  The application sets a threshold: if φ exceeds it, treat as dead.
+  φ adapts to actual observed network conditions over time.
+
+HOW IT WORKS:
+  1. Monitor records the inter-arrival times of heartbeats from each node.
+     Maintains a sliding window of the last N heartbeat intervals.
+     Example window: [1.01s, 0.98s, 1.02s, 0.99s, 1.00s, ...]
+  
+  2. From the window, compute a statistical distribution (mean + variance)
+     of expected inter-arrival times.
+  
+  3. When the next heartbeat is due, compute φ:
+     φ = -log10( probability that the node is still alive given
+                  the time since the last heartbeat )
+     
+     Intuitively: φ measures how many standard deviations late the
+     heartbeat is. Higher φ = more suspicious the node is dead.
+  
+  4. φ INTERPRETATION:
+     φ = 1: 10% chance the node is dead (likely alive, just slow)
+     φ = 2: 1% chance the node is dead
+     φ = 3: 0.1% chance
+     φ = 8: 1 in 100 million chance → effectively certain it's dead
+  
+  5. Application configures threshold φ_threshold:
+     φ < threshold → node ALIVE (might be slow, but tolerated)
+     φ ≥ threshold → node SUSPECTED_DEAD → trigger recovery action
+
+ADAPTIVE BEHAVIOR:
+  If the network suddenly becomes slow (GC pause, congestion):
+    Heartbeats arrive late → window shifts → mean increases.
+    φ threshold becomes harder to exceed for future late heartbeats.
+    → Fewer false positives during transient slowness.
+  
+  If a node truly crashes:
+    Heartbeats stop completely → φ rises rapidly past threshold.
+    → Correctly detected as dead.
+
+CASSANDRA CONFIGURATION:
+  phi_convict_threshold in cassandra.yaml
+  Default: 8 (roughly 1-in-100M probability of false positive)
+  Lower (e.g., 5): faster detection, more false positives.
+  Higher (e.g., 12): slower detection, fewer false positives.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+APPROACH 3: GOSSIP PROTOCOL (Epidemic Failure Detection)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Gossip: nodes periodically exchange their view of cluster health with
+random neighbors. Information "spreads" like a rumor through the cluster.
+
+CASSANDRA GOSSIP (every second):
+  Each node selects 1-3 random peers.
+  Exchanges: "Here's what I know about every node's heartbeat counter."
+  Receiving node: update its view with the higher heartbeat count.
+  
+  Node state propagates to the whole cluster in O(log N) rounds.
+  With 100 nodes: after ~7 gossip rounds, all nodes know the failure.
+  
+  Node state tracked per peer:
+    heartbeat_version: increments every second (alive proof)
+    generation: increments on restart (distinguishes reboot from revived)
+    status: NORMAL / LEAVING / LEFT / REMOVING / REMOVED
+
+BENEFITS OF GOSSIP:
+  ✓ No single point of failure in detection (no central monitor).
+  ✓ Scales well — O(log N) propagation regardless of cluster size.
+  ✓ Self-healing — nodes automatically learn about new joins and failures.
+  ✓ Works even during partial network partitions.
+
+LIMITATIONS:
+  ✗ Eventual consistency — information takes time to propagate.
+  ✗ False positives possible if gossip is disrupted (network partition).
+  ✗ Gossip traffic grows with cluster size (each message is O(N) metadata).
+
+Used by: Cassandra (primary failure detection), Amazon DynamoDB (internal),
+          HashiCorp Serf/Consul (gossip for service discovery), Bitcoin (node discovery).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+APPROACH 4: EXTERNAL HEALTH CHECKS (Used in Kubernetes / Load Balancers)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A separate monitoring agent probes services externally.
+
+KUBERNETES PROBES:
+  Liveness probe:
+    Kubernetes pings /health (HTTP GET) or checks TCP port every N seconds.
+    If it fails K consecutive times → kubelet kills the pod → restarts it.
+    Used for: detecting deadlocks, frozen processes.
+    
+  Readiness probe:
+    Kubernetes pings /ready every N seconds.
+    If it fails → pod is removed from the Service's endpoints (no traffic).
+    Pod stays alive but receives no traffic until it's ready again.
+    Used for: detecting when a pod is overwhelmed or starting up.
+  
+  Startup probe:
+    Gives slow-starting containers time to initialize before liveness kicks in.
+    Prevents premature kill during JVM startup (which can take 10-30s).
+
+LOAD BALANCER HEALTH CHECKS:
+  AWS ALB, nginx, HAProxy periodically probe each backend.
+  Probe: HTTP GET /health → expect 200 OK within timeout.
+  Failure threshold: 2-3 consecutive failures → remove from rotation.
+  Recovery threshold: 2-3 consecutive successes → add back.
+  
+  Health check endpoint should verify:
+    ✓ Application is serving requests (not just that the JVM is alive).
+    ✓ Database connection pool has available connections.
+    ✓ Downstream dependencies are reachable (deep health check).
+    Warning: deep health checks can cascade failures — if DB is slow,
+             all pods fail health checks simultaneously.
+             Prefer shallow health checks for routing; deep for alerting.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SPLIT-BRAIN: THE CONSEQUENCES OF FALSE POSITIVES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Scenario:
+  - Node A is the leader. It pauses for 2 seconds (long GC).
+  - Nodes B and C detect A as dead (fixed timeout = 1.5s).
+  - B wins election. B becomes leader.
+  - A resumes. A still thinks it is leader (GC pause is transparent to A).
+  - NOW: Two leaders (A and B) both accepting writes → data corruption.
+
+This is called SPLIT-BRAIN.
+
+PREVENTION STRATEGIES:
+  1. FENCING TOKENS (see 07_Leader_Election.txt — Fencing Tokens section):
+     Every leader gets an incrementing token.
+     Storage layer rejects writes from a leader with an old token.
+     Even if A resumes and thinks it's leader, its token is stale → rejected.
+  
+  2. QUORUM-BASED WRITES:
+     Leader cannot commit without acknowledgment from majority.
+     GC-paused leader can't contact majority → can't commit anything.
+     Safe even without fencing.
+  
+  3. STONITH (Shoot The Other Node In The Head):
+     Before a new leader is elected, the cluster explicitly fences
+     (kills/powers off) the old leader.
+     Used in high-stakes clusters (PostgreSQL Patroni + Pacemaker/Corosync).
+  
+  4. LEASE-BASED LEADERSHIP:
+     Leader holds a lease (TTL lock in etcd/ZooKeeper).
+     Leader STOPS accepting writes when its lease has < 0 seconds remaining.
+     A new leader waits for the old lease to expire before starting.
+     Ensures zero overlap in leadership authority.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NUMBERS TO KNOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Zookeeper session timeout default:   10 seconds
+  etcd leader heartbeat interval:      100ms (default)
+  etcd election timeout:               500ms-2.5s (default range)
+  Cassandra gossip interval:           1 second
+  Cassandra phi_convict_threshold:     8 (default)
+  Kubernetes liveness probe default:   period=10s, failureThreshold=3
+                                       → declares dead after 30 seconds
+  AWS ALB health check interval:       30s default (configurable to 5s)
+  Java G1GC typical stop-the-world:    < 200ms
+  Java ZGC stop-the-world:             < 10ms
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: "How do you detect that a node in your distributed system has failed?"
+A: "You can never be certain — a slow node and a crashed node look
+    identical (no response within timeout). The practical approaches are:
+    (1) Fixed timeout + heartbeats: simple, but prone to false positives
+    during GC pauses or network congestion. (2) Phi Accrual failure detector:
+    used by Cassandra — adapts to observed network conditions, outputs a
+    continuous suspicion level rather than binary dead/alive. Threshold is
+    tunable. (3) Gossip protocol: nodes exchange health info peer-to-peer
+    without a central monitor — O(log N) propagation, no SPOF. (4) External
+    health checks: Kubernetes probes, load balancer health checks — useful
+    for service routing but don't replace consensus-based detection."
+
+Q: "What is a split-brain and how do you prevent it?"
+A: "Split-brain is when two nodes both believe they are the leader and
+    simultaneously accept writes, leading to data divergence or corruption.
+    It happens when the failure detector false-positives: the leader is
+    slow (GC pause, network spike) and followers declare it dead and elect
+    a new leader — then the old leader resumes thinking it's still in charge.
+    Prevention: (1) Fencing tokens — storage layer rejects writes from
+    stale leaders (monotonically increasing token per leader term). (2)
+    Quorum-based writes — leader needs majority acknowledgment, so a
+    GC-paused leader can't commit. (3) STONITH — explicitly power-fence
+    the old leader before promoting a new one. (4) Lease-based leadership —
+    leader stops accepting writes when its TTL lease expires, new leader
+    waits for old lease to expire before starting."
+
+Q: "What's the difference between a liveness and readiness probe in Kubernetes?"
+A: "Liveness: 'Is this pod alive?' If it fails, Kubernetes kills and restarts
+    the pod. Used for detecting deadlocks or frozen processes where the process
+    is running but stuck.
+    Readiness: 'Is this pod ready to receive traffic?' If it fails, the pod
+    is removed from the Service's load balancer endpoints but NOT restarted.
+    Traffic stops going to it until it recovers. Used for overloaded pods,
+    pods that are warming up, or pods with a temporarily unavailable dependency.
+    Key distinction: liveness failure = restart. Readiness failure = stop traffic.
+    I also set startup probes for Java services with long JVM startup times to
+    prevent premature liveness kills during initialization."
+
+Q: "How does Cassandra know when a node has failed?"
+A: "Cassandra uses a combination of gossip protocol and the Phi Accrual failure
+    detector. Every second, each node gossips with 1-3 random peers, exchanging
+    heartbeat counters for all known nodes. The Phi Accrual detector tracks the
+    inter-arrival distribution of heartbeats from each peer. It outputs a
+    continuous suspicion value φ (phi). When φ exceeds phi_convict_threshold
+    (default 8, roughly 1-in-100M false-positive probability), the node is
+    marked DOWN. This is adaptive — during a slow network period, the baseline
+    distribution shifts and it becomes harder to trigger a false positive.
+    Unlike a fixed timeout, it doesn't false-positive on a single delayed heartbeat."

@@ -132,6 +132,182 @@ Example: Order → Reserve Inventory → Charge Payment → Ship
 Provides eventual consistency, not ACID. But scales well.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONSISTENCY MODELS — THE FULL SPECTRUM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Strongest ←─────────────────────────────────────────────────→ Weakest
+
+Linearizability > Sequential Consistency > Causal Consistency
+> Session Guarantees > Eventual Consistency
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CRITICAL DISTINCTION: LINEARIZABILITY vs SERIALIZABILITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+These are DIFFERENT things. Confusing them is a common interview mistake.
+
+LINEARIZABILITY (a.k.a. Atomic Consistency, External Consistency):
+  A SINGLE-OBJECT, SINGLE-OPERATION guarantee.
+  Every operation appears to execute atomically at some point between
+  its invocation and its completion — as if there's a single copy of data.
+  
+  Key property: Once a write completes and any client reads, they see
+  the new value. No client ever sees a "stale" value after a completed write.
+  
+  Example:
+    Client A writes X=1 (completes at t=10).
+    Client B reads X at t=11 → must see X=1.  [linearizable]
+    Client B reads X at t=11 → sees X=0.      [NOT linearizable]
+  
+  Cost: Requires coordination across replicas for every operation.
+        Significantly reduces throughput and increases latency.
+  
+  Used by: etcd, ZooKeeper, Google Spanner, CockroachDB
+  Implementation: Single-leader with sync replication + leader reads,
+                  or consensus (Raft) with leader lease reads.
+
+SERIALIZABILITY (a.k.a. Isolation Level: Serializable):
+  A MULTI-OBJECT, MULTI-OPERATION (transaction) guarantee.
+  The result of executing concurrent transactions is equivalent to
+  some SERIAL (one-at-a-time) execution order.
+  
+  Key property: Transactions appear as if they ran sequentially.
+  Does NOT require real-time ordering between transactions.
+  
+  Example:
+    Tx1 reads account A, then Tx2 reads account A and writes it.
+    Serializable allows Tx1's read to be "placed" before Tx2 in the
+    serial order even if their real-time execution overlapped.
+  
+  Cost: Less expensive than linearizability in theory, but hard to implement
+        efficiently. Often approximated with SSI or 2PL.
+  
+  Used by: PostgreSQL (with SERIALIZABLE level), MySQL InnoDB, CockroachDB
+
+STRICT SERIALIZABILITY = SERIALIZABILITY + LINEARIZABILITY:
+  Transactions execute serially AND respect real-time order.
+  Most expensive guarantee. Spanner achieves this with TrueTime.
+  Used in: Google Spanner, FoundationDB.
+
+COMPARISON TABLE:
+┌──────────────────────┬───────────────────┬────────────────────────┐
+│ Property             │ Linearizability   │ Serializability        │
+├──────────────────────┼───────────────────┼────────────────────────┤
+│ Scope                │ Single object/op  │ Multi-object (txn)     │
+│ Real-time ordering   │ YES (required)    │ NO (just serial equiv.)│
+│ Multi-key atomicity  │ NO                │ YES                    │
+│ Who uses it          │ CP datastores     │ RDBMS                  │
+│ Implementation       │ Consensus/leader  │ 2PL, SSI               │
+└──────────────────────┴───────────────────┴────────────────────────┘
+
+INTERVIEW TIP: "Linearizability" is about a single value behaving as
+if there's one copy. "Serializability" is about transactions having
+ACID isolation. Spanner has both = "strict serializability."
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SESSION GUARANTEES (Client-Centric Consistency)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Full system-wide consistency is expensive. Session guarantees provide
+a weaker but practically useful set of per-client guarantees.
+Defined by Terry et al. (1994). Used heavily in DynamoDB, Cassandra.
+
+1. READ YOUR WRITES (RYW):
+   After a client writes a value, it always reads its own write.
+   
+   WITHOUT RYW: Client posts a tweet → is routed to replica A.
+                Client refreshes page → is routed to replica B (no sync yet).
+                Client sees their tweet has disappeared. Confusing!
+   
+   WITH RYW: Client tracks its own write timestamp/token.
+             Reads must return data at least as fresh as that token.
+   
+   Implementation: Client sends "read-after-token" in requests.
+                   Server waits for replication to catch up before responding.
+                   OR: Always route client to same replica (sticky session).
+   
+   Used by: DynamoDB consistent reads, Cassandra LOCAL_QUORUM, MongoDB sessions.
+
+2. MONOTONIC READS:
+   If a client reads a value, subsequent reads will never return OLDER values.
+   
+   WITHOUT MONOTONIC READS: Client reads post count = 500. Refreshes. Sees 490.
+                             (Was routed to a lagging replica.)
+   
+   WITH MONOTONIC READS: Each read is at least as fresh as the previous read.
+   
+   Implementation: Client tracks highest version/timestamp seen.
+                   Route subsequent reads to replicas that are at least that fresh.
+
+3. MONOTONIC WRITES:
+   Writes from a single client are applied in the order they were submitted.
+   If W1 happens before W2 in a session, W1 is reflected before W2 globally.
+   
+   Violation example: Client sends W1=set counter to 10, W2=increment counter.
+                      If W2 arrives before W1 → counter becomes 11, then 10. Wrong.
+
+4. WRITES FOLLOW READS (WFR):
+   If a client reads a value X, then writes Y, the write of Y is guaranteed
+   to occur after the version of X that was read.
+   
+   This maintains causality: "I read X, therefore wrote Y" makes sense to others.
+   If another client reads Y, they can also see the X that caused it.
+
+PRAM CONSISTENCY (Pipeline RAM):
+   Combines Monotonic Reads + Monotonic Writes + Reads Your Writes.
+   All writes from a single process are seen by all other processes
+   in the order they were issued. Does NOT require cross-client causality.
+
+CAUSAL CONSISTENCY:
+   Stronger than PRAM. Causally related operations are seen in causal order by ALL clients.
+   Concurrent (causally unrelated) operations may be seen in different orders.
+   
+   Causal relationship: A → B if:
+     - Same process: A happened before B
+     - A is a write, B is a read of the same value
+     - Transitivity: if A→B and B→C then A→C
+   
+   Implementation: Vector clocks or dependency tracking.
+   Used by: MongoDB causal sessions, some versions of Riak.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ISOLATION LEVELS (Database Transaction Anomalies)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SQL standard defines isolation levels to prevent transaction anomalies.
+
+ANOMALIES:
+  DIRTY READ:     Reading uncommitted data from another transaction.
+  NON-REPEATABLE READ: Same read returns different values within a transaction
+                        (another transaction committed between reads).
+  PHANTOM READ:   Same query returns different ROWS (another transaction
+                  inserted/deleted rows between reads).
+  WRITE SKEW:     Two transactions each read overlapping data, then write
+                  based on what they read, violating a constraint.
+                  (Example: two doctors both read "≥1 on call" → both go off call)
+  LOST UPDATE:    Two transactions read-modify-write same value; one overwrites other.
+
+ISOLATION LEVELS VS ANOMALIES:
+┌───────────────────┬───────────┬──────────────┬───────────┬────────────┐
+│ Level             │Dirty Read │Non-Rep. Read │Phantom    │Write Skew  │
+├───────────────────┼───────────┼──────────────┼───────────┼────────────┤
+│ READ UNCOMMITTED  │ Possible  │ Possible     │ Possible  │ Possible   │
+│ READ COMMITTED    │ Prevented │ Possible     │ Possible  │ Possible   │
+│ REPEATABLE READ   │ Prevented │ Prevented    │ Possible* │ Possible   │
+│ SNAPSHOT ISOLATION│ Prevented │ Prevented    │ Prevented │ Possible   │
+│ SERIALIZABLE      │ Prevented │ Prevented    │ Prevented │ Prevented  │
+└───────────────────┴───────────┴──────────────┴───────────┴────────────┘
+  * MySQL InnoDB REPEATABLE READ prevents phantoms via gap locks.
+
+DEFAULT LEVELS BY DATABASE:
+  PostgreSQL:  READ COMMITTED (serializable available)
+  MySQL:       REPEATABLE READ (InnoDB default)
+  Oracle:      READ COMMITTED
+  SQL Server:  READ COMMITTED
+  CockroachDB: SERIALIZABLE (always)
+  Spanner:     SERIALIZABLE (always, via TrueTime)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CHOOSING A CONSISTENCY PATTERN
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -146,4 +322,36 @@ CHOOSING A CONSISTENCY PATTERN
 │ Collaborative editing           │ OT or CRDTs                     │
 │ Distributed locks               │ Raft-based (etcd, Zookeeper)    │
 │ Global transactions (expensive) │ Spanner (TrueTime + 2PC)        │
+│ Mobile/offline clients          │ Session guarantees (RYW, MR)    │
+│ No stale reads ever             │ Linearizability (etcd, Spanner) │
+│ Conflict-free data structures   │ CRDTs (see 15_CRDTs.txt)        │
 └─────────────────────────────────┴─────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: "What's the difference between linearizability and serializability?"
+A: "Linearizability is a single-object guarantee: each operation appears
+    to execute instantaneously at some point between invocation and response,
+    respecting real-time order. Serializability is a multi-object/transaction
+    guarantee: concurrent transactions produce results equivalent to some serial
+    execution. Linearizability is about a single value behaving like one copy;
+    serializability is about transactions having ACID isolation. Strict
+    serializability (Spanner) has both — very expensive."
+
+Q: "What is 'read your writes' and when do you need it?"
+A: "After a client writes, subsequent reads from that client must reflect
+    the write — even if requests hit different replicas. Without it, users
+    see their own updates disappear. I'd implement it by having clients
+    include a write token, and servers waiting until replication catches up
+    before responding. Alternatively, use sticky sessions or strong consistency
+    for write paths."
+
+Q: "What is write skew and how do you prevent it?"
+A: "Write skew occurs when two transactions each read overlapping data,
+    then write based on that read, violating a constraint that required
+    both reads to be consistent. Classic example: two doctors both see
+    '1 doctor on call', both decide to go off call — now 0 doctors on call.
+    Prevention requires SERIALIZABLE isolation (SSI in PostgreSQL) or
+    explicit SELECT FOR UPDATE to take locks before reading."

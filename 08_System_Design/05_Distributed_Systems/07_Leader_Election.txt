@@ -107,30 +107,94 @@ KEY CHALLENGE: CLOCK SKEW
   expiry, giving time for a new one to be elected safely.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FENCING TOKENS (Preventing Stale Leaders)
+FENCING TOKENS (Preventing Stale Leaders from Corrupting Data)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Problem: Stale leader (GC pause, slow network):
-  1. Leader 1 holds lease.
-  2. Leader 1 pauses for GC for 30 seconds.
-  3. Lease expires. Node 2 becomes Leader.
-  4. Node 2 writes data as new leader.
-  5. Leader 1 resumes (GC pause ends). Thinks it's still leader.
-  6. Leader 1 also writes data → conflict!
+THE PROBLEM — Stale Leader (Split Brain in Practice):
 
-Solution: Fencing Tokens
-  When acquiring a lock/lease, client gets a monotonically increasing TOKEN.
-  Token 1 → Leader 1
-  Token 2 → Leader 2 (after re-election)
-  
-  Leader includes token in all write requests to storage.
-  Storage REJECTS writes with a token older than the last seen token.
-  
-  Leader 1 (with token 1) tries to write → storage has seen token 2 → REJECTED.
-  Leader 2 (with token 2) writes → accepted.
+  Timeline WITHOUT fencing tokens:
 
-This prevents split-brain data corruption.
-Use in: Distributed caches, distributed file systems, DB writes.
+  t=0:  Leader A acquires lock (token=1). Begins processing.
+  t=10: Leader A experiences a long GC pause (30 seconds).
+  t=15: Followers detect A as dead (timeout). B wins election.
+  t=16: Leader B acquires lock (token=2). Writes record X=100.
+  t=40: Leader A resumes from GC. It has no idea 30 seconds passed.
+        A still thinks it holds the lock (its in-memory state says so).
+  t=41: Leader A writes record X=200 to storage. CORRUPTION.
+        Storage now has X=200, but B already committed downstream
+        actions based on X=100.
+
+  This is split-brain. Both leaders believe they are legitimate.
+  The fundamental problem: a process cannot distinguish "I was paused"
+  from "I was running normally."
+
+SOLUTION — Fencing Tokens:
+
+  Every time a node acquires a lock/lease, the lock service returns
+  a FENCING TOKEN: a monotonically increasing integer.
+
+  Token 1 → issued to Leader A (first election)
+  Token 2 → issued to Leader B (second election, after A's lease expired)
+  Token 3 → issued to Leader C (third election), etc.
+
+  The token is INCLUDED in every write request to the storage backend.
+  The storage backend tracks the MAXIMUM token it has seen.
+  It REJECTS any write carrying a token lower than the max seen.
+
+  Timeline WITH fencing tokens:
+
+  t=40: Leader A resumes. Tries to write X=200 with token=1.
+        Storage has already seen token=2 (from Leader B).
+        Storage REJECTS: "token 1 is stale. Current leader token is ≥ 2."
+  t=40: Leader A's write fails. A must step down or crash.
+        DATA IS SAFE. Only B's writes (token=2) were committed.
+
+IMPLEMENTATION PATTERN:
+
+  Lock service (etcd example):
+    // Acquire lock — etcd returns a revision number (the fencing token)
+    LeaseGrantResponse lease = etcdClient.leaseGrant(30); // 30s TTL
+    TxnResponse txn = etcdClient.txn()
+        .If(new Cmp("/leader-lock", Cmp.Op.VERSION, CmpTarget.VALUE, 0))
+        .Then(Op.put("/leader-lock", nodeId, PutOption.newBuilder()
+                                                       .withLeaseId(lease.getID())
+                                                       .build()))
+        .commit();
+    long fencingToken = txn.getHeader().getRevision(); // monotonically increasing
+
+  Storage backend (write path):
+    // Every write includes the fencing token in the request header
+    PUT /api/storage/record/X
+    X-Fencing-Token: 2
+    { "value": 100 }
+
+    // Storage validates before accepting:
+    if (request.fencingToken < this.maxSeenToken) {
+        throw new StaleLeaderException("Rejected: token " +
+            request.fencingToken + " < current " + this.maxSeenToken);
+    }
+    this.maxSeenToken = Math.max(this.maxSeenToken, request.fencingToken);
+    // proceed with write
+
+KEY INSIGHT — Why the stale leader can't fake a high token:
+  The fencing token comes from the lock service, not from the leader itself.
+  A stale leader can only use the token it was issued. It cannot forge a
+  higher token — that would require winning a new election.
+
+WHERE FENCING TOKENS ARE USED:
+  etcd: lock revision number serves as fencing token.
+  ZooKeeper: ephemeral node version / zxid serves as fencing token.
+  Distributed file systems: HBase uses ZooKeeper epoch numbers.
+  Custom distributed caches: Redis with WATCH + monotonic version.
+  Database HA: Patroni uses fencing + STONITH to prevent stale PostgreSQL primary.
+
+WHEN FENCING ISN'T ENOUGH:
+  Fencing only helps if the storage backend enforces it.
+  If the storage backend doesn't check tokens (e.g., a plain database
+  with no token awareness), you need additional protection:
+    - STONITH: physically power off the stale node.
+    - Network-level fencing: firewall the stale node out.
+    - Epoch-based lease: leader stops ITSELF before lease expires.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 IN INTERVIEWS

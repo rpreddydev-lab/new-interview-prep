@@ -1,0 +1,285 @@
+================================================================
+BACKPRESSURE AND FLOW CONTROL
+================================================================
+
+WHAT IS BACKPRESSURE?
+----------------------
+Backpressure is a mechanism for a downstream system to signal to its
+upstream that it's overwhelmed and cannot handle more work.
+
+Without backpressure: A fast producer sending to a slow consumer will
+cause the consumer's queue to grow unboundedly → memory exhaustion →
+crash → cascading failure across the entire system.
+
+ANALOGY: A garden hose connected to a fire hydrant.
+  Without backpressure: hose explodes from pressure.
+  With backpressure: hose signals "I'm full" → hydrant slows down.
+
+THE CORE PROBLEM IN DISTRIBUTED SYSTEMS:
+  Service A calls Service B. B is slow.
+  A keeps sending requests. B's queue grows.
+  B runs out of memory → crashes.
+  A now has no dependency → A fails too.
+  The failure propagates upstream = CASCADING FAILURE.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PATTERN 1: BLOCKING / SYNCHRONOUS BACKPRESSURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Simplest form: the producer is blocked (waits) until the consumer is ready.
+
+TCP FLOW CONTROL (built-in backpressure):
+  Receiver advertises a "receive window" — how much buffer space is available.
+  Sender can only send up to the receive window bytes before waiting for ACK.
+  If receiver is slow → window shrinks → sender slows automatically.
+  
+  This is backpressure built into the TCP protocol itself.
+
+BLOCKING QUEUE:
+  In thread-based systems: use a bounded blocking queue.
+  Producer thread calls queue.put(item) — blocks if queue is full.
+  Consumer threads drain the queue at their own pace.
+  
+  Java: LinkedBlockingQueue(capacity), ArrayBlockingQueue(capacity)
+  
+  Effect: Producer thread is naturally rate-limited by consumer speed.
+  
+  RISK: If all threads are blocked waiting, the system appears frozen.
+        Must monitor queue depth and alert/reject upstream if sustained.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PATTERN 2: REACTIVE STREAMS / ASYNC BACKPRESSURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+In async/non-blocking systems (reactive programming), blocking is
+not possible. Backpressure must be explicit in the protocol.
+
+REACTIVE STREAMS PROTOCOL (Java: Reactor, RxJava, Akka Streams):
+  Publisher  → produces items
+  Subscriber → consumes items
+  
+  Subscriber signals "I want N items" via request(N).
+  Publisher sends AT MOST N items.
+  Subscriber processes N, then requests(M) more when ready.
+  
+  This is DEMAND-DRIVEN (pull-based) vs traditional push-based.
+  Producer only produces what consumer can handle.
+
+PROJECT REACTOR EXAMPLE (Java):
+  Flux.range(1, 1_000_000)
+      .onBackpressureBuffer(100)   // buffer up to 100 items
+      .publishOn(Schedulers.boundedElastic())
+      .subscribe(item -> slowProcess(item));
+  
+  Backpressure strategies:
+    onBackpressureBuffer(n):  Buffer up to N items. Drop or error if full.
+    onBackpressureDrop():     Drop items that can't be handled immediately.
+    onBackpressureLatest():   Keep only the most recent item (overwrite buffer).
+    onBackpressureError():    Throw MissingBackpressureException when overwhelmed.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PATTERN 3: MESSAGE QUEUE AS BACKPRESSURE BUFFER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Use a message queue (Kafka, RabbitMQ, SQS) as a buffer between
+fast producers and slow consumers. Classic "work queue" pattern.
+
+HOW IT PROVIDES BACKPRESSURE:
+  Producer publishes to queue at any rate.
+  Consumer reads from queue at its own pace.
+  Queue absorbs the spike → neither producer nor consumer overwhelmed.
+  
+  Producer rate > Consumer rate → queue depth grows.
+  Monitor queue depth (Kafka: consumer lag) as a health signal.
+  Alert when queue depth exceeds threshold.
+  Scale consumers if sustained high lag.
+
+KAFKA CONSUMER LAG:
+  consumer_lag = latest_offset - committed_offset per partition.
+  High lag = consumer is falling behind producer.
+  Alert: consumer_lag > 10,000 messages → trigger auto-scaling.
+
+BENEFITS:
+  ✓ Decouples producer and consumer speeds.
+  ✓ Handles traffic spikes (queue absorbs burst).
+  ✓ Consumer can be scaled independently.
+  ✓ Queue is durable (Kafka retains messages if consumer crashes).
+
+RISKS:
+  ✗ Unbounded queues can grow forever → disk exhaustion.
+     Mitigation: Set retention policies. Alert on lag growth rate.
+  ✗ If consumer is chronically slow, lag grows indefinitely.
+     Mitigation: Scale consumers, optimize processing, or drop old messages.
+  ✗ Latency increases as queue depth grows.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PATTERN 4: LOAD SHEDDING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When a system cannot handle all incoming work, deliberately DROP
+some requests to protect the system and serve the rest well.
+
+BETTER TO FAIL FAST on 20% of requests than to fail slowly on 100%.
+
+STRATEGIES:
+
+QUEUE LENGTH SHEDDING:
+  If internal queue length > threshold → reject new incoming requests.
+  Return HTTP 503 / GRPC RESOURCE_EXHAUSTED immediately.
+  
+  Example: Thread pool queue max = 1000.
+    if (queue.size() > 900) { return 503; }  // shed early
+  
+  Queue at 90% = danger zone. Shed before it fills completely.
+
+RATE-BASED SHEDDING (Adaptive):
+  Monitor current success rate and latency.
+  If P99 latency > threshold → start shedding % of traffic.
+  Netflix Hystrix / resilience4j CircuitBreaker can auto-shed.
+
+PRIORITY-BASED SHEDDING:
+  Assign priority to request types.
+  Under load, shed low-priority requests first.
+  
+  Example: Health checks and free tier users shed first.
+           Premium users and internal services served last.
+  
+  Implementation: Thread pools with separate queues per priority.
+
+RANDOM SHEDDING:
+  Under load, reject a random % of requests.
+  Simple to implement. No priority bias.
+  Used by: Google, with the "Weighted Random Early Detection (WRED)" approach.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PATTERN 5: BULKHEAD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CONCEPT: Isolate failures by partitioning resources. Named after ship
+bulkheads that prevent one flooded compartment from sinking the ship.
+
+PROBLEM WITHOUT BULKHEADS:
+  Service A calls Service B and Service C.
+  A has a shared thread pool of 100 threads.
+  Service B becomes slow → 100 threads all blocked waiting for B.
+  Now A has no threads to process requests to Service C either.
+  B's failure has taken down C — even though C is healthy.
+
+BULKHEAD SOLUTION:
+  Assign separate, fixed thread pools for each downstream dependency.
+    Thread pool for Service B: 20 threads (max)
+    Thread pool for Service C: 20 threads (max)
+    Thread pool for Service D: 20 threads (max)
+    General thread pool:       40 threads
+  
+  Now if B becomes slow, only its 20 threads are consumed.
+  C and D are unaffected — their thread pools are independent.
+
+BULKHEAD IN PRACTICE (Resilience4j / Hystrix):
+  @Bulkhead(name = "serviceB", type = Bulkhead.Type.THREADPOOL)
+  public Response callServiceB(Request r) { ... }
+  
+  @Bulkhead(name = "serviceC", maxConcurrentCalls = 20)
+  public Response callServiceC(Request r) { ... }
+
+SEMAPHORE BULKHEAD:
+  Alternative: Use semaphores instead of separate thread pools.
+  Limits concurrent calls per service without separate threads.
+  More efficient (no thread context switching).
+  Used by: Resilience4j semaphore bulkhead.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PATTERN 6: CIRCUIT BREAKER (Backpressure at the Caller)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+(Covered in depth in Microservices/Resilience — brief recap here.)
+
+Circuit breaker prevents calling a struggling downstream service
+by "opening" (failing fast) when error rate exceeds a threshold.
+
+STATES:
+  CLOSED: Normal operation. Requests pass through.
+  OPEN:   Downstream is unhealthy. Requests fail immediately (no call made).
+          Gives downstream time to recover.
+  HALF-OPEN: Probe with a test request. If succeeds → CLOSE. Else → OPEN.
+
+BACKPRESSURE RELATIONSHIP:
+  Circuit breaker provides backpressure at the CALLER side:
+  "Stop sending requests to an already-overwhelmed service."
+  This prevents the caller from holding resources waiting for a slow response,
+  and prevents further overloading the struggling downstream.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BACKPRESSURE IN KAFKA CONSUMERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Kafka consumers naturally implement pull-based backpressure:
+  Consumer POLLS Kafka for records at its own pace.
+  Consumer controls how many records to fetch per poll (max.poll.records).
+  Consumer processes records, then polls again.
+  
+  If processing is slow → consumer polls less frequently → Kafka lag grows.
+  Kafka does NOT push to consumers (no risk of overwhelming a slow consumer).
+
+KEY CONFIGS:
+  max.poll.records: max records returned per poll (default 500).
+  max.poll.interval.ms: max time between polls before consumer is considered dead.
+  fetch.max.bytes: max bytes per fetch (limits batch size).
+
+CONSUMER BACKPRESSURE SIGNALS:
+  1. Consumer lag (per partition): track with Kafka consumer group metrics.
+  2. Processing latency: how long each batch takes to process.
+  3. Rebalance frequency: frequent rebalances indicate overloaded consumers.
+
+RESPONSE: Scale up consumer instances (up to partition count).
+          Optimize per-message processing.
+          Implement parallel processing within each consumer.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FLOW CONTROL vs BACKPRESSURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FLOW CONTROL: Sender-driven. Sender limits rate proactively.
+  Example: Rate limiter (sender checks token bucket before sending).
+  Example: Exponential backoff on retries.
+
+BACKPRESSURE: Receiver-driven. Receiver signals sender to slow down.
+  Example: TCP receive window.
+  Example: Reactive Streams request(N).
+  Example: Queue depth signal → reject new work.
+
+Both are complementary. Production systems use BOTH:
+  Flow control at the API boundary (rate limiting per client).
+  Backpressure internally (thread pool limits, queue depth limits).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: "What is backpressure and why does it matter?"
+A: "Backpressure is a mechanism for a downstream system to signal to
+    its upstream that it's overwhelmed. Without it, a fast producer can
+    exhaust a slow consumer's memory and crash it. The crash propagates
+    upstream causing cascading failure. I handle backpressure with:
+    (1) bounded queues with rejection at capacity,
+    (2) load shedding (HTTP 503) when queue is near full,
+    (3) circuit breakers to stop calling struggling services,
+    (4) bulkheads to isolate failures per dependency,
+    (5) message queues as elastic buffers between producer and consumer."
+
+Q: "What is a bulkhead pattern and why use it?"
+A: "Bulkhead isolates resource pools per downstream dependency.
+    Without it, a slow service B can exhaust all shared threads,
+    preventing calls to healthy service C. With bulkheads, each
+    downstream has its own fixed thread pool. Failure in B is contained
+    to B's pool. C remains fully operational. It prevents fault isolation
+    failure — where one bad dependency takes down all others."
+
+Q: "How would you handle a downstream service that's becoming slow?"
+A: "I'd use a layered approach:
+    1. Circuit breaker: monitor error rate/latency; open circuit if threshold exceeded.
+    2. Timeout: always set aggressive timeouts (not TCP default 75s).
+    3. Bulkhead: limit threads dedicated to that downstream.
+    4. Retry with backoff: retry transiently failed requests with exponential backoff.
+    5. Fallback: serve cached data or a degraded response when circuit is open.
+    6. Alert: surface consumer lag or queue depth metrics for the on-call team."

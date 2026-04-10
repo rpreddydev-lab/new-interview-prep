@@ -1,0 +1,304 @@
+================================================================
+GEO-REPLICATION AND MULTI-REGION STRATEGIES
+================================================================
+
+WHY MULTI-REGION?
+------------------
+Deploying a single region means:
+  - Users far from the region suffer high latency (150–300ms cross-continent).
+  - Region failure (AWS us-east-1 outage) → complete downtime.
+  - Regulatory requirements (EU data must stay in EU).
+
+Multi-region deployment goals:
+  1. Low latency: serve users from the nearest region.
+  2. High availability: survive regional failures (99.99%+ SLA).
+  3. Disaster recovery: data survives catastrophic regional loss.
+  4. Compliance: data residency requirements.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DEPLOYMENT MODELS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MODEL 1: ACTIVE-PASSIVE (Primary-Secondary, Warm Standby)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+One region is the PRIMARY (handles all reads and writes).
+Other regions are STANDBY (receive replicated data but serve no traffic).
+
+  Traffic → [us-east-1 PRIMARY] ──async replication──→ [eu-west-1 STANDBY]
+                                                     → [ap-southeast-1 STANDBY]
+
+VARIANTS:
+  HOT STANDBY: Standby is fully up and in sync. Failover in seconds.
+  WARM STANDBY: Standby is scaled down. Failover takes minutes (scale-up needed).
+  COLD STANDBY: Standby is just backups/snapshots. Failover takes hours.
+
+FAILOVER:
+  If primary fails:
+    1. Detect failure (health check, manual).
+    2. Promote standby to primary (update DNS, load balancer).
+    3. Redirect all traffic to new primary.
+    4. Async: replicate from new primary back to rebuilt old region.
+
+REPLICATION LAG:
+  Async replication means standby may be seconds/minutes behind.
+  RPO (Recovery Point Objective) = how much data you can lose.
+  RTO (Recovery Time Objective) = how long failover takes.
+  
+  Hot standby: RPO ~seconds, RTO ~30–60 seconds.
+  Warm standby: RPO ~minutes, RTO ~5–15 minutes.
+
+BENEFITS:
+  ✓ Simple architecture — no conflict resolution needed.
+  ✓ Strong consistency in primary region (no cross-region coordination).
+  ✓ Good for compliance (all writes in one region).
+
+DRAWBACKS:
+  ✗ Users far from primary suffer high latency.
+  ✗ Standby capacity is wasted (not serving traffic).
+  ✗ Writes go to one region only — doesn't improve write throughput.
+
+USED BY: Most traditional RDBMS HA setups (RDS Multi-AZ, Aurora Global DB).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MODEL 2: ACTIVE-ACTIVE (Multi-Master, Multi-Region Read-Write)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+All regions serve both READS and WRITES. Data is replicated across all regions.
+
+  US users  → [us-east-1] ←──bi-directional replication──→ [eu-west-1] ← EU users
+                           ←─────────────────────────────→ [ap-southeast-1] ← APAC
+
+WRITE CONFLICT:
+  User A in US updates their profile at t=100 (us-east-1).
+  User A in EU also updates at t=101 (eu-west-1, same user account).
+  Both writes arrive at both regions. WHICH ONE WINS?
+
+CONFLICT RESOLUTION STRATEGIES:
+
+  LAST-WRITE-WINS (LWW):
+    Use timestamp to determine winner.
+    Higher timestamp wins.
+    Problem: Clock skew. May pick the wrong write.
+    Used by: Cassandra (default), DynamoDB (default for non-transactional).
+
+  APPLICATION-DEFINED MERGE:
+    Application defines how to merge conflicting writes.
+    "All items from both carts survive" (OR-Set / union semantics).
+    Used by: Amazon Dynamo shopping cart.
+
+  CRDT-BASED CONFLICT-FREE:
+    Use CRDT data structures that always converge.
+    No conflict resolution needed — merge is always well-defined.
+    Used by: Riak, Aerospike.
+
+  REGION-PINNING (Avoid Conflicts):
+    Route writes for a given user/entity to a specific "home" region.
+    User profiles always written to user's home region.
+    Other regions read from home region with replication.
+    Avoids conflicts at the cost of cross-region write latency for some users.
+
+BENEFITS:
+  ✓ Low read AND write latency for all users.
+  ✓ Traffic capacity scales with number of regions.
+  ✓ Resilient: losing one region doesn't stop writes (others continue).
+
+DRAWBACKS:
+  ✗ Conflict resolution is complex and application-specific.
+  ✗ Replication lag means a write in one region isn't immediately visible elsewhere.
+  ✗ Some operations (inventory decrement, seat booking) are inherently non-mergeable.
+
+USED BY: Cassandra (native), DynamoDB Global Tables, CockroachDB, Azure Cosmos DB.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MODEL 3: READ-LOCAL, WRITE-GLOBAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Reads are served locally (low latency).
+Writes are sent to a single global primary (strong consistency).
+
+  EU User reads → [eu-west-1 replica] (fast, local)
+  EU User writes → routed to [us-east-1 PRIMARY] (cross-region, higher latency)
+  us-east-1 replicates write to eu-west-1 (async)
+
+Replication lag means a user in EU may read stale data after writing.
+Mitigation: "Read your own writes" — route reads to primary for a short
+window after a write, then allow local reads.
+
+USED BY: Aurora Global Database, PlanetScale (Vitess), some Spanner deployments.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REPLICATION IN GEO-DISTRIBUTED SYSTEMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SYNCHRONOUS CROSS-REGION REPLICATION:
+  Write waits for ACK from all regions before confirming to client.
+  Latency penalty = cross-region RTT (50–300ms per hop).
+  Benefit: Zero RPO — no data loss on failure.
+  Cost: Every write is slow (latency bounded by the farthest region).
+  Used by: Google Spanner (TrueTime allows safe sync across DCs).
+
+ASYNCHRONOUS CROSS-REGION REPLICATION:
+  Write confirmed locally. Replication to other regions happens asynchronously.
+  Latency: fast (local write only).
+  RPO: Non-zero — if primary fails, seconds/minutes of data may be lost.
+  Used by: AWS RDS Read Replicas, Aurora Global DB (primary → secondaries).
+
+SEMI-SYNCHRONOUS:
+  Wait for ONE secondary to ACK (not all).
+  Balance between durability and latency.
+  MySQL/MariaDB semi-sync replication.
+
+AURORA GLOBAL DATABASE:
+  Primary region: read+write. Up to 5 secondary regions: read-only.
+  Replication: sub-second (typically ~100ms) via Aurora's storage layer.
+  Failover: promote a secondary to primary in ~1 minute.
+  RPO: ~1 second typical.
+
+COCKROACHDB:
+  Multi-region deployment with Raft consensus.
+  Data can be "region-pinned" to stay close to users.
+  Writes within a region: low latency (local Raft group).
+  Cross-region writes: higher latency (cross-region Raft).
+  Survival goals: "zone failure" (AZs in one region) or "region failure" (full region).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GOOGLE SPANNER AND TRUETIME
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TRUETIME API:
+  Google's globally synchronized clock service.
+  Uses GPS receivers and atomic clocks in every Google datacenter.
+  
+  TrueTime.now() returns an interval [earliest, latest], not a single timestamp.
+  The true current time is guaranteed to be within this interval.
+  Interval width: typically 1–7 ms.
+  
+  Key guarantee: If event A completes before event B starts,
+  A's TrueTime interval is entirely before B's.
+
+HOW SPANNER USES TRUETIME:
+  Every transaction is assigned a commit timestamp from TrueTime.
+  After a write, Spanner WAITS for the uncertainty window to pass
+  (up to 7ms) before committing.
+  
+  This "commit wait" ensures no future transaction can have a timestamp
+  less than this transaction's committed timestamp.
+  
+  Result: Strict serializability + external consistency across all regions.
+  "Any transaction that commits after T is assigned a timestamp > T."
+
+  Performance impact: 1–7ms per transaction (commit wait).
+  Worth it for Google's use cases (global financial transactions, ads).
+
+HYBRID LOGICAL CLOCKS (HLC):
+  Practical alternative to TrueTime for systems without GPS clocks.
+  Combines physical time with logical clocks.
+  HLC(node) = max(wall_clock, max_hlc_seen) with a counter for same-ms ties.
+  
+  Ensures: HLC timestamps are always greater than or equal to physical time.
+           Events in causal order get increasing HLC timestamps.
+           No need for GPS hardware.
+  
+  Used by: CockroachDB (uses HLC for external consistency),
+            YugabyteDB, some versions of Cassandra.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LATENCY AND CONSISTENCY TRADE-OFFS IN MULTI-REGION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────────┬──────────────┬────────────────────────────┐
+│ Architecture            │ Write Lat.   │ Consistency                │
+├─────────────────────────┼──────────────┼────────────────────────────┤
+│ Single region           │ ~5ms         │ Strong (local ACID)        │
+│ Active-Passive (async)  │ ~5ms         │ Eventual (cross-region)    │
+│ Active-Passive (sync)   │ ~100–300ms   │ Strong (but slow)          │
+│ Active-Active (LWW)     │ ~5ms         │ Eventual (conflict risk)   │
+│ Active-Active (CRDT)    │ ~5ms         │ Strong eventual            │
+│ Read-local/Write-global │ Write: ~100ms│ Strong (writes to primary) │
+│ Spanner (TrueTime)      │ ~10–100ms    │ Strict serializability     │
+│ CockroachDB (HLC)       │ ~5–50ms      │ Serializable               │
+└─────────────────────────┴──────────────┴────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DATA RESIDENCY AND COMPLIANCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+GDPR (EU): Personal data of EU residents must stay in EU. Cannot transfer
+  to US without SCCs (Standard Contractual Clauses) or adequacy decision.
+
+IMPLEMENTATION:
+  User's home region is determined at signup (IP geolocation or explicit choice).
+  Data is stored in that region's database.
+  Cross-region reads only for non-PII (personal identifiable information).
+  
+  CockroachDB: "Table Locality" — mark tables as "REGIONAL BY ROW."
+    Each row stored in the region closest to the user.
+    Writes to "home" region only. Global reads for non-localized tables.
+  
+  Azure Cosmos DB: "Multi-region writes with region-pinned data partitions."
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FAILOVER AND DISASTER RECOVERY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RPO (Recovery Point Objective): Max acceptable data loss.
+  "We can tolerate losing up to 30 seconds of data."
+  Determines whether sync or async replication is needed.
+
+RTO (Recovery Time Objective): Max acceptable downtime.
+  "The system must be back up within 5 minutes."
+  Determines failover automation requirements.
+
+FAILOVER AUTOMATION:
+  1. Health monitoring: CloudWatch / Datadog detects primary region unhealthy.
+  2. DNS failover: Route53 health checks → switch DNS to standby.
+  3. Load balancer: Update to route to new primary.
+  4. Database: Promote read replica to writer (RDS, Aurora automatic failover).
+  5. Validation: Run smoke tests against new primary before declaring healthy.
+
+SPLIT-BRAIN IN MULTI-REGION:
+  If network partition isolates regions, each may think the other is dead
+  and promote itself to primary. Two primaries → data corruption.
+  
+  Prevention:
+    Use consensus (Raft/Paxos) to elect leader — requires quorum (majority).
+    With 3 regions, 2 must be alive to elect leader. Isolated region can't progress.
+    etcd/ZooKeeper in multiple regions: write requires majority-region quorum.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: "How would you design a globally available system with low latency?"
+A: "I'd use an active-active multi-region setup where each region
+    serves both reads and writes. Traffic is routed via GeoDNS (Route53,
+    Cloudflare) to the nearest region. Data is replicated asynchronously.
+    
+    For data that must be strongly consistent (financial transactions):
+    route writes to a designated primary region, or use CockroachDB/Spanner
+    for distributed transactions with strong consistency.
+    
+    For eventually consistent data (social feeds, counts): use Cassandra
+    with QUORUM writes and LOCAL_QUORUM reads, using LWW or CRDTs for
+    conflict resolution. Monitor replication lag as a key metric."
+
+Q: "What is TrueTime and how does Spanner use it?"
+A: "TrueTime is Google's globally synchronized clock service using GPS
+    and atomic clocks. It provides a timestamp as an interval [earliest, latest]
+    where the true time is guaranteed to fall. Spanner uses this to assign
+    globally ordered commit timestamps: after a write, Spanner waits for
+    the uncertainty window (~7ms) before committing. This guarantees any
+    later transaction gets a strictly higher timestamp, achieving strict
+    serializability across global regions — at the cost of 1–7ms commit wait."
+
+Q: "Active-Active vs Active-Passive — when to use each?"
+A: "Active-Passive: simpler, no conflicts, good when writes must be strongly
+    consistent or when all users tolerate primary-region latency. Good for
+    most OLTP apps with a dominant user region.
+    
+    Active-Active: lower read AND write latency for all users, higher
+    resilience, but requires conflict resolution strategy. Good for truly
+    global apps (social platforms, global SaaS) where different user
+    populations are geographically separated and often write independently."

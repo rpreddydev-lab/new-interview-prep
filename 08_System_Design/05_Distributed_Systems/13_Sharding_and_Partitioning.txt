@@ -1,0 +1,436 @@
+================================================================
+SHARDING AND PARTITIONING
+================================================================
+
+What to use this for: "How would you scale this database?" /
+"How do you shard a users table?" / "What is your shard key strategy?" /
+"What happens when a shard is hot?" / "How do you avoid cross-shard joins?"
+
+WHY SHARDING?
+--------------
+A single database node has limits:
+  - Disk: can store only so much data (typically <10 TB practical limit).
+  - CPU: can handle only so many queries per second.
+  - RAM: working set must fit in memory for performance.
+  - Network: I/O throughput is bounded.
+
+Sharding (horizontal partitioning): split data across multiple nodes.
+Each node holds a SUBSET of the data (a shard or partition).
+Together, all shards hold the full dataset.
+
+TERMINOLOGY:
+  Partitioning  = general term (DDIA / academic usage)
+  Sharding      = same concept (MongoDB / Cassandra / DynamoDB usage)
+  Shard         = one partition node
+  Shard Key     = the field(s) used to determine which shard holds a record
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 1: PARTITIONING STRATEGIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+─────────────────────────────────────────────────────────────
+STRATEGY 1: RANGE PARTITIONING
+─────────────────────────────────────────────────────────────
+
+Split data by sorted ranges of the shard key.
+
+Example: Partition users by last name:
+  Shard A: A–F
+  Shard B: G–M
+  Shard C: N–S
+  Shard D: T–Z
+
+Example: Partition IoT sensor data by timestamp:
+  Shard 1: Jan 2024
+  Shard 2: Feb 2024
+  Shard 3: Mar 2024
+  ...
+
+PROS:
+  ✓ RANGE QUERIES ARE EFFICIENT:
+    "Get all events between Jan 1 and Jan 31" hits exactly 1 shard.
+    "Get all users with last name starting with G–L" hits 1 shard.
+  ✓ Natural for time-series data (query recent data = query one shard).
+  ✓ Easy to reason about data locality.
+
+CONS:
+  ✗ HOT SPOTS (the biggest problem with range partitioning):
+    If your workload writes mostly recent data, the "current" time shard
+    gets ALL the writes. Other shards are idle. One node is overwhelmed.
+    Called a "hot partition" or "hot shard."
+  
+  ✗ UNEVEN DISTRIBUTION:
+    If names cluster in B–D range, Shard A is huge; Shard D is tiny.
+    Ranges must be manually rebalanced or auto-split.
+
+HOT SPOT SOLUTIONS:
+  1. Add a random prefix to the shard key.
+     Instead of shard key = timestamp, use shard key = random(0–10) + timestamp.
+     Spreads writes across 10 partitions. But: range queries must now
+     query all 10 partitions and merge results (scatter-gather).
+  
+  2. Use a compound shard key: (sensor_region, timestamp).
+     Different regions write to different shards. Range queries per
+     region are still efficient.
+  
+  3. Pre-split: predict the high-write range and pre-allocate more shards there.
+
+Used by: HBase (row key ranges), BigTable, MongoDB (range sharding),
+          Cassandra (with partition key ranges per node ring segment).
+
+─────────────────────────────────────────────────────────────
+STRATEGY 2: HASH PARTITIONING
+─────────────────────────────────────────────────────────────
+
+Apply a hash function to the shard key. Route to shard based on hash.
+
+  shard = hash(shard_key) % num_shards
+
+Example: Partition users by user_id:
+  hash("user_001") % 4 = 2 → Shard 2
+  hash("user_002") % 4 = 0 → Shard 0
+  hash("user_003") % 4 = 3 → Shard 3
+
+PROS:
+  ✓ EVEN DATA DISTRIBUTION: Good hash functions distribute keys uniformly.
+    No hot spots for uniform write patterns.
+  ✓ SIMPLE: No need to maintain range boundaries.
+
+CONS:
+  ✗ RANGE QUERIES ARE INEFFICIENT:
+    "Get all users signed up in January 2024" — timestamp is hashed,
+    so January users are on all shards. Must query ALL shards and merge.
+    Called a "scatter-gather" or "fan-out" query.
+  
+  ✗ RESHARDING IS EXPENSIVE:
+    Adding or removing a shard changes the modulo → most keys remap.
+    (Consistent hashing solves this — see file 09.)
+
+Best practice: Use CONSISTENT HASHING instead of simple modulo
+  to allow shard addition/removal with minimal key remapping.
+
+Used by: Cassandra (consistent hash ring), DynamoDB (consistent hashing),
+          Redis Cluster (16384 hash slots), MongoDB (hashed sharding).
+
+─────────────────────────────────────────────────────────────
+STRATEGY 3: DIRECTORY-BASED PARTITIONING
+─────────────────────────────────────────────────────────────
+
+Maintain a lookup table (directory): key → shard.
+
+  Directory Service:
+    user_001 → Shard 2
+    user_002 → Shard 0
+    order_789 → Shard 1
+
+PROS:
+  ✓ Maximum flexibility — any key can go to any shard.
+  ✓ Easy to rebalance: just update the directory.
+  ✓ Works for irregular distributions.
+
+CONS:
+  ✗ Directory is a SINGLE POINT OF FAILURE and bottleneck.
+  ✗ Every read/write requires a directory lookup (extra network hop).
+  ✗ Directory must be kept consistent (hard in itself).
+
+Used by: LinkedIn (Espresso), some sharded MySQL setups with a routing tier.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 2: SHARD KEY DESIGN — THE MOST IMPORTANT DECISION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The shard key determines:
+  - How evenly data and load are distributed.
+  - Which queries are efficient (same-shard) vs. expensive (cross-shard).
+  - How hard it is to rebalance later.
+
+Changing the shard key after launch is extremely painful. GET IT RIGHT.
+
+─────────────────────────────────────────────────────────────
+GOOD SHARD KEY PROPERTIES:
+─────────────────────────────────────────────────────────────
+  1. HIGH CARDINALITY: Many distinct values → fine-grained distribution.
+     Bad: boolean field (only 2 shards possible).
+     Good: user_id (millions of distinct values).
+  
+  2. LOW CORRELATION WITH ACCESS PATTERN:
+     If you hash user_id but 90% of reads are for 100 celebrity users,
+     those 100 users' shards are hot. Cardinality alone isn't enough.
+  
+  3. COLLOCATES RELATED DATA:
+     Data frequently accessed together should be on the same shard.
+     → Avoids expensive cross-shard joins.
+     Example: For a multi-tenant SaaS, shard by tenant_id.
+              All data for one tenant lives on one shard → no cross-shard
+              queries for single-tenant operations.
+  
+  4. STABLE:
+     Shard key should not change. If it changes, the record must MOVE
+     to a different shard (expensive re-migration).
+     Bad shard key: email (users change emails).
+     Good shard key: immutable UUID generated at record creation.
+
+─────────────────────────────────────────────────────────────
+REAL-WORLD SHARD KEY EXAMPLES:
+─────────────────────────────────────────────────────────────
+
+USE CASE: Twitter-style social feed
+  Shard by: user_id
+  Why: Most queries are "get tweets by user X" → hits 1 shard.
+  Problem: Celebrity users (10M followers) cause hot shards for reads.
+  Fix: Replicate celebrity user data to all shards (fan-out on write
+       model) or use a separate hot-key shard cluster.
+
+USE CASE: Multi-tenant SaaS (like Minerva)
+  Shard by: tenant_id
+  Why: All operations are per-tenant → no cross-shard queries.
+       Tenants can be migrated between shards for rebalancing.
+  Problem: Large tenants overwhelm their shard.
+  Fix: Put large tenants on dedicated shards. Small tenants are binpacked.
+
+USE CASE: E-commerce orders
+  Shard by: order_id (hashed)
+  Why: Uniform distribution of writes (one order per customer action).
+       Most queries are by order_id (order detail page).
+  Problem: "All orders for customer 123" requires scatter-gather.
+  Fix: Denormalize — also store orders in a customer-partitioned table
+       for customer-centric queries (two writes per order — outbox pattern).
+
+USE CASE: Time-series (IoT sensor data)
+  Shard by: (device_id, time_bucket)
+  Why: Queries are typically "data from device X in time range Y."
+       Compound key avoids hot single-device shards AND enables range queries.
+  Problem: Balancing across time buckets as data ages.
+  Fix: Archive old time-buckets to cold storage (S3 + Athena).
+
+─────────────────────────────────────────────────────────────
+THE HOT KEY PROBLEM
+─────────────────────────────────────────────────────────────
+
+Scenario: Justin Bieber posts a photo. 10M users fetch it simultaneously.
+All reads go to the shard that holds his user record → that shard melts.
+
+Solutions:
+  1. REPLICA READS: Add read replicas for hot shards specifically.
+  2. CACHE: Put the hot item in Redis/Memcached. Cache hit → no DB read.
+  3. KEY SPLITTING: Shard key = (user_id + random suffix 0–9).
+                   Write is broadcast to all 10 sub-shards.
+                   Reads are scatter-gathered and merged.
+                   Trade: write fan-out for read distribution.
+  4. APPLICATION-LEVEL CACHING: CDN for static content, in-process
+     cache (Caffeine/Guava) for frequently-accessed records.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 3: CROSS-SHARD OPERATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The BIGGEST challenge with sharding: operations that span multiple shards.
+
+─────────────────────────────────────────────────────────────
+CROSS-SHARD QUERIES (Scatter-Gather)
+─────────────────────────────────────────────────────────────
+
+When a query's filter is not on the shard key:
+  - Route query to ALL shards in parallel (scatter).
+  - Collect results from all shards (gather).
+  - Merge, sort, paginate the combined result set.
+
+Cost: N × single-shard query cost + merge overhead.
+  "Get top 10 most active users across all shards":
+  → Query all shards for their top 10 → merge 10N results → re-sort.
+
+How to avoid:
+  1. Denormalize data so common queries are single-shard.
+  2. Maintain secondary indexes that are NOT sharded by the primary shard key.
+     (MongoDB global secondary indexes, DynamoDB GSI.)
+  3. Use a separate read-optimized store (Elasticsearch, ClickHouse)
+     for complex cross-shard queries.
+     Sync via CDC (Debezium → Kafka → Elasticsearch).
+
+─────────────────────────────────────────────────────────────
+CROSS-SHARD JOINS
+─────────────────────────────────────────────────────────────
+
+Traditional JOIN across shards is not supported at the database level.
+Each shard is an independent database instance.
+
+Options:
+  1. DENORMALIZE: Embed the joined data at write time.
+     Store user name inside each order record.
+     Trade: storage vs. join cost.
+  
+  2. APPLICATION-SIDE JOIN:
+     Fetch data from shard A, then fetch related data from shard B,
+     join in application memory.
+     Acceptable for small result sets. Not for analytics.
+  
+  3. GLOBAL SECONDARY INDEX:
+     DynamoDB: GSI can be on a different partition key.
+     Query the GSI (scatter-gather across GSI partitions) → get PKs
+     → fetch records by PK (targeted single-shard reads).
+  
+  4. SEPARATE ANALYTICS STORE:
+     Never join in OLTP. For analytics queries:
+     ETL data into a data warehouse (BigQuery, Redshift, Snowflake).
+     Let the warehouse handle cross-shard joins at query time.
+
+─────────────────────────────────────────────────────────────
+CROSS-SHARD TRANSACTIONS
+─────────────────────────────────────────────────────────────
+
+Updating records on multiple shards atomically.
+Cannot use a single DB transaction (different DB instances).
+
+Options:
+  1. SAGA PATTERN (preferred for microservices):
+     Local transactions per shard + compensating actions on failure.
+     (See 05_Distributed_Transactions.txt)
+  
+  2. TWO-PHASE COMMIT (2PC):
+     Works but: blocking, slow, requires distributed transaction coordinator.
+     Avoid for high-throughput systems.
+  
+  3. REDESIGN: Restructure so the operation is single-shard.
+     Often the best option — if a transaction spans shards, your shard
+     key choice may be wrong for your access patterns.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 4: RESHARDING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+What is resharding?
+  Adding or removing shards as the dataset or traffic grows.
+  The hardest operational task in a sharded system.
+
+Why it's hard:
+  Data must MOVE from old shards to new shards while the system is live.
+  During the move, reads and writes must still work correctly.
+  The move can take hours or days for large datasets.
+
+─────────────────────────────────────────────────────────────
+APPROACHES TO RESHARDING:
+─────────────────────────────────────────────────────────────
+
+1. CONSISTENT HASHING (Minimize movement):
+   Each new shard takes over a segment of the hash ring.
+   On average, only 1/N fraction of data moves.
+   Cassandra, DynamoDB handle this automatically with virtual nodes (vnodes).
+   (See 09_Consistent_Hashing.txt)
+
+2. DOUBLE-WRITE (Zero-downtime resharding):
+   Phase 1 — BACKFILL: Copy all existing data from old shards to new shards.
+   Phase 2 — DUAL-WRITE: Write to both old and new shard topology simultaneously.
+   Phase 3 — VERIFY: Confirm new shards have complete and current data.
+   Phase 4 — CUTOVER: Switch reads to new shards. Stop writing to old shards.
+   Phase 5 — CLEANUP: Decommission old shards.
+   
+   This is the standard technique for zero-downtime resharding in
+   custom sharded systems (sharded MySQL, custom shard routers).
+
+3. SPLIT-BRAIN WINDOW:
+   Brief period during cutover where old and new shards both accept
+   writes → must be kept as short as possible.
+   Coordinate with a routing tier (Vitess, ProxySQL) to atomically
+   flip routing for a key range.
+
+4. VITESS (MySQL sharding):
+   Open-source sharding middleware from YouTube.
+   Handles resharding: online schema changes, vschema routing,
+   horizontal re-sharding with minimal downtime.
+   Used by: YouTube, Slack, GitHub.
+
+5. CITUS (PostgreSQL sharding):
+   Extension that turns PostgreSQL into a distributed DB.
+   Handles shard rebalancing automatically.
+   Used by: Heap Analytics, Algolia.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 5: SECONDARY INDEXES ON SHARDED DATABASES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Two approaches for secondary indexes in a sharded system:
+
+LOCAL SECONDARY INDEX (per-shard):
+  Each shard maintains its own index for records it holds.
+  Query on non-shard-key field → scatter-gather all shards.
+  
+  Example (sharded by user_id, index on email):
+    "Find user by email john@example.com"
+    → Query all N shards' local email index in parallel.
+    → One shard finds it, others return empty.
+    → Latency = slowest shard response.
+  
+  Used by: MongoDB per-shard indexes, DynamoDB LSI.
+
+GLOBAL SECONDARY INDEX (cross-shard):
+  A separate index structure covering all shards, itself partitioned
+  by the index key.
+  Query on index key → targeted read to the GSI partition.
+  
+  Example: DynamoDB GSI on email field.
+    "Find user by email" → query GSI (partitioned by email) → O(1) lookup.
+    Trade: GSI writes are asynchronous → eventual consistency.
+           GSI query returns matching items; fetch full record from primary table.
+  
+  Used by: DynamoDB Global Secondary Indexes, Cassandra secondary indexes.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUICK REFERENCE: RANGE vs HASH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌────────────────────┬──────────────────────┬──────────────────────┐
+│ Property           │ Range Partitioning   │ Hash Partitioning    │
+├────────────────────┼──────────────────────┼──────────────────────┤
+│ Distribution       │ Potentially uneven   │ Even (good hash fn)  │
+│ Range queries      │ ✓ Efficient (1 shard)│ ✗ Scatter-gather     │
+│ Point queries      │ ✓ Efficient          │ ✓ Efficient          │
+│ Hot spots          │ ✗ Yes (sequential)   │ ✓ Unlikely           │
+│ Resharding         │ Split ranges         │ Consistent hashing   │
+│ Best for           │ Time-series, logs    │ Random access, OLTP  │
+│ Examples           │ HBase, BigTable      │ Cassandra, DynamoDB  │
+└────────────────────┴──────────────────────┴──────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: "How would you shard a users table for a social media app with 1B users?"
+A: "I'd shard by user_id using consistent hashing. user_id is high-cardinality,
+    immutable, and most queries are user_id-scoped (profile page, settings).
+    I'd use ~100 virtual nodes per physical shard for even distribution and
+    smooth resharding. For the celebrity hot-key problem (10M followers fetching
+    Bieber's profile), I'd layer Redis in front — cache popular profiles with
+    a short TTL. For queries that cross shard boundaries (e.g., 'find users by
+    email'), I'd use a separate Elasticsearch index synced via CDC/Debezium."
+
+Q: "What is a hot partition and how do you fix it?"
+A: "A hot partition is a shard that receives disproportionately high traffic —
+    either because the shard key correlates with write patterns (sequential
+    timestamps on a range-partitioned table) or because a small number of
+    high-traffic keys hash to the same shard (celebrity problem).
+    Fixes: (1) For sequential key hot spots, add a random prefix (0-N) to
+    distribute across N shards at the cost of scatter-gather reads. (2) For
+    celebrity hot keys, cache aggressively at the application layer. (3) For
+    structural imbalance, switch from range to hash partitioning, or use
+    consistent hashing with more virtual nodes."
+
+Q: "What's the difference between a local and global secondary index
+    in a sharded database? Which is better?"
+A: "A local secondary index (LSI) is maintained per shard, covering only
+    the records on that shard. Queries on the index field require scatter-gather
+    across all shards — you ask every shard, each checks its local index.
+    Latency = slowest shard.
+    A global secondary index (GSI) is a separate, independently partitioned
+    index covering all data. Query the GSI → get a targeted result, no
+    scatter-gather. But GSI updates are typically asynchronous → eventual
+    consistency. GSI is better for read performance; LSI is simpler.
+    DynamoDB's GSIs are a great production example."
+
+Q: "How do you handle cross-shard transactions?"
+A: "I avoid them by design first — if a business operation constantly
+    requires cross-shard transactions, that signals the shard key is wrong
+    for the access pattern. If I truly can't avoid it, I use the Saga
+    pattern: decompose into a sequence of local transactions per shard,
+    with compensating transactions on failure. I avoid 2PC in high-throughput
+    systems — it's blocking and becomes a bottleneck. The Outbox pattern
+    ensures event publication is atomic with each local step."

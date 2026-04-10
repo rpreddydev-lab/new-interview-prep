@@ -1,0 +1,267 @@
+================================================================
+CRDTs — CONFLICT-FREE REPLICATED DATA TYPES
+================================================================
+
+WHAT ARE CRDTs?
+----------------
+CRDTs are data structures designed so that concurrent updates on
+different replicas can ALWAYS be merged automatically, without conflicts,
+without coordination, and without rollback.
+
+Key insight: Instead of designing data to be "correct" and preventing
+concurrent updates (via locks), design the DATA STRUCTURE so ANY two
+states can be merged into a consistent result.
+
+CRDTs guarantee:
+  ✓ Strong Eventual Consistency: replicas that receive the same set of
+    updates (in any order) will converge to the same state.
+  ✓ No coordination required: updates can be applied locally with zero
+    network round trips. Sync happens asynchronously.
+  ✓ No conflicts, no rollbacks: merge is always well-defined.
+
+WHERE CRDTs ARE USED:
+  Collaborative editing: Google Docs (Operational Transform, similar idea)
+  Shopping carts:        Amazon Dynamo uses CRDT-like structures
+  Distributed counters:  Like counts, view counts, vote counts
+  Offline-first apps:    Mobile apps that work offline and sync later
+  Databases:             Riak (uses CRDTs natively), Redis (some types)
+  Distributed config:    Feature flags, presence indicators
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TWO FAMILIES OF CRDTs
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STATE-BASED CRDTs (CvRDTs — Convergent):
+  Each replica sends its FULL STATE to others.
+  Merge function: takes two states, produces combined state.
+  Requirement: Merge must be commutative, associative, and idempotent.
+  Pro: Simple, retry-safe (resending same state is fine).
+  Con: Large state to transmit (full replica state every sync).
+  
+  merge(A, B) = merge(B, A)         [commutative]
+  merge(A, merge(B, C)) = merge(merge(A, B), C)  [associative]
+  merge(A, A) = A                   [idempotent]
+
+OPERATION-BASED CRDTs (CmRDTs — Commutative):
+  Each replica sends OPERATIONS (not full state) to others.
+  Operations must be commutative (order doesn't matter for result).
+  Pro: Efficient (only send deltas/ops, not full state).
+  Con: Operations must be delivered exactly once and commutatively.
+  Requires: reliable causal broadcast (at-least-once + deduplication).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CRDT TYPE 1: G-COUNTER (Grow-only Counter)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Supports: INCREMENT only (no decrement). Counts can only grow.
+
+STRUCTURE: A vector of counters — one per node.
+  Node A: [A:5, B:3, C:2]
+  Node B: [A:4, B:7, C:2]
+  Node C: [A:5, B:3, C:6]
+
+INCREMENT at Node X: Increment only Node X's slot.
+  Node A does +1 → A's vector: [A:6, B:3, C:2]
+
+READ (total count): Sum of all slots.
+  Node A's local count: 5 + 3 + 2 = 10
+
+MERGE (on sync between two replicas):
+  Take the MAX of each slot:
+  merge([A:5, B:3, C:2], [A:4, B:7, C:2]) = [A:5, B:7, C:2]
+  
+  This is safe because each node only increments its OWN slot.
+  No other node can "create" a higher value in Node A's slot.
+
+CONVERGENCE PROOF:
+  After all replicas sync, they all have max of each slot.
+  Total = sum of maxes = unique increments = correct count.
+
+USE CASES:
+  - View counts, play counts, like counts
+  - Page visit counters in analytics
+  - Request counters per service instance
+  
+  Example: "How many times has video V been watched?"
+    Each video streaming server has its own slot.
+    Increment locally on each play (zero latency, no coordination).
+    Sync periodically. Final count = sum of all slots.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CRDT TYPE 2: PN-COUNTER (Positive-Negative Counter)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Supports: INCREMENT and DECREMENT.
+Built from TWO G-Counters: P (for increments) + N (for decrements).
+
+  value = sum(P) - sum(N)
+
+INCREMENT: Add to P[node]
+DECREMENT: Add to N[node]
+MERGE: merge P vectors separately, merge N vectors separately.
+
+USE CASES:
+  - Stock counts (increase on restock, decrease on purchase)
+  - Score deltas in games
+  - Online/offline user presence (increment on connect, decrement on disconnect)
+
+LIMITATION: Can go negative (N > P is allowed — no floor enforcement).
+  For inventory, you'd need application-level checks. CRDTs don't enforce constraints.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CRDT TYPE 3: LWW-REGISTER (Last-Write-Wins Register)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Supports: SET a value (like a single-field object).
+
+STRUCTURE: (value, timestamp) pair.
+  Each replica stores the value with the timestamp of the write.
+
+MERGE: Take the entry with the HIGHER timestamp.
+  Replica A: ("Alice", t=100)
+  Replica B: ("Bob",   t=150)
+  merge → ("Bob", t=150)  [Bob wins because timestamp is higher]
+
+PROBLEM: Requires synchronized clocks. If clocks skew, wrong value "wins."
+  Replica A (fast clock): ("Wrong",   t=200)
+  Replica B (real write): ("Correct", t=180)
+  merge → ("Wrong", t=200) ← WRONG RESULT due to clock skew.
+
+SOLUTION: Use logical timestamps (Lamport clocks, vector clocks)
+  instead of wall-clock time. Or use unique node IDs to break ties.
+
+ALTERNATIVE: LWW-Element-Set → use LWW-Register per element in a set.
+  Used by: Cassandra (LWW is the default conflict resolution).
+           Riak (supports LWW as one strategy).
+  Warning: Cassandra's LWW is vulnerable to clock skew — avoid for critical data.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CRDT TYPE 4: OR-SET (Observed-Remove Set)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Supports: ADD and REMOVE elements from a set.
+Solves: The "add wins vs remove wins" conflict.
+
+PROBLEM WITH NAIVE SETS:
+  Node A adds element "x". Node B removes element "x" concurrently.
+  Merge: Did "x" survive or not? Ambiguous.
+
+OR-SET SOLUTION:
+  Each ADD operation assigns a unique tag to the element.
+  (element, unique_tag) pair.
+  
+  REMOVE removes only the SPECIFIC TAGS it has observed.
+  If a concurrent ADD happened with a new tag, that tag survives.
+
+EXAMPLE:
+  Node A: Add "x" → {("x", tag1)}
+  Node B: Add "x" → {("x", tag2)} (concurrent with A)
+  Node A: Remove "x" → removes tag1 → {} (locally empty)
+  
+  Merge A and B:
+    A knows about tag1 (removed), tag2 (from B)
+    B knows about tag2 (present), tag1 (never saw it)
+    After merge: "x" survives via tag2 (observed by B, not removed by A).
+  
+  Result: Add wins over concurrent remove.
+  This is the "add-wins" semantics — generally the right choice for UX.
+
+USE CASES:
+  - Shopping carts: Adding item wins over removing same item concurrently.
+  - Collaborative document tags.
+  - Distributed membership lists.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CRDT TYPE 5: MV-REGISTER (Multi-Value Register)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Instead of picking a winner (LWW), keep ALL concurrent values.
+Surface the conflict to the application for resolution.
+
+EXAMPLE:
+  Node A: profile.name = "Alice"    (at time vector {A:1})
+  Node B: profile.name = "Alicia"   (concurrent update, {B:1})
+  
+  Merge: profile.name = ["Alice", "Alicia"]  (both kept)
+  
+  Application must resolve: Show both? Ask user? Pick alphabetically?
+  Amazon Dynamo uses this for shopping carts (MV-Register variant).
+
+This is Amazon Dynamo's shopping cart:
+  "Shopping cart = MV-Register (version vectors)."
+  Concurrent modifications both survive in the cart.
+  On read, application merges (union of items = "add wins" semantics).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CRDTs IN PRACTICE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RIAK (distributed database):
+  Native CRDT types: Counter (PN-Counter), Set (OR-Set),
+  Map (nested CRDTs), Register (LWW or MV), Flag (enable/disable).
+  These are stored as first-class types and merged automatically on conflict.
+
+REDIS:
+  No native CRDTs, but:
+  - INCR/DECR on a key is idempotent-friendly but NOT a real CRDT.
+  - Redis Streams + CRDTs can be built on top.
+
+AUTOMERGE / YATA (collaborative editing):
+  CRDT-based libraries for real-time document collaboration.
+  Figma, Linear, Notion use CRDT-based sync for collaborative features.
+  
+  Used by: Figma (multiplayer cursor/object positions),
+           Atom Teletype, VS Code Live Share, Linear.
+
+APACHE CASSANDRA (de facto LWW-Register):
+  Cassandra uses timestamp-based LWW by default.
+  Not a true CRDT (clock skew is a real risk) but works in practice.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CRDT SUMMARY TABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌──────────────────┬──────────────────┬──────────────────────────────┐
+│ CRDT Type        │ Supported Ops    │ Use Case                     │
+├──────────────────┼──────────────────┼──────────────────────────────┤
+│ G-Counter        │ Increment        │ View/like/play counts        │
+│ PN-Counter       │ Increment/Dec.   │ Inventory, scores, presence  │
+│ LWW-Register     │ Set (last wins)  │ User profile fields          │
+│ MV-Register      │ Set (all survive)│ Amazon shopping cart         │
+│ G-Set            │ Add only         │ Tags, permissions (no remove)│
+│ 2P-Set           │ Add, remove once │ Tombstone-based membership   │
+│ OR-Set           │ Add, remove many │ Collaborative lists/sets     │
+│ RGA/YATA         │ Insert, delete   │ Text/doc collaborative edit  │
+└──────────────────┴──────────────────┴──────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: "What is a CRDT and when would you use one?"
+A: "A CRDT is a data structure where concurrent updates on different
+    replicas can always be merged automatically without conflicts.
+    It gives strong eventual consistency — replicas receiving the same
+    updates converge to the same state, regardless of order.
+    
+    I'd use CRDTs for: like/view counts (G-Counter), collaborative
+    editing (OR-Set, RGA), offline-first mobile apps that sync later,
+    and distributed shopping carts (MV-Register or OR-Set).
+    
+    The trade-off: you can't enforce arbitrary constraints (e.g., 'count
+    must stay ≥ 0') and some types (like OR-Set) have higher overhead."
+
+Q: "How does Amazon's Dynamo handle shopping cart conflicts?"
+A: "Dynamo uses version vectors (similar to MV-Register CRDTs).
+    When two clients update a cart concurrently, both versions are kept.
+    On the next read, the client sees all versions and merges them —
+    typically by taking the union of items. This means items can never
+    be 'lost' due to conflicts, though a deleted item may reappear
+    if it was deleted concurrently with an add from another session."
+
+Q: "What's the difference between a G-Counter and a PN-Counter?"
+A: "A G-Counter only supports increment — each node has its own slot,
+    and the total is the sum of all slots. Merge takes the max per slot.
+    A PN-Counter supports both increment and decrement by maintaining
+    two G-Counters: P (increments) and N (decrements). The value is
+    sum(P) - sum(N). Merge applies G-Counter merge to each component."

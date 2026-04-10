@@ -1,0 +1,315 @@
+================================================================
+EXACTLY-ONCE DELIVERY AND MESSAGE SEMANTICS
+================================================================
+
+THE THREE DELIVERY GUARANTEES
+-------------------------------
+Distributed messaging systems make one of three promises about
+how many times a message is delivered to a consumer:
+
+AT-MOST-ONCE:
+  Message may be lost, but will never be delivered twice.
+  "Fire and forget."
+  Use when: Loss is acceptable (metrics, non-critical logs, UDP audio/video).
+  How: Send and don't retry. No ACK tracking.
+
+AT-LEAST-ONCE:
+  Message will be delivered eventually, but MAY be delivered multiple times.
+  "Retry until ACK."
+  Use when: Loss is unacceptable. Duplicates can be tolerated or deduplicated.
+  How: Retry on failure. Consumer must be idempotent or use deduplication.
+  Default in: Kafka (default), RabbitMQ, SQS, most messaging systems.
+
+EXACTLY-ONCE:
+  Message delivered exactly once. No loss, no duplicates.
+  "The holy grail of messaging."
+  Use when: Both loss and duplicates are unacceptable (financial transactions).
+  How: Requires coordination between producer, broker, and consumer.
+  Supported by: Kafka (with configuration), Google Pub/Sub (with ack IDs).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHY EXACTLY-ONCE IS HARD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The fundamental challenge: in a distributed system, you cannot
+distinguish between "message delivered and ACK lost" vs "message not delivered."
+
+SCENARIO WITHOUT EXACTLY-ONCE:
+  1. Producer sends message M.
+  2. Broker receives M, writes to log.
+  3. Broker sends ACK.
+  4. ACK is lost in transit (network failure).
+  5. Producer times out, retries → sends M again.
+  6. Broker writes M twice → Consumer receives M twice.
+  → DUPLICATE.
+
+  OR:
+  1. Producer sends M.
+  2. Broker crashes before writing.
+  3. Producer's retry reaches the recovered broker.
+  → Only one delivery. But if producer never retries → LOSS.
+
+ACHIEVING EXACTLY-ONCE REQUIRES:
+  1. Idempotent producer: Broker deduplicates retried sends.
+  2. Transactional producer: Atomically write to multiple partitions.
+  3. Idempotent consumer: Consumer processes each message at most once.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+KAFKA EXACTLY-ONCE SEMANTICS (EOS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Kafka achieves exactly-once through three components working together:
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMPONENT 1: IDEMPOTENT PRODUCER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Each producer is assigned a unique Producer ID (PID) by the broker.
+Each message batch sent by a producer has a monotonically increasing
+Sequence Number per (PID, partition) pair.
+
+Broker tracks the highest sequence number seen per (PID, partition).
+On receiving a batch:
+  If seq_num == expected (last + 1): Write to log. → Normal case.
+  If seq_num == last (duplicate):    Discard silently (idempotent!).
+  If seq_num < last - 1:            Out of order. Return error.
+
+This eliminates duplicate writes caused by producer retries.
+
+CONFIGURATION:
+  // Enable idempotent producer
+  props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+  // Automatically also sets:
+  // acks=all (wait for all ISR replicas)
+  // retries=Integer.MAX_VALUE
+  // max.in.flight.requests.per.connection=5
+
+SCOPE: Per partition. Prevents duplicates on retries to the same partition.
+  Does NOT handle sending to multiple partitions atomically.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMPONENT 2: TRANSACTIONAL PRODUCER (Cross-Partition Atomicity)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Allows atomic writes to MULTIPLE partitions and topics.
+Either all writes in a transaction are committed, or none are.
+
+CONFIGURATION:
+  props.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "my-transactional-id");
+  // transactional.id must be unique and stable per producer instance
+  // (survives restarts — used to fence zombie producers)
+
+USAGE:
+  KafkaProducer<String, String> producer = new KafkaProducer<>(props);
+  producer.initTransactions();  // register with transaction coordinator
+  
+  try {
+      producer.beginTransaction();
+      
+      // Send to multiple partitions — all or nothing
+      producer.send(new ProducerRecord<>("orders", key, orderPayload));
+      producer.send(new ProducerRecord<>("audit-log", key, auditPayload));
+      producer.send(new ProducerRecord<>("inventory", key, inventoryPayload));
+      
+      producer.commitTransaction();  // atomic commit
+  } catch (ProducerFencedException e) {
+      // Another instance with same transactional.id took over (fencing).
+      producer.close();
+  } catch (KafkaException e) {
+      producer.abortTransaction();  // atomic rollback
+      // retry or propagate
+  }
+
+HOW IT WORKS:
+  1. Transaction coordinator (a Kafka broker) tracks the transaction state.
+  2. On beginTransaction: coordinator assigns a transaction epoch.
+  3. Messages are written to partitions but marked as "not committed" (uncommitted).
+  4. On commitTransaction: coordinator atomically writes a commit marker to all
+     participating partition logs.
+  5. Consumers with isolation.level=read_committed only see committed messages.
+
+ZOMBIE FENCING:
+  If a producer restarts with the same transactional.id, the broker increments
+  the epoch. Old producer's writes with lower epoch are REJECTED.
+  Prevents "zombie" producers from re-committing aborted transactions.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMPONENT 3: TRANSACTIONAL CONSUMER (Read Committed Isolation)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CONSUMER CONFIGURATION:
+  props.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
+  // Only reads messages that are part of a committed transaction.
+  // Skips messages from aborted transactions and uncommitted messages.
+
+DEFAULT: isolation.level=read_uncommitted (reads all messages, even uncommitted).
+
+CONSUMER OFFSET COMMIT:
+  For end-to-end exactly-once, the consumer must commit its offset
+  atomically with its own output (e.g., writing to another Kafka topic).
+  
+  // Commit consumer offset WITHIN the producer's transaction:
+  producer.beginTransaction();
+  
+  ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+  for (ConsumerRecord<String, String> record : records) {
+      // Process record, send transformed output
+      producer.send(new ProducerRecord<>("output-topic", transform(record)));
+  }
+  
+  // Atomically commit: output messages + consumer offset
+  producer.sendOffsetsToTransaction(currentOffsets, consumer.groupMetadata());
+  producer.commitTransaction();
+  
+  Effect: Either output is written AND offset advanced, or neither.
+          No way to process a message twice (offset ensures position).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+END-TO-END EXACTLY-ONCE: THE FULL PICTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TRUE end-to-end exactly-once requires exactly-once at every layer:
+  1. Producer → Kafka: Use idempotent + transactional producer.
+  2. Kafka → Consumer: Use read_committed isolation.
+  3. Consumer → External system (DB, API): Consumer must be idempotent.
+
+THE EXTERNAL SYSTEM PROBLEM:
+  Kafka EOS only guarantees exactly-once WITHIN Kafka.
+  When the consumer writes to an external database:
+    Consumer processes record, writes to DB: SUCCESS.
+    Consumer commits offset: CRASH.
+    Consumer restarts, re-reads record (offset not committed).
+    Consumer writes to DB AGAIN: DUPLICATE.
+
+SOLUTIONS FOR EXTERNAL SYSTEM WRITES:
+  
+  1. IDEMPOTENT WRITE OPERATIONS:
+     Include a unique message ID in the DB write.
+     Use INSERT ... ON CONFLICT DO NOTHING (PostgreSQL) or equivalent.
+     Second write with same ID is silently ignored.
+     
+     INSERT INTO processed_events (id, data)
+     VALUES (kafka_offset_as_id, ...)
+     ON CONFLICT (id) DO NOTHING;
+
+  2. OUTBOX + TRANSACTIONAL OFFSET COMMIT:
+     Write to DB + write to Kafka outbox in same DB transaction.
+     Only commit Kafka offset after DB transaction is committed.
+     (See 05_Distributed_Transactions.txt for Outbox Pattern detail.)
+
+  3. EXACTLY-ONCE WITH EXTERNAL STATE:
+     Store the consumed offset IN the external system.
+     On startup: query external system for last committed offset.
+     Only process records newer than that offset.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+KAFKA STREAM PROCESSING: EXACTLY-ONCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Kafka Streams natively supports exactly-once for stream processing
+(reading from Kafka, processing, writing back to Kafka).
+
+  StreamsConfig.PROCESSING_GUARANTEE_CONFIG = "exactly_once_v2"
+  (Default: "at_least_once")
+
+Internally: Uses transactional producer + read_committed consumer
+  in a single transaction per processing batch.
+
+Performance cost: ~10-40% throughput reduction vs at_least_once.
+Use exactly_once_v2 over exactly_once (uses 1 transaction coordinator
+per StreamThread vs 1 per consumer partition — more efficient).
+
+APACHE FLINK:
+  Native exactly-once via distributed snapshots (Chandy-Lamport algorithm).
+  Periodic checkpoints save both processing state AND Kafka offsets.
+  On failure: restore last checkpoint → reprocess from that offset.
+  Sink must be transactional or idempotent to prevent duplicate output.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IN-SYNC REPLICAS (ISR) AND ACKS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Understanding ISR is critical for durability guarantees.
+
+ISR (In-Sync Replicas): The set of replicas that are "caught up" with
+  the leader (within replica.lag.time.max.ms).
+
+ACKS SETTING:
+  acks=0: Producer doesn't wait for any ACK.
+          Fastest. Messages can be lost if broker crashes. At-most-once.
+  
+  acks=1: Leader ACKs after writing to its log.
+          Faster. Message lost if leader crashes before follower syncs.
+          Default. At-least-once if retries enabled.
+  
+  acks=all (or -1): Leader waits for ALL ISR replicas to ACK.
+          Slowest. No data loss as long as ≥1 ISR replica survives.
+          Required for idempotent and transactional producers.
+          At-least-once (with idempotent: exactly-once).
+
+MIN.INSYNC.REPLICAS:
+  Minimum number of replicas in ISR required for a write to succeed.
+  min.insync.replicas=2 with acks=all: at least 2 replicas must ACK.
+  Provides durability guarantee: can survive 1 replica failure.
+  
+  If fewer than min.insync.replicas are in ISR → producer gets
+  NotEnoughReplicasException → write fails (availability sacrifice for durability).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DELIVERY GUARANTEE COMPARISON
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌──────────────────┬──────────────┬───────────────┬─────────────────────┐
+│ System           │ Default      │ Exactly-Once? │ How                 │
+├──────────────────┼──────────────┼───────────────┼─────────────────────┤
+│ Kafka            │ At-least-once│ YES           │ Idempotent + Trans. │
+│ RabbitMQ         │ At-least-once│ NO (native)   │ App deduplication   │
+│ AWS SQS Standard │ At-least-once│ NO            │ App deduplication   │
+│ AWS SQS FIFO     │ Exactly-once │ YES           │ Dedup ID per msg    │
+│ Google Pub/Sub   │ At-least-once│ Approx.       │ Ack ID + dedup      │
+│ Azure Service Bus│ At-least-once│ YES (sessions)│ MessageId dedup     │
+│ Apache Pulsar    │ At-least-once│ YES           │ Transactions API    │
+└──────────────────┴──────────────┴───────────────┴─────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: "Explain Kafka's exactly-once semantics."
+A: "Kafka achieves exactly-once through three pieces:
+    (1) Idempotent producer: each producer gets a PID and sends sequence
+        numbers. The broker deduplicates retried sends with the same sequence.
+    (2) Transactional producer: atomic writes across multiple partitions.
+        Messages are uncommitted until commitTransaction() is called.
+    (3) read_committed consumer: only reads committed messages, skipping
+        aborted transactions.
+    For end-to-end EOS in stream processing, I'd also commit consumer
+    offsets atomically within the producer transaction using
+    sendOffsetsToTransaction(). Without that, a crash between processing
+    and offset commit causes reprocessing."
+
+Q: "What's the difference between at-least-once and exactly-once?"
+A: "At-least-once: messages are retried until ACK'd, so they may be
+    delivered multiple times. The consumer must be idempotent or deduplicate.
+    Exactly-once: no loss AND no duplicates. Requires coordination:
+    idempotent producer (dedup at broker), transactional writes (atomic
+    cross-partition), and idempotent or transactional consumer writes.
+    At-least-once with idempotent consumers is the practical approach
+    for most systems — pure exactly-once has significant overhead."
+
+Q: "What does acks=all mean in Kafka and why use it?"
+A: "acks=all means the producer waits for ALL in-sync replicas (ISR)
+    to acknowledge the write before returning success. This ensures
+    no data loss as long as at least one ISR replica survives — since
+    that replica has the message. Combined with min.insync.replicas=2,
+    the system tolerates one replica failure with no data loss.
+    It's required for idempotent and transactional producers."
+
+Q: "How do you prevent duplicate processing when a Kafka consumer writes to a DB?"
+A: "Kafka EOS only covers Kafka-to-Kafka. For Kafka-to-DB, I use
+    idempotent DB writes: include a unique identifier (Kafka topic +
+    partition + offset as a composite key), and use INSERT ... ON CONFLICT
+    DO NOTHING (or UPSERT). The second identical write is silently ignored.
+    Alternatively, I use the Outbox pattern: DB write + outbox event in a
+    single DB transaction, then poll the outbox and commit the Kafka offset
+    only after the outbox entry is published."

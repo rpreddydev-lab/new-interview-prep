@@ -1,0 +1,307 @@
+================================================================
+DISTRIBUTED RATE LIMITING
+================================================================
+
+WHAT IS RATE LIMITING?
+-----------------------
+Rate limiting controls how many requests a client (user, IP, API key,
+service) can make in a given time window. Protects services from:
+  - Abuse and DDoS attacks
+  - Resource exhaustion from misbehaving clients
+  - Cascading overload in downstream services
+  - Fair usage across multiple tenants
+
+Rate limiting = "allow N requests per second/minute/hour per client."
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ALGORITHMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ALGORITHM 1: TOKEN BUCKET
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CONCEPT:
+  Each client has a "bucket" that holds up to CAPACITY tokens.
+  Tokens are added at a REFILL RATE (e.g., 10 tokens/second).
+  Each request consumes 1 token.
+  If no tokens available → request is rejected (or queued).
+
+EXAMPLE:
+  Capacity = 100 tokens, Refill = 10 tokens/second.
+  Burst allowed: client can consume 100 tokens instantly.
+  Sustained: after burst, limited to 10 req/sec.
+
+PROPERTIES:
+  ✓ Allows short bursts (up to bucket capacity).
+  ✓ Smooth steady-state throughput.
+  ✓ Simple to implement (store last_refill_time and current_tokens).
+  
+  Implementation:
+    tokens_now = min(capacity,
+                     stored_tokens + (now - last_refill) × refill_rate)
+    if tokens_now >= 1:
+        tokens_now -= 1; proceed
+    else:
+        reject
+
+USED BY: Stripe, AWS API Gateway, Twitter API, most production APIs.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ALGORITHM 2: LEAKY BUCKET
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CONCEPT:
+  Requests arrive at any rate but are processed at a fixed rate.
+  A queue (the "bucket") holds pending requests.
+  If queue is full, excess requests are dropped.
+
+ANALOGY: A bucket with a hole in the bottom.
+  Water (requests) pours in at any rate.
+  Drains at a fixed rate.
+  If full → overflows (dropped requests).
+
+PROPERTIES:
+  ✓ Smooths bursty traffic into a constant output rate.
+  ✗ Does NOT allow bursts — all requests processed at fixed rate.
+  ✓ Good for downstream rate protection.
+
+USED BY: Traffic shaping in networking (QoS), some API gateways.
+
+DIFFERENCE from Token Bucket:
+  Token Bucket: allows bursts (drain tokens instantly).
+  Leaky Bucket: no bursts (fixed drain rate — smoothed output).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ALGORITHM 3: FIXED WINDOW COUNTER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CONCEPT:
+  Divide time into fixed windows (e.g., 1-minute buckets).
+  Track request count per window.
+  Reject if count exceeds limit.
+
+EXAMPLE:
+  Limit = 100 req/min.
+  Window 12:00–12:01: client sends 100 requests → all allowed.
+  Window 12:01–12:02: counter resets → client can send 100 more.
+
+PROBLEM — BOUNDARY BURST:
+  Client sends 100 requests at 12:00:59 → allowed (end of window 1).
+  At 12:01:00 window resets → client sends 100 more → allowed.
+  In 2 seconds, client sent 200 requests (2× the limit).
+
+USED BY: Simple API rate limiters. Not recommended for strict limits.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ALGORITHM 4: SLIDING WINDOW LOG
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CONCEPT:
+  Store timestamps of each request in a sorted log.
+  On each request: remove timestamps older than window, count remaining.
+  If count < limit → allow; else → reject.
+
+EXAMPLE:
+  Limit = 100 req/min. Current time = 12:05:30.
+  Log: [12:04:31, 12:04:45, ..., 12:05:29] (sorted timestamps)
+  Remove entries before 12:04:30. Count = 87. Allow.
+
+PROPERTIES:
+  ✓ Perfectly accurate — no boundary burst.
+  ✗ High memory (store one entry per request).
+  ✗ O(n) per request (scan log to remove old entries).
+  
+  Best for: Low-traffic, accuracy-critical rate limiting.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ALGORITHM 5: SLIDING WINDOW COUNTER (BEST PRACTICAL CHOICE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CONCEPT: Approximate sliding window using fixed windows + weighting.
+
+  count_estimate = prev_window_count × overlap_ratio + current_window_count
+  
+  where overlap_ratio = fraction of previous window still "within" the slide.
+
+EXAMPLE:
+  Limit = 100 req/min.
+  Previous minute: 80 requests.
+  Current minute so far (40 seconds in, so 40/60 = 0.67 overlap): 30 requests.
+  
+  Estimate = 80 × (1 - 0.67) + 30 = 80 × 0.33 + 30 ≈ 26 + 30 = 56 requests.
+  → Under limit. Allow.
+  
+  This approximates the sliding window with O(1) space per client per window.
+
+PROPERTIES:
+  ✓ Low memory (2 counters per client).
+  ✓ O(1) per request.
+  ✓ Close to accurate (small error at window boundaries).
+  ✓ Used by Cloudflare, Nginx (rate_limit zone).
+  
+USED BY: Cloudflare rate limiting (confirmed in their engineering blog).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DISTRIBUTED RATE LIMITING — THE HARD PART
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Rate limiting is easy on a single node. Hard when you have MULTIPLE
+API gateway/proxy nodes serving the same clients.
+
+PROBLEM: If you have 10 gateway nodes, each tracking state locally:
+  Client sends 100 requests, routed across 10 nodes.
+  Each node sees 10 requests → all 10 nodes say "allowed."
+  But client actually sent 100 — which should be rate-limited.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+APPROACH 1: CENTRALIZED REDIS COUNTER (Standard Production Approach)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+All gateway nodes share a SINGLE Redis instance (or Redis Cluster)
+for rate limit counters. Each incoming request:
+  1. Gateway atomically increments counter in Redis (INCR).
+  2. Sets TTL on key if first request in window (EXPIRE).
+  3. Checks if counter exceeds limit → allow or reject.
+
+IMPLEMENTATION (Sliding Window Counter in Redis):
+
+  -- Lua script (atomic in Redis):
+  local key = "rate:" .. user_id .. ":" .. current_window
+  local prev_key = "rate:" .. user_id .. ":" .. prev_window
+  
+  local current = tonumber(redis.call('INCR', key))
+  redis.call('EXPIRE', key, 120)  -- expire after 2 windows
+  
+  local prev = tonumber(redis.call('GET', prev_key)) or 0
+  local overlap = 1 - (current_second_in_window / window_size)
+  local estimate = math.floor(prev * overlap) + current
+  
+  if estimate > limit then
+      redis.call('DECR', key)  -- undo increment
+      return 0  -- rejected
+  end
+  return 1  -- allowed
+
+  Key: Use Lua scripts to make read-increment-check ATOMIC in Redis.
+       Without atomicity, two concurrent requests can both read "99/100"
+       and both increment → counter reaches 101 (race condition).
+
+REDIS CLUSTER:
+  Shard rate limit keys across Redis Cluster nodes.
+  key = "rate:{user_id}:window" → consistent hashing by user_id.
+  All requests for same user → same Redis node (no cross-shard needed).
+
+LATENCY COST: Every request requires 1 Redis round-trip (~1ms in same DC).
+  Acceptable for most APIs. Can be mitigated with local budgets (see below).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+APPROACH 2: STICKY SESSIONS (Client-to-Node Affinity)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Route all requests from a given client (API key, user ID) to the
+SAME gateway node. That node maintains local state → no Redis needed.
+
+MECHANISM: Hash(client_id) → gateway node selection.
+  Load balancer routes client_id → gateway_node = hash(client_id) % N_nodes.
+
+PROPERTIES:
+  ✓ No shared state needed. O(1) local check.
+  ✗ Node failure: all clients on that node lose rate limit state.
+  ✗ Hot spots: popular clients all route to same node.
+  ✗ Poor load balancing if client traffic is uneven.
+  
+USED BY: Nginx IP hash module, some CDN providers.
+  Not recommended for most production systems (use Redis instead).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+APPROACH 3: LOCAL BUDGET + PERIODIC SYNC (Approximate, High Scale)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Each gateway node gets a LOCAL BUDGET = total_limit / N_nodes.
+Uses local counter for fast checks. Periodically syncs to central store.
+
+EXAMPLE:
+  Total limit = 1000 req/min, N=10 gateways.
+  Each gateway gets local_budget = 100 req/min.
+  Each gateway enforces locally (zero Redis RTT on hot path).
+  Every 10 seconds: sync actual usage to Redis, rebalance budgets.
+
+PROPERTIES:
+  ✓ Very low latency (local check only).
+  ✓ Scales to very high request rates.
+  ✗ Slightly inaccurate (up to ±1 budget window of error).
+  ✗ Temporary over-admission during sync interval.
+  
+USED BY: Uber's rate limiter (discussed in Uber Engineering blog),
+         Netflix Zuul rate limiting.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARCHITECTURE: RATE LIMITER AS A SIDECAR / MIDDLEWARE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Client → API Gateway → [Rate Limiter Middleware] → Backend Service
+
+STANDALONE RATE LIMITER SERVICE:
+  For large-scale systems, deploy rate limiting as a dedicated service.
+  API gateways call rate limiter gRPC endpoint per request.
+  Rate limiter maintains counters in Redis Cluster.
+  
+  Pro: Centralized logic, easy to update algorithms.
+  Con: Rate limiter becomes a latency-critical dependency.
+
+SIDECAR (Service Mesh):
+  Envoy proxy (sidecar in Kubernetes) can do rate limiting via:
+    - Local token bucket (per-pod)
+    - Global rate limit service (centralized, Lyft's ratelimit project)
+  
+  ratelimit service: https://github.com/envoyproxy/ratelimit
+  Used by: Lyft, Stripe, many Kubernetes deployments.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ALGORITHM COMPARISON
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌──────────────────────┬────────────┬─────────────┬──────────┬──────────────┐
+│ Algorithm            │ Bursts     │ Accuracy    │ Memory   │ Complexity   │
+├──────────────────────┼────────────┼─────────────┼──────────┼──────────────┤
+│ Token Bucket         │ Allowed    │ High        │ O(1)     │ Low          │
+│ Leaky Bucket         │ Not allowed│ High        │ O(queue) │ Medium       │
+│ Fixed Window Counter │ Allowed    │ Low (burst) │ O(1)     │ Very Low     │
+│ Sliding Window Log   │ Not allowed│ Perfect     │ O(n)     │ Medium       │
+│ Sliding Window Count.│ Allowed    │ Good (≈)    │ O(1)     │ Low          │
+└──────────────────────┴────────────┴─────────────┴──────────┴──────────────┘
+
+RECOMMENDATION: Use Sliding Window Counter for most production use cases.
+               Use Token Bucket when burst tolerance is explicitly desired.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERVIEW ANSWERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: "Design a rate limiter for a distributed API."
+A: "I'd use a Sliding Window Counter algorithm for accuracy, stored
+    in Redis Cluster. Each API request goes through a rate limiter
+    middleware that atomically increments a counter in Redis (Lua script
+    for atomicity). The key is {api_key}:{window} and expires after
+    2 windows. I compute the estimate as:
+    estimate = prev_window × (1 - elapsed/window) + current_window.
+    If estimate > limit, reject with HTTP 429 and a Retry-After header.
+    
+    For very high scale: give each gateway node a local budget
+    (limit/N_nodes) and sync periodically, accepting minor inaccuracy."
+
+Q: "What's the difference between token bucket and leaky bucket?"
+A: "Token bucket allows bursts: tokens accumulate up to capacity,
+    and a client can spend them all at once. Leaky bucket smooths
+    traffic: requests drain at a fixed rate regardless of arrival rate,
+    no bursting allowed. Token bucket is better for API rate limiting
+    where some burst tolerance is desired; leaky bucket is better
+    for traffic shaping where a uniform output rate is needed."
+
+Q: "Why is fixed window counter problematic?"
+A: "It suffers from the boundary burst problem: a client can send
+    2× the limit in a very short period by sending max requests at
+    the end of one window and max requests at the start of the next.
+    Sliding window counter solves this by weighting requests from the
+    previous window based on how much time has elapsed."
