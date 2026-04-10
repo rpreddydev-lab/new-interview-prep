@@ -1,0 +1,585 @@
+# 09 — Dashboard Catalog (Real Configured Dashboards)
+
+> **What to use this for:** "What kind of dashboards did you build?" / "Give me a concrete example of a dashboard configuration" / "Who used the platform and for what?"
+
+---
+
+## Overview
+
+All dashboards below are **100% configuration-driven** — no code was written per dashboard. A CONFIGURATOR (Analytics Lead / Senior Network Engineer) defined the filters, charts, grids, and map layers via the Admin UI. The config was saved to PostgreSQL. React rendered it dynamically.
+
+| Dashboard | Primary Team | Key Data Source | Has Map? | Has Report? |
+|-----------|-------------|----------------|----------|-------------|
+| **FWA Analysis** | RF / Fixed Wireless Team | `coverage_data`, `tower_metrics` | ✅ WMS heatmap | ✅ Site export |
+| **Coverage & Capacity Analysis** | RF + Traffic Engineers | `coverage_data`, `traffic_hourly` | ✅ WMS heatmap + point | ✅ Gap report |
+| **5G Home (Verizon Select Internet)** | 5G Home Planning Team | `coverage_data`, `network_kpis_daily` | ✅ WMS coverage layer | ✅ Eligibility report |
+| **Ultra Gauge Insights** | NOC + Performance Engineers | `network_kpis_daily`, `sla_compliance` | ❌ | ✅ Weekly gauge report |
+| **Optimal Sector Planning** | RF Planning Engineers | `coverage_data`, `tower_metrics` | ✅ WMS sector overlay | ✅ Sector config export |
+
+---
+
+## Dashboard 1: FWA Analysis
+
+**FWA = Fixed Wireless Access** — Verizon's home internet service delivered over 5G/4G towers instead of fiber.
+
+### Business Question
+> "Which towers have sufficient capacity and signal strength to serve residential FWA customers? Where are coverage gaps that need new sites or beam optimization?"
+
+### Primary Users
+- RF Engineers (ANALYST) — day-to-day analysis
+- RF Analytics Lead (CONFIGURATOR) — configured and maintains this dashboard
+- VP Network Planning (VIEWER) — executive summary view
+
+### Filters Configured
+
+| Filter Label | Type | Options Source | BigQuery Param |
+|-------------|------|---------------|----------------|
+| Region | DROPDOWN | `SELECT region_id, region_name FROM dim_regions` | `${region}` |
+| Technology | MULTI_SELECT | `SELECT DISTINCT technology FROM dim_regions` | `${technology}` |
+| Signal Threshold (RSRP) | DROPDOWN | Static: `-80`, `-90`, `-100`, `-110 dBm` | `${rsrp_threshold}` |
+| Date Range | DATE_RANGE | — | `${start_date}`, `${end_date}` |
+| Tower Status | DROPDOWN | Static: `ALL`, `ACTIVE`, `DEGRADED`, `OFFLINE` | `${tower_status}` |
+
+### Charts Configured
+
+**Chart 1 — FWA Eligible Sites (Bar Chart)**
+```sql
+SELECT region_name, COUNT(DISTINCT site_id) as eligible_sites
+FROM coverage_data cd
+JOIN dim_regions dr ON cd.region_id = dr.region_id
+WHERE cd.region_id = ${region}
+  AND cd.technology IN UNNEST(${technology})
+  AND cd.rsrp >= ${rsrp_threshold}
+  AND cd.date BETWEEN ${start_date} AND ${end_date}
+GROUP BY region_name
+ORDER BY eligible_sites DESC
+```
+*Chart type: BAR | X-axis: region_name | Y-axis: eligible_sites*
+
+**Chart 2 — RSRP Distribution (Line Chart over time)**
+```sql
+SELECT date, AVG(rsrp) as avg_rsrp, MIN(rsrp) as min_rsrp, MAX(rsrp) as max_rsrp
+FROM coverage_data
+WHERE region_id = ${region}
+  AND technology IN UNNEST(${technology})
+  AND date BETWEEN ${start_date} AND ${end_date}
+GROUP BY date
+ORDER BY date
+```
+*Chart type: LINE | X-axis: date | Y-axis: avg_rsrp*
+
+**Chart 3 — Capacity vs Demand Gauge**
+```sql
+SELECT AVG(capacity_pct) as avg_capacity_utilized
+FROM tower_metrics
+WHERE region_id = ${region}
+  AND date = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+  AND status = ${tower_status}
+```
+*Chart type: GAUGE | threshold config: green < 70%, yellow 70–85%, red > 85%*
+
+### Grid Configured
+
+**Site-Level FWA Eligibility Table**
+```sql
+SELECT tm.tower_id, tm.site_id, dr.region_name,
+       AVG(cd.rsrp) as avg_rsrp, AVG(cd.sinr) as avg_sinr,
+       tm.capacity_pct, tm.status,
+       CASE WHEN AVG(cd.rsrp) >= ${rsrp_threshold} AND tm.capacity_pct < 85
+            THEN 'ELIGIBLE' ELSE 'NOT_ELIGIBLE' END as fwa_eligibility
+FROM tower_metrics tm
+JOIN coverage_data cd ON tm.site_id = cd.site_id
+JOIN dim_regions dr ON tm.region_id = dr.region_id
+WHERE tm.region_id = ${region}
+  AND cd.technology IN UNNEST(${technology})
+  AND tm.date = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+GROUP BY tm.tower_id, tm.site_id, dr.region_name, tm.capacity_pct, tm.status
+ORDER BY avg_rsrp DESC
+```
+*Columns: Tower ID, Site ID, Region, Avg RSRP, Avg SINR, Capacity %, Status, FWA Eligibility*
+*Exportable: ✅ (ANALYST+) | Page size: 50*
+
+### Map Layer Configured
+- **Layer type:** Heatmap
+- **Kinetica table:** `coverage_data_geo`
+- **Color column:** `rsrp` (red = weak, green = strong)
+- **CQL_FILTER (server-side):** `technology IN (${technology}) AND region_id = '${region}'`
+- **Use:** Visually identify strong-signal zones suitable for FWA deployment
+
+### Report Configured
+- **Name:** FWA Eligible Sites Export
+- **SQL:** Same as grid above, no pagination limit
+- **Format:** Excel
+- **Max rows:** 500,000
+- **Scheduled:** Every Monday 6 AM ET → RF team leads
+
+---
+
+## Dashboard 2: Coverage & Capacity Analysis
+
+### Business Question
+> "Where does our network have coverage gaps or capacity bottlenecks? Which regions are nearing full utilization and need capacity upgrades?"
+
+### Primary Users
+- RF Engineers (ANALYST) — coverage gap identification
+- Traffic Engineers (ANALYST) — capacity planning
+- Analytics Lead (CONFIGURATOR) — dashboard owner
+
+### Filters Configured
+
+| Filter Label | Type | Options Source | BigQuery Param |
+|-------------|------|---------------|----------------|
+| Region | DROPDOWN | `dim_regions` | `${region}` |
+| Sub-Region | DROPDOWN | `dim_regions WHERE parent_region = ${region}` (cascading) | `${sub_region}` |
+| Technology | MULTI_SELECT | `dim_regions` DISTINCT | `${technology}` |
+| KPI Type | DROPDOWN | Static: `RSRP`, `RSRQ`, `SINR`, `CQI`, `Throughput` | `${kpi_type}` |
+| Analysis Date | DATE_RANGE | — | `${start_date}`, `${end_date}` |
+
+*Note: Sub-Region uses `depends_on: region` — cascading filter. Options reload when Region changes.*
+
+### Charts Configured
+
+**Chart 1 — Coverage KPI Trend**
+```sql
+SELECT date, AVG(kpi_value) as avg_kpi
+FROM network_kpis_daily
+WHERE region_id = ${region}
+  AND kpi_name = ${kpi_type}
+  AND technology IN UNNEST(${technology})
+  AND date BETWEEN ${start_date} AND ${end_date}
+GROUP BY date ORDER BY date
+```
+*Chart type: AREA | Shows trend with fill to emphasize degradation periods*
+
+**Chart 2 — Peak Hour Capacity Utilization (Bar)**
+```sql
+SELECT EXTRACT(HOUR FROM hour) as peak_hour,
+       AVG(traffic_volume_gb) as avg_traffic,
+       AVG(peak_users) as avg_users
+FROM traffic_hourly
+WHERE region_id = ${region}
+  AND date BETWEEN ${start_date} AND ${end_date}
+GROUP BY peak_hour
+ORDER BY peak_hour
+```
+*Chart type: BAR | X-axis: peak_hour | Y-axis: avg_traffic*
+
+**Chart 3 — Coverage vs Capacity Scatter**
+```sql
+SELECT tm.site_id, AVG(cd.rsrp) as coverage_score, tm.capacity_pct
+FROM tower_metrics tm
+JOIN coverage_data cd ON tm.site_id = cd.site_id
+WHERE tm.region_id = ${region}
+  AND tm.date = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+  AND cd.technology IN UNNEST(${technology})
+GROUP BY tm.site_id, tm.capacity_pct
+```
+*Chart type: SCATTER | X-axis: coverage_score | Y-axis: capacity_pct | Quadrant view: identify sites with poor coverage AND high capacity (upgrade candidates)*
+
+### Map Layers Configured
+- **Layer 1:** Coverage heatmap (RSRP) — `coverage_data_geo`, color by `rsrp`
+- **Layer 2:** Tower point map — `tower_locations_geo`, color by `capacity_pct` (red = overloaded)
+- Both layers respond to filter changes (`refreshOnFilterChange: true`)
+
+### Alert Configured
+```sql
+-- Fires when average capacity in region exceeds 90%
+SELECT AVG(capacity_pct) FROM tower_metrics
+WHERE region_id = ${region} AND date = CURRENT_DATE()
+```
+*Operator: GREATER_THAN | Threshold: 90 | Severity: CRITICAL | Notify: ANALYST, CONFIGURATOR*
+
+---
+
+## Dashboard 3: 5G Home (Verizon Select Internet)
+
+**Verizon Select Internet** = Verizon's branded residential 5G home internet product (also known internally as FWA/5G Home).
+
+### Business Question
+> "Which residential areas are currently eligible for 5G Home service? What is signal quality at the household level, and where should marketing focus new subscriber acquisition?"
+
+### Primary Users
+- 5G Home Planning Team (ANALYST) — eligibility analysis
+- RF Engineers (ANALYST) — signal quality validation
+- VP / Senior Director (VIEWER) — subscriber growth tracking
+
+### Filters Configured
+
+| Filter Label | Type | Options Source | BigQuery Param |
+|-------------|------|---------------|----------------|
+| Market / Region | DROPDOWN | `dim_regions WHERE product = '5G_HOME'` | `${market}` |
+| Coverage Tier | DROPDOWN | Static: `ULTRA WIDEBAND`, `5G NATIONWIDE`, `4G LTE` | `${coverage_tier}` |
+| Eligibility Status | DROPDOWN | Static: `ALL`, `ELIGIBLE`, `MARGINAL`, `INELIGIBLE` | `${eligibility}` |
+| Date | DATE_RANGE | — | `${start_date}`, `${end_date}` |
+
+### Charts Configured
+
+**Chart 1 — Eligible Addresses by Market (Bar)**
+```sql
+SELECT dr.region_name as market,
+       COUNTIF(cd.rsrp >= -105 AND tm.capacity_pct < 80) as eligible,
+       COUNTIF(cd.rsrp BETWEEN -115 AND -106) as marginal,
+       COUNTIF(cd.rsrp < -115 OR tm.capacity_pct >= 80) as ineligible
+FROM coverage_data cd
+JOIN tower_metrics tm ON cd.site_id = tm.site_id
+JOIN dim_regions dr ON cd.region_id = dr.region_id
+WHERE cd.region_id = ${market}
+  AND cd.technology = ${coverage_tier}
+  AND cd.date BETWEEN ${start_date} AND ${end_date}
+GROUP BY dr.region_name
+```
+*Chart type: BAR (stacked) | Colors: green/yellow/red per eligibility*
+
+**Chart 2 — 5G Home Subscriber Growth KPI**
+```sql
+SELECT date, kpi_value as active_subscribers
+FROM network_kpis_daily
+WHERE region_id = ${market}
+  AND kpi_name = '5G_HOME_ACTIVE_SUBS'
+  AND date BETWEEN ${start_date} AND ${end_date}
+ORDER BY date
+```
+*Chart type: LINE | Shows subscriber growth trend*
+
+**Chart 3 — Average RSRP by Coverage Tier (Bar)**
+```sql
+SELECT technology as coverage_tier, AVG(rsrp) as avg_rsrp, COUNT(DISTINCT site_id) as sites
+FROM coverage_data
+WHERE region_id = ${market}
+  AND date = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+GROUP BY technology
+ORDER BY avg_rsrp DESC
+```
+*Chart type: BAR | Compares UWB vs 5G NR vs 4G LTE signal quality*
+
+### Map Layer Configured
+- **Layer type:** Heatmap
+- **Kinetica table:** `coverage_data_geo`
+- **Color column:** `rsrp`
+- **Color scheme:** `green_yellow_red` (green = strong 5G Home eligible, red = ineligible)
+- **CQL_FILTER:** `technology = '${coverage_tier}' AND region_id = '${market}'`
+- **Business use:** Marketing team uses this map to target door-to-door sales in green zones
+
+### Report Configured
+- **Name:** 5G Home Eligibility Export by Market
+- **Format:** Excel (with market breakdown tabs via template)
+- **Scheduled:** Every 1st of month → 5G Home Planning team + Marketing leads
+- **Row cap:** 500K (covers all sites per market)
+
+---
+
+## Dashboard 4: Ultra Gauge Insights
+
+### Business Question
+> "How are our network KPI gauges performing against defined targets? Which metrics are breaching SLA thresholds and need immediate attention?"
+
+*"Ultra Gauge" is Verizon's internal term for the set of top-tier network performance KPIs used in executive and NOC reporting.*
+
+### Primary Users
+- NOC Analysts (ANALYST) — real-time monitoring
+- Performance Engineers (ANALYST) — SLA tracking and root cause
+- VP / Director (VIEWER) — executive health check
+- Analytics Lead (CONFIGURATOR) — owns alert threshold config
+
+### Filters Configured
+
+| Filter Label | Type | Options Source | BigQuery Param |
+|-------------|------|---------------|----------------|
+| Market | DROPDOWN | `dim_regions` | `${market}` |
+| Technology | MULTI_SELECT | `dim_regions` DISTINCT | `${technology}` |
+| KPI Category | DROPDOWN | Static: `AVAILABILITY`, `THROUGHPUT`, `LATENCY`, `DROP_RATE`, `HANDOVER` | `${kpi_category}` |
+| Time Period | DROPDOWN | Static: `TODAY`, `LAST_7_DAYS`, `LAST_30_DAYS`, `MTD`, `QTD` | `${time_period}` |
+
+### Charts Configured
+
+**Chart 1 — KPI Gauge (GAUGE chart per metric)**
+```sql
+SELECT kpi_name, kpi_value,
+       CASE kpi_name
+         WHEN 'AVAILABILITY' THEN 99.95       -- target
+         WHEN 'THROUGHPUT_MBPS' THEN 100
+         WHEN 'LATENCY_MS' THEN 30
+         WHEN 'DROP_RATE_PCT' THEN 0.5
+       END as target_value
+FROM network_kpis_daily
+WHERE region_id = ${market}
+  AND technology IN UNNEST(${technology})
+  AND kpi_name LIKE CONCAT(${kpi_category}, '%')
+  AND date = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+```
+*Chart type: GAUGE (multiple) | Each gauge shows actual vs target | Color: green/yellow/red*
+
+**Chart 2 — KPI Trend vs Target (Line)**
+```sql
+SELECT date,
+       AVG(kpi_value) as actual,
+       MAX(CASE WHEN kpi_name = 'AVAILABILITY' THEN 99.95 END) as target
+FROM network_kpis_daily
+WHERE region_id = ${market}
+  AND technology IN UNNEST(${technology})
+  AND kpi_name = ${kpi_category}
+  AND date >= DATE_SUB(CURRENT_DATE(),
+        CASE ${time_period}
+          WHEN 'LAST_7_DAYS' THEN INTERVAL 7 DAY
+          WHEN 'LAST_30_DAYS' THEN INTERVAL 30 DAY
+          ELSE INTERVAL 1 DAY
+        END)
+GROUP BY date ORDER BY date
+```
+*Chart type: LINE | Dual-line: actual (blue) + target (red dashed)*
+
+**Chart 3 — SLA Compliance Rate by Region (Bar)**
+```sql
+SELECT dr.region_name,
+       COUNTIF(sc.compliant = TRUE) as compliant_days,
+       COUNTIF(sc.compliant = FALSE) as breach_days,
+       ROUND(COUNTIF(sc.compliant = TRUE) * 100.0 / COUNT(*), 2) as compliance_pct
+FROM sla_compliance sc
+JOIN dim_regions dr ON sc.region_id = dr.region_id
+WHERE sc.region_id = ${market}
+  AND sc.sla_metric = ${kpi_category}
+  AND sc.month >= DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL 3 MONTH), MONTH)
+GROUP BY dr.region_name
+ORDER BY compliance_pct ASC
+```
+*Chart type: BAR | Shows worst-performing regions first*
+
+### Grid Configured
+
+**Gauge Breach Detail Table**
+```sql
+SELECT kpi_name, region_id, date, kpi_value,
+       target_value,
+       ROUND((kpi_value - target_value) / target_value * 100, 2) as deviation_pct,
+       CASE WHEN kpi_value < target_value THEN 'BREACH' ELSE 'OK' END as status
+FROM network_kpis_daily nk
+JOIN (SELECT 'AVAILABILITY' as kpi_name, 99.95 as target_value UNION ALL
+      SELECT 'THROUGHPUT_MBPS', 100 UNION ALL
+      SELECT 'LATENCY_MS', 30 UNION ALL
+      SELECT 'DROP_RATE_PCT', 0.5) targets USING (kpi_name)
+WHERE nk.region_id = ${market}
+  AND nk.technology IN UNNEST(${technology})
+  AND nk.date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+  AND kpi_value < target_value  -- only show breaches
+ORDER BY deviation_pct ASC, date DESC
+```
+*Exportable: ✅ | Sortable: ✅ | Used by NOC to log incidents*
+
+### Alerts Configured
+
+```sql
+-- Alert 1: Availability drop
+SELECT AVG(kpi_value) FROM network_kpis_daily
+WHERE kpi_name = 'AVAILABILITY' AND region_id = ${market}
+AND date = CURRENT_DATE()
+```
+*Threshold: < 99.5 | Severity: CRITICAL | Notify: ANALYST, CONFIGURATOR | Cooldown: 15 min*
+
+```sql
+-- Alert 2: Latency spike
+SELECT AVG(kpi_value) FROM network_kpis_daily
+WHERE kpi_name = 'LATENCY_MS' AND region_id = ${market}
+AND date = CURRENT_DATE()
+```
+*Threshold: > 50 | Severity: WARNING | Notify: ANALYST*
+
+### Report Configured
+- **Name:** Weekly Ultra Gauge Report
+- **Format:** Excel
+- **Scheduled:** Every Monday 7 AM ET → NOC leads, Performance Engineers, VP Network Ops
+- **Content:** All KPI gauges + 4-week trend + breach summary
+
+---
+
+## Dashboard 5: Optimal Sector Planning
+
+### Business Question
+> "Which cell sectors are underperforming, overshooting, or creating interference? Where should RF engineers retilt antennas, adjust azimuth, or split sectors to improve coverage efficiency?"
+
+### Primary Users
+- RF Planning Engineers (ANALYST) — sector optimization analysis
+- Senior RF Engineers (ANALYST / CONFIGURATOR) — interpret and act on recommendations
+- Team Lead (CONFIGURATOR) — dashboard owner, configures new alert thresholds
+
+### Filters Configured
+
+| Filter Label | Type | Options Source | BigQuery Param |
+|-------------|------|---------------|----------------|
+| Region | DROPDOWN | `dim_regions` | `${region}` |
+| Technology | MULTI_SELECT | `dim_regions` DISTINCT | `${technology}` |
+| Sector Issue Type | DROPDOWN | Static: `ALL`, `OVERSHOOT`, `COVERAGE_GAP`, `INTERFERENCE`, `UNDERLOAD`, `OVERLOAD` | `${issue_type}` |
+| Analysis Period | DROPDOWN | Static: `LAST_7_DAYS`, `LAST_30_DAYS`, `LAST_90_DAYS` | `${period}` |
+| Min Sample Count | DROPDOWN | Static: `100`, `500`, `1000`, `5000` | `${min_samples}` |
+
+### Charts Configured
+
+**Chart 1 — Sector Performance Score Distribution (Bar)**
+```sql
+SELECT
+  CASE
+    WHEN AVG(rsrp) >= -80 AND AVG(sinr) >= 20 THEN 'EXCELLENT'
+    WHEN AVG(rsrp) >= -95 AND AVG(sinr) >= 10 THEN 'GOOD'
+    WHEN AVG(rsrp) >= -110 AND AVG(sinr) >= 0  THEN 'FAIR'
+    ELSE 'POOR'
+  END as performance_band,
+  COUNT(DISTINCT site_id) as sector_count
+FROM coverage_data
+WHERE region_id = ${region}
+  AND technology IN UNNEST(${technology})
+  AND date >= DATE_SUB(CURRENT_DATE(),
+        CASE ${period}
+          WHEN 'LAST_7_DAYS' THEN INTERVAL 7 DAY
+          WHEN 'LAST_30_DAYS' THEN INTERVAL 30 DAY
+          ELSE INTERVAL 90 DAY END)
+GROUP BY performance_band
+ORDER BY sector_count DESC
+```
+*Chart type: PIE | Shows distribution of sectors by performance band*
+
+**Chart 2 — RSRP vs SINR Scatter (Identify Problem Sectors)**
+```sql
+SELECT site_id,
+       AVG(rsrp) as avg_rsrp,
+       AVG(sinr) as avg_sinr,
+       COUNT(*) as sample_count
+FROM coverage_data
+WHERE region_id = ${region}
+  AND technology IN UNNEST(${technology})
+  AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+GROUP BY site_id
+HAVING COUNT(*) >= ${min_samples}
+```
+*Chart type: SCATTER | X-axis: avg_rsrp | Y-axis: avg_sinr | Low RSRP + Low SINR = interference/overshoot candidates*
+
+**Chart 3 — Capacity Trend by Sector Load (Line)**
+```sql
+SELECT date, AVG(capacity_pct) as avg_capacity,
+       COUNTIF(capacity_pct > 85) as overloaded_sectors,
+       COUNTIF(capacity_pct < 20) as underloaded_sectors
+FROM tower_metrics
+WHERE region_id = ${region}
+  AND date >= DATE_SUB(CURRENT_DATE(),
+        CASE ${period}
+          WHEN 'LAST_7_DAYS' THEN INTERVAL 7 DAY
+          WHEN 'LAST_30_DAYS' THEN INTERVAL 30 DAY
+          ELSE INTERVAL 90 DAY END)
+GROUP BY date ORDER BY date
+```
+*Chart type: LINE (multi-series) | Shows sector load balance over time*
+
+### Grid Configured
+
+**Sector Optimization Candidates Table**
+```sql
+SELECT cd.site_id,
+       dr.region_name,
+       cd.technology,
+       AVG(cd.rsrp) as avg_rsrp,
+       AVG(cd.sinr) as avg_sinr,
+       AVG(cd.cqi) as avg_cqi,
+       tm.capacity_pct,
+       tm.alarm_count,
+       CASE
+         WHEN AVG(cd.rsrp) > -70 AND tm.capacity_pct < 30 THEN 'OVERSHOOT'
+         WHEN AVG(cd.rsrp) < -115 THEN 'COVERAGE_GAP'
+         WHEN AVG(cd.sinr) < -3 THEN 'INTERFERENCE'
+         WHEN tm.capacity_pct > 90 THEN 'OVERLOAD'
+         WHEN tm.capacity_pct < 15 THEN 'UNDERLOAD'
+         ELSE 'OK'
+       END as recommended_action
+FROM coverage_data cd
+JOIN tower_metrics tm ON cd.site_id = tm.site_id
+JOIN dim_regions dr ON cd.region_id = dr.region_id
+WHERE cd.region_id = ${region}
+  AND cd.technology IN UNNEST(${technology})
+  AND cd.date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+  AND tm.date = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+GROUP BY cd.site_id, dr.region_name, cd.technology, tm.capacity_pct, tm.alarm_count
+HAVING COUNT(*) >= ${min_samples}
+  AND (${issue_type} = 'ALL' OR recommended_action = ${issue_type})
+ORDER BY alarm_count DESC, avg_rsrp ASC
+```
+*Columns: Site ID, Region, Tech, Avg RSRP, Avg SINR, Avg CQI, Capacity %, Alarms, Recommended Action*
+*Exportable: ✅ — RF Engineers export this and use it as a work order list for field teams*
+
+### Map Layers Configured
+- **Layer 1:** Coverage heatmap — `coverage_data_geo` colored by `rsrp`
+- **Layer 2:** Tower point map — `tower_locations_geo` colored by `capacity_pct`
+- **Layer 3:** Sector overlay — `tower_locations_geo` with `alarm_count > 0` highlighted in red
+- All 3 layers toggle independently via Leaflet layer control
+
+### Report Configured
+- **Name:** Sector Optimization Work Orders
+- **Format:** Excel
+- **Max rows:** 500K
+- **Scheduled:** Every Friday 5 AM ET → RF Planning team leads
+- **Use:** Weekly work order list for field optimization teams
+
+---
+
+## How a CONFIGURATOR Built Each Dashboard
+
+This is the most important interview talking point — the process, not just the result:
+
+```
+Step 1 (5 min):   Go to Admin UI → "New Dashboard"
+                  → Set name, department, layout (columns/rows)
+
+Step 2 (10 min):  Add Filters
+                  → Each filter: label, type (DROPDOWN/MULTI_SELECT/DATE_RANGE)
+                  → For DROPDOWN: paste the optionsSql (dim_* table query)
+                  → System runs dry-run, shows available options immediately
+
+Step 3 (10 min):  Add Charts
+                  → Select chart type (LINE/BAR/PIE/SCATTER/GAUGE)
+                  → Paste BigQuery SQL with ${filter_name} placeholders
+                  → System runs dry-run: validates SQL, estimates scan size
+                  → Warning if > 10 GB scan → CONFIGURATOR adds partition filters
+                  → Set x_axis, y_axis, color scheme
+
+Step 4 (3 min):   Add Grid (optional)
+                  → Paste SQL, define column labels, set exportable: true/false
+                  → VIEWER role dashboards: exportable: false (enforced server-side)
+
+Step 5 (2 min):   Add Map Layers (if needed)
+                  → Select Kinetica table, column mappings, color scheme
+                  → Map Service handles CQL_FILTER server-side automatically
+
+Step 6 (instant): Save → Dashboard is LIVE
+                  → Cache warm-up runs for default filters
+                  → Users see it in their dashboard list immediately
+```
+
+**Total time: ~30 minutes. Zero developer involvement. Zero deployment.**
+
+---
+
+## Interview Q&A (Dashboard-Specific)
+
+**Q: "What was the most technically complex dashboard?"**
+> "Optimal Sector Planning. It has a SCATTER chart correlating RSRP vs SINR per sector to identify interference patterns, plus a 3-layer Leaflet map (coverage heatmap + tower points + alarm overlay), all driven by 5 cascading filters. The SQL has a CASE-WHEN logic that classifies each sector as OVERSHOOT, COVERAGE_GAP, INTERFERENCE, OVERLOAD, or UNDERLOAD. The RF engineers use the exported grid as actual field work orders — so the data accuracy directly impacts network quality."
+
+**Q: "How did business users actually interact with the dashboards?"**
+> "Different ways per role. RF Engineers used filter dropdowns to zoom into specific regions and technologies, then exported the sector optimization grid as Excel to hand off to field teams. NOC Analysts watched the Ultra Gauge dashboard in real-time — they had it on a wall-mounted monitor — with alert banners firing via WebSocket when availability dropped below 99.5%. VPs got a read-only Executive Health dashboard — no filters to change, no export button, just the numbers."
+
+**Q: "Did you build all these dashboards yourself?"**
+> "No — that's the point. I built the platform. The Analytics Leads (CONFIGURATORs) built the dashboards themselves. I only got involved when they hit limitations — like when the Sector Planning team wanted a SCATTER chart type we hadn't implemented yet. We added the new chart type to the renderer once, and every dashboard could use it immediately."
+
+**Q: "How did you handle dashboard-specific business logic like the FWA eligibility rules?"**
+> "It's all in the SQL. The CONFIGURATOR writes `CASE WHEN rsrp >= -105 AND capacity_pct < 80 THEN 'ELIGIBLE'` directly in the chart/grid SQL. The platform just executes whatever SQL is configured — it doesn't know or care about FWA eligibility rules. That separation is intentional: business logic lives in SQL (owned by domain experts), rendering logic lives in code (owned by us)."
+
+---
+
+## Quick Navigation
+
+| File | What's Inside |
+|------|--------------|
+| **01-project-overview.md** | Pitch, diagram, roles, tech stack |
+| **02-architecture-deep-dive.md** | All 7 services in detail |
+| **03-e2e-flows.md** | All 15 E2E flows |
+| **04-security-rbac.md** | ForgeRock SSO, RBAC, security code |
+| **05-data-layer.md** | PostgreSQL, BigQuery, Kinetica, Redis, Kafka |
+| **06-spring-boot-frontend.md** | Spring Boot + React patterns |
+| **07-devops-deployment.md** | EKS, Docker, ArgoCD, GitLab CI |
+| **08-interview-cheat-sheet.md** | Rapid-fire answers, STAR stories |
+| **09-dashboard-catalog.md** | ← You are here. Real dashboards, real SQL |

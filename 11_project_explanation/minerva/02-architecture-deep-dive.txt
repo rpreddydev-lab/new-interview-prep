@@ -1,0 +1,625 @@
+# 02 — Architecture Deep Dive
+
+> **What to use this for:** "Walk me through the architecture" / "Why did you make that design decision?" / "How does service X work?"
+
+---
+
+## Why Configuration-Driven? (The Core Design Decision)
+
+**Q: Why not just build dashboards the traditional way?**
+
+> "Verizon's network engineering org has 5+ departments — RF, Traffic, NOC, Performance, Executive — each needing different views of the same underlying data. In a traditional approach, every new dashboard means a Jira ticket, a sprint, a deployment. We had a backlog of 20+ dashboard requests.
+>
+> So we inverted the model: **the database IS the application**. Every visual element — filter dropdowns, chart configs, grid columns, map layers, report definitions — is a row in PostgreSQL. React reads that config and renders dynamically. A CONFIGURATOR (our Analytics Leads) can create a complete dashboard in 30 minutes without any engineering involvement.
+>
+> This reduced our dashboard delivery time from **2 weeks to 30 minutes** and eliminated the deployment bottleneck entirely."
+
+**Trade-offs I'd discuss in an interview:**
+- ✅ Speed: 30 min vs 2 weeks for new dashboards
+- ✅ Self-service: Non-developers can create dashboards
+- ✅ Zero-deployment: No CI/CD needed for new content
+- ⚠️ Complexity: SQL validation layer is non-trivial (SELECT-only parse + dry-run)
+- ⚠️ Testing: Config changes aren't code-reviewed (we compensate with dry-run validation + audit logging)
+- ⚠️ Flexibility: Truly custom visualizations still need dev work
+
+---
+
+## Service 1: ForgeRock SSO (External IdP)
+
+**Owner:** Verizon Enterprise IAM team (not us)  
+**Our Role:** Integrate as a relying party
+
+### What ForgeRock Provides
+- OAuth2 Authorization Server + OIDC Provider
+- PKCE flow (public SPA client — no client_secret in browser)
+- RS256-signed JWTs with custom claims: `tenant_id`, `roles[]`, `department`
+- JWKS endpoint for public key distribution
+- Token revocation endpoint
+
+### How We Integrate
+```
+React SPA
+  │
+  ├── 1. Redirect to ForgeRock /authorize (with PKCE code_challenge)
+  │
+  ├── 2. User authenticates (ForgeRock login page)
+  │
+  ├── 3. Redirect back with authorization_code
+  │
+  ├── 4. POST /token (code + code_verifier) → access_token + refresh_token + id_token
+  │
+  └── 5. All API calls: Authorization: Bearer <access_token>
+```
+
+### JWT Structure (What ForgeRock Returns)
+```json
+{
+  "sub": "john.smith@verizon.com",
+  "iss": "https://sso.verizon.com/openam/oauth2",
+  "aud": "minerva-spa",
+  "exp": 1712700000,
+  "iat": 1712696400,
+  "tenant_id": "vz-network-eng",
+  "roles": ["ANALYST"],
+  "department": "rf-engineering",
+  "name": "John Smith",
+  "email": "john.smith@verizon.com"
+}
+```
+
+### Our Spring Security Integration
+- All 6 internal services validate JWTs **locally** — no call back to ForgeRock per request
+- JWKS public keys cached at startup, refreshed every 5 minutes
+- JWT validation: signature (RS256), expiration, issuer, audience
+- Roles extracted from `roles[]` claim → Spring `GrantedAuthority`
+- Tenant extracted from `tenant_id` claim → `TenantContext` ThreadLocal
+
+---
+
+## Service 2: Dashboard Service
+
+**Owner:** Our team  
+**Purpose:** Config CRUD — the brain of the configuration-driven model
+
+### What It Owns
+| Table | Purpose | Example Row |
+|-------|---------|-------------|
+| `dashboards` | Dashboard metadata | `{id, name, department, layout_json, created_by, tenant_id}` |
+| `dashboard_filters` | Filter definitions | `{id, dashboard_id, label, type, options_sql, default_value, display_order}` |
+| `dashboard_charts` | Chart definitions | `{id, dashboard_id, chart_type, data_sql, x_axis, y_axis, color_scheme, display_order}` |
+| `dashboard_grids` | Grid/table definitions | `{id, dashboard_id, data_sql, columns_json, page_size, sortable, exportable}` |
+| `dashboard_map_layers` | Map layer definitions | `{id, dashboard_id, kinetica_table, wms_layer_type, lat_col, lng_col, color_col, opacity}` |
+| `dashboard_reports` | Report definitions | `{id, dashboard_id, report_sql, format, max_rows, template_id}` |
+| `report_schedules` | Cron schedules | `{id, report_id, cron_expression, timezone, recipients, enabled}` |
+| `alert_configs` | Threshold alerts | `{id, dashboard_id, metric_sql, operator, threshold, notify_roles}` |
+
+### Key APIs
+```
+GET    /api/dashboards                        → list (role + department scoped)
+GET    /api/dashboards/{id}                   → full config payload (filters, charts, grids, maps)
+POST   /api/dashboards                        → create (CONFIGURATOR+)
+PUT    /api/dashboards/{id}                   → update config
+DELETE /api/dashboards/{id}                   → soft delete
+
+POST   /api/dashboards/{id}/filters           → add filter to dashboard
+PUT    /api/dashboards/{id}/filters/{fid}     → update filter config
+POST   /api/dashboards/{id}/charts            → add chart
+POST   /api/dashboards/{id}/grids             → add grid
+POST   /api/dashboards/{id}/map-layers        → add map layer
+POST   /api/dashboards/{id}/reports           → add report definition
+
+POST   /api/dashboards/validate-sql           → dry-run SQL validation
+```
+
+### SQL Validation (On Config Save) — Production Guard
+
+When a CONFIGURATOR saves a chart/grid/report SQL:
+
+1. **Parse** — Verify it's a SELECT statement (no INSERT/UPDATE/DELETE/DROP). Uses a lightweight SQL parser.
+2. **Parameterize** — Verify all `${filter_name}` placeholders match defined filters
+3. **BigQuery Dry-Run** — `JobConfigurationQuery.setDryRun(true)` → validates syntax, checks column existence, returns estimated bytes scanned
+4. **Scan Estimate Warning** — If estimated scan > 10 GB, return a warning (not a block) to the CONFIGURATOR
+5. **Save** — Store validated SQL in PostgreSQL
+
+```java
+// SQL validation on save
+public SqlValidationResult validateSql(String sql, String tenantId) {
+    // Step 1: SELECT-only check
+    if (!sqlParser.isSelectOnly(sql)) {
+        return SqlValidationResult.rejected("Only SELECT statements allowed");
+    }
+
+    // Step 2: BigQuery dry-run
+    QueryJobConfiguration dryRunConfig = QueryJobConfiguration.newBuilder(sql)
+        .setDryRun(true)
+        .setUseQueryCache(false)
+        .build();
+
+    Job dryRunJob = bigQuery.create(JobInfo.of(dryRunConfig));
+    long estimatedBytes = dryRunJob.getStatistics().getQuery().getTotalBytesProcessed();
+
+    // Step 3: Scan estimate warning
+    if (estimatedBytes > 10L * 1024 * 1024 * 1024) { // 10 GB
+        return SqlValidationResult.warning(
+            "Query will scan ~" + (estimatedBytes / 1_073_741_824) + " GB. Consider adding partition filters."
+        );
+    }
+
+    return SqlValidationResult.valid(estimatedBytes);
+}
+```
+
+### Config Payload Shape (What React Receives)
+```json
+{
+  "id": "dash-rf-coverage",
+  "name": "RF Coverage Analysis",
+  "department": "rf-engineering",
+  "layout": { "columns": 2, "rows": 3 },
+  "filters": [
+    {
+      "id": "f1",
+      "label": "Region",
+      "type": "DROPDOWN",
+      "optionsSql": "SELECT region_id, region_name FROM dim_regions WHERE tenant_id = :tenantId",
+      "defaultValue": "ALL",
+      "displayOrder": 1
+    },
+    {
+      "id": "f2",
+      "label": "Technology",
+      "type": "MULTI_SELECT",
+      "optionsSql": "SELECT DISTINCT technology FROM dim_regions",
+      "defaultValue": ["4G-LTE", "5G-NR"],
+      "displayOrder": 2
+    }
+  ],
+  "charts": [
+    {
+      "id": "c1",
+      "chartType": "LINE",
+      "title": "RSRP Trend (7 Days)",
+      "dataSql": "SELECT date, AVG(rsrp) as avg_rsrp FROM coverage_data WHERE region_id = ${region} AND technology IN UNNEST(${technology}) AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) GROUP BY date ORDER BY date",
+      "xAxis": "date",
+      "yAxis": "avg_rsrp",
+      "displayOrder": 1
+    }
+  ],
+  "grids": [ ... ],
+  "mapLayers": [ ... ],
+  "reports": [ ... ]
+}
+```
+
+---
+
+## Service 3: Query Execution Service
+
+**Owner:** Our team  
+**Purpose:** Execute configured SQL against BigQuery, cache results, enforce limits
+
+### Why a Separate Service?
+- **Single responsibility:** Dashboard Service owns config, Query Execution owns data retrieval
+- **Cost control:** Centralized BigQuery quota management, rate limiting, audit logging
+- **Caching:** Results cached in Redis — same query + same filters = cache hit
+- **Isolation:** If BigQuery has issues, Dashboard Service (config) still works
+
+### Key APIs
+```
+POST   /api/query/execute                     → execute SQL with filter params
+POST   /api/query/execute-batch               → execute multiple queries (chart + grid in parallel)
+GET    /api/query/filters/{filterId}/options   → run optionsSql against PostgreSQL
+GET    /api/query/cache/stats                  → cache hit/miss rates (PLATFORM_ADMIN)
+POST   /api/query/cache/invalidate             → manual cache invalidation (PLATFORM_ADMIN)
+```
+
+### Query Execution Flow (with Production Guards)
+
+```
+Request: { dashboardId, chartId, filters: { region: "northeast", technology: ["5G-NR"] } }
+    │
+    ├── 1. Rate Limit Check (30 req/min per user via Redis sliding window)
+    │
+    ├── 2. Lookup chart config from Dashboard Service (inter-service call with JWT forwarding)
+    │
+    ├── 3. Build Cache Key: SHA256(tenantId + dashboardId + chartId + sortedFilterValues)
+    │
+    ├── 4. Redis Cache Check → HIT? Return cached result
+    │
+    ├── 5. MISS → Parameter Binding (replace ${region} with parameterized value)
+    │
+    ├── 6. Execute against BigQuery:
+    │       - maximumBytesBilled: 50 GB (safety cap)
+    │       - timeoutMs: 60,000 (60 seconds)
+    │       - priority: INTERACTIVE
+    │
+    ├── 7. Cache Result in Redis (TTL from config, default 10 min)
+    │
+    ├── 8. Write Audit Log → query_execution_log table
+    │       (user, dashboard, query hash, bytes scanned, duration, cost estimate)
+    │
+    └── 9. Return result to caller
+```
+
+### Filter Options (Against PostgreSQL, NOT BigQuery)
+
+Filter dropdowns (e.g., "Select Region") query **dimension tables in PostgreSQL**, not BigQuery:
+
+```java
+// Executes optionsSql against read-only PG connection
+// PG user is scoped to dim_* tables only (schema-level security)
+public List<FilterOption> getFilterOptions(String filterId, String tenantId) {
+    DashboardFilter filter = dashboardService.getFilter(filterId);
+    String sql = filter.getOptionsSql(); // e.g., "SELECT region_id, region_name FROM dim_regions WHERE tenant_id = :tenantId"
+
+    return readOnlyJdbcTemplate.query(sql,
+        Map.of("tenantId", tenantId),
+        (rs, i) -> new FilterOption(rs.getString(1), rs.getString(2))
+    );
+}
+```
+
+**Why PostgreSQL for filters?** Dimension tables are small (~1K rows), rarely change, and querying BigQuery for a dropdown would be wasteful and slow.
+
+### Cache Warm-Up (After Daily Data Refresh)
+
+When the DE team publishes a `data-refresh-events` Kafka message:
+1. Notification Service consumes the event
+2. Publishes `cache-events` → Query Execution Service
+3. Query Execution Service:
+   - Invalidates all cached results for the refreshed table
+   - Re-executes queries for **recently-viewed dashboards** (last 7 days) with **default filters only**
+   - Batched execution (5 concurrent queries max) to avoid BigQuery quota spike
+
+---
+
+## Service 4: Report Service
+
+**Owner:** Our team  
+**Purpose:** Async report generation with SAGA pattern, scheduled reports via Quartz
+
+### Why SAGA?
+
+Reports can take 30–120 seconds (large BigQuery queries → CSV/Excel generation → S3 upload). Synchronous request-response would timeout. The SAGA pattern orchestrates the multi-step process with compensating actions on failure.
+
+### SAGA Flow (Report Generation)
+
+```
+Step 1: QUERY          Step 2: GENERATE         Step 3: UPLOAD          Step 4: NOTIFY
+┌─────────────┐       ┌─────────────────┐      ┌──────────────┐       ┌──────────────┐
+│ Execute SQL │──OK──►│ Generate CSV/   │─OK──►│ Upload to S3 │──OK──►│ Kafka event  │
+│ against     │       │ Excel from      │      │ with signed  │       │ → Notification│
+│ BigQuery    │       │ result set      │      │ URL (24h TTL)│       │   Service    │
+│             │       │                 │      │              │       │ → WebSocket  │
+│ 500K row    │       │                 │      │              │       │   push       │
+│ cap enforced│       │                 │      │              │       │              │
+└──────┬──────┘       └────────┬────────┘      └──────┬───────┘       └──────────────┘
+       │ FAIL                  │ FAIL                  │ FAIL
+       ▼                       ▼                       ▼
+  Mark FAILED            Delete temp file        Delete S3 object
+  Notify user            Mark FAILED             Mark FAILED
+                         Notify user             Notify user
+```
+
+### Report Status Lifecycle
+```
+QUEUED → RUNNING → QUERY_COMPLETE → GENERATING → UPLOADING → COMPLETED
+                                                              │
+                                             Any step fails → FAILED (with error detail)
+```
+
+### Key APIs
+```
+POST   /api/reports/generate                  → start async report (returns reportId)
+GET    /api/reports/{id}/status               → poll status + download URL when COMPLETED
+GET    /api/reports                            → list user's reports (paginated)
+GET    /api/reports/{id}/download              → redirect to S3 signed URL
+DELETE /api/reports/{id}                       → cancel if QUEUED/RUNNING, delete if COMPLETED
+```
+
+### Scheduled Reports (Quartz)
+
+```java
+// Quartz job triggered by cron expression stored in report_schedules table
+@DisallowConcurrentExecution
+public class ScheduledReportJob implements Job {
+
+    @Override
+    public void execute(JobExecutionContext context) {
+        String scheduleId = context.getJobDetail().getJobDataMap().getString("scheduleId");
+        ReportSchedule schedule = reportScheduleRepository.findById(scheduleId);
+
+        // Generate report using same SAGA flow
+        String reportId = reportService.generateReport(
+            schedule.getReportConfig(),
+            schedule.getTenantId(),
+            "SYSTEM" // system-triggered, not user-triggered
+        );
+
+        // Email notification to recipients
+        notificationService.sendReportEmail(
+            schedule.getRecipients(),
+            reportId,
+            schedule.getTimezone() // UTC stored, converted for display
+        );
+    }
+}
+```
+
+### Production Guards
+- **500K row cap:** `LIMIT 500001` — if 500,001 rows return, reject with "Report too large, add filters"
+- **60-second BigQuery timeout:** Prevents runaway queries
+- **`maximumBytesBilled: 100GB`:** Cost ceiling per report query
+- **Idempotency:** Redis `setIfAbsent(reportId, ..., TTL 1h)` prevents duplicate generation from Kafka retries
+- **Cleanup:** S3 objects auto-expire after 7 days (S3 lifecycle policy)
+
+---
+
+## Service 5: Map Service
+
+**Owner:** Our team  
+**Purpose:** WMS tile proxy between React/Leaflet and Kinetica
+
+### Why a Proxy? Why Not Call Kinetica Directly?
+
+1. **Security:** CQL_FILTER is constructed **server-side** from the user's role/tenant/filters — never trusted from the browser
+2. **Tenant isolation:** Server appends `AND tenant_id = '...'` to every CQL_FILTER
+3. **Credential hiding:** Kinetica connection details never exposed to frontend
+4. **Caching headers:** We control `Cache-Control` per layer type
+
+### How WMS Tiles Work
+
+```
+React (Leaflet)                    Map Service                         Kinetica WMS
+    │                                  │                                    │
+    ├── GET /api/map/wms?              │                                    │
+    │   LAYERS=coverage_heatmap&       │                                    │
+    │   BBOX=40.7,-74.0,40.8,-73.9&   │                                    │
+    │   WIDTH=256&HEIGHT=256&          │                                    │
+    │   SRS=EPSG:4326&                 │                                    │
+    │   dashboardId=dash-rf&           │                                    │
+    │   filters={region:"northeast"}   │                                    │
+    │                                  │                                    │
+    │                    ┌─────────────┤                                    │
+    │                    │ 1. Validate JWT (tenant, role)                   │
+    │                    │ 2. Lookup map layer config from Dashboard Service│
+    │                    │ 3. Build CQL_FILTER server-side:                 │
+    │                    │    "tenant_id='vz-network-eng'                   │
+    │                    │     AND region_id='northeast'"                   │
+    │                    │ 4. Forward to Kinetica WMS endpoint              │
+    │                    └─────────────┤                                    │
+    │                                  │                                    │
+    │                                  ├── GET /wms?                        │
+    │                                  │   LAYERS=coverage_heatmap&         │
+    │                                  │   CQL_FILTER=tenant_id='...'...&   │
+    │                                  │   BBOX=...&WIDTH=256&HEIGHT=256    │
+    │                                  │                                    │
+    │                                  │◄── PNG tile (256x256 pixels)       │
+    │◄── PNG tile ─────────────────────┤                                    │
+```
+
+### Key APIs
+```
+GET    /api/map/wms                           → WMS tile proxy (transparent to Leaflet)
+GET    /api/map/layers/{dashboardId}          → available map layers for dashboard
+GET    /api/map/legend/{layerId}              → legend (color scheme, ranges)
+```
+
+### Kinetica Map Layer Config (From PostgreSQL)
+```json
+{
+  "id": "ml-coverage-heatmap",
+  "dashboardId": "dash-rf-coverage",
+  "kineticaTable": "coverage_data_geo",
+  "wmsLayerType": "heatmap",
+  "latColumn": "latitude",
+  "lngColumn": "longitude",
+  "colorColumn": "rsrp",
+  "colorScheme": "red_yellow_green",
+  "opacity": 0.7,
+  "refreshOnFilterChange": true
+}
+```
+
+---
+
+## Service 6: Notification Service
+
+**Owner:** Our team  
+**Purpose:** Kafka consumer → WebSocket push to browser, email notifications
+
+### What It Handles
+
+| Event Source | Kafka Topic | Action |
+|-------------|-------------|--------|
+| DE Team data refresh | `data-refresh-events` | WebSocket: "Data updated, refresh dashboard" |
+| Report completed | `report-events` | WebSocket: "Report ready" + email if scheduled |
+| Alert threshold breach | `alert-events` | WebSocket: urgent banner + email to configured roles |
+| Dashboard saved | `dashboard-events` | WebSocket: "Dashboard updated" to active viewers |
+| Cache invalidation | (internal) | Publishes `cache-events` → Query Execution Service |
+
+### WebSocket Architecture (Multi-Pod)
+
+```
+Browser 1 ──── Pod A (Notification Service)
+                    │
+Browser 2 ──── Pod B (Notification Service)    ← Redis Pub/Sub bridges pods
+                    │
+Browser 3 ──── Pod A (Notification Service)
+```
+
+- **STOMP over WebSocket** with SockJS fallback
+- **Redis Pub/Sub** for cross-pod message delivery (user on Pod A, event consumed on Pod B)
+- **ChannelInterceptor** validates JWT + tenant + role on every SUBSCRIBE
+
+### Subscribe Auth (Production Guard)
+
+```java
+@Override
+public Message<?> preSend(Message<?> message, MessageChannel channel) {
+    StompHeaderAccessor accessor = StompHeaderAccessor.wrap(message);
+
+    if (StompCommand.SUBSCRIBE.equals(accessor.getCommand())) {
+        String destination = accessor.getDestination();
+        // e.g., /topic/tenant/vz-network-eng/dashboard/dash-rf-coverage
+
+        String token = accessor.getFirstNativeHeader("Authorization");
+        Claims claims = jwtValidator.validate(token);
+
+        String tenantId = claims.get("tenant_id", String.class);
+        List<String> roles = claims.get("roles", List.class);
+
+        // Verify tenant matches subscription channel
+        if (!destination.contains("/tenant/" + tenantId)) {
+            throw new AccessDeniedException("Cross-tenant subscription denied");
+        }
+
+        // Verify role has access to this dashboard
+        String dashboardId = extractDashboardId(destination);
+        if (!accessService.canView(dashboardId, tenantId, roles)) {
+            throw new AccessDeniedException("Insufficient role for this dashboard");
+        }
+    }
+    return message;
+}
+```
+
+---
+
+## Service 7: Admin Service
+
+**Owner:** Our team  
+**Purpose:** Platform administration — tenant/user management, audit trails, DLT viewer, cost dashboard
+
+### What It Owns
+
+| Feature | Who Uses It | Description |
+|---------|-------------|-------------|
+| Tenant Management | PLATFORM_ADMIN | Create/edit tenants, configure BigQuery datasets per tenant |
+| User Management | TENANT_ADMIN | Invite users, assign roles within their tenant |
+| Audit Trail | PLATFORM_ADMIN, TENANT_ADMIN | Searchable log of all actions (who did what, when) |
+| DLT Viewer | PLATFORM_ADMIN | View dead-letter topic messages, retry/discard |
+| Cost Dashboard | PLATFORM_ADMIN | BigQuery cost per tenant/dashboard/user from `query_execution_log` |
+| Query Execution Log | PLATFORM_ADMIN | All queries executed, bytes scanned, duration, cost estimate |
+
+### Key APIs
+```
+GET    /api/admin/tenants                     → list tenants (PLATFORM_ADMIN)
+POST   /api/admin/tenants                     → create tenant
+GET    /api/admin/tenants/{id}/users          → list users in tenant (TENANT_ADMIN+)
+POST   /api/admin/tenants/{id}/users          → invite user + assign role
+PUT    /api/admin/tenants/{id}/users/{uid}    → update role
+
+GET    /api/admin/audit                       → search audit events (filterable)
+GET    /api/admin/dlt                         → list DLT messages (PLATFORM_ADMIN)
+POST   /api/admin/dlt/{id}/retry              → retry failed message
+POST   /api/admin/dlt/{id}/discard            → mark as discarded
+
+GET    /api/admin/cost/summary                → cost by tenant/dashboard/user
+GET    /api/admin/cost/queries                → top-N expensive queries
+```
+
+### Audit Events (Kafka Consumer)
+
+All services publish to `audit-events` topic. Admin Service consumes and stores:
+
+```json
+{
+  "eventId": "uuid",
+  "timestamp": "2025-03-15T14:30:00Z",
+  "service": "dashboard-service",
+  "action": "DASHBOARD_CREATED",
+  "actor": "jane.doe@verizon.com",
+  "tenantId": "vz-network-eng",
+  "resource": "dashboard/dash-rf-coverage",
+  "details": { "name": "RF Coverage Analysis", "department": "rf-engineering" },
+  "ip": "10.0.1.42"
+}
+```
+
+### Cost Dashboard (From query_execution_log)
+
+```sql
+-- Top 10 most expensive dashboards this month
+SELECT d.name, d.department,
+       COUNT(*) as query_count,
+       SUM(qel.bytes_scanned) as total_bytes,
+       SUM(qel.estimated_cost_usd) as total_cost
+FROM query_execution_log qel
+JOIN dashboards d ON qel.dashboard_id = d.id
+WHERE qel.executed_at >= DATE_TRUNC('month', CURRENT_DATE)
+GROUP BY d.name, d.department
+ORDER BY total_cost DESC
+LIMIT 10;
+```
+
+---
+
+## Design Decision Matrix (Interview-Ready)
+
+| Decision | Why | Alternatives Considered |
+|----------|-----|------------------------|
+| **Config-driven (no-code)** | 30-min dashboard delivery vs 2-week dev cycle; 5 departments need different views | Traditional coded dashboards, BI tools (Looker/Tableau) |
+| **PostgreSQL for config** | Relational integrity for dashboard→filter→chart relationships; ACID for config changes | MongoDB (flexible schema but no FK constraints), BigQuery (overkill for config) |
+| **BigQuery for analytics** | Verizon DE team already loads data there; serverless, scales to PB, cost-per-query model | Snowflake (similar but Verizon standardized on GCP for data), Redshift (AWS but cross-cloud latency) |
+| **Kinetica for maps** | GPU-accelerated WMS server-side tile rendering; no GeoJSON transfer to browser | PostGIS (CPU-based, slower for large datasets), Mapbox (SaaS, data sovereignty concerns) |
+| **Separate Query Execution Service** | Centralized BigQuery cost control, rate limiting, caching; isolation from config service | Queries in Dashboard Service (simpler but no isolation, harder to rate-limit) |
+| **SAGA for reports** | Reports take 30–120s; synchronous would timeout; need compensating actions on failure | Simple async with polling (no compensation), queued jobs (no orchestration visibility) |
+| **Quartz for scheduling** | Spring-native, persistent job store in PostgreSQL, cluster-safe, cron expressions | Spring @Scheduled (no persistence, no cluster awareness), external scheduler (over-engineering) |
+| **Redis for caching** | Sub-ms reads; dual-purpose: query result cache + WebSocket pub/sub + JWT blacklist | Caffeine (local only, no cross-pod), Memcached (no pub/sub) |
+| **Kafka for events** | DE team already publishes data-refresh events; we needed guaranteed delivery + DLT | RabbitMQ (simpler but no built-in DLT pattern), SQS (AWS-only, no topic fan-out) |
+| **ForgeRock (not custom auth)** | Verizon enterprise standard; SSO across all internal tools; we don't own identity | Keycloak (self-hosted, more work), Auth0 (SaaS, doesn't meet Verizon enterprise policy) |
+| **ArgoCD GitOps** | Declarative deployments; git as source of truth; automatic drift detection | Helm install via CI (imperative, no drift detection), Spinnaker (heavier, more complex) |
+
+---
+
+## Scaling Strategy
+
+### Horizontal Scaling (HPA)
+
+| Service | Scale Trigger | Min/Max Pods | Why |
+|---------|--------------|-------------|-----|
+| Dashboard Service | CPU > 70% | 2 / 6 | Config reads are lightweight |
+| Query Execution Service | CPU > 60% OR queue depth | 3 / 10 | BigQuery calls are the bottleneck |
+| Report Service | Queue depth | 2 / 8 | Reports are batch-heavy |
+| Map Service | CPU > 70% | 2 / 6 | WMS proxying is I/O-bound |
+| Notification Service | WebSocket connections | 2 / 6 | Connection count matters more than CPU |
+| Admin Service | CPU > 70% | 2 / 4 | Low traffic, admin-only |
+
+### What Scales and What Doesn't
+
+- **BigQuery:** Auto-scales (serverless) — but we cap cost with `maximumBytesBilled`
+- **PostgreSQL:** Single primary + read replica — config reads go to replica, writes to primary
+- **Redis:** Cluster mode with 3 shards — cache + pub/sub + JWT blacklist
+- **Kafka:** 3 brokers, partition-per-consumer for parallel consumption
+- **Kinetica:** Managed by Verizon infra team — we just call the WMS endpoint
+
+---
+
+## Inter-Service Communication
+
+```
+┌────────────────┐     REST + JWT forwarding     ┌─────────────────────┐
+│ Dashboard      │◄──────────────────────────────►│ Query Execution     │
+│ Service        │                                │ Service             │
+└────────┬───────┘                                └──────────┬──────────┘
+         │                                                   │
+         │  Kafka: dashboard-events                          │  Kafka: audit-events
+         ▼                                                   ▼
+┌────────────────┐     Kafka: report-events      ┌─────────────────────┐
+│ Notification   │◄──────────────────────────────│ Report Service      │
+│ Service        │                                └─────────────────────┘
+└────────────────┘
+         ▲
+         │  Kafka: alert-events, data-refresh-events, cache-events
+         │
+┌────────────────┐                                ┌─────────────────────┐
+│ Map Service    │                                │ Admin Service       │
+│                │  (no direct communication —    │ (Kafka consumer:    │
+│                │   NetworkPolicy enforced)      │  audit-events)      │
+└────────────────┘                                └─────────────────────┘
+```
+
+**Sync (REST):** Service-to-service calls forward the original JWT — no service accounts needed  
+**Async (Kafka):** Events published with `tenantId` + `actorId` in headers; DLT for failures  
+**Network Policy:** K8s NetworkPolicy restricts which services can talk to which (e.g., Map Service cannot call Admin Service directly)

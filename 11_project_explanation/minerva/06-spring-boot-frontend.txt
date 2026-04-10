@@ -1,0 +1,841 @@
+# 06 — Spring Boot & Frontend Patterns
+
+> **What to use this for:** "Show me your Spring Boot setup" / "How does the React frontend work?" / "How do you test?"
+
+---
+
+## Part A: Spring Boot 3 / Java 17
+
+### Project Structure (Per Microservice)
+
+```
+dashboard-service/
+├── src/main/java/com/minerva/dashboard/
+│   ├── DashboardServiceApplication.java
+│   ├── config/
+│   │   ├── SecurityConfig.java           # SecurityFilterChain, JWKS, roles
+│   │   ├── RedisConfig.java              # Redis connection, serialization
+│   │   ├── BigQueryConfig.java           # BigQuery client bean
+│   │   ├── KafkaProducerConfig.java      # Kafka producer settings
+│   │   └── WebConfig.java               # CORS, Jackson, interceptors
+│   ├── controller/
+│   │   ├── DashboardController.java      # REST endpoints
+│   │   └── SqlValidationController.java  # SQL dry-run endpoint
+│   ├── service/
+│   │   ├── DashboardService.java         # Business logic
+│   │   ├── SqlValidationService.java     # SELECT-only parse + BQ dry-run
+│   │   └── ConfigCacheService.java       # Redis config caching
+│   ├── repository/
+│   │   ├── DashboardRepository.java      # Spring Data JPA
+│   │   ├── DashboardFilterRepository.java
+│   │   └── DashboardChartRepository.java
+│   ├── model/
+│   │   ├── entity/                       # JPA entities
+│   │   └── dto/                          # Request/Response DTOs
+│   ├── security/
+│   │   ├── TenantContextFilter.java      # Extract tenant_id → ThreadLocal
+│   │   ├── JwtBlacklistFilter.java       # Redis JWT revocation check
+│   │   └── TenantContext.java            # ThreadLocal holder
+│   ├── kafka/
+│   │   └── DashboardEventProducer.java   # Publish dashboard-events
+│   └── exception/
+│       ├── GlobalExceptionHandler.java   # @ControllerAdvice
+│       └── BusinessException.java
+├── src/main/resources/
+│   ├── application.yml
+│   └── application-prod.yml
+└── src/test/java/
+    ├── controller/                       # @WebMvcTest
+    ├── service/                          # Unit tests with Mockito
+    └── integration/                      # @SpringBootTest + Testcontainers
+```
+
+### Key Dependencies (pom.xml)
+
+```xml
+<parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.2.4</version>
+</parent>
+
+<properties>
+    <java.version>17</java.version>
+</properties>
+
+<dependencies>
+    <!-- Core -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-jpa</artifactId>
+    </dependency>
+
+    <!-- Security -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+    </dependency>
+
+    <!-- Caching -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-redis</artifactId>
+    </dependency>
+
+    <!-- Kafka -->
+    <dependency>
+        <groupId>org.springframework.kafka</groupId>
+        <artifactId>spring-kafka</artifactId>
+    </dependency>
+
+    <!-- BigQuery -->
+    <dependency>
+        <groupId>com.google.cloud</groupId>
+        <artifactId>google-cloud-bigquery</artifactId>
+        <version>2.35.0</version>
+    </dependency>
+
+    <!-- Resilience -->
+    <dependency>
+        <groupId>io.github.resilience4j</groupId>
+        <artifactId>resilience4j-spring-boot3</artifactId>
+        <version>2.2.0</version>
+    </dependency>
+
+    <!-- Observability -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>io.micrometer</groupId>
+        <artifactId>micrometer-registry-prometheus</artifactId>
+    </dependency>
+
+    <!-- Database -->
+    <dependency>
+        <groupId>org.postgresql</groupId>
+        <artifactId>postgresql</artifactId>
+    </dependency>
+
+    <!-- Testing -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-test</artifactId>
+        <scope>test</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>postgresql</artifactId>
+        <scope>test</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>kafka</artifactId>
+        <scope>test</scope>
+    </dependency>
+</dependencies>
+```
+
+### Application Configuration
+
+```yaml
+# application.yml
+spring:
+  application:
+    name: dashboard-service
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:5432/minerva
+    username: ${DB_USER:minerva_app}
+    password: ${DB_PASSWORD}
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 3000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate   # Flyway manages schema, Hibernate only validates
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: 6379
+      cluster:
+        nodes: ${REDIS_CLUSTER_NODES:}
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: https://sso.verizon.com/openam/oauth2/jwks
+          issuer-uri: https://sso.verizon.com/openam/oauth2
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BROKERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      retries: 3
+
+# BigQuery
+bigquery:
+  project-id: ${BQ_PROJECT:minerva-analytics}
+  dataset: ${BQ_DATASET:vz_network_eng}
+  max-bytes-billed: 53687091200  # 50 GB
+  timeout-ms: 60000
+
+# Resilience4j Circuit Breaker
+resilience4j:
+  circuitbreaker:
+    instances:
+      bigquery:
+        failure-rate-threshold: 50
+        minimum-number-of-calls: 5
+        sliding-window-size: 10
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 1
+
+# Actuator
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, prometheus, metrics
+  metrics:
+    tags:
+      application: ${spring.application.name}
+```
+
+### REST Controller Pattern
+
+```java
+@RestController
+@RequestMapping("/api/dashboards")
+@RequiredArgsConstructor
+public class DashboardController {
+
+    private final DashboardService dashboardService;
+
+    @GetMapping
+    public ResponseEntity<List<DashboardSummaryDto>> listDashboards(
+            @AuthenticationPrincipal Jwt jwt) {
+
+        String tenantId = jwt.getClaimAsString("tenant_id");
+        String department = jwt.getClaimAsString("department");
+        List<String> roles = jwt.getClaimAsStringList("roles");
+        int roleLevel = RoleUtils.getHighestLevel(roles);
+
+        List<DashboardSummaryDto> dashboards = dashboardService
+            .listAccessible(tenantId, department, roleLevel);
+
+        return ResponseEntity.ok(dashboards);
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<DashboardConfigDto> getDashboard(
+            @PathVariable String id,
+            @AuthenticationPrincipal Jwt jwt) {
+
+        String tenantId = jwt.getClaimAsString("tenant_id");
+        DashboardConfigDto config = dashboardService.getFullConfig(id, tenantId);
+
+        return ResponseEntity.ok(config);
+    }
+
+    @PostMapping
+    @PreAuthorize("hasAnyRole('CONFIGURATOR', 'TENANT_ADMIN', 'PLATFORM_ADMIN')")
+    public ResponseEntity<DashboardConfigDto> createDashboard(
+            @Valid @RequestBody CreateDashboardRequest request,
+            @AuthenticationPrincipal Jwt jwt) {
+
+        String tenantId = jwt.getClaimAsString("tenant_id");
+        String createdBy = jwt.getSubject();
+
+        DashboardConfigDto created = dashboardService.create(request, tenantId, createdBy);
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(created);
+    }
+}
+```
+
+### Service Layer Pattern (with Caching + Events)
+
+```java
+@Service
+@RequiredArgsConstructor
+@Transactional(readOnly = true)
+public class DashboardService {
+
+    private final DashboardRepository dashboardRepo;
+    private final DashboardFilterRepository filterRepo;
+    private final DashboardChartRepository chartRepo;
+    private final DashboardGridRepository gridRepo;
+    private final DashboardMapLayerRepository mapLayerRepo;
+    private final ConfigCacheService cacheService;
+    private final DashboardEventProducer eventProducer;
+    private final SqlValidationService sqlValidator;
+
+    public DashboardConfigDto getFullConfig(String dashboardId, String tenantId) {
+        // Try cache first
+        Optional<DashboardConfigDto> cached = cacheService.getConfig(dashboardId);
+        if (cached.isPresent()) {
+            return cached.get();
+        }
+
+        // Cache miss — load from DB
+        Dashboard dashboard = dashboardRepo.findByIdAndTenantId(dashboardId, tenantId)
+            .orElseThrow(() -> new NotFoundException("Dashboard not found"));
+
+        List<DashboardFilter> filters = filterRepo.findByDashboardIdOrderByDisplayOrder(dashboardId);
+        List<DashboardChart> charts = chartRepo.findByDashboardIdOrderByDisplayOrder(dashboardId);
+        List<DashboardGrid> grids = gridRepo.findByDashboardIdOrderByDisplayOrder(dashboardId);
+        List<DashboardMapLayer> mapLayers = mapLayerRepo.findByDashboardIdOrderByDisplayOrder(dashboardId);
+
+        DashboardConfigDto config = DashboardConfigDto.builder()
+            .id(dashboard.getId())
+            .name(dashboard.getName())
+            .department(dashboard.getDepartment())
+            .layout(dashboard.getLayoutJson())
+            .filters(filters.stream().map(FilterDto::from).toList())
+            .charts(charts.stream().map(ChartDto::from).toList())
+            .grids(grids.stream().map(GridDto::from).toList())
+            .mapLayers(mapLayers.stream().map(MapLayerDto::from).toList())
+            .build();
+
+        // Cache for next request
+        cacheService.cacheConfig(dashboardId, config);
+
+        return config;
+    }
+
+    @Transactional
+    public DashboardConfigDto create(CreateDashboardRequest request, String tenantId, String createdBy) {
+        // Validate all SQL in the request
+        for (ChartRequest chart : request.getCharts()) {
+            SqlValidationResult result = sqlValidator.validateSql(chart.getDataSql(), tenantId);
+            if (result.isRejected()) {
+                throw new ValidationException("Chart SQL invalid: " + result.getMessage());
+            }
+        }
+
+        // Save all components in one transaction
+        Dashboard dashboard = Dashboard.builder()
+            .id(generateId())
+            .tenantId(tenantId)
+            .name(request.getName())
+            .department(request.getDepartment())
+            .layoutJson(request.getLayout())
+            .createdBy(createdBy)
+            .build();
+
+        dashboardRepo.save(dashboard);
+        // Save filters, charts, grids, map layers...
+
+        // Publish events
+        eventProducer.publishDashboardCreated(dashboard.getId(), tenantId, createdBy);
+
+        return getFullConfig(dashboard.getId(), tenantId);
+    }
+}
+```
+
+### Global Exception Handler
+
+```java
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(NotFoundException.class)
+    public ResponseEntity<ErrorResponse> handleNotFound(NotFoundException ex) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+            .body(new ErrorResponse("NOT_FOUND", ex.getMessage()));
+    }
+
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<ErrorResponse> handleAccessDenied(AccessDeniedException ex) {
+        return ResponseEntity.status(HttpStatus.FORBIDDEN)
+            .body(new ErrorResponse("FORBIDDEN", "You don't have permission for this action"));
+    }
+
+    @ExceptionHandler(ValidationException.class)
+    public ResponseEntity<ErrorResponse> handleValidation(ValidationException ex) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+            .body(new ErrorResponse("VALIDATION_ERROR", ex.getMessage()));
+    }
+
+    @ExceptionHandler(CallNotPermittedException.class) // Resilience4j circuit breaker
+    public ResponseEntity<ErrorResponse> handleCircuitBreaker(CallNotPermittedException ex) {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+            .body(new ErrorResponse("SERVICE_UNAVAILABLE",
+                "Analytics service temporarily unavailable. Please try again in 30 seconds."));
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ErrorResponse> handleGeneral(Exception ex) {
+        log.error("Unhandled exception", ex);
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+            .body(new ErrorResponse("INTERNAL_ERROR", "An unexpected error occurred"));
+    }
+
+    record ErrorResponse(String code, String message) {}
+}
+```
+
+### Testing Strategy
+
+```java
+// ==========================================
+// 1. Controller Test (@WebMvcTest)
+// ==========================================
+@WebMvcTest(DashboardController.class)
+@Import(SecurityConfig.class)
+class DashboardControllerTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @MockBean
+    private DashboardService dashboardService;
+
+    @Test
+    void listDashboards_asAnalyst_returnsFilteredList() throws Exception {
+        // Given
+        Jwt jwt = Jwt.withTokenValue("test-token")
+            .header("alg", "RS256")
+            .claim("tenant_id", "vz-network-eng")
+            .claim("roles", List.of("ANALYST"))
+            .claim("department", "rf-engineering")
+            .build();
+
+        when(dashboardService.listAccessible("vz-network-eng", "rf-engineering", 2))
+            .thenReturn(List.of(
+                new DashboardSummaryDto("dash-rf", "RF Coverage Analysis", "rf-engineering")
+            ));
+
+        // When/Then
+        mockMvc.perform(get("/api/dashboards")
+                .with(jwt().jwt(jwt)))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$[0].name").value("RF Coverage Analysis"));
+    }
+
+    @Test
+    void createDashboard_asViewer_returns403() throws Exception {
+        Jwt jwt = Jwt.withTokenValue("test-token")
+            .header("alg", "RS256")
+            .claim("roles", List.of("VIEWER"))
+            .build();
+
+        mockMvc.perform(post("/api/dashboards")
+                .with(jwt().jwt(jwt))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"name\": \"test\"}"))
+            .andExpect(status().isForbidden());
+    }
+}
+
+// ==========================================
+// 2. Service Test (Mockito)
+// ==========================================
+@ExtendWith(MockitoExtension.class)
+class DashboardServiceTest {
+
+    @Mock private DashboardRepository dashboardRepo;
+    @Mock private ConfigCacheService cacheService;
+    @Mock private SqlValidationService sqlValidator;
+    @InjectMocks private DashboardService dashboardService;
+
+    @Test
+    void getFullConfig_cacheHit_doesNotQueryDb() {
+        DashboardConfigDto cached = DashboardConfigDto.builder().id("dash-1").build();
+        when(cacheService.getConfig("dash-1")).thenReturn(Optional.of(cached));
+
+        DashboardConfigDto result = dashboardService.getFullConfig("dash-1", "vz-net");
+
+        verify(dashboardRepo, never()).findByIdAndTenantId(any(), any());
+        assertEquals("dash-1", result.getId());
+    }
+
+    @Test
+    void create_withInvalidSql_throwsValidation() {
+        when(sqlValidator.validateSql(any(), any()))
+            .thenReturn(SqlValidationResult.rejected("DELETE not allowed"));
+
+        CreateDashboardRequest request = new CreateDashboardRequest();
+        request.setCharts(List.of(new ChartRequest("DELETE FROM table")));
+
+        assertThrows(ValidationException.class,
+            () -> dashboardService.create(request, "vz-net", "user@vz.com"));
+    }
+}
+
+// ==========================================
+// 3. Integration Test (Testcontainers)
+// ==========================================
+@SpringBootTest
+@Testcontainers
+class DashboardIntegrationTest {
+
+    @Container
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:15")
+        .withDatabaseName("minerva_test")
+        .withInitScript("schema.sql");
+
+    @Container
+    static GenericContainer<?> redis = new GenericContainer<>("redis:7")
+        .withExposedPorts(6379);
+
+    @DynamicPropertySource
+    static void configureProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", postgres::getJdbcUrl);
+        registry.add("spring.datasource.username", postgres::getUsername);
+        registry.add("spring.datasource.password", postgres::getPassword);
+        registry.add("spring.data.redis.host", redis::getHost);
+        registry.add("spring.data.redis.port", () -> redis.getMappedPort(6379));
+    }
+
+    @Autowired
+    private DashboardRepository dashboardRepo;
+
+    @Autowired
+    private ConfigCacheService cacheService;
+
+    @Test
+    void fullConfigFlow_saveAndRetrieveWithCache() {
+        // Save dashboard
+        Dashboard dashboard = Dashboard.builder()
+            .id("test-dash")
+            .tenantId("vz-test")
+            .name("Test Dashboard")
+            .build();
+        dashboardRepo.save(dashboard);
+
+        // First call → cache miss → DB query → cache write
+        // Second call → cache hit → no DB query
+        // Verify behavior...
+    }
+}
+```
+
+---
+
+## Part B: React Frontend
+
+### Architecture Overview
+
+```
+React 18 + TypeScript
+├── src/
+│   ├── App.tsx                         # Router, AuthProvider, WebSocketProvider
+│   ├── auth/
+│   │   ├── AuthProvider.tsx            # ForgeRock PKCE flow, token management
+│   │   ├── useAuth.ts                 # Custom hook: login, logout, token refresh
+│   │   └── AxiosInterceptor.ts        # Auto-attach Bearer token, handle 401
+│   ├── components/
+│   │   ├── DashboardRenderer.tsx       # Dynamic renderer — reads config, renders components
+│   │   ├── FilterBar.tsx               # Renders filters from config
+│   │   ├── ChartPanel.tsx              # Highcharts wrapper — renders by chartType
+│   │   ├── DataGrid.tsx                # Server-side paginated grid
+│   │   ├── MapContainer.tsx            # Leaflet + WMS tile layer
+│   │   └── ConfigEditor.tsx            # CONFIGURATOR-only: create/edit dashboards
+│   ├── hooks/
+│   │   ├── useDashboardConfig.ts       # Fetch full config payload
+│   │   ├── useQueryExecution.ts        # Execute configured SQL, handle cache
+│   │   ├── useFilterOptions.ts         # Fetch filter dropdown options
+│   │   ├── useWebSocket.ts            # STOMP connection, subscribe, receive
+│   │   └── useDebounce.ts             # 300ms debounce for filter changes
+│   ├── services/
+│   │   ├── api.ts                     # Axios instance with interceptors
+│   │   └── websocket.ts              # STOMP client setup
+│   └── types/
+│       └── dashboard.ts               # TypeScript interfaces for config payloads
+```
+
+### The Config-Driven Renderer (Core Concept)
+
+```tsx
+// DashboardRenderer.tsx — The heart of the config-driven model
+// This component receives config from the API and dynamically renders the right components
+
+interface DashboardRendererProps {
+  dashboardId: string;
+}
+
+export const DashboardRenderer: React.FC<DashboardRendererProps> = ({ dashboardId }) => {
+  const { config, isLoading } = useDashboardConfig(dashboardId);
+  const [filters, setFilters] = useState<Record<string, any>>({});
+  const debouncedFilters = useDebounce(filters, 300); // 300ms debounce
+
+  if (isLoading) return <Skeleton />;
+
+  return (
+    <div className="dashboard" style={{ display: 'grid', gridTemplateColumns: `repeat(${config.layout.columns}, 1fr)` }}>
+
+      {/* Filters — rendered from config */}
+      <FilterBar
+        filters={config.filters}
+        values={filters}
+        onChange={setFilters}
+      />
+
+      {/* Charts — each rendered by chartType from config */}
+      {config.charts.map(chart => (
+        <ChartPanel
+          key={chart.id}
+          chartConfig={chart}
+          dashboardId={dashboardId}
+          filters={debouncedFilters}
+        />
+      ))}
+
+      {/* Grids — server-side paginated */}
+      {config.grids.map(grid => (
+        <DataGrid
+          key={grid.id}
+          gridConfig={grid}
+          dashboardId={dashboardId}
+          filters={debouncedFilters}
+        />
+      ))}
+
+      {/* Map Layers — Leaflet + WMS tiles */}
+      {config.mapLayers.length > 0 && (
+        <MapContainer
+          layers={config.mapLayers}
+          dashboardId={dashboardId}
+          filters={debouncedFilters}
+        />
+      )}
+    </div>
+  );
+};
+```
+
+### ChartPanel — Dynamic Highcharts Rendering
+
+```tsx
+// Renders ANY chart type based on config — LINE, BAR, PIE, AREA, SCATTER, GAUGE
+export const ChartPanel: React.FC<ChartPanelProps> = ({ chartConfig, dashboardId, filters }) => {
+  const { data, isLoading, error, isStale } = useQueryExecution(
+    dashboardId, chartConfig.id, filters
+  );
+
+  if (isLoading) return <ChartSkeleton />;
+  if (error) return <ErrorBanner message={error} />;
+
+  const highchartsOptions: Highcharts.Options = {
+    chart: { type: chartConfig.chartType.toLowerCase() }, // LINE → line, BAR → bar
+    title: { text: chartConfig.title },
+    xAxis: { categories: data.map(row => row[chartConfig.xAxis]) },
+    series: [{
+      name: chartConfig.yAxis,
+      data: data.map(row => row[chartConfig.yAxis]),
+      color: CHART_COLOR_SCHEMES[chartConfig.colorScheme]?.[0]
+    }]
+  };
+
+  return (
+    <div className="chart-panel">
+      {isStale && <Badge variant="warning">Stale data — service recovering</Badge>}
+      <HighchartsReact highcharts={Highcharts} options={highchartsOptions} />
+    </div>
+  );
+};
+```
+
+### MapContainer — Leaflet + WMS Tiles
+
+```tsx
+// Renders map with Kinetica WMS tile layers
+export const MapContainer: React.FC<MapContainerProps> = ({ layers, dashboardId, filters }) => {
+  return (
+    <LeafletMap center={[39.8, -98.5]} zoom={5} style={{ height: '500px' }}>
+      <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+
+      {layers.map(layer => (
+        <WMSTileLayer
+          key={layer.id}
+          url={`/api/map/wms`}   // Proxied through Map Service (NEVER direct to Kinetica)
+          layers={layer.kineticaTable}
+          format="image/png"
+          transparent={true}
+          opacity={layer.opacity}
+          // Filters passed as query params — Map Service constructs CQL server-side
+          params={{
+            dashboardId,
+            layerId: layer.id,
+            filters: JSON.stringify(filters)
+          }}
+        />
+      ))}
+    </LeafletMap>
+  );
+};
+```
+
+**Key point:** The WMS URL points to `/api/map/wms` (our Map Service), NOT directly to Kinetica. Map Service constructs the CQL_FILTER server-side from the JWT and filters.
+
+### WebSocket Integration
+
+```tsx
+// useWebSocket hook — connects to Notification Service
+export const useWebSocket = (dashboardId: string) => {
+  const { token } = useAuth();
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+
+  useEffect(() => {
+    const client = new Client({
+      brokerURL: `wss://minerva.vz/ws`,
+      connectHeaders: { Authorization: `Bearer ${token}` },
+      onConnect: () => {
+        // Subscribe to dashboard-specific channel
+        client.subscribe(
+          `/topic/tenant/${getTenantId(token)}/dashboard/${dashboardId}`,
+          (message) => {
+            const notification = JSON.parse(message.body);
+            setNotifications(prev => [notification, ...prev]);
+
+            // Auto-refresh dashboard data on data-refresh event
+            if (notification.type === 'DATA_REFRESHED') {
+              queryClient.invalidateQueries(['dashboard', dashboardId]);
+            }
+          },
+          { Authorization: `Bearer ${token}` } // STOMP header for ChannelInterceptor
+        );
+      },
+      onStompError: (frame) => {
+        console.error('WebSocket error:', frame.body);
+      }
+    });
+
+    client.activate();
+    return () => client.deactivate();
+  }, [dashboardId, token]);
+
+  return { notifications };
+};
+```
+
+### Axios Interceptor (Token Management)
+
+```tsx
+// Auto-attach Bearer token, handle 401 with silent refresh
+const api = axios.create({ baseURL: '/api' });
+
+let isRefreshing = false;
+let failedQueue: Array<{ resolve: Function; reject: Function }> = [];
+
+api.interceptors.request.use((config) => {
+  const token = getAccessToken(); // from memory, not localStorage
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+api.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    if (error.response?.status !== 401) throw error;
+
+    if (isRefreshing) {
+      // Queue this request — will retry after refresh completes
+      return new Promise((resolve, reject) => {
+        failedQueue.push({ resolve, reject });
+      }).then((token) => {
+        error.config.headers.Authorization = `Bearer ${token}`;
+        return api(error.config);
+      });
+    }
+
+    isRefreshing = true;
+
+    try {
+      const newToken = await refreshToken(); // POST to ForgeRock /token
+      setAccessToken(newToken);
+
+      // Retry all queued requests with new token
+      failedQueue.forEach(({ resolve }) => resolve(newToken));
+      failedQueue = [];
+
+      error.config.headers.Authorization = `Bearer ${newToken}`;
+      return api(error.config);
+    } catch (refreshError) {
+      failedQueue.forEach(({ reject }) => reject(refreshError));
+      failedQueue = [];
+      logout(); // redirect to ForgeRock login
+      throw refreshError;
+    } finally {
+      isRefreshing = false;
+    }
+  }
+);
+```
+
+### Role-Based UI Rendering
+
+```tsx
+// RoleGuard component — renders children only if user has required role
+export const RoleGuard: React.FC<{ minRole: RoleLevel; children: ReactNode }> = ({
+  minRole, children
+}) => {
+  const { roles } = useAuth();
+  const userLevel = getHighestRoleLevel(roles);
+
+  if (userLevel < minRole) return null;
+  return <>{children}</>;
+};
+
+// Usage in sidebar
+<nav>
+  <NavLink to="/dashboards">Dashboards</NavLink>
+
+  <RoleGuard minRole={RoleLevel.ANALYST}>
+    <NavLink to="/reports">Reports & Exports</NavLink>
+  </RoleGuard>
+
+  <RoleGuard minRole={RoleLevel.CONFIGURATOR}>
+    <NavLink to="/config-editor">Dashboard Builder</NavLink>
+  </RoleGuard>
+
+  <RoleGuard minRole={RoleLevel.TENANT_ADMIN}>
+    <NavLink to="/user-management">User Management</NavLink>
+  </RoleGuard>
+
+  <RoleGuard minRole={RoleLevel.PLATFORM_ADMIN}>
+    <NavLink to="/admin">Admin Console</NavLink>
+  </RoleGuard>
+</nav>
+```
+
+**Important:** UI role gating is **convenience only** — the real enforcement is server-side in Spring Security. Even if someone hacks the React bundle to show admin links, the API calls would be blocked by `@PreAuthorize` and `SecurityFilterChain`.
+
+---
+
+## Q&A Bank (Spring Boot + Frontend)
+
+**Q: "How do you handle database migrations?"**
+> "Flyway. Every schema change is a versioned migration file (`V1__create_dashboards.sql`, `V2__add_alert_configs.sql`). Runs automatically on startup. Hibernate is set to `ddl-auto: validate` — it verifies the schema matches entities but never modifies the DB. This gives us repeatable, versioned schema evolution."
+
+**Q: "How do you handle configuration across environments?"**
+> "Spring profiles (`application-dev.yml`, `application-prod.yml`) for per-environment config. Secrets (DB passwords, API keys) are Kubernetes Secrets mounted as environment variables. The application.yml uses `${ENV_VAR:default}` syntax — defaults for local dev, overrides in K8s."
+
+**Q: "Why React and not Angular or Vue?"**
+> "Team familiarity and the React ecosystem. Highcharts has official React bindings. React-Leaflet gives us declarative map components. React Query (TanStack Query) handles our server state beautifully — auto-refetch, cache invalidation, optimistic updates. Plus, the hooks pattern maps naturally to our custom hooks for config loading and query execution."
+
+**Q: "How do you prevent XSS?"**
+> "React automatically escapes rendered content (JSX). We store tokens in memory (not localStorage). CSP headers restrict script sources. The only user-generated content is dashboard names/descriptions, which are always escaped on render."
+
+**Q: "What about accessibility?"**
+> "Highcharts has built-in accessibility features (screen reader descriptions for charts). Our DataGrid uses semantic HTML tables with ARIA attributes. Filter dropdowns use headless UI components from Radix for keyboard navigation."

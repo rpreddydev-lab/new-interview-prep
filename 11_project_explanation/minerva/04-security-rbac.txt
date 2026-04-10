@@ -1,0 +1,499 @@
+# 04 — Security & RBAC Deep Dive
+
+> **What to use this for:** "How did you handle security?" / "Walk me through your auth flow" / "How does RBAC work?"
+
+---
+
+## Authentication: ForgeRock SSO (Verizon's Enterprise IdP)
+
+### Why ForgeRock?
+- Verizon's enterprise standard — every internal app uses it (SSO across 50+ tools)
+- We don't own identity management — ForgeRock team manages user provisioning, MFA, password policies
+- Compliance: FedRAMP-aligned, SOC 2, Verizon's security team audits ForgeRock, not us
+
+### Protocol Stack
+```
+┌───────────────────────────────────────────────────────┐
+│                    OIDC (Identity)                      │
+│  id_token with user claims (name, email, roles)        │
+├───────────────────────────────────────────────────────┤
+│                    OAuth 2.0 (Authorization)            │
+│  Authorization Code + PKCE (public SPA client)         │
+├───────────────────────────────────────────────────────┤
+│                    RS256 JWT (Token Format)             │
+│  Asymmetric signing — ForgeRock holds private key,     │
+│  we validate with public key from JWKS endpoint        │
+└───────────────────────────────────────────────────────┘
+```
+
+### Q: "Why PKCE? Why not just Authorization Code?"
+
+> "Because our React SPA is a **public client** — it runs in the user's browser and can't securely store a client_secret. Without PKCE, an attacker who intercepts the authorization code could exchange it for tokens. PKCE adds a `code_verifier` / `code_challenge` pair that proves the token request came from the same client that initiated the login. It's the OAuth 2.1 recommendation for all SPAs."
+
+### Q: "Why RS256? Why not HS256?"
+
+> "RS256 uses asymmetric keys — ForgeRock signs with a private key, and all 6 of our microservices validate with the public key from the JWKS endpoint. With HS256, every service would need the shared secret, which is a single point of compromise. RS256 means our services never possess the signing key."
+
+### Q: "How do you avoid calling ForgeRock on every API request?"
+
+> "We cache the JWKS public keys at startup and refresh every 5 minutes. JWT validation is 100% local — parse token, check signature against cached public key, verify `exp`, `iss`, `aud`. That's ~1ms per request, zero network calls."
+
+---
+
+## JWT Anatomy (What ForgeRock Issues)
+
+```json
+// HEADER
+{
+  "alg": "RS256",
+  "kid": "forgerock-key-2025-03"
+}
+
+// PAYLOAD
+{
+  "sub": "john.smith@verizon.com",
+  "iss": "https://sso.verizon.com/openam/oauth2",
+  "aud": "minerva-spa",
+  "exp": 1712700000,
+  "iat": 1712696400,
+  "jti": "unique-token-id-uuid",
+  "tenant_id": "vz-network-eng",
+  "roles": ["ANALYST"],
+  "department": "rf-engineering",
+  "name": "John Smith",
+  "email": "john.smith@verizon.com"
+}
+
+// SIGNATURE
+RS256(header + "." + payload, ForgeRock_private_key)
+```
+
+**Custom claims we requested from ForgeRock:**
+- `tenant_id` — multi-tenant isolation (all queries scoped by this)
+- `roles` — array, supports multiple roles per user
+- `department` — used for dashboard visibility scoping
+
+---
+
+## The 5 RBAC Roles
+
+### Role Hierarchy
+```
+PLATFORM_ADMIN (Level 5)
+    └── TENANT_ADMIN (Level 4)
+            └── CONFIGURATOR (Level 3)
+                    └── ANALYST (Level 2)
+                            └── VIEWER (Level 1)
+```
+
+Higher levels inherit all permissions of lower levels.
+
+### Full Permission Matrix
+
+| Permission | VIEWER | ANALYST | CONFIGURATOR | TENANT_ADMIN | PLATFORM_ADMIN |
+|-----------|--------|---------|-------------|-------------|----------------|
+| View dashboards | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Apply filters | ✅ | ✅ | ✅ | ✅ | ✅ |
+| View map layers | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Export data (CSV/Excel) | ❌ | ✅ | ✅ | ✅ | ✅ |
+| Run ad-hoc reports | ❌ | ✅ | ✅ | ✅ | ✅ |
+| Create/edit dashboards | ❌ | ❌ | ✅ | ✅ | ✅ |
+| Configure filters/charts | ❌ | ❌ | ✅ | ✅ | ✅ |
+| Configure alerts | ❌ | ❌ | ✅ | ✅ | ✅ |
+| Schedule reports | ❌ | ❌ | ✅ | ✅ | ✅ |
+| Manage users in tenant | ❌ | ❌ | ❌ | ✅ | ✅ |
+| Assign roles | ❌ | ❌ | ❌ | ✅ | ✅ |
+| View audit trail | ❌ | ❌ | ❌ | ✅ | ✅ |
+| Create/manage tenants | ❌ | ❌ | ❌ | ❌ | ✅ |
+| DLT viewer | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Cost dashboard | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Cache management | ❌ | ❌ | ❌ | ❌ | ✅ |
+
+### Verizon Job Title → Role Mapping
+
+| Verizon Title | Department | Role | Why |
+|--------------|------------|------|-----|
+| RF Engineer | RF Engineering | ANALYST | Analyzes coverage data, exports for field tools |
+| Senior RF Engineer | RF Engineering | ANALYST | Same as RF Engineer (seniority ≠ more Minerva permissions) |
+| Traffic Engineer | Network Planning | ANALYST | Traffic/capacity analysis, ad-hoc reports |
+| NOC Analyst | Network Operations | ANALYST | Real-time monitoring dashboards, alert response |
+| Performance Engineer | Performance | ANALYST | SLA compliance reports, trend analysis |
+| Analytics Lead | Cross-department | CONFIGURATOR | Creates dashboards for their team |
+| Senior Network Engineer | Cross-department | CONFIGURATOR | Configures advanced analytics dashboards |
+| Team Lead | Cross-department | CONFIGURATOR | Manages team's dashboard configurations |
+| IT Ops Manager | IT Operations | TENANT_ADMIN | User provisioning, role assignment |
+| Director | Executive | VIEWER | Read-only executive dashboards |
+| Senior Director | Executive | VIEWER | Read-only executive dashboards |
+| VP | Executive | VIEWER | Read-only executive dashboards |
+| SVP | Executive | VIEWER | Read-only executive dashboards |
+| Minerva Dev Team | Platform | PLATFORM_ADMIN | Us — full platform access |
+
+**Q: "Why are VPs VIEWER and not ANALYST?"**
+
+> "By design. Executives need to see the data but should never export raw network data to their laptops. VIEWER role gives them dashboard access with zero export capability. If they need a specific report, they ask their Performance Engineer to schedule one through Minerva. This also satisfies Verizon's data handling policies — network performance data is classified as sensitive."
+
+---
+
+## Spring Security Implementation
+
+### SecurityFilterChain (Each Microservice)
+
+```java
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable()) // SPA uses Bearer tokens, not cookies
+            .sessionManagement(session ->
+                session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(jwt -> jwt
+                    .jwkSetUri("https://sso.verizon.com/openam/oauth2/jwks")
+                    .jwtAuthenticationConverter(jwtAuthenticationConverter())
+                ))
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/actuator/health").permitAll()
+                .requestMatchers("/api/admin/tenants/*/users/**").hasAnyRole("TENANT_ADMIN", "PLATFORM_ADMIN")
+                .requestMatchers("/api/admin/tenants/**").hasRole("PLATFORM_ADMIN")
+                .requestMatchers("/api/admin/dlt/**").hasRole("PLATFORM_ADMIN")
+                .requestMatchers("/api/admin/cost/**").hasRole("PLATFORM_ADMIN")
+                .requestMatchers(HttpMethod.POST, "/api/dashboards/**").hasAnyRole("CONFIGURATOR", "TENANT_ADMIN", "PLATFORM_ADMIN")
+                .requestMatchers(HttpMethod.PUT, "/api/dashboards/**").hasAnyRole("CONFIGURATOR", "TENANT_ADMIN", "PLATFORM_ADMIN")
+                .requestMatchers(HttpMethod.DELETE, "/api/dashboards/**").hasAnyRole("CONFIGURATOR", "TENANT_ADMIN", "PLATFORM_ADMIN")
+                .requestMatchers("/api/reports/generate").hasAnyRole("ANALYST", "CONFIGURATOR", "TENANT_ADMIN", "PLATFORM_ADMIN")
+                .requestMatchers(HttpMethod.GET, "/api/**").authenticated()
+                .anyRequest().denyAll()
+            )
+            .addFilterBefore(tenantContextFilter, BearerTokenAuthenticationFilter.class)
+            .addFilterBefore(jwtBlacklistFilter, BearerTokenAuthenticationFilter.class);
+
+        return http.build();
+    }
+
+    private JwtAuthenticationConverter jwtAuthenticationConverter() {
+        JwtGrantedAuthoritiesConverter authoritiesConverter = new JwtGrantedAuthoritiesConverter();
+        // ForgeRock puts roles in "roles" claim, not "scope"
+        authoritiesConverter.setAuthoritiesClaimName("roles");
+        authoritiesConverter.setAuthorityPrefix("ROLE_");
+
+        JwtAuthenticationConverter converter = new JwtAuthenticationConverter();
+        converter.setJwtGrantedAuthoritiesConverter(authoritiesConverter);
+        return converter;
+    }
+}
+```
+
+### Filter Chain Order (7 Steps)
+
+```
+Request → ① CORS → ② JwtBlacklistFilter → ③ BearerTokenAuthenticationFilter
+                                                       │
+                                               ④ JwtDecoder (RS256 + JWKS)
+                                                       │
+                                               ⑤ JwtAuthenticationConverter
+                                                 (roles[] → ROLE_ANALYST etc.)
+                                                       │
+                                               ⑥ TenantContextFilter
+                                                 (extract tenant_id → ThreadLocal)
+                                                       │
+                                               ⑦ AuthorizationFilter
+                                                 (URL pattern → role check)
+                                                       │
+                                                   Controller
+```
+
+### TenantContextFilter (Multi-Tenant Isolation)
+
+```java
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE + 10)
+public class TenantContextFilter extends OncePerRequestFilter {
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                     HttpServletResponse response,
+                                     FilterChain chain) throws ServletException, IOException {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+
+        if (auth instanceof JwtAuthenticationToken jwtAuth) {
+            String tenantId = jwtAuth.getToken().getClaimAsString("tenant_id");
+
+            if (tenantId == null || tenantId.isBlank()) {
+                response.sendError(HttpServletResponse.SC_FORBIDDEN, "Missing tenant_id claim");
+                return;
+            }
+
+            TenantContext.setTenantId(tenantId);
+        }
+
+        try {
+            chain.doFilter(request, response);
+        } finally {
+            TenantContext.clear(); // prevent ThreadLocal leak
+        }
+    }
+}
+
+// ThreadLocal holder
+public class TenantContext {
+    private static final ThreadLocal<String> TENANT = new ThreadLocal<>();
+
+    public static void setTenantId(String tenantId) { TENANT.set(tenantId); }
+    public static String getTenantId() { return TENANT.get(); }
+    public static void clear() { TENANT.remove(); }
+}
+```
+
+### JwtBlacklistFilter (Token Revocation)
+
+```java
+@Component
+public class JwtBlacklistFilter extends OncePerRequestFilter {
+
+    private final RedisTemplate<String, String> redisTemplate;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                     HttpServletResponse response,
+                                     FilterChain chain) throws ServletException, IOException {
+        String token = extractBearerToken(request);
+
+        if (token != null) {
+            String jti = extractJti(token); // JWT ID claim
+            Boolean isBlacklisted = redisTemplate.hasKey("jwt:blacklist:" + jti);
+
+            if (Boolean.TRUE.equals(isBlacklisted)) {
+                response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Token has been revoked");
+                return;
+            }
+        }
+
+        chain.doFilter(request, response);
+    }
+
+    // Called when ForgeRock revokes a token (e.g., admin disables user)
+    public void blacklistToken(String jti, long expSeconds) {
+        redisTemplate.opsForValue().set(
+            "jwt:blacklist:" + jti,
+            "revoked",
+            Duration.ofSeconds(expSeconds) // TTL = token's remaining lifetime
+        );
+    }
+}
+```
+
+**Q: "Why a blacklist? JWTs are stateless."**
+
+> "They are, and that's the problem. If ForgeRock revokes a user's access (e.g., employee termination), their JWT is still valid until expiry (60 minutes). The blacklist in Redis gives us immediate revocation capability. It's a small trade-off — one Redis lookup per request (~0.5ms) — for the ability to instantly cut off access. The TTL on the Redis key matches the JWT's remaining lifetime, so it self-cleans."
+
+---
+
+## Data-Level Security (Not Just API-Level)
+
+### Tenant Isolation at Every Layer
+
+```
+API Layer:        SecurityFilterChain → role check → TenantContextFilter
+                                                          │
+                                                    tenant_id in ThreadLocal
+                                                          │
+Service Layer:    Every repository query includes WHERE tenant_id = :tenantId
+                                                          │
+Database Layer:   PostgreSQL RLS (Row-Level Security) as defense-in-depth
+                  BigQuery: dataset-level IAM (tenant's data in separate dataset)
+                  Redis: key prefix includes tenant_id
+```
+
+### PostgreSQL Row-Level Security (Defense-in-Depth)
+
+```sql
+-- Even if service code has a bug and forgets tenant_id filter,
+-- RLS ensures cross-tenant data can't leak
+ALTER TABLE dashboards ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON dashboards
+    USING (tenant_id = current_setting('app.tenant_id'));
+
+-- Set at connection level by TenantAwareDataSource
+SET app.tenant_id = 'vz-network-eng';
+```
+
+### BigQuery Tenant Isolation
+
+```
+BigQuery Project: minerva-analytics
+├── Dataset: vz_network_eng    ← Verizon Network Engineering
+│   ├── coverage_data
+│   ├── network_kpis_daily
+│   └── traffic_hourly
+├── Dataset: vz_wireless_ops   ← (if we had another tenant)
+│   ├── coverage_data
+│   └── ...
+```
+
+- Each tenant's data is in a separate BigQuery dataset
+- Service account IRSA has IAM permissions scoped to specific datasets
+- Even if SQL is manipulated, BigQuery IAM blocks cross-dataset access
+
+---
+
+## Inter-Service Authentication
+
+### JWT Forwarding (Service-to-Service)
+
+```java
+// When Query Execution Service calls Dashboard Service to get chart config
+@Component
+public class JwtForwardingInterceptor implements ClientHttpRequestInterceptor {
+
+    @Override
+    public ClientHttpResponse intercept(HttpRequest request, byte[] body,
+                                         ClientHttpRequestExecution execution) throws IOException {
+        // Get the current user's JWT from SecurityContext
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth instanceof JwtAuthenticationToken jwtAuth) {
+            request.getHeaders().setBearerAuth(jwtAuth.getToken().getTokenValue());
+        }
+        return execution.execute(request, body);
+    }
+}
+
+// Register with RestTemplate
+@Bean
+public RestTemplate serviceRestTemplate() {
+    RestTemplate template = new RestTemplate();
+    template.getInterceptors().add(new JwtForwardingInterceptor());
+    return template;
+}
+```
+
+**Why forward the user's JWT instead of service accounts?**
+- Maintains the user identity chain → downstream service can log WHO requested the data
+- No separate service account credentials to manage/rotate
+- Downstream service enforces the same RBAC — no privilege escalation
+
+### K8s NetworkPolicy (Network-Level Defense)
+
+```yaml
+# Only Query Execution Service can call Dashboard Service
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dashboard-service-ingress
+  namespace: minerva
+spec:
+  podSelector:
+    matchLabels:
+      app: dashboard-service
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: query-execution-service
+        - podSelector:
+            matchLabels:
+              app: report-service
+      ports:
+        - protocol: TCP
+          port: 8080
+```
+
+---
+
+## WebSocket Security
+
+### Problem
+WebSocket `upgrade` request carries the JWT, but subsequent STOMP frames don't have standard HTTP headers. How do we authenticate subscriptions?
+
+### Solution: STOMP ChannelInterceptor
+
+```java
+@Configuration
+@EnableWebSocketMessageBroker
+public class WebSocketSecurityConfig implements WebSocketMessageBrokerConfigurer {
+
+    @Override
+    public void configureClientInboundChannel(ChannelRegistration registration) {
+        registration.interceptors(new StompAuthInterceptor(jwtValidator, accessService));
+    }
+}
+
+// Validates every SUBSCRIBE frame
+public class StompAuthInterceptor implements ChannelInterceptor {
+
+    @Override
+    public Message<?> preSend(Message<?> message, MessageChannel channel) {
+        StompHeaderAccessor accessor = StompHeaderAccessor.wrap(message);
+
+        if (StompCommand.CONNECT.equals(accessor.getCommand())) {
+            // Validate JWT on initial connect
+            String token = accessor.getFirstNativeHeader("Authorization");
+            Claims claims = jwtValidator.validate(token.replace("Bearer ", ""));
+            accessor.setUser(new JwtPrincipal(claims));
+        }
+
+        if (StompCommand.SUBSCRIBE.equals(accessor.getCommand())) {
+            String destination = accessor.getDestination();
+            JwtPrincipal principal = (JwtPrincipal) accessor.getUser();
+
+            // e.g., /topic/tenant/vz-network-eng/dashboard/dash-rf
+            String channelTenant = extractTenant(destination);
+            String dashboardId = extractDashboardId(destination);
+
+            // Tenant check
+            if (!principal.getTenantId().equals(channelTenant)) {
+                throw new AccessDeniedException("Cross-tenant subscription blocked");
+            }
+
+            // Dashboard access check
+            if (dashboardId != null && !accessService.canView(dashboardId, principal)) {
+                throw new AccessDeniedException("No access to this dashboard's notifications");
+            }
+        }
+
+        return message;
+    }
+}
+```
+
+---
+
+## Security Checklist (Interview-Ready)
+
+| Threat | Mitigation | Layer |
+|--------|-----------|-------|
+| **XSS token theft** | Tokens in memory (not localStorage), HttpOnly refresh cookie option | Frontend |
+| **CSRF** | Disabled — we use Bearer tokens, not cookies for auth | API |
+| **SQL Injection** | Parameterized queries (BigQuery `@param`), SELECT-only validation | Query Execution |
+| **Cross-tenant data leak** | TenantContext ThreadLocal + PG RLS + BQ dataset IAM | Every layer |
+| **Privilege escalation** | Server-side role check (not frontend), URL pattern + method level | Spring Security |
+| **Token replay** | JWT expiry (60 min) + Redis blacklist for immediate revocation | All services |
+| **CQL injection (maps)** | Server-side CQL_FILTER construction, never from browser | Map Service |
+| **WebSocket sniffing** | TLS (wss://), STOMP ChannelInterceptor validates tenant/role | Notification |
+| **Service-to-service spoofing** | JWT forwarding + K8s NetworkPolicy | Network |
+| **BigQuery cost attack** | maximumBytesBilled cap + rate limiting + scan estimate warnings | Query Execution |
+| **Report abuse** | 500K row cap, 60s timeout, VIEWER can't export | Report Service |
+| **Audit evasion** | All actions → Kafka audit-events → immutable audit trail | Admin Service |
+| **DLT poison messages** | Isolated DLT topics, PLATFORM_ADMIN-only DLT viewer | Kafka |
+
+---
+
+## Q&A Bank (Security-Focused)
+
+**Q: "How do you handle user offboarding?"**
+> "ForgeRock handles the identity lifecycle. When IT disables a user in ForgeRock, their JWT is no longer refreshable. For immediate revocation, we add the JWT's `jti` to our Redis blacklist. The token is blocked within seconds across all 6 services."
+
+**Q: "What if someone modifies the JWT claims (changes their role to PLATFORM_ADMIN)?"**
+> "RS256 prevents this. The JWT is signed with ForgeRock's private key, which we don't have. Any modification invalidates the signature. Our JWKS-based validation catches this instantly."
+
+**Q: "How do you prevent a CONFIGURATOR from writing SQL that exfiltrates data?"**
+> "Three layers: (1) SQL parser rejects anything that's not SELECT, (2) BigQuery dry-run validates column existence and syntax, (3) all queries are parameterized — the SQL template uses `${filter_name}` placeholders that are bound to approved filter values at execution time, not string-concatenated."
+
+**Q: "Can a user see another tenant's dashboards?"**
+> "No, enforced at 3 levels: (1) TenantContextFilter extracts `tenant_id` from JWT and stores in ThreadLocal, (2) every repository query includes `WHERE tenant_id = :tenantId`, (3) PostgreSQL RLS as defense-in-depth blocks cross-tenant queries even if our service code has a bug."
+
+**Q: "Why not use OAuth2 scopes instead of custom role claims?"**
+> "Scopes in OAuth2 are typically coarse-grained (e.g., `read`, `write`). Our 5-role hierarchy with department-based dashboard visibility is more granular than what scopes naturally express. Custom claims in the JWT give us exactly what we need — `roles[]` and `department` — without overloading the scope mechanism."

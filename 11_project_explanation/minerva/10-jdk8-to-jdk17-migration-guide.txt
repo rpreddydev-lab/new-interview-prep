@@ -1,0 +1,1242 @@
+# 10 — JDK 8 + Spring Boot 2.x → JDK 17 + Spring Boot 3.x Migration Guide
+
+> **What to use this for:** "How would you migrate legacy microservices to modern Java?" / "Walk me through a JDK/Spring Boot upgrade strategy" / "What breaks when you move to Java 17?"
+
+---
+
+## Migration Summary
+
+```
+┌──────────────────────────────┐         ┌──────────────────────────────┐
+│         BEFORE               │         │         AFTER                │
+│                              │         │                              │
+│  JDK 8 (LTS — EOL Jan 2030) │  ────►  │  JDK 17 (LTS — EOL Sep 2029)│
+│  Spring Boot 2.7.x           │         │  Spring Boot 3.2.x           │
+│  Java EE (javax.*)           │         │  Jakarta EE 10 (jakarta.*)   │
+│  Spring Security 5.x         │         │  Spring Security 6.x         │
+│  Hibernate 5.x               │         │  Hibernate 6.x               │
+│  JUnit 4 (possibly mixed)    │         │  JUnit 5 (Jupiter)           │
+│  Legacy XML config (maybe)   │         │  Java config + Boot starters │
+└──────────────────────────────┘         └──────────────────────────────┘
+```
+
+**Why JDK 17 and not JDK 21?**
+> JDK 17 is the baseline requirement for Spring Boot 3.x. JDK 21 (the next LTS) is also supported, but 17 is the safest upgrade target — widest library compatibility, longest proven track record, and still under active support until Sep 2029.
+
+**Why Spring Boot 3.2.x?**
+> Spring Boot 3.0 introduced the Jakarta EE namespace migration (the biggest breaking change). 3.2.x is a mature patch line with strong community support and all the critical bug fixes from the 3.0/3.1 wave.
+
+---
+
+## Phase 0: Pre-Migration Assessment (Before Writing Any Code)
+
+### 0.1 — Inventory All Microservices
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Service Name         │ Spring Boot │ JDK │ Key Deps      │
+├──────────────────────┼─────────────┼─────┼───────────────┤
+│ dashboard-service    │ 2.7.18      │ 8   │ JPA, Kafka    │
+│ query-exec-service   │ 2.7.18      │ 8   │ BigQuery, Redis│
+│ report-service       │ 2.7.18      │ 8   │ Quartz, S3    │
+│ map-service          │ 2.7.18      │ 8   │ HTTP client   │
+│ notification-service │ 2.7.18      │ 8   │ WebSocket, Kafka│
+│ admin-service        │ 2.7.18      │ 8   │ JPA, Kafka    │
+└──────────────────────┴─────────────┴─────┴───────────────┘
+```
+
+### 0.2 — Dependency Compatibility Check
+
+Before migrating, verify every dependency supports Jakarta EE 10 + JDK 17:
+
+```bash
+# Generate full dependency tree per service
+./mvnw dependency:tree -pl dashboard-service > dashboard-deps.txt
+
+# Check for javax.* usage across all source code
+grep -rn "import javax\." --include="*.java" src/
+# Exclude javax.crypto, javax.net.ssl (these are JDK packages, NOT Jakarta EE)
+grep -rn "import javax\." --include="*.java" src/ | grep -v "javax.crypto" | grep -v "javax.net.ssl" | grep -v "javax.security"
+```
+
+**Key libraries to check:**
+
+| Library | JDK 8 Version | JDK 17 + Spring Boot 3 Version | Breaking Changes? |
+|---------|--------------|-------------------------------|-------------------|
+| Spring Boot | 2.7.x | 3.2.x | ✅ Major (Jakarta, Security) |
+| Spring Security | 5.8.x | 6.2.x | ✅ Major (API rewrites) |
+| Hibernate / JPA | 5.6.x | 6.4.x | ✅ Moderate (jakarta.persistence) |
+| Spring Kafka | 2.9.x | 3.1.x | ⚠️ Minor (config changes) |
+| Resilience4j | 1.7.x | 2.2.x | ⚠️ Minor (module names) |
+| Lombok | 1.18.x | 1.18.30+ | ✅ Needs update for JDK 17 |
+| MapStruct | 1.5.x | 1.5.5+ | ❌ No changes |
+| Flyway | 8.x | 9.x / 10.x | ⚠️ Config property changes |
+| Testcontainers | 1.17.x | 1.19.x | ❌ Minimal |
+| Jackson | 2.14.x | 2.16.x | ❌ Minimal |
+| Micrometer | 1.10.x | 1.12.x | ⚠️ Observation API changes |
+| google-cloud-bigquery | 2.20.x | 2.35.x | ❌ Minimal |
+| Swagger/Springfox | 3.0.x | ❌ Dead | 🔄 Replace with SpringDoc 2.x |
+
+### 0.3 — Establish Baseline
+
+Before touching ANY code:
+
+```bash
+# 1. Ensure all tests pass on the CURRENT stack
+./mvnw verify -pl <service-module>
+
+# 2. Record test count & coverage
+./mvnw jacoco:report -pl <service-module>
+# Note: X tests, Y% coverage
+
+# 3. Tag the current state in git
+git tag pre-migration-baseline
+
+# 4. Create a migration branch
+git checkout -b feature/jdk17-spring-boot3-migration
+```
+
+---
+
+## Phase 1: JDK 8 → JDK 17 (Without Changing Spring Boot Yet)
+
+**Strategy:** Upgrade the JDK first on the CURRENT Spring Boot 2.7.x. This isolates JDK-related breaks from Spring Boot breaks.
+
+### 1.1 — Update Build Configuration
+
+**pom.xml (Parent POM or per-service):**
+
+```xml
+<!-- BEFORE -->
+<properties>
+    <java.version>1.8</java.version>
+    <!-- or -->
+    <java.version>8</java.version>
+    <maven.compiler.source>1.8</maven.compiler.source>
+    <maven.compiler.target>1.8</maven.compiler.target>
+</properties>
+
+<!-- AFTER -->
+<properties>
+    <java.version>17</java.version>
+    <maven.compiler.source>17</maven.compiler.source>
+    <maven.compiler.target>17</maven.compiler.target>
+</properties>
+```
+
+### 1.2 — Fix JDK 17 Compilation Issues
+
+#### Issue 1: Removed Java EE Modules from JDK
+
+JDK 11 removed `java.xml.bind`, `java.activation`, `java.xml.ws`, `java.corba` from the JDK. If any service used JAXB (XML binding), you need explicit dependencies:
+
+```xml
+<!-- Add these if you used JAXB (common in SOAP clients or XML config) -->
+<dependency>
+    <groupId>jakarta.xml.bind</groupId>
+    <artifactId>jakarta.xml.bind-api</artifactId>
+    <version>4.0.1</version>
+</dependency>
+<dependency>
+    <groupId>org.glassfish.jaxb</groupId>
+    <artifactId>jaxb-runtime</artifactId>
+    <version>4.0.4</version>
+</dependency>
+
+<!-- If you used javax.annotation.Generated, javax.annotation.PostConstruct -->
+<dependency>
+    <groupId>jakarta.annotation</groupId>
+    <artifactId>jakarta.annotation-api</artifactId>
+    <version>2.1.1</version>
+</dependency>
+```
+
+#### Issue 2: Strong Encapsulation (The Biggest JDK 17 Issue)
+
+JDK 17 enforces strong encapsulation of internal APIs. Code that uses `sun.misc.*`, `com.sun.*`, or relies on reflective access to JDK internals will FAIL at runtime.
+
+**Common symptoms:**
+```
+java.lang.reflect.InaccessibleObjectException:
+  Unable to make field private final byte[] java.lang.String.value accessible:
+  module java.base does not "opens java.lang" to unnamed module
+```
+
+**Fix for libraries that need deep reflection (Hibernate, Spring, serialization):**
+
+```dockerfile
+# In Dockerfile or startup script — add JVM args:
+ENTRYPOINT ["java", \
+    "--add-opens", "java.base/java.lang=ALL-UNNAMED", \
+    "--add-opens", "java.base/java.lang.reflect=ALL-UNNAMED", \
+    "--add-opens", "java.base/java.util=ALL-UNNAMED", \
+    "--add-opens", "java.base/java.time=ALL-UNNAMED", \
+    "-jar", "app.jar"]
+```
+
+**Or in Maven Surefire (for tests):**
+```xml
+<plugin>
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-surefire-plugin</artifactId>
+    <configuration>
+        <argLine>
+            --add-opens java.base/java.lang=ALL-UNNAMED
+            --add-opens java.base/java.lang.reflect=ALL-UNNAMED
+            --add-opens java.base/java.util=ALL-UNNAMED
+        </argLine>
+    </configuration>
+</plugin>
+```
+
+> **Goal:** Minimize `--add-opens` flags. Each one is a debt. Libraries like Hibernate 6 and Spring 6 don't need them — the older versions do. These flags are a bridge during the transition.
+
+#### Issue 3: Nashorn JavaScript Engine Removed
+
+If any service used `ScriptEngine` with Nashorn (JDK's built-in JavaScript engine, removed in JDK 15):
+
+```java
+// BEFORE (JDK 8)
+ScriptEngine engine = new ScriptEngineManager().getEngineByName("nashorn");
+
+// AFTER (JDK 17) — add dependency + use GraalJS or standalone Nashorn
+// Option 1: Standalone Nashorn
+<dependency>
+    <groupId>org.openjdk.nashorn</groupId>
+    <artifactId>nashorn-core</artifactId>
+    <version>15.4</version>
+</dependency>
+```
+
+#### Issue 4: Lombok Version Update
+
+Lombok < 1.18.22 doesn't support JDK 17:
+
+```xml
+<dependency>
+    <groupId>org.projectlombok</groupId>
+    <artifactId>lombok</artifactId>
+    <version>1.18.30</version> <!-- Must be 1.18.22+ for JDK 17 -->
+    <scope>provided</scope>
+</dependency>
+```
+
+### 1.3 — Verify JDK 17 on Spring Boot 2.7.x
+
+```bash
+# Build and test with JDK 17 + Spring Boot 2.7.x
+JAVA_HOME=/path/to/jdk-17 ./mvnw clean verify
+
+# Run the service locally, smoke test key APIs
+JAVA_HOME=/path/to/jdk-17 ./mvnw spring-boot:run -pl dashboard-service
+```
+
+**Checkpoint:** All tests pass on JDK 17 with Spring Boot 2.7.x. Commit this state.
+
+```bash
+git add -A
+git commit -m "chore: upgrade to JDK 17 (still on Spring Boot 2.7.x)"
+```
+
+---
+
+## Phase 2: Spring Boot 2.7.x → 3.2.x (The Big Migration)
+
+### 2.1 — Update Parent POM
+
+```xml
+<!-- BEFORE -->
+<parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>2.7.18</version>
+</parent>
+
+<!-- AFTER -->
+<parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.2.4</version>
+</parent>
+```
+
+### 2.2 — The javax → jakarta Namespace Migration (BIGGEST Change)
+
+**This is the single largest breaking change.** Every `javax.*` EE import becomes `jakarta.*`.
+
+```
+javax.persistence.*      →  jakarta.persistence.*
+javax.servlet.*          →  jakarta.servlet.*
+javax.validation.*       →  jakarta.validation.*
+javax.annotation.*       →  jakarta.annotation.*
+javax.transaction.*      →  jakarta.transaction.*
+javax.inject.*           →  jakarta.inject.*
+javax.ws.rs.*            →  jakarta.ws.rs.*
+javax.mail.*             →  jakarta.mail.*
+javax.websocket.*        →  jakarta.websocket.*
+```
+
+**⚠️ DO NOT change these** (they are JDK packages, not Jakarta EE):
+```
+javax.crypto.*           →  NO CHANGE (JDK package)
+javax.net.ssl.*          →  NO CHANGE (JDK package)
+javax.security.auth.*    →  NO CHANGE (JDK package)
+javax.sql.*              →  NO CHANGE (JDK package)
+javax.naming.*           →  NO CHANGE (JDK package)
+javax.management.*       →  NO CHANGE (JDK package)
+```
+
+#### Automated Migration Using OpenRewrite
+
+**The most efficient approach** — don't do this manually across hundreds of files:
+
+```xml
+<!-- Add to pom.xml temporarily -->
+<plugin>
+    <groupId>org.openrewrite.maven</groupId>
+    <artifactId>rewrite-maven-plugin</artifactId>
+    <version>5.23.1</version>
+    <configuration>
+        <activeRecipes>
+            <recipe>org.openrewrite.java.spring.boot3.UpgradeSpringBoot_3_2</recipe>
+        </activeRecipes>
+    </configuration>
+    <dependencies>
+        <dependency>
+            <groupId>org.openrewrite.recipe</groupId>
+            <artifactId>rewrite-spring</artifactId>
+            <version>5.7.0</version>
+        </dependency>
+    </dependencies>
+</plugin>
+```
+
+```bash
+# Run OpenRewrite — it will:
+# 1. Replace javax.* → jakarta.* imports
+# 2. Update Spring Security deprecated APIs
+# 3. Update Spring property names
+# 4. Update Hibernate config
+# 5. Migrate to new Spring Boot 3 patterns
+
+./mvnw rewrite:run -pl <service-module>
+
+# Review ALL changes carefully before committing
+git diff
+```
+
+#### Manual javax → jakarta (If NOT Using OpenRewrite)
+
+```bash
+# macOS/Linux — find and replace across all Java files
+find src -name "*.java" -exec sed -i '' \
+  's/import javax\.persistence/import jakarta.persistence/g; 
+   s/import javax\.servlet/import jakarta.servlet/g; 
+   s/import javax\.validation/import jakarta.validation/g; 
+   s/import javax\.annotation/import jakarta.annotation/g; 
+   s/import javax\.transaction/import jakarta.transaction/g;
+   s/import javax\.inject/import jakarta.inject/g;
+   s/import javax\.websocket/import jakarta.websocket/g' {} \;
+
+# Verify — should return NO results for javax.persistence, javax.servlet, etc.
+grep -rn "import javax\." --include="*.java" src/ | grep -v "javax.crypto" | grep -v "javax.net" | grep -v "javax.sql" | grep -v "javax.security" | grep -v "javax.naming" | grep -v "javax.management"
+```
+
+#### Concrete Code Examples
+
+```java
+// ============================================
+// BEFORE (Spring Boot 2.7 / JDK 8)
+// ============================================
+import javax.persistence.Entity;
+import javax.persistence.Id;
+import javax.persistence.Table;
+import javax.persistence.Column;
+import javax.validation.constraints.NotNull;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+@Entity
+@Table(name = "dashboards")
+public class Dashboard {
+    @Id
+    private String id;
+    
+    @NotNull
+    @Column(name = "tenant_id")
+    private String tenantId;
+}
+
+// ============================================
+// AFTER (Spring Boot 3.2 / JDK 17)
+// ============================================
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import jakarta.persistence.Column;
+import jakarta.validation.constraints.NotNull;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+
+@Entity
+@Table(name = "dashboards")
+public class Dashboard {
+    @Id
+    private String id;
+    
+    @NotNull
+    @Column(name = "tenant_id")
+    private String tenantId;
+}
+```
+
+### 2.3 — Spring Security 5.x → 6.x (Major Breaking Changes)
+
+This is the **second most impactful** change after javax → jakarta.
+
+#### SecurityFilterChain Rewrite
+
+```java
+// ============================================
+// BEFORE (Spring Security 5.x / Spring Boot 2.7)
+// ============================================
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig extends WebSecurityConfigurerAdapter {
+
+    @Override
+    protected void configure(HttpSecurity http) throws Exception {
+        http
+            .csrf().disable()
+            .sessionManagement()
+                .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            .and()
+            .oauth2ResourceServer()
+                .jwt()
+                .jwkSetUri("https://sso.verizon.com/openam/oauth2/jwks")
+                .jwtAuthenticationConverter(jwtAuthenticationConverter())
+            .and().and()
+            .authorizeRequests()
+                .antMatchers("/actuator/health").permitAll()
+                .antMatchers(HttpMethod.POST, "/api/dashboards/**")
+                    .hasAnyRole("CONFIGURATOR", "TENANT_ADMIN", "PLATFORM_ADMIN")
+                .antMatchers(HttpMethod.GET, "/api/**").authenticated()
+                .anyRequest().denyAll();
+    }
+}
+
+// ============================================
+// AFTER (Spring Security 6.x / Spring Boot 3.2)
+// ============================================
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable())
+            .sessionManagement(session ->
+                session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(jwt -> jwt
+                    .jwkSetUri("https://sso.verizon.com/openam/oauth2/jwks")
+                    .jwtAuthenticationConverter(jwtAuthenticationConverter())
+                ))
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/actuator/health").permitAll()
+                .requestMatchers(HttpMethod.POST, "/api/dashboards/**")
+                    .hasAnyRole("CONFIGURATOR", "TENANT_ADMIN", "PLATFORM_ADMIN")
+                .requestMatchers(HttpMethod.GET, "/api/**").authenticated()
+                .anyRequest().denyAll()
+            );
+
+        return http.build();
+    }
+}
+```
+
+**Key Spring Security changes cheat sheet:**
+
+| Spring Security 5.x (Boot 2.7) | Spring Security 6.x (Boot 3.2) |
+|---------------------------------|--------------------------------|
+| `extends WebSecurityConfigurerAdapter` | ❌ Removed — use `@Bean SecurityFilterChain` |
+| `.and()` chaining | ❌ Removed — use lambda DSL |
+| `.authorizeRequests()` | `.authorizeHttpRequests()` |
+| `.antMatchers(...)` | `.requestMatchers(...)` |
+| `.mvcMatchers(...)` | `.requestMatchers(...)` |
+| `.access("hasRole('X') and hasRole('Y')")` | `.access(AuthorizationManagers.allOf(...))` |
+| `@EnableGlobalMethodSecurity` | `@EnableMethodSecurity` |
+| `@Secured("ROLE_ADMIN")` | `@Secured("ROLE_ADMIN")` (unchanged) |
+| `@PreAuthorize(...)` | `@PreAuthorize(...)` (unchanged) |
+
+#### @EnableMethodSecurity Annotation Change
+
+```java
+// BEFORE
+@EnableGlobalMethodSecurity(prePostEnabled = true, securedEnabled = true)
+
+// AFTER
+@EnableMethodSecurity(securedEnabled = true)
+// Note: prePostEnabled = true is the DEFAULT in @EnableMethodSecurity
+```
+
+### 2.4 — Spring Data / Hibernate Changes
+
+#### Hibernate 5.x → 6.x
+
+```java
+// BEFORE — Hibernate 5.x ID generators
+@Entity
+public class AuditEvent {
+    @Id
+    @GeneratedValue(strategy = GenerationType.AUTO) 
+    // In Hibernate 5, AUTO on PostgreSQL → SEQUENCE
+    private Long id;
+}
+
+// AFTER — Hibernate 6.x changed AUTO behavior
+@Entity
+public class AuditEvent {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    // Explicit IDENTITY, or use SEQUENCE with @SequenceGenerator
+    // Hibernate 6 changed AUTO to use TABLE strategy by default
+    private Long id;
+}
+
+// PREFERRED (explicit sequence)
+@Entity
+public class AuditEvent {
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "audit_seq")
+    @SequenceGenerator(name = "audit_seq", sequenceName = "audit_events_id_seq", allocationSize = 1)
+    private Long id;
+}
+```
+
+#### Spring Data JPA Changes
+
+```java
+// BEFORE — Spring Data 2.x
+public interface DashboardRepository extends JpaRepository<Dashboard, String> {
+    
+    // getById() was deprecated, getOne() was deprecated
+    Dashboard getById(String id); // Returns proxy
+}
+
+// AFTER — Spring Data 3.x
+public interface DashboardRepository extends JpaRepository<Dashboard, String> {
+    
+    // Use getReferenceById() instead
+    Dashboard getReferenceById(String id); // Returns proxy
+    
+    // findById() remains the preferred method
+    Optional<Dashboard> findById(String id);
+}
+```
+
+### 2.5 — application.properties / application.yml Changes
+
+Several Spring Boot configuration property names changed in 3.x:
+
+```yaml
+# ===================================
+# BEFORE (Spring Boot 2.7)
+# ===================================
+spring:
+  redis:
+    host: ${REDIS_HOST:localhost}
+    port: 6379
+    cluster:
+      nodes: ${REDIS_CLUSTER_NODES:}
+
+  # Actuator
+  management:
+    endpoints:
+      web:
+        exposure:
+          include: health,info,prometheus
+
+server:
+  error:
+    include-binding-errors: always
+
+# ===================================
+# AFTER (Spring Boot 3.2)
+# ===================================
+spring:
+  data:
+    redis:                           # ← Moved under spring.data.redis
+      host: ${REDIS_HOST:localhost}
+      port: 6379
+      cluster:
+        nodes: ${REDIS_CLUSTER_NODES:}
+
+  management:
+    endpoints:
+      web:
+        exposure:
+          include: health,info,prometheus
+
+server:
+  error:
+    include-binding-errors: on-param  # ← 'always' is no longer a valid value
+```
+
+**Full list of changed properties:**
+
+| Spring Boot 2.7 Property | Spring Boot 3.2 Property |
+|--------------------------|--------------------------|
+| `spring.redis.*` | `spring.data.redis.*` |
+| `spring.data.cassandra.*` | Restructured |
+| `spring.flyway.url` | `spring.flyway.url` (same, but Flyway 9+) |
+| `server.max-http-header-size` | `server.max-http-request-header-size` |
+| `spring.mvc.throw-exception-if-no-handler-found` | Removed (now default `true`) |
+| `management.metrics.export.*` | `management.*.<product>.metrics.export.*` |
+
+### 2.6 — Flyway Migration
+
+```xml
+<!-- BEFORE (Flyway 8.x auto-included by Spring Boot 2.7) -->
+<!-- Managed by spring-boot-starter-parent -->
+
+<!-- AFTER (Flyway 9.x/10.x with Spring Boot 3.2) -->
+<!-- Spring Boot 3.2 manages Flyway 9.16+ -->
+<!-- Key changes: -->
+<!-- 1. Flyway community edition is free for PostgreSQL -->
+<!-- 2. Flyway Teams renamed to Flyway Enterprise -->
+<!-- 3. If you use Flyway callbacks or Java migrations: -->
+```
+
+```java
+// BEFORE (Flyway 8.x callback)
+import org.flywaydb.core.api.callback.Callback;
+import org.flywaydb.core.api.callback.Context;
+import org.flywaydb.core.api.callback.Event;
+
+// AFTER — Same API, but verify your callback code compiles with Flyway 9.x
+// Flyway 9 dropped some deprecated methods
+```
+
+### 2.7 — Observability Changes (Micrometer)
+
+Spring Boot 3 introduced the new **Observation API** (replacing Sleuth for tracing):
+
+```xml
+<!-- BEFORE (Spring Boot 2.7) -->
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-sleuth</artifactId>
+</dependency>
+
+<!-- AFTER (Spring Boot 3.2) — Sleuth is DEAD, use Micrometer Tracing -->
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-tracing-bridge-otel</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.opentelemetry</groupId>
+    <artifactId>opentelemetry-exporter-zipkin</artifactId>
+</dependency>
+```
+
+```yaml
+# New Spring Boot 3 tracing config
+management:
+  tracing:
+    sampling:
+      probability: 1.0  # 100% in dev, lower in prod
+  observations:
+    key-values:
+      application: ${spring.application.name}
+```
+
+### 2.8 — WebSocket / STOMP Changes
+
+```java
+// BEFORE (Spring Boot 2.7)
+import javax.websocket.*;
+
+// AFTER (Spring Boot 3.2)
+import jakarta.websocket.*;
+```
+
+Spring's STOMP/WebSocket APIs remain largely the same, but the underlying servlet container namespace changed.
+
+### 2.9 — Replace Springfox (Swagger) with SpringDoc
+
+Springfox is **dead** — not compatible with Spring Boot 3.x. Replace with SpringDoc:
+
+```xml
+<!-- REMOVE -->
+<dependency>
+    <groupId>io.springfox</groupId>
+    <artifactId>springfox-boot-starter</artifactId>
+    <version>3.0.0</version>
+</dependency>
+
+<!-- ADD -->
+<dependency>
+    <groupId>org.springdoc</groupId>
+    <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+    <version>2.3.0</version>
+</dependency>
+```
+
+```java
+// BEFORE — Springfox annotations
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiOperation;
+
+@Api(tags = "Dashboards")
+@ApiOperation("List all accessible dashboards")
+
+// AFTER — SpringDoc (uses standard OpenAPI 3 annotations)
+import io.swagger.v3.oas.annotations.tags.Tag;
+import io.swagger.v3.oas.annotations.Operation;
+
+@Tag(name = "Dashboards")
+@Operation(summary = "List all accessible dashboards")
+```
+
+### 2.10 — JUnit 4 → JUnit 5 (If Not Already Migrated)
+
+Spring Boot 3.x dropped JUnit 4 support from `spring-boot-starter-test`.
+
+```java
+// ============================================
+// BEFORE (JUnit 4)
+// ============================================
+import org.junit.Test;
+import org.junit.Before;
+import org.junit.runner.RunWith;
+import org.springframework.test.context.junit4.SpringRunner;
+import org.junit.Assert;
+
+@RunWith(SpringRunner.class)
+@SpringBootTest
+public class DashboardServiceTest {
+
+    @Before
+    public void setUp() { ... }
+
+    @Test
+    public void testCreateDashboard() {
+        Assert.assertEquals(expected, actual);
+    }
+
+    @Test(expected = NotFoundException.class)
+    public void testNotFound() { ... }
+}
+
+// ============================================
+// AFTER (JUnit 5 / Jupiter)
+// ============================================
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.test.context.junit.jupiter.SpringExtension;
+import static org.junit.jupiter.api.Assertions.*;
+
+// @RunWith → @ExtendWith (but @SpringBootTest auto-includes it)
+@SpringBootTest
+class DashboardServiceTest {
+
+    @BeforeEach  // @Before → @BeforeEach
+    void setUp() { ... }
+
+    @Test
+    void createDashboard() {  // Methods can be package-private
+        assertEquals(expected, actual);
+    }
+
+    @Test
+    void notFound_throwsException() {
+        assertThrows(NotFoundException.class, () -> {
+            dashboardService.getFullConfig("nonexistent", "tenant");
+        });
+    }
+}
+```
+
+**JUnit migration cheat sheet:**
+
+| JUnit 4 | JUnit 5 |
+|---------|---------|
+| `@Test` (org.junit) | `@Test` (org.junit.jupiter.api) |
+| `@Before` | `@BeforeEach` |
+| `@After` | `@AfterEach` |
+| `@BeforeClass` | `@BeforeAll` |
+| `@AfterClass` | `@AfterAll` |
+| `@Ignore` | `@Disabled` |
+| `@RunWith(SpringRunner.class)` | `@ExtendWith(SpringExtension.class)` or implicit with `@SpringBootTest` |
+| `@Test(expected = X.class)` | `assertThrows(X.class, () -> ...)` |
+| `@Rule` / `@ClassRule` | `@ExtendWith` + Extension API |
+| `Assert.assertEquals(a, b)` | `assertEquals(a, b)` (static import) |
+
+---
+
+## Phase 3: Leverage JDK 17 Features (Post-Migration Polish)
+
+Once everything compiles and passes tests on JDK 17 + Spring Boot 3.2, modernize the code:
+
+### 3.1 — Records (Replace Boilerplate DTOs)
+
+```java
+// BEFORE — 40 lines of boilerplate (or Lombok @Data)
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class DashboardSummaryDto {
+    private String id;
+    private String name;
+    private String department;
+}
+
+// AFTER — 1 line (JDK 16+ records)
+public record DashboardSummaryDto(String id, String name, String department) {}
+
+// Also great for:
+public record ErrorResponse(String code, String message) {}
+public record FilterOption(String id, String label) {}
+public record QueryRequest(String dashboardId, String chartId, Map<String, Object> filters) {}
+```
+
+> **⚠️ Records are immutable.** Don't use them for JPA entities (Hibernate requires mutable objects with no-arg constructors). Use records for DTOs, value objects, and API payloads.
+
+### 3.2 — Sealed Classes (Type-Safe Hierarchies)
+
+```java
+// Define a closed hierarchy for SQL validation results
+public sealed interface SqlValidationResult
+        permits SqlValidationResult.Valid,
+                SqlValidationResult.Warning,
+                SqlValidationResult.Rejected {
+
+    record Valid(long estimatedBytes) implements SqlValidationResult {}
+    record Warning(String message, long estimatedBytes) implements SqlValidationResult {}
+    record Rejected(String reason) implements SqlValidationResult {}
+}
+
+// Usage with pattern matching (JDK 17 preview → JDK 21 stable)
+public String describe(SqlValidationResult result) {
+    if (result instanceof SqlValidationResult.Valid v) {
+        return "Valid, estimated " + v.estimatedBytes() + " bytes";
+    } else if (result instanceof SqlValidationResult.Warning w) {
+        return "Warning: " + w.message();
+    } else if (result instanceof SqlValidationResult.Rejected r) {
+        return "Rejected: " + r.reason();
+    }
+    throw new IllegalStateException("Unhandled result type");
+}
+```
+
+### 3.3 — Text Blocks (Multi-Line Strings)
+
+```java
+// BEFORE — SQL in Java strings (escaped, unreadable)
+String sql = "SELECT d.name, d.department,\n" +
+    "       COUNT(*) as query_count,\n" +
+    "       SUM(qel.bytes_scanned) as total_bytes\n" +
+    "FROM query_execution_log qel\n" +
+    "JOIN dashboards d ON qel.dashboard_id = d.id\n" +
+    "WHERE qel.executed_at >= DATE_TRUNC('month', CURRENT_DATE)\n" +
+    "GROUP BY d.name, d.department\n" +
+    "ORDER BY total_bytes DESC\n" +
+    "LIMIT 10";
+
+// AFTER — Text blocks (JDK 15+)
+String sql = """
+    SELECT d.name, d.department,
+           COUNT(*) as query_count,
+           SUM(qel.bytes_scanned) as total_bytes
+    FROM query_execution_log qel
+    JOIN dashboards d ON qel.dashboard_id = d.id
+    WHERE qel.executed_at >= DATE_TRUNC('month', CURRENT_DATE)
+    GROUP BY d.name, d.department
+    ORDER BY total_bytes DESC
+    LIMIT 10
+    """;
+```
+
+### 3.4 — Pattern Matching for instanceof
+
+```java
+// BEFORE
+if (auth instanceof JwtAuthenticationToken) {
+    JwtAuthenticationToken jwtAuth = (JwtAuthenticationToken) auth;
+    String tenantId = jwtAuth.getToken().getClaimAsString("tenant_id");
+}
+
+// AFTER (JDK 16+)
+if (auth instanceof JwtAuthenticationToken jwtAuth) {
+    String tenantId = jwtAuth.getToken().getClaimAsString("tenant_id");
+}
+```
+
+### 3.5 — Switch Expressions
+
+```java
+// BEFORE
+int roleLevel;
+switch (role) {
+    case "VIEWER": roleLevel = 1; break;
+    case "ANALYST": roleLevel = 2; break;
+    case "CONFIGURATOR": roleLevel = 3; break;
+    case "TENANT_ADMIN": roleLevel = 4; break;
+    case "PLATFORM_ADMIN": roleLevel = 5; break;
+    default: throw new IllegalArgumentException("Unknown role: " + role);
+}
+
+// AFTER (JDK 14+)
+int roleLevel = switch (role) {
+    case "VIEWER" -> 1;
+    case "ANALYST" -> 2;
+    case "CONFIGURATOR" -> 3;
+    case "TENANT_ADMIN" -> 4;
+    case "PLATFORM_ADMIN" -> 5;
+    default -> throw new IllegalArgumentException("Unknown role: " + role);
+};
+```
+
+### 3.6 — Helpful NullPointerExceptions
+
+JDK 17 provides detailed NPE messages by default:
+
+```
+// BEFORE (JDK 8) — cryptic
+Exception: java.lang.NullPointerException
+
+// AFTER (JDK 17) — helpful
+Exception: java.lang.NullPointerException:
+  Cannot invoke "String.length()" because the return value of
+  "com.minerva.model.Dashboard.getName()" is null
+```
+
+No code changes needed — JDK 17 enables `-XX:+ShowCodeDetailsInExceptionMessages` by default.
+
+### 3.7 — Stream / Collection Improvements
+
+```java
+// BEFORE (JDK 8)
+List<String> result = items.stream()
+    .collect(Collectors.toList());                     // Mutable list
+List<String> unmodifiable = Collections.unmodifiableList(result);
+
+// AFTER (JDK 10+)
+List<String> result = items.stream()
+    .toList();                                         // Immutable list (JDK 16+)
+
+// BEFORE
+Map<String, String> map = new HashMap<>();
+map.put("key1", "value1");
+map.put("key2", "value2");
+
+// AFTER (JDK 9+)
+var map = Map.of("key1", "value1", "key2", "value2"); // Immutable map
+```
+
+---
+
+## Phase 4: Docker & CI/CD Updates
+
+### 4.1 — Update Dockerfile Base Images
+
+```dockerfile
+# BEFORE (JDK 8)
+FROM eclipse-temurin:8-jdk-alpine AS builder
+# ...
+FROM eclipse-temurin:8-jre-alpine
+
+# AFTER (JDK 17)
+FROM eclipse-temurin:17-jdk-alpine AS builder
+# ...
+FROM eclipse-temurin:17-jre-alpine
+
+# JVM flags update:
+ENTRYPOINT ["java", \
+    "-XX:MaxRAMPercentage=75.0", \
+    "-XX:+UseG1GC", \
+    "-Djava.security.egd=file:/dev/urandom", \
+    "org.springframework.boot.loader.launch.JarLauncher"]
+#                                    ^^^^^^^^
+# NOTE: In Spring Boot 3.2+, the launcher class moved from
+#   org.springframework.boot.loader.JarLauncher
+# to
+#   org.springframework.boot.loader.launch.JarLauncher
+```
+
+### 4.2 — Update CI Pipeline
+
+```yaml
+# .gitlab-ci.yml — Update JDK image
+unit-test:
+  stage: test
+  image: eclipse-temurin:17-jdk  # was eclipse-temurin:8-jdk or openjdk:8
+  script:
+    - ./mvnw verify -pl ${SERVICE_MODULE} -am
+```
+
+### 4.3 — Update Helm Chart / K8s
+
+No specific Helm changes needed for the JDK upgrade, but verify:
+
+```yaml
+# readiness/liveness probes remain the same
+readinessProbe:
+  httpGet:
+    path: /actuator/health/readiness  # Same in Boot 3
+    port: 8080
+  initialDelaySeconds: 20             # JDK 17 CDS can actually speed up startup
+```
+
+---
+
+## Phase 5: Testing & Validation
+
+### 5.1 — Test Execution Plan
+
+```bash
+# Step 1: Unit tests
+./mvnw test -pl <service-module>
+
+# Step 2: Integration tests (Testcontainers)
+./mvnw verify -pl <service-module> -P integration-test
+
+# Step 3: Run the service locally, hit key APIs
+curl -H "Authorization: Bearer <test-jwt>" http://localhost:8080/api/dashboards
+curl http://localhost:8080/actuator/health
+
+# Step 4: Check for deprecation warnings in startup logs
+# Search for: "deprecated", "WARNING", "no longer supported"
+
+# Step 5: Verify all Kafka consumers/producers connect
+# Step 6: Verify Redis cache operations
+# Step 7: Verify BigQuery queries execute correctly
+# Step 8: Verify WebSocket STOMP connections
+```
+
+### 5.2 — Performance Baseline Comparison
+
+```
+Metric              │ JDK 8 + Boot 2.7 │ JDK 17 + Boot 3.2 │ Expected
+────────────────────┼───────────────────┼────────────────────┼─────────
+Startup time        │ ~8 seconds        │ ~6 seconds         │ Faster (JDK 17 CDS)
+Memory (RSS)        │ ~450 MB           │ ~400 MB            │ Smaller (JVM improvements)
+GC pause (p99)      │ ~25 ms            │ ~15 ms             │ Shorter (G1GC improvements)
+API response (p95)  │ ~120 ms           │ ~110 ms            │ Similar or better
+```
+
+---
+
+## Phase 6: Migration Strategy for Multiple Microservices
+
+### Service Migration Order
+
+Migrate services from **least dependent → most dependent**:
+
+```
+1. admin-service         (fewest dependents, lowest risk)
+2. map-service           (standalone WMS proxy, no Kafka producers)
+3. notification-service  (Kafka consumer, WebSocket)
+4. report-service        (SAGA pattern, Quartz)
+5. dashboard-service     (core config service, depended on by others)
+6. query-exec-service    (highest traffic, most critical)
+```
+
+### Parallel Running Strategy
+
+During migration, old (JDK 8) and new (JDK 17) services must coexist:
+
+```
+                    ┌───────────────────────┐
+                    │    API Gateway /       │
+                    │    Load Balancer       │
+                    └───────────┬───────────┘
+                                │
+            ┌───────────────────┼───────────────────┐
+            │                   │                   │
+     ┌──────┴──────┐    ┌──────┴──────┐    ┌───────┴──────┐
+     │ admin-svc   │    │ dashboard   │    │ query-exec   │
+     │ JDK 17 ✅   │    │ JDK 8 🔄    │    │ JDK 8 🔄     │
+     │ Boot 3.2    │    │ Boot 2.7    │    │ Boot 2.7     │
+     └─────────────┘    └─────────────┘    └──────────────┘
+```
+
+**Key compatibility points:**
+- REST APIs: No breaking changes — JSON payloads are the same
+- Kafka messages: Unchanged — JSON serialization is version-agnostic
+- Redis: Client protocol unchanged between Lettuce versions
+- PostgreSQL: JDBC driver updated but protocol compatible
+- JWT: Token format and validation logic unchanged
+
+### Per-Service Migration Checklist
+
+```
+□ Create migration branch: feature/<service>-jdk17-boot3
+□ Update pom.xml (JDK 17, Spring Boot 3.2.x)
+□ Run OpenRewrite OR manual javax → jakarta
+□ Rewrite SecurityFilterChain (Spring Security 6)
+□ Update Hibernate ID generation strategy if needed
+□ Update application.yml property names (spring.data.redis.*)
+□ Replace Springfox with SpringDoc (if applicable)
+□ Migrate JUnit 4 → JUnit 5 (if applicable)
+□ Fix --add-opens for any remaining reflection issues
+□ Update Dockerfile base image (temurin:17)
+□ Run all unit tests — GREEN
+□ Run all integration tests — GREEN
+□ Local smoke test (start service, hit APIs)
+□ Deploy to staging — verify with other services
+□ Performance comparison (startup, memory, latency)
+□ Deploy to production (canary → full rollout)
+□ Monitor for 48 hours (error rates, latency, memory)
+□ Remove --add-opens flags that are no longer needed
+□ Commit & merge
+```
+
+---
+
+## Common Pitfalls & Troubleshooting
+
+### Pitfall 1: Mixed javax and jakarta at Runtime
+
+**Symptom:** `ClassNotFoundException: javax.persistence.Entity` or `NoClassDefFoundError`
+
+**Cause:** A transitive dependency still pulls in an old `javax.*` library that conflicts with `jakarta.*`.
+
+**Fix:**
+```bash
+# Find who's pulling in the old javax dependency
+./mvnw dependency:tree -pl <service> | grep "javax.persistence"
+./mvnw dependency:tree -pl <service> | grep "javax.servlet"
+
+# Exclude it
+<dependency>
+    <groupId>problematic-library</groupId>
+    <artifactId>problematic-artifact</artifactId>
+    <exclusions>
+        <exclusion>
+            <groupId>javax.persistence</groupId>
+            <artifactId>javax.persistence-api</artifactId>
+        </exclusion>
+    </exclusions>
+</dependency>
+```
+
+### Pitfall 2: Hibernate 6 ID Generation Change
+
+**Symptom:** `SequenceGenerator not found` or IDs start from 1 instead of continuing from existing max.
+
+**Cause:** Hibernate 6 changed the default `GenerationType.AUTO` behavior.
+
+**Fix:** Either use `IDENTITY` or configure the naming strategy:
+```properties
+# application.yml — Force Hibernate 5-compatible ID generation behavior in Hibernate 6
+# NOTE: "hibernate.id.new_generator_mappings" was REMOVED in Hibernate 6 — do NOT use it.
+# Instead, use the db_structure_naming_strategy:
+spring.jpa.properties.hibernate.id.db_structure_naming_strategy=legacy
+
+# OR (preferred) — fix each entity to use an explicit strategy:
+# @GeneratedValue(strategy = GenerationType.IDENTITY)          ← for auto-increment columns
+# @GeneratedValue(strategy = GenerationType.SEQUENCE,
+#                 generator = "dashboard_seq")
+# @SequenceGenerator(name = "dashboard_seq",
+#                    sequenceName = "dashboard_id_seq",
+#                    allocationSize = 1)                       ← for explicit sequences
+```
+
+### Pitfall 3: Spring Security 6 Returns 403 Instead of 401
+
+**Symptom:** Unauthenticated requests return 403 (Forbidden) instead of 401 (Unauthorized).
+
+**Cause:** Spring Security 6 changed the default `AuthenticationEntryPoint` behavior.
+
+**Fix:**
+```java
+http.exceptionHandling(exceptions -> exceptions
+    .authenticationEntryPoint((request, response, authException) -> {
+        response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Unauthorized");
+    })
+);
+```
+
+### Pitfall 4: Trailing Slash Matching Disabled by Default
+
+**Symptom:** `/api/dashboards/` returns 404 when `/api/dashboards` works.
+
+**Cause:** Spring Boot 3.x disabled trailing slash matching by default.
+
+**Fix:**
+```java
+@Configuration
+public class WebConfig implements WebMvcConfigurer {
+    @Override
+    public void configurePathMatch(PathMatchConfigurer configurer) {
+        configurer.setUseTrailingSlashMatch(true); // Re-enable if needed
+    }
+}
+```
+
+### Pitfall 5: Circular Bean Dependencies
+
+**Symptom:** `BeanCurrentlyInCreationException` on startup.
+
+**Cause:** Spring Boot 3.x makes circular dependencies a hard error (was a warning in 2.7).
+
+**Fix:** Refactor to break the cycle, or as a temporary escape hatch:
+```yaml
+spring:
+  main:
+    allow-circular-references: true  # Temporary! Fix the actual cycle
+```
+
+---
+
+## Timeline Estimate (Per Microservice)
+
+| Phase | Effort | Duration |
+|-------|--------|----------|
+| Phase 0: Assessment & Baseline | Low | 1 day |
+| Phase 1: JDK 8 → 17 (on Boot 2.7) | Low-Medium | 1-2 days |
+| Phase 2: Spring Boot 2.7 → 3.2 | High | 3-5 days |
+| Phase 3: JDK 17 feature adoption | Low | 1-2 days (optional, can be gradual) |
+| Phase 4: Docker/CI updates | Low | 0.5 day |
+| Phase 5: Testing & validation | Medium | 2-3 days |
+| **Total per service** | | **~7-12 days** |
+| **6 services total** | | **~6-10 weeks** (with parallel work) |
+
+> **Recommendation:** Don't try to migrate all 6 services simultaneously. Do 1-2 at a time. Start with `admin-service` (lowest risk) to build confidence and document service-specific gotchas, then accelerate through the remaining services.
+
+---
+
+## Interview Q&A
+
+**Q: "How would you approach migrating microservices from JDK 8 to 17?"**
+> "Two-phase approach. First, upgrade JDK 8 → 17 while staying on Spring Boot 2.7 — this isolates JDK-level issues like strong encapsulation and removed modules (JAXB). Once tests pass on JDK 17, upgrade Spring Boot 2.7 → 3.2, which brings the javax → jakarta namespace migration, Spring Security 6 rewrites, and Hibernate 6 changes. I use OpenRewrite to automate the bulk of the javax→jakarta renames, then manually fix Spring Security and test failures. Migrate services one at a time, starting with the least critical."
+
+**Q: "What was the hardest part of the migration?"**
+> "Spring Security. The API completely changed — `WebSecurityConfigurerAdapter` was removed, `.and()` chaining was removed, `antMatchers` became `requestMatchers`, and `authorizeRequests` became `authorizeHttpRequests`. Every service's security configuration had to be rewritten from scratch using the lambda DSL. We used OpenRewrite's Spring Boot 3 recipe to handle 80% of it, then manually fixed the edge cases."
+
+**Q: "Why not jump straight to JDK 21?"**
+> "JDK 17 is the minimum for Spring Boot 3.x and has the widest library compatibility. JDK 21 brings virtual threads and pattern matching improvements, but some of our dependencies (especially internal Verizon libraries) weren't certified for 21 yet. We'll upgrade to 21 in a follow-up phase once the ecosystem catches up."
+
+**Q: "How did you ensure backward compatibility during the migration?"**
+> "REST APIs use JSON — the serialization format doesn't change between Spring Boot versions. Kafka messages are JSON strings — version-agnostic. Redis uses the same protocol. The only breaking surface is internal: Java package names (javax→jakarta) and Spring Security APIs. By migrating one service at a time and running old and new services in parallel, we ensured zero downtime. Each service was validated in staging before production deployment."
+
+---
+
+## Quick Navigation
+
+| File | What's Inside |
+|------|--------------|
+| **01-project-overview.md** | Pitch, diagram, roles, tech stack |
+| **02-architecture-deep-dive.md** | All 7 services in detail |
+| **03-e2e-flows.md** | All 15 E2E flows |
+| **04-security-rbac.md** | ForgeRock SSO, RBAC, security code |
+| **05-data-layer.md** | PostgreSQL, BigQuery, Kinetica, Redis, Kafka |
+| **06-spring-boot-frontend.md** | Spring Boot + React patterns |
+| **07-devops-deployment.md** | EKS, Docker, ArgoCD, GitLab CI |
+| **08-interview-cheat-sheet.md** | Rapid-fire answers, STAR stories |
+| **09-dashboard-catalog.md** | Real dashboards, real SQL |
+| **10-jdk8-to-jdk17-migration-guide.md** | ← You are here. Full migration playbook |
