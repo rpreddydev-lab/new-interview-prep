@@ -1,0 +1,300 @@
+===================================================================
+  DATE & TIME QUERY PATTERNS
+  (Functions, range filters, gaps, grouping by period)
+===================================================================
+
+SCHEMA REMINDER
+  orders     (id, customer_id, order_date DATE, total, status)
+  employees  (id, name, department, salary, hire_date DATE, manager_id)
+  logins     (user_id, login_date DATE)
+  events     (id, user_id, event_time DATETIME, event_type)
+
+===================================================================
+PART 1: DATE FUNCTION QUICK REFERENCE
+===================================================================
+
+-- Extract parts of a date
+YEAR(date)                      -- 2025
+MONTH(date)                     -- 1..12
+DAY(date) / DAYOFMONTH(date)    -- 1..31
+DAYOFWEEK(date)                 -- 1=Sunday .. 7=Saturday
+DAYNAME(date)                   -- 'Monday'
+QUARTER(date)                   -- 1..4
+WEEK(date)                      -- week number (0-53)
+HOUR(datetime)                  -- 0..23
+MINUTE(datetime)
+SECOND(datetime)
+
+-- EXTRACT (SQL standard, works in MySQL & PostgreSQL)
+EXTRACT(YEAR  FROM order_date)
+EXTRACT(MONTH FROM order_date)
+EXTRACT(DOW   FROM order_date)   -- PostgreSQL: 0=Sunday
+EXTRACT(EPOCH FROM datetime)     -- PostgreSQL: Unix timestamp
+
+-- Format dates
+DATE_FORMAT(date, '%Y-%m')       -- '2025-01'   (MySQL)
+DATE_FORMAT(date, '%Y-%m-%d')    -- '2025-01-15'
+TO_CHAR(date, 'YYYY-MM')         -- PostgreSQL equivalent
+
+-- Current date/time
+CURRENT_DATE                     -- today's date (no time)
+CURRENT_TIMESTAMP / NOW()        -- current datetime
+CURDATE()                        -- MySQL alias for CURRENT_DATE
+SYSDATE()                        -- MySQL: time of function call (differs from NOW in stored procs)
+
+-- Date arithmetic
+date + INTERVAL 7 DAY            -- add 7 days
+date - INTERVAL 1 MONTH          -- subtract 1 month
+date + INTERVAL '1-3' YEAR_MONTH -- add 1 year 3 months
+
+-- Difference between dates
+DATEDIFF(date1, date2)           -- integer days (date1 - date2), MySQL
+date1 - date2                    -- PostgreSQL: returns integer days
+TIMESTAMPDIFF(MONTH, d1, d2)     -- MySQL: difference in specified unit
+AGE(d1, d2)                      -- PostgreSQL: interval (e.g. '2 years 3 mons')
+
+-- Truncate to period
+DATE(datetime)                   -- strip time component
+DATE_TRUNC('month', date)        -- PostgreSQL: first day of month
+DATE_FORMAT(date,'%Y-%m-01')     -- MySQL: first day of month
+
+===================================================================
+PART 2: DATE RANGE FILTERING
+===================================================================
+
+-- Q: Orders placed in January 2025.
+SELECT * FROM orders
+WHERE order_date >= '2025-01-01'
+  AND order_date <  '2025-02-01';
+-- PREFERRED over BETWEEN '2025-01-01' AND '2025-01-31'
+-- because BETWEEN is inclusive at both ends; for DATETIMEs it misses 2025-01-31 23:59:59
+
+-- Q: Orders placed in the last 30 days.
+SELECT * FROM orders
+WHERE order_date >= CURRENT_DATE - INTERVAL 30 DAY;
+
+-- Q: Orders placed this calendar year.
+SELECT * FROM orders
+WHERE YEAR(order_date) = YEAR(CURRENT_DATE);
+-- CAUTION: YEAR() on a column prevents index use; prefer range:
+WHERE order_date >= DATE_FORMAT(CURRENT_DATE, '%Y-01-01')
+  AND order_date <  DATE_FORMAT(CURRENT_DATE + INTERVAL 1 YEAR, '%Y-01-01');
+
+-- Q: Employees hired in the last 6 months.
+SELECT * FROM employees
+WHERE hire_date >= CURRENT_DATE - INTERVAL 6 MONTH;
+
+-- Q: Orders placed on a weekend.
+SELECT * FROM orders
+WHERE DAYOFWEEK(order_date) IN (1, 7);   -- 1=Sunday, 7=Saturday
+
+===================================================================
+PART 3: GROUP BY TIME PERIOD
+===================================================================
+
+-- Q: Total revenue per month.
+SELECT
+    DATE_FORMAT(order_date, '%Y-%m') AS month,
+    SUM(total)                       AS revenue,
+    COUNT(*)                         AS order_count
+FROM orders
+GROUP BY DATE_FORMAT(order_date, '%Y-%m')
+ORDER BY month;
+
+-- Q: Total revenue per quarter.
+SELECT
+    YEAR(order_date)    AS yr,
+    QUARTER(order_date) AS qtr,
+    SUM(total)          AS revenue
+FROM orders
+GROUP BY YEAR(order_date), QUARTER(order_date)
+ORDER BY yr, qtr;
+
+-- Q: Revenue per day of week (to find busiest day).
+SELECT
+    DAYNAME(order_date) AS day_name,
+    DAYOFWEEK(order_date) AS dow,
+    SUM(total)          AS revenue,
+    COUNT(*)            AS orders
+FROM orders
+GROUP BY DAYOFWEEK(order_date), DAYNAME(order_date)
+ORDER BY dow;
+
+-- Q: Number of new users registered per week.
+SELECT
+    YEAR(hire_date)      AS yr,
+    WEEK(hire_date)      AS wk,
+    COUNT(*)             AS new_hires
+FROM employees
+GROUP BY YEAR(hire_date), WEEK(hire_date)
+ORDER BY yr, wk;
+
+===================================================================
+PART 4: DATE DIFFERENCE CALCULATIONS
+===================================================================
+
+-- Q: How many days has each order been in 'PENDING' status?
+SELECT
+    id,
+    order_date,
+    status,
+    DATEDIFF(CURRENT_DATE, order_date) AS days_pending
+FROM orders
+WHERE status = 'PENDING'
+ORDER BY days_pending DESC;
+
+-- Q: Employee tenure in years.
+SELECT
+    name,
+    hire_date,
+    TIMESTAMPDIFF(YEAR, hire_date, CURRENT_DATE)  AS years_at_company,
+    TIMESTAMPDIFF(MONTH, hire_date, CURRENT_DATE) AS months_at_company
+FROM employees;
+
+-- Q: Age in years from a birth_date column.
+SELECT
+    name,
+    birth_date,
+    TIMESTAMPDIFF(YEAR, birth_date, CURRENT_DATE) AS age
+FROM persons;
+
+-- Q: Average days between orders per customer.
+WITH ordered AS (
+    SELECT
+        customer_id,
+        order_date,
+        LAG(order_date) OVER (PARTITION BY customer_id ORDER BY order_date) AS prev_date
+    FROM orders
+)
+SELECT
+    customer_id,
+    AVG(DATEDIFF(order_date, prev_date)) AS avg_days_between_orders
+FROM ordered
+WHERE prev_date IS NOT NULL
+GROUP BY customer_id;
+
+===================================================================
+PART 5: FIND GAPS IN DATES (missing days / no-activity periods)
+===================================================================
+
+-- Q: Find dates in a date range where no orders were placed.
+-- Step 1: generate a calendar (recursive CTE)
+WITH RECURSIVE calendar AS (
+    SELECT DATE('2025-01-01') AS cal_date
+    UNION ALL
+    SELECT cal_date + INTERVAL 1 DAY
+    FROM calendar
+    WHERE cal_date < '2025-01-31'
+),
+order_dates AS (
+    SELECT DISTINCT DATE(order_date) AS order_date FROM orders
+    WHERE order_date BETWEEN '2025-01-01' AND '2025-01-31'
+)
+SELECT cal_date AS no_order_date
+FROM calendar
+LEFT JOIN order_dates ON order_dates.order_date = calendar.cal_date
+WHERE order_dates.order_date IS NULL;
+
+-- Q: Find the longest gap between consecutive orders company-wide.
+WITH ordered AS (
+    SELECT
+        order_date,
+        LAG(order_date) OVER (ORDER BY order_date) AS prev_date
+    FROM (SELECT DISTINCT DATE(order_date) AS order_date FROM orders) d
+)
+SELECT
+    prev_date       AS gap_start,
+    order_date      AS gap_end,
+    DATEDIFF(order_date, prev_date) - 1 AS gap_days
+FROM ordered
+WHERE prev_date IS NOT NULL
+ORDER BY gap_days DESC
+LIMIT 1;
+
+===================================================================
+PART 6: PERIOD COMPARISON (YoY, MoM, same period last year)
+===================================================================
+
+-- Q: Compare monthly revenue this year vs same month last year.
+WITH monthly AS (
+    SELECT
+        YEAR(order_date)               AS yr,
+        MONTH(order_date)              AS mo,
+        DATE_FORMAT(order_date,'%Y-%m') AS month_label,
+        SUM(total)                     AS revenue
+    FROM orders
+    GROUP BY YEAR(order_date), MONTH(order_date)
+)
+SELECT
+    a.yr,
+    a.mo,
+    a.revenue                          AS this_year,
+    b.revenue                          AS last_year,
+    ROUND(a.revenue - b.revenue, 2)    AS yoy_change,
+    ROUND((a.revenue - b.revenue) * 100.0 / NULLIF(b.revenue, 0), 2) AS yoy_pct
+FROM monthly a
+LEFT JOIN monthly b ON a.mo = b.mo AND a.yr = b.yr + 1
+WHERE a.yr = YEAR(CURRENT_DATE)
+ORDER BY a.mo;
+
+-- Q: Customers who placed orders in Jan 2025 but not in Jan 2024 (new customers).
+SELECT DISTINCT customer_id
+FROM orders
+WHERE YEAR(order_date) = 2025 AND MONTH(order_date) = 1
+  AND customer_id NOT IN (
+      SELECT DISTINCT customer_id FROM orders
+      WHERE YEAR(order_date) = 2024 AND MONTH(order_date) = 1
+  );
+
+===================================================================
+PART 7: DATETIME — TIME-BASED ANALYSIS
+===================================================================
+
+-- Q: Count events per hour of day (peak hour analysis).
+SELECT
+    HOUR(event_time)  AS hr,
+    COUNT(*)          AS event_count
+FROM events
+GROUP BY HOUR(event_time)
+ORDER BY hr;
+
+-- Q: Count active sessions — sessions where event_time within last 30 minutes.
+SELECT COUNT(DISTINCT user_id) AS active_users
+FROM events
+WHERE event_time >= NOW() - INTERVAL 30 MINUTE;
+
+-- Q: Average session duration per user (assuming event pairs: login/logout).
+SELECT
+    user_id,
+    AVG(TIMESTAMPDIFF(MINUTE, login_time, logout_time)) AS avg_session_min
+FROM sessions
+GROUP BY user_id;
+
+===================================================================
+PART 8: COMMON DATE TRAPS
+===================================================================
+
+TRAP 1: BETWEEN with DATETIME — misses the last second
+  -- BAD: misses rows at 2025-01-31 23:59:59
+  WHERE order_date BETWEEN '2025-01-01' AND '2025-01-31'
+  -- GOOD:
+  WHERE order_date >= '2025-01-01' AND order_date < '2025-02-01'
+
+TRAP 2: Applying function to indexed column kills the index
+  -- BAD (no index on YEAR(hire_date)):
+  WHERE YEAR(hire_date) = 2024
+  -- GOOD (index on hire_date is used):
+  WHERE hire_date >= '2024-01-01' AND hire_date < '2025-01-01'
+
+TRAP 3: DATEDIFF argument order
+  DATEDIFF(later_date, earlier_date)   -- positive
+  DATEDIFF(earlier_date, later_date)   -- negative → use ABS() if needed
+
+TRAP 4: Comparing DATE and DATETIME columns
+  -- hire_date DATE vs created_at DATETIME: implicit cast may cause issues
+  WHERE DATE(created_at) = hire_date   -- force DATE cast when mixing types
+
+TRAP 5: NULL dates in range filters
+  -- NULLs are excluded by >, <, BETWEEN automatically (NULL comparisons = UNKNOWN)
+  -- But make this explicit in code review: add AND col IS NOT NULL if needed
+===================================================================
