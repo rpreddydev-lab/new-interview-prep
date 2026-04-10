@@ -661,3 +661,191 @@ Q: "What's your rollback strategy?"
 
 Q: "How do you handle cross-cloud networking (AWS EKS → GCP BigQuery)?"
 "We use GCP service account keys stored as K8s Secrets for BigQuery authentication. The traffic goes over the public internet (HTTPS/TLS). The added latency (~20-50ms per request vs ~5ms for same-cloud) is mitigated by aggressive Redis caching. Long-term, we're evaluating GCP Workload Identity Federation to eliminate the service account key."
+
+Observability Deep Dive
+-----------------------
+
+What to use this for: "How do you monitor your services?" / "Walk me through your observability stack" / "What are your SLIs/SLOs?"
+
+Observability Stack
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        MINERVA OBSERVABILITY                                │
+│                                                                             │
+│  ┌─────────────────┐  ┌──────────────────┐  ┌──────────────────────────┐   │
+│  │   METRICS        │  │   LOGGING         │  │   ALERTING               │   │
+│  │                  │  │                   │  │                          │   │
+│  │  Micrometer      │  │  Logback + JSON   │  │  Grafana Alert Rules     │   │
+│  │  → Prometheus    │  │  → CloudWatch     │  │  → PagerDuty (P1/P2)    │   │
+│  │  → Grafana       │  │    Logs Insights  │  │  → Slack (P3)           │   │
+│  │                  │  │                   │  │  → Email (reports)       │   │
+│  └─────────────────┘  └──────────────────┘  └──────────────────────────┘   │
+│                                                                             │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │   TRACING                                                            │   │
+│  │   MDC context (tenantId, userId, dashboardId, traceId)               │   │
+│  │   Propagated via HTTP headers for sync calls                         │   │
+│  │   Kafka headers for async event correlation                          │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Metrics Layer (Micrometer + Prometheus + Grafana)
+
+Spring Boot Actuator exposes /actuator/prometheus on every service. Prometheus scrapes all pods every 15 seconds.
+
+Key Custom Metrics We Track
+
+| Metric Name | Type | Labels | Purpose |
+|-------------|------|--------|----------|
+| bigquery_query_duration_seconds | Histogram | service, dashboard_id, cache_hit | Query performance tracking |
+| bigquery_bytes_scanned_total | Counter | service, dashboard_id, tenant_id | Cost tracking per dashboard |
+| bigquery_query_errors_total | Counter | service, error_type | Error rate monitoring |
+| dashboard_config_loads_total | Counter | service, cache_hit | Cache hit rate calculation |
+| report_generation_duration_seconds | Histogram | format, status | Report performance |
+| report_saga_step_status | Counter | step, status (success/fail/compensated) | SAGA reliability tracking |
+| websocket_active_connections | Gauge | service, tenant_id | WebSocket connection monitoring |
+| kafka_consumer_lag | Gauge | topic, consumer_group | Consumer lag detection |
+| redis_cache_hit_ratio | Gauge | cache_name | Cache effectiveness |
+| jwt_validation_duration_seconds | Histogram | service | Auth overhead tracking |
+| rate_limit_rejected_total | Counter | service, tenant_id | Rate limiting visibility |
+
+Custom Metrics Implementation
+
+@Component
+@RequiredArgsConstructor
+public class BigQueryMetrics {
+
+    private final MeterRegistry meterRegistry;
+
+    public void recordQuery(String dashboardId, boolean cacheHit, long durationMs, long bytesScanned) {
+        Timer.builder("bigquery.query.duration")
+            .tag("dashboard_id", dashboardId)
+            .tag("cache_hit", String.valueOf(cacheHit))
+            .register(meterRegistry)
+            .record(durationMs, TimeUnit.MILLISECONDS);
+
+        if (!cacheHit) {
+            meterRegistry.counter("bigquery.bytes.scanned",
+                "dashboard_id", dashboardId)
+                .increment(bytesScanned);
+        }
+    }
+
+    public void recordError(String errorType) {
+        meterRegistry.counter("bigquery.query.errors",
+            "error_type", errorType)
+            .increment();
+    }
+}
+
+Grafana Dashboards (Monitoring Minerva Itself)
+
+We built 4 Grafana dashboards to monitor the platform:
+
+| Grafana Dashboard | Panels | Primary Audience |
+|-------------------|--------|------------------|
+| Service Health Overview | Pod status, CPU/memory per service, restart count, error rate (5xx), p50/p95/p99 latency | On-call engineer |
+| BigQuery Cost & Performance | Bytes scanned/day (with cost estimate), query duration heatmap, top 10 expensive dashboards, cache hit ratio | Platform team + PLATFORM_ADMIN |
+| Kafka & Event Pipeline | Consumer lag per topic, DLT message count, event throughput, SAGA step success/failure rate | Platform team |
+| User Activity & RBAC | Active users by role, dashboard views/day, report generation count, login frequency, rate-limit rejections | Product owner |
+
+Structured Logging
+
+All services use Logback with JSON encoder. Every log line includes MDC context:
+
+LOGBACK-SPRING.XML
+==================
+<configuration>
+  <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+      <includeMdcKeyName>tenantId</includeMdcKeyName>
+      <includeMdcKeyName>userId</includeMdcKeyName>
+      <includeMdcKeyName>dashboardId</includeMdcKeyName>
+      <includeMdcKeyName>traceId</includeMdcKeyName>
+      <includeMdcKeyName>service</includeMdcKeyName>
+    </encoder>
+  </appender>
+  <root level="INFO">
+    <appender-ref ref="CONSOLE" />
+  </root>
+</configuration>
+
+Sample Log Query (CloudWatch Logs Insights)
+
+-- Find all queries for a specific user in the last hour
+fields @timestamp, @message
+| filter tenantId = "vz-network-eng" and userId = "john.smith@verizon.com"
+| sort @timestamp desc
+| limit 50
+
+-- Find slow BigQuery queries (> 3 seconds)
+fields @timestamp, dashboardId, userId, durationMs, bytesScanned
+| filter message like /Query completed/ and durationMs > 3000
+| sort durationMs desc
+
+-- Trace a request across services by traceId
+fields @timestamp, service, @message
+| filter traceId = "abc-123-def"
+| sort @timestamp asc
+
+SLIs and SLOs
+
+| SLI (What We Measure) | SLO (Target) | How We Measure | Alert Threshold |
+|----------------------|-------------|----------------|------------------|
+| Dashboard load latency (p95) | < 2 seconds | Prometheus histogram: bigquery_query_duration_seconds | P1: > 5s for 5 min |
+| Dashboard availability | 99.5% uptime | Synthetic probe hitting /api/dashboards every 60s | P1: 3 consecutive failures |
+| Report generation success rate | > 99% | report_saga_step_status counter | P2: < 95% over 1 hour |
+| Cache hit ratio | > 50% | redis_cache_hit_ratio gauge | P3: < 30% for 30 min |
+| BigQuery error rate | < 1% | bigquery_query_errors_total / total queries | P2: > 5% for 10 min |
+| WebSocket delivery rate | > 99% | websocket notifications sent vs acknowledged | P3: < 95% for 15 min |
+| API error rate (5xx) | < 0.5% | http_server_requests_seconds_count with status=5xx | P2: > 2% for 5 min |
+| Kafka consumer lag | < 1000 messages | kafka_consumer_lag gauge per topic | P2: > 5000 for 10 min |
+
+Alert Severity and Routing
+
+| Severity | Criteria | Notification | Response Time |
+|----------|----------|-------------|----------------|
+| P1 — Critical | Data unavailable, auth down, all dashboards failing | PagerDuty (phone call) + Slack #minerva-incidents | 15 min |
+| P2 — Degraded | Elevated error rate, slow queries, Kafka lag, partial feature outage | PagerDuty (push notification) + Slack | 1 hour |
+| P3 — Warning | Cache hit ratio drop, single dashboard issue, cosmetic errors | Slack #minerva-alerts | Next business day |
+| P4 — Info | Cost threshold approaching, scheduled maintenance | Email digest | Weekly review |
+
+Grafana Alert Rule Example
+
+// Alert: BigQuery circuit breaker opened
+alert: BigQueryCircuitBreakerOpen
+expr: resilience4j_circuitbreaker_state{name="bigquery"} == 1  // 1 = OPEN
+for: 1m
+labels:
+  severity: P1
+  team: minerva
+annotations:
+  summary: "BigQuery circuit breaker OPEN on {{ $labels.instance }}"
+  description: "BigQuery calls are failing. Circuit breaker opened. Dashboard queries will return stale cached data or 503."
+  runbook: "https://wiki.verizon.com/minerva/runbooks/bigquery-circuit-breaker"
+
+Incident Response Runbook (Abbreviated)
+
+1. DETECT: Grafana alert fires → PagerDuty pages on-call engineer
+2. ACKNOWLEDGE: Engineer acknowledges in PagerDuty (SLA: 15 min for P1)
+3. ASSESS: Check Grafana Service Health dashboard → identify affected service
+4. MITIGATE:
+   - BigQuery down → Circuit breaker auto-opens, stale cache serves data
+   - Redis down → Graceful degradation, queries go direct to DB/BigQuery
+   - Kafka lag → Check consumer health, restart consumer group if stuck
+   - Pod crash loop → Check logs, rollback to previous image via ArgoCD
+5. COMMUNICATE: Post in Slack #minerva-incidents with status + ETA
+6. RESOLVE: Fix root cause, verify via Grafana, close PagerDuty incident
+7. POST-MORTEM: Blameless review within 48 hours, action items in Jira
+
+Q&A Bank (Observability)
+------------------------
+
+Q: "What metrics do you track?"
+"We track four categories: (1) Business metrics — dashboard views, report generations, active users by role. (2) Performance metrics — BigQuery query duration (p50/p95/p99), cache hit ratio, API latency. (3) Cost metrics — BigQuery bytes scanned per dashboard, estimated daily cost. (4) Reliability metrics — error rates, circuit breaker state, Kafka consumer lag, SAGA step success rates. All exposed via Micrometer → Prometheus → Grafana."
+
+Q: "How do you debug a slow dashboard?"
+"Start with the traceId from the user's request. Search CloudWatch Logs to trace the request across services. Check if it was a cache miss (bigquery.query.duration with cache_hit=false). Look at bytesScanned — if it's high, the configured SQL may need partition filters. Check the BigQuery Cost dashboard in Grafana for that specific dashboard_id. If it's a pattern, talk to the CONFIGURATOR about query optimization."
+
+Q: "What would you improve about your observability?"
+"Three things: (1) Adopt OpenTelemetry for automatic distributed tracing — our current MDC-based traceId doesn't propagate through Kafka events automatically. (2) Add synthetic monitoring — automated browser tests that exercise full dashboard load flows. (3) Add SLO burn rate alerts instead of threshold alerts — 'we're burning through our error budget 10x faster than sustainable' is more actionable than 'error rate > 2%'."  

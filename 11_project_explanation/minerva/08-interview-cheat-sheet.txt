@@ -128,6 +128,64 @@ Q: "Tell me about a time you had to make a tradeoff."
 Q: "How do you handle production incidents?"
 "We follow a structured incident response: (1) Detect via Grafana alerts (PagerDuty integration), (2) Acknowledge and assess severity (P1 = data unavailable, P2 = degraded, P3 = cosmetic), (3) Mitigate first (e.g., circuit breaker auto-opens for BigQuery issues), (4) Root cause analysis using structured logs + audit trail + queryexecutionlog, (5) Post-mortem with blameless review, action items tracked in Jira. Our circuit breaker and stale cache serving handle most P2 incidents automatically."
 
+Story 7: Production Outage — BigQuery Quota Exhaustion (Incident Response)
+
+S: On a Monday morning, all dashboard charts started returning 503 errors. Grafana fired a P1 alert — the BigQuery circuit breaker had opened across all Query Execution Service pods simultaneously. ~200 users were impacted.
+
+T: Restore dashboard functionality immediately, identify root cause, and prevent recurrence.
+
+A: (1) Mitigate first (5 min): Confirmed circuit breaker was open via Actuator endpoint. Checked BigQuery console — our project had exhausted the daily query quota (concurrent query limit hit). A scheduled report cron job had misfired over the weekend, triggering ~500 queued reports simultaneously at 8 AM Monday. Immediately killed the Quartz batch via Admin Service DLT viewer and manually reset the circuit breaker.
+(2) Restore (10 min): Circuit breaker transitioned to half-open, let one request through — BigQuery responded normally. Within 2 minutes all pods recovered. Users saw cached data (stale but functional) for charts that had recent cache entries, while fresh queries resumed.
+(3) Root cause: A CONFIGURATOR had created a scheduled report with a cron expression that ran every minute instead of every Monday ("* * * * 1" vs "0 8 * * 1"). The Quartz misfire policy was set to FIRE_AND_PROCEED, so 2,880 missed executions (48 hours × 60/hr) all fired at once on Monday startup.
+(4) Prevent: Added cron expression validation in Dashboard Service — minimum interval of 1 hour for scheduled reports. Added a Quartz misfire policy override to IGNORE_MISFIRES for reports. Added a concurrent report execution cap (max 5 simultaneous report jobs per tenant). Added a Grafana alert on BigQuery concurrent query count approaching 80% of quota.
+
+R: Total outage was 15 minutes. Zero data loss. Post-mortem led to 4 preventive measures. The cron validation caught 2 similar misconfigurations in the following month. Added the incident to our runbook with step-by-step recovery playbook.
+
+Key interview points:
+- Circuit breaker (Resilience4j) contained the blast radius — BigQuery failure didn't crash the services
+- Stale cache serving meant some users saw data during the outage (graceful degradation)
+- Blameless post-mortem — the CONFIGURATOR wasn't at fault; our system should have validated the cron expression
+- Defense in depth: validation + misfire policy + concurrency cap + monitoring alert
+
+Story 8: Redis Cluster Failure — Graceful Degradation Under Dependency Loss
+
+S: During a routine Redis cluster upgrade in our staging environment (which shared infrastructure with production in our early months), a misconfigured rolling restart caused all Redis pods to be unavailable simultaneously for ~8 minutes. This cascaded into production because the Lettuce connection pool exhausted its retry budget and started failing fast. Grafana fired alerts simultaneously for: cache miss rate → 100%, JWT blacklist check failures, WebSocket cross-pod pub/sub broken, and rate limiter returning errors.
+
+T: Restore the system to a functional state immediately, assess what data was exposed or corrupted, and document the failure modes we hadn't properly designed for.
+
+A: (1) Immediate mitigation (2 min): Confirmed Redis was the root cause via Grafana. Rolled back the Redis cluster restart — Redis came back online within 3 minutes. Lettuce connection pools auto-recovered within 30 seconds of Redis availability.
+(2) Impact assessment: Cache misses → all API calls fell through to PostgreSQL/BigQuery directly. Slower (2-5s vs <1s), but functionally correct. JWT blacklist failures → we had coded these to fail open (accept the token) to avoid a hard Redis dependency blocking all traffic. That decision proved correct — no users were locked out. Rate limiting fell back to the in-memory counter per pod (not cross-pod), so technically rate limits were enforced per-pod instead of globally for 8 minutes. WebSocket cross-pod delivery stopped, but connections stayed alive — users connected to the same pod still got notifications.
+(3) Root cause: The Redis rolling restart config was missing the cluster-require-full-coverage: no flag. With full coverage required (the default), Redis refuses reads/writes when any slot is missing. Our staging/production cluster boundary was also incorrectly configured — a mistake I caught and fixed immediately after this incident by splitting the infrastructure properly.
+(4) Fixes shipped: (a) Set cluster-require-full-coverage: no on all Redis clusters so partial availability degrades gracefully instead of failing completely. (b) Added Resilience4j circuit breaker specifically around Redis operations — not just BigQuery. This ensures cache operations fail fast and fall through to the data store rather than blocking. (c) Added a Grafana alert on Redis connection pool saturation at 70% so we catch pressure before it becomes an outage. (d) Documented the fail-open vs fail-closed decision for each Redis use case in the runbook — JWT blacklist is fail-open (availability wins), rate limiting is per-pod fallback (acceptable degradation), WebSocket pub/sub is fail-silent (local pod delivery only).
+
+R: Incident lasted 8 minutes, no data loss, no security exposure. The fail-open JWT blacklist decision, which I had debated at design time, turned out to be the right call — it kept users working during the outage. Post-incident, we properly separated staging and production Redis clusters (they should never have shared infrastructure), and the circuit breaker around Redis has prevented 2 subsequent smaller Redis hiccups from impacting users at all.
+
+Key interview points:
+- Fail-open vs. fail-closed is a deliberate security vs. availability tradeoff — not laziness
+- Every external dependency needs a circuit breaker, not just the ones you're most worried about
+- Shared staging/production infrastructure is a hidden risk that looks fine until it isn't
+- Graceful degradation means designing every failure path, not just the happy path
+
+"What Would You Do Differently?" (Pre-Built Answers)
+----------------------------------------------------
+
+Q: "If you could start Minerva over, what would you change?"
+
+1. Same-Cloud Architecture
+"I'd push harder to keep compute and data in the same cloud. Our AWS EKS → GCP BigQuery cross-cloud hop adds 20-50ms latency per query. We compensate with aggressive Redis caching (60% hit rate), but same-cloud would give us sub-5ms data access and eliminate the GCP service account key management overhead. The DE team's investment in GCP pipelines was the reason we didn't migrate, but in hindsight, the long-term operational cost of cross-cloud exceeds the one-time migration effort."
+
+2. Contract Testing Between Services
+"I'd add Pact contract tests between React ↔ Backend and between microservices. Right now, we catch integration issues in staging, but contract tests would shift that left to PR time. We had 2-3 incidents where a Dashboard Service API response shape change broke the React SPA because the frontend team didn't know about the change until staging deployment."
+
+3. Event Sourcing for Configuration Changes
+"Config changes are currently CRUD operations with audit logging after the fact. If I started over, I'd use event sourcing for the configuration layer — every config change as an immutable event. This would give us built-in audit trail, config versioning (rollback to any point in time), and the ability to replay config state. The current system has audit logs but can't reconstruct 'what did this dashboard look like 3 weeks ago?'"
+
+4. OpenTelemetry from Day One
+"We added observability incrementally — Micrometer metrics, then MDC logging, then manual traceId propagation. If I started fresh, I'd adopt OpenTelemetry from day one for unified traces, metrics, and logs with automatic context propagation. Our current traceId is manually set in MDC and doesn't propagate through Kafka events, which makes debugging async flows harder than it should be."
+
+5. Feature Flags for Configuration
+"Dashboard configurations go live the moment a CONFIGURATOR saves them. I'd add a feature flag layer — save config as 'draft', preview in staging mode, then promote to 'live'. We compensate with SQL dry-run validation, but there's no way to preview a dashboard before it's visible to all users with access."
+
 Technology Defense (Why We Chose X)
 -----------------------------------
 
@@ -153,12 +211,13 @@ File Quick Reference
 
 | File | When to Read |
 |------|-------------|
-| 01-project-overview.md | Before any interview — your opening pitch |
-| 02-architecture-deep-dive.md | "Walk me through the architecture" questions |
+| 01-project-overview.md | Before any interview — your opening pitch + My Role (team, ownership) |
+| 02-architecture-deep-dive.md | "Walk me through the architecture" + API versioning strategy |
 | 03-e2e-flows.md | "Walk me through what happens when..." questions |
 | 04-security-rbac.md | "How did you handle security?" questions |
 | 05-data-layer.md | "Tell me about your database choices" / "How does Kafka work?" |
-| 06-spring-boot-frontend.md | "Show me code" / "How does the React frontend work?" |
-| 07-devops-deployment.md | "How do you deploy?" / "CI/CD?" / "Scaling?" |
-| 08-interview-cheat-sheet.md | ← You are here. Quick reference for everything |
+| 06-spring-boot-frontend.md | "Show me code" / testing strategy / test pyramid + coverage |
+| 07-devops-deployment.md | "How do you deploy?" / CI/CD / Scaling / Observability / SLIs/SLOs |
+| 08-interview-cheat-sheet.md | ← You are here. Quick reference + STAR stories (Stories 1-8) + "what would you change?" |
 | 09-dashboard-catalog.md | "Give me a concrete example" — real dashboards with SQL |
+| 10-jdk8-to-jdk17-migration-guide.md | "Have you done this migration?" — personal STAR story at the top, then full playbook |
